@@ -1,5 +1,11 @@
 ![GNU/Dogfish Lockup Logo](./assets/dogfish-logo.png)
 
+[![CI (macOS & Linux)](https://github.com/oddurs/gnu-dogfish/actions/workflows/ci.yml/badge.svg)](https://github.com/oddurs/gnu-dogfish/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/oddurs/gnu-dogfish?color=black&label=release)](https://github.com/oddurs/gnu-dogfish/releases)
+[![License: GPL-3.0 / MIT](https://img.shields.io/badge/license-GPLv3%20%2F%20MIT-blue.svg)](./LICENSE)
+[![Platform: macOS & Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-success.svg)](https://github.com/oddurs/gnu-dogfish)
+[![Utilities: 57](https://img.shields.io/badge/utilities-57%20libre%20tools-orange.svg)](#all-57-libre-utilities)
+
 ---
 
 > *"I'd just like to interject for a moment. What you are referring to as 'Coreutils', is in fact, **GNU/Dogfish**, or as I've recently taken to calling it, **GNU plus Dogfish**. Coreutils is not an operating system unto itself, but rather another free component of a fully functioning POSIX system made useful by the GNU/Dogfish SIMD byte kernels, NDJSON object pipelines, and reversible transaction journals comprising a full OS as defined by POSIX."*
@@ -170,9 +176,13 @@ eval "$(/path/to/dogfish/target/release/dogfish init zsh --safe-rm)"
 
 ---
 
-## ⚖️ License & Copyleft Notice
+## ⚖️ License, Copyleft & Trademark Notice
 
 Copyright © 2026 The GNU/Dogfish Contributors.
-Distributed as **Free and Open Source Software** under the dual **GPL-3.0-or-later / MIT** license.
+Distributed as **Free and Open Source Software** under the dual **GPL-3.0-or-later OR MIT** license ([LICENSE](./LICENSE)).
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md), [CHANGELOG.md](./CHANGELOG.md), [SECURITY.md](./SECURITY.md), and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) for community and security guidelines.
+
+*Note: GNU/Dogfish is an independent Free Software project inspired by the GNU Project and is not affiliated with or endorsed by the Free Software Foundation.*
 
 *"Share and enjoy! Happy hacking!"* — 🦈🦬

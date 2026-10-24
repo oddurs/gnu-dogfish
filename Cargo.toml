@@ -8,9 +8,14 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
-authors = ["Dogfish Contributors"]
-description = "Modern, high-performance, object-aware coreutils in Rust"
+license = "GPL-3.0-or-later OR MIT"
+authors = ["The GNU/Dogfish Contributors"]
+description = "GNU/Dogfish: Libre, high-velocity, object-aware coreutils in Rust"
+repository = "https://github.com/oddurs/gnu-dogfish"
+homepage = "https://github.com/oddurs/gnu-dogfish"
+readme = "README.md"
+keywords = ["coreutils", "cli", "unix", "ndjson", "simd"]
+categories = ["command-line-utilities", "filesystem", "os::unix-apis"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }

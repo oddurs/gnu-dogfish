@@ -242,7 +242,14 @@ fn test_base64_and_basenc_all_radixes() {
     let b64_dec = run_stdin(&["base64", "-d"], &b64_enc.stdout);
     assert_eq!(b64_dec.stdout, payload);
 
-    for flag in ["--base64", "--base64url", "--base32", "--base32hex", "--base16", "--base2msbf"] {
+    for flag in [
+        "--base64",
+        "--base64url",
+        "--base32",
+        "--base32hex",
+        "--base16",
+        "--base2msbf",
+    ] {
         let enc = run_stdin(&["basenc", flag, "-w", "0"], payload);
         assert!(enc.status.success());
         let dec = run_stdin(&["basenc", flag, "-d"], &enc.stdout);
@@ -348,7 +355,13 @@ fn test_cut_tr_paste_shuf() {
     let f2 = tmp.path().join("p2");
     fs::write(&f1, "a\nb\n").unwrap();
     fs::write(&f2, "1\n2\n").unwrap();
-    let p_out = run(&["paste", "-d", ":", f1.to_str().unwrap(), f2.to_str().unwrap()]);
+    let p_out = run(&[
+        "paste",
+        "-d",
+        ":",
+        f1.to_str().unwrap(),
+        f2.to_str().unwrap(),
+    ]);
     assert_eq!(stdout_str(&p_out), "a:1\nb:2\n");
 
     // shuf range
@@ -399,7 +412,11 @@ fn test_mkdir_touch_ln_chmod_stat_realpath_basename_dirname_mktemp() {
     let nested = tmp.path().join("a/b/c");
 
     // mkdir -p
-    assert!(run(&["mkdir", "-p", nested.to_str().unwrap()]).status.success());
+    assert!(
+        run(&["mkdir", "-p", nested.to_str().unwrap()])
+            .status
+            .success()
+    );
     assert!(nested.is_dir());
 
     // touch & ln -s
@@ -421,10 +438,21 @@ fn test_mkdir_touch_ln_chmod_stat_realpath_basename_dirname_mktemp() {
     assert!(link_p.symlink_metadata().unwrap().file_type().is_symlink());
 
     // chmod symbolic (+x) and octal (640)
-    assert!(run(&["chmod", "+x", file_p.to_str().unwrap()]).status.success());
-    assert_ne!(fs::metadata(&file_p).unwrap().permissions().mode() & 0o111, 0);
+    assert!(
+        run(&["chmod", "+x", file_p.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_ne!(
+        fs::metadata(&file_p).unwrap().permissions().mode() & 0o111,
+        0
+    );
 
-    assert!(run(&["chmod", "640", file_p.to_str().unwrap()]).status.success());
+    assert!(
+        run(&["chmod", "640", file_p.to_str().unwrap()])
+            .status
+            .success()
+    );
     assert_eq!(
         fs::metadata(&file_p).unwrap().permissions().mode() & 0o777,
         0o640
@@ -619,7 +647,11 @@ fn test_differential_vs_system_utilities() {
             .args(["-q", s_path])
             .output()
             .unwrap();
-        let df_hex = stdout_str(&df_md5).split_whitespace().next().unwrap().to_string();
+        let df_hex = stdout_str(&df_md5)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
         let sys_hex = String::from_utf8_lossy(&sys_md5.stdout).trim().to_string();
         assert_eq!(df_hex, sys_hex);
     } else if std::path::Path::new("/usr/bin/md5sum").exists() {
@@ -628,7 +660,11 @@ fn test_differential_vs_system_utilities() {
             .args([s_path])
             .output()
             .unwrap();
-        let df_hex = stdout_str(&df_md5).split_whitespace().next().unwrap().to_string();
+        let df_hex = stdout_str(&df_md5)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
         let sys_hex = String::from_utf8_lossy(&sys_md5.stdout)
             .split_whitespace()
             .next()
@@ -644,14 +680,20 @@ fn test_differential_vs_system_utilities() {
             .args(["-a", "256", s_path])
             .output()
             .unwrap();
-        assert_eq!(stdout_str(&df_sha).trim(), String::from_utf8_lossy(&sys_sha.stdout).trim());
+        assert_eq!(
+            stdout_str(&df_sha).trim(),
+            String::from_utf8_lossy(&sys_sha.stdout).trim()
+        );
     } else if std::path::Path::new("/usr/bin/sha256sum").exists() {
         let df_sha = run(&["sha256sum", s_path]);
         let sys_sha = Command::new("/usr/bin/sha256sum")
             .args([s_path])
             .output()
             .unwrap();
-        assert_eq!(stdout_str(&df_sha).trim(), String::from_utf8_lossy(&sys_sha.stdout).trim());
+        assert_eq!(
+            stdout_str(&df_sha).trim(),
+            String::from_utf8_lossy(&sys_sha.stdout).trim()
+        );
     }
 }
 
@@ -683,7 +725,9 @@ fn test_empty_files_and_no_trailing_newline_edge_cases() {
 
     // SHA-256 of empty file must be e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     let sha_empty = stdout_str(&run(&["sha256sum", e_str]));
-    assert!(sha_empty.starts_with("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    assert!(
+        sha_empty.starts_with("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    );
 
     // No trailing newline checks
     let wc_no_nl: serde_json::Value =
@@ -693,8 +737,14 @@ fn test_empty_files_and_no_trailing_newline_edge_cases() {
     assert_eq!(wc_no_nl["bytes"].as_u64(), Some(27));
     assert_eq!(wc_no_nl["max_line_length"].as_u64(), Some(27));
 
-    assert_eq!(stdout_str(&run(&["head", "-n", "1", n_str])), "single line without newline");
-    assert_eq!(stdout_str(&run(&["tail", "-n", "1", n_str])), "single line without newline");
+    assert_eq!(
+        stdout_str(&run(&["head", "-n", "1", n_str])),
+        "single line without newline"
+    );
+    assert_eq!(
+        stdout_str(&run(&["tail", "-n", "1", n_str])),
+        "single line without newline"
+    );
 }
 
 #[test]
@@ -704,7 +754,10 @@ fn test_large_multi_chunk_tail_and_head() {
     let big = tmp.path().join("big.log");
     let mut content = String::with_capacity(250_000);
     for i in 1..=5000 {
-        content.push_str(&format!("2026-10-24T00:00:00Z event_index={:05} payload=0123456789abcdef\n", i));
+        content.push_str(&format!(
+            "2026-10-24T00:00:00Z event_index={:05} payload=0123456789abcdef\n",
+            i
+        ));
     }
     fs::write(&big, &content).unwrap();
     let b_str = big.to_str().unwrap();
@@ -752,31 +805,79 @@ fn test_chmod_complex_symbolic_clauses_and_recursive() {
     // Set initial mode 0600
     assert!(run(&["chmod", "600", f.to_str().unwrap()]).status.success());
     // Apply compound symbolic mode: u+x,g+r,o+r -> 0744
-    assert!(run(&["chmod", "u+x,g+r,o+r", f.to_str().unwrap()]).status.success());
-    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o744);
+    assert!(
+        run(&["chmod", "u+x,g+r,o+r", f.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o744
+    );
 
     // Apply =rw to all: a=rw -> 0666
-    assert!(run(&["chmod", "a=rw", f.to_str().unwrap()]).status.success());
-    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o666);
+    assert!(
+        run(&["chmod", "a=rw", f.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o666
+    );
 
     // Apply go-w -> 0644
-    assert!(run(&["chmod", "go-w", f.to_str().unwrap()]).status.success());
-    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o644);
+    assert!(
+        run(&["chmod", "go-w", f.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
 
     // Recursive chmod -R 755 on directory
-    assert!(run(&["chmod", "-R", "755", dir.to_str().unwrap()]).status.success());
-    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o755);
+    assert!(
+        run(&["chmod", "-R", "755", dir.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }
 
 #[test]
 fn test_error_handling_and_exit_codes() {
     // Non-existent files should return non-zero exit codes
-    assert!(!run(&["cat", "/nonexistent/dogfish_missing_file"]).status.success());
-    assert!(!run(&["ls", "/nonexistent/dogfish_missing_dir"]).status.success());
-    assert!(!run(&["stat", "/nonexistent/dogfish_missing_file"]).status.success());
-    assert!(!run(&["rm", "/nonexistent/dogfish_missing_file"]).status.success());
+    assert!(
+        !run(&["cat", "/nonexistent/dogfish_missing_file"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["ls", "/nonexistent/dogfish_missing_dir"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["stat", "/nonexistent/dogfish_missing_file"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["rm", "/nonexistent/dogfish_missing_file"])
+            .status
+            .success()
+    );
     // But `rm -f` on nonexistent file must succeed (exit 0)
-    assert!(run(&["rm", "-f", "/nonexistent/dogfish_missing_file"]).status.success());
+    assert!(
+        run(&["rm", "-f", "/nonexistent/dogfish_missing_file"])
+            .status
+            .success()
+    );
 
     // `seq` with 0 step must fail
     assert!(!run(&["seq", "1", "0", "10"]).status.success());
@@ -807,7 +908,10 @@ fn test_all_57_tools_respond_to_help_cleanly() {
     assert_eq!(tools.len(), 57);
 
     for tool in &tools {
-        if matches!(tool.as_str(), "true" | "false" | "echo" | "printf" | "hostname") {
+        if matches!(
+            tool.as_str(),
+            "true" | "false" | "echo" | "printf" | "hostname"
+        ) {
             continue;
         }
         let h_out = run(&[tool, "--help"]);

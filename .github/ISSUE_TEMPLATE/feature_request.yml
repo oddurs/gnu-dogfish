@@ -1,0 +1,19 @@
+name: Feature / Utility Request
+description: Propose a new core utility, NDJSON query feature, or SIMD optimization
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: utility
+    attributes:
+      label: Utility or Component
+      placeholder: "e.g., `dd`, `split`, `factor`, or `dogfish-core`"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal & Use Case
+      description: How should this utility or flag work, and how can we make it more ergonomic or faster than legacy coreutils?
+    validations:
+      required: true

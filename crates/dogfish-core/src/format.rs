@@ -166,7 +166,11 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
         }
     }
     if !current_num.is_empty() {
-        let unit = if current_unit.is_empty() { "s" } else { &current_unit };
+        let unit = if current_unit.is_empty() {
+            "s"
+        } else {
+            &current_unit
+        };
         total += apply_duration_unit(&current_num, unit)?;
     } else {
         return Err(format!("invalid duration '{}'", s));
@@ -313,13 +317,31 @@ mod tests {
 
     #[test]
     fn test_parse_duration_str_human_and_compound() {
-        assert_eq!(parse_duration_str("500ns").unwrap(), Duration::from_nanos(500));
-        assert_eq!(parse_duration_str("250us").unwrap(), Duration::from_micros(250));
-        assert_eq!(parse_duration_str("100ms").unwrap(), Duration::from_millis(100));
-        assert_eq!(parse_duration_str("2.5s").unwrap(), Duration::from_millis(2500));
+        assert_eq!(
+            parse_duration_str("500ns").unwrap(),
+            Duration::from_nanos(500)
+        );
+        assert_eq!(
+            parse_duration_str("250us").unwrap(),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            parse_duration_str("100ms").unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            parse_duration_str("2.5s").unwrap(),
+            Duration::from_millis(2500)
+        );
         assert_eq!(parse_duration_str("3").unwrap(), Duration::from_secs(3));
-        assert_eq!(parse_duration_str("1m 30s").unwrap(), Duration::from_secs(90));
-        assert_eq!(parse_duration_str("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(
+            parse_duration_str("1m 30s").unwrap(),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            parse_duration_str("1h30m").unwrap(),
+            Duration::from_secs(5400)
+        );
         assert!(parse_duration_str("-5s").is_err());
         assert!(parse_duration_str("abc").is_err());
     }

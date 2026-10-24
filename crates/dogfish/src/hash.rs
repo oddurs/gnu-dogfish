@@ -76,7 +76,8 @@ where
     });
 
     // If multiple file sources and none is stdin, hash in parallel using Rayon!
-    let can_parallel = sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
+    let can_parallel =
+        sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
 
     let results: Vec<Result<HashRecord>> = if can_parallel {
         sources
@@ -135,8 +136,7 @@ fn compute_source_hash<D>(
 where
     D: Digest + Default,
 {
-    let mut reader = FastReader::open(src)
-        .map_err(|e| anyhow!("{}: {}", src.display_name(), e))?;
+    let mut reader = FastReader::open(src).map_err(|e| anyhow!("{}: {}", src.display_name(), e))?;
     let mut hasher = D::default();
     let mut bytes_len = 0_u64;
 
@@ -253,7 +253,10 @@ fn parse_checksum_line(line: &str) -> Option<(&str, &str)> {
 // base64
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "base64", about = "Base64 encode or decode data to standard output")]
+#[command(
+    name = "base64",
+    about = "Base64 encode or decode data to standard output"
+)]
 struct Base64Args {
     /// Decode data
     #[arg(short = 'd', long = "decode")]
@@ -289,9 +292,7 @@ pub fn run_base64(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 bytes
                     .iter()
                     .copied()
-                    .filter(|b| {
-                        b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'='
-                    })
+                    .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
                     .collect()
             } else {
                 bytes
@@ -321,7 +322,10 @@ pub fn run_base64(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // basenc — Multi-radix encoder/decoder (base64, base64url, base32, base16/hex, base2)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "basenc", about = "Encode or decode data in various bases (base64url, base32, base16/hex, base2)")]
+#[command(
+    name = "basenc",
+    about = "Encode or decode data in various bases (base64url, base32, base16/hex, base2)"
+)]
 struct BasencArgs {
     #[arg(long = "base64")]
     base64: bool,

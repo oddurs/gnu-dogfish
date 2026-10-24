@@ -131,7 +131,10 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 2. nl — Number lines of files
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "nl", about = "Write each FILE to standard output, with line numbers added")]
+#[command(
+    name = "nl",
+    about = "Write each FILE to standard output, with line numbers added"
+)]
 struct NlArgs {
     /// Use NUMBER columns for line numbers
     #[arg(short = 'w', long = "number-width", default_value_t = 6)]
@@ -193,7 +196,10 @@ pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 3. head — SIMD newline scan + NDJSON auto-table rendering!
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "head", about = "Output the first part of files (or NDJSON object streams)")]
+#[command(
+    name = "head",
+    about = "Output the first part of files (or NDJSON object streams)"
+)]
 struct HeadArgs {
     /// Print the first NUM lines/objects instead of the first 10
     #[arg(short = 'n', long = "lines", default_value_t = 10)]
@@ -244,7 +250,8 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 all_lines.push(l?);
             }
             if let Some(objs) = read_ndjson_stdin(&all_lines) {
-                ctx.telemetry.set_strategy("NDJSON object stream + auto-table");
+                ctx.telemetry
+                    .set_strategy("NDJSON object stream + auto-table");
                 let slice = &objs[..objs.len().min(parsed.lines)];
                 ctx.telemetry.add_items(slice.len() as u64);
                 emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
@@ -357,7 +364,10 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 4. tail — SIMD reverse newline scan (`memrchr`) + `-f` follow + NDJSON support
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "tail", about = "Output the last part of files (or NDJSON object streams)")]
+#[command(
+    name = "tail",
+    about = "Output the last part of files (or NDJSON object streams)"
+)]
 struct TailArgs {
     /// Output the last NUM lines/objects instead of the last 10
     #[arg(short = 'n', long = "lines", default_value_t = 10)]
@@ -395,7 +405,8 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     {
         let all_lines = read_all_stdin_lines()?;
         if let Some(objs) = read_ndjson_stdin(&all_lines) {
-            ctx.telemetry.set_strategy("NDJSON object stream + auto-table");
+            ctx.telemetry
+                .set_strategy("NDJSON object stream + auto-table");
             let start = objs.len().saturating_sub(parsed.lines);
             let slice = &objs[start..];
             ctx.telemetry.add_items(slice.len() as u64);
@@ -417,7 +428,8 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         None => None,
     };
 
-    ctx.telemetry.set_strategy("reverse SeekFrom::End + memrchr SIMD");
+    ctx.telemetry
+        .set_strategy("reverse SeekFrom::End + memrchr SIMD");
     let show_headers = parsed.verbose || (!parsed.quiet && sources.len() > 1);
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
@@ -558,7 +570,10 @@ fn normalize_legacy_num_arg(args: Vec<String>) -> Vec<String> {
 // 5. wc — SIMD `bytecount` + `--json` + visual table mode
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "wc", about = "Print newline, word, and byte counts for each FILE")]
+#[command(
+    name = "wc",
+    about = "Print newline, word, and byte counts for each FILE"
+)]
 struct WcArgs {
     /// Print the byte counts
     #[arg(short = 'c', long = "bytes")]
@@ -611,13 +626,15 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let need_chars = parsed.chars || parsed.json || parsed.table;
     let need_max_len = parsed.max_line_length || parsed.json || parsed.table;
 
-    ctx.telemetry.set_strategy(if !need_words && !need_chars && !need_max_len {
-        "SIMD bytecount::count (newlines + len only)"
-    } else {
-        "SIMD bytecount + single-pass word scanner"
-    });
+    ctx.telemetry
+        .set_strategy(if !need_words && !need_chars && !need_max_len {
+            "SIMD bytecount::count (newlines + len only)"
+        } else {
+            "SIMD bytecount + single-pass word scanner"
+        });
 
-    let can_parallel = sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
+    let can_parallel =
+        sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
     let records: Vec<WcRecord> = if can_parallel {
         sources
             .par_iter()
@@ -675,7 +692,12 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         total.chars += r.chars;
         total.bytes += r.bytes;
         total.max_line_length = total.max_line_length.max(r.max_line_length);
-        print_wc_row(r, &parsed, default_cols, sources.len() == 1 && parsed.files.is_empty());
+        print_wc_row(
+            r,
+            &parsed,
+            default_cols,
+            sources.len() == 1 && parsed.files.is_empty(),
+        );
     }
 
     if records.len() > 1 {
@@ -842,7 +864,10 @@ fn print_wc_row(r: &WcRecord, args: &WcArgs, default_cols: bool, omit_filename: 
 // 6. sort — Parallel TimSort + NDJSON `--by <field>` + numeric/human/reverse/unique
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "sort", about = "Sort lines of text files or NDJSON object streams")]
+#[command(
+    name = "sort",
+    about = "Sort lines of text files or NDJSON object streams"
+)]
 struct SortArgs {
     /// Reverse the result of comparisons
     #[arg(short = 'r', long = "reverse", visible_alias = "desc")]
@@ -896,7 +921,11 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let sources = InputSource::from_args(&parsed.files);
 
     // Fast zero-allocation mmap slice sort when reading from a single file and not NDJSON!
-    if sources.len() == 1 && matches!(sources[0], InputSource::File(_)) && parsed.by_field.is_none() && parsed.where_expr.is_none() {
+    if sources.len() == 1
+        && matches!(sources[0], InputSource::File(_))
+        && parsed.by_field.is_none()
+        && parsed.where_expr.is_none()
+    {
         let mut reader = FastReader::open(&sources[0])?;
         if reader.is_mapped() {
             let handled = reader.with_bytes(|bytes| -> Result<bool> {
@@ -904,7 +933,8 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     return Ok(false);
                 }
                 ctx.telemetry.add_read(bytes.len() as u64);
-                ctx.telemetry.set_strategy("zero-alloc mmap &[u8] + rayon par_sort_unstable");
+                ctx.telemetry
+                    .set_strategy("zero-alloc mmap &[u8] + rayon par_sort_unstable");
 
                 let mut slices: Vec<&[u8]> = Vec::with_capacity(bytes.len() / 32 + 1);
                 let mut start = 0;
@@ -935,10 +965,22 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     slices.par_sort_unstable_by(|a, b| {
                         let sa = std::str::from_utf8(a).unwrap_or("");
                         let sb = std::str::from_utf8(b).unwrap_or("");
-                        let ka = extract_sort_key(sa, parsed.key, parsed.separator, parsed.ignore_blanks);
-                        let kb = extract_sort_key(sb, parsed.key, parsed.separator, parsed.ignore_blanks);
+                        let ka = extract_sort_key(
+                            sa,
+                            parsed.key,
+                            parsed.separator,
+                            parsed.ignore_blanks,
+                        );
+                        let kb = extract_sort_key(
+                            sb,
+                            parsed.key,
+                            parsed.separator,
+                            parsed.ignore_blanks,
+                        );
                         let ord = if parsed.human_numeric {
-                            parse_size_str(ka).unwrap_or(0).cmp(&parse_size_str(kb).unwrap_or(0))
+                            parse_size_str(ka)
+                                .unwrap_or(0)
+                                .cmp(&parse_size_str(kb).unwrap_or(0))
                         } else if parsed.numeric {
                             let na = ka.trim().parse::<f64>().unwrap_or(0.0);
                             let nb = kb.trim().parse::<f64>().unwrap_or(0.0);
@@ -984,7 +1026,8 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // Check if input is an NDJSON object stream!
     if let Some(mut objs) = read_ndjson_stdin(&all_lines) {
-        ctx.telemetry.set_strategy("NDJSON field-aware parallel sort");
+        ctx.telemetry
+            .set_strategy("NDJSON field-aware parallel sort");
         if let Some(ref expr) = parsed.where_expr {
             objs.retain(|o| eval_json_where(o, expr));
         }
@@ -1059,7 +1102,10 @@ fn extract_sort_key(line: &str, key_idx: Option<usize>, sep: Option<char>, trim:
 // 7. uniq — Deduplicate lines or NDJSON objects (`--by <field>`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "uniq", about = "Report or omit repeated lines or NDJSON objects")]
+#[command(
+    name = "uniq",
+    about = "Report or omit repeated lines or NDJSON objects"
+)]
 struct UniqArgs {
     /// Prefix lines by the number of occurrences
     #[arg(short = 'c', long = "count")]
@@ -1146,26 +1192,28 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     // O(1) memory single-pass streaming deduplicator!
-    ctx.telemetry.set_strategy("O(1) memory streaming deduplicator");
+    ctx.telemetry
+        .set_strategy("O(1) memory streaming deduplicator");
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
     let mut prev = first_line.trim_end_matches(&['\r', '\n'][..]).to_string();
     let mut count = 1usize;
     let mut cur = String::with_capacity(256);
 
-    let emit_group = |out: &mut io::BufWriter<io::StdoutLock<'_>>, line: &str, cnt: usize| -> io::Result<()> {
-        if parsed.repeated && cnt <= 1 {
-            return Ok(());
-        }
-        if parsed.unique && cnt != 1 {
-            return Ok(());
-        }
-        if parsed.count {
-            ignore_broken_pipe(writeln!(out, "{:7} {}", cnt, line))
-        } else {
-            ignore_broken_pipe(writeln!(out, "{}", line))
-        }
-    };
+    let emit_group =
+        |out: &mut io::BufWriter<io::StdoutLock<'_>>, line: &str, cnt: usize| -> io::Result<()> {
+            if parsed.repeated && cnt <= 1 {
+                return Ok(());
+            }
+            if parsed.unique && cnt != 1 {
+                return Ok(());
+            }
+            if parsed.count {
+                ignore_broken_pipe(writeln!(out, "{:7} {}", cnt, line))
+            } else {
+                ignore_broken_pipe(writeln!(out, "{}", line))
+            }
+        };
 
     while reader.read_line(&mut cur)? > 0 {
         let trimmed = cur.trim_end_matches(&['\r', '\n'][..]);
@@ -1193,7 +1241,10 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 8. cut — Supports byte/char/field slicing AND NDJSON `--field name,size` projection!
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "cut", about = "Remove sections from each line of files or project fields from NDJSON")]
+#[command(
+    name = "cut",
+    about = "Remove sections from each line of files or project fields from NDJSON"
+)]
 struct CutArgs {
     /// Select only these bytes (e.g. 1-5, 2,4)
     #[arg(short = 'b', long = "bytes")]
@@ -1403,7 +1454,10 @@ fn parse_ranges_precomputed(spec: &str) -> Vec<(usize, usize)> {
 // 9. tr — Translate, squeeze, or delete characters with character class support
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "tr", about = "Translate, squeeze, and/or delete characters from standard input")]
+#[command(
+    name = "tr",
+    about = "Translate, squeeze, and/or delete characters from standard input"
+)]
 struct TrArgs {
     /// Delete characters in SET1, do not translate
     #[arg(short = 'd', long = "delete")]
@@ -1436,7 +1490,11 @@ pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
         set1 = comp;
     }
-    let set2 = parsed.sets.get(1).map(|s| expand_tr_set(s)).unwrap_or_default();
+    let set2 = parsed
+        .sets
+        .get(1)
+        .map(|s| expand_tr_set(s))
+        .unwrap_or_default();
 
     // Fast path: 256-entry ASCII lookup table when all chars in set1 & set2 are ASCII
     // and neither delete nor squeeze is set!
@@ -1577,7 +1635,11 @@ pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         .replace("\\t", "\t")
         .chars()
         .collect();
-    let delims = if delims.is_empty() { vec!['\t'] } else { delims };
+    let delims = if delims.is_empty() {
+        vec!['\t']
+    } else {
+        delims
+    };
 
     let mut file_lines: Vec<VecDeque<String>> = Vec::with_capacity(sources.len());
     for src in &sources {
@@ -1627,7 +1689,10 @@ pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 11. tac — Concatenate and print files in reverse (SIMD memrchr_iter)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "tac", about = "Concatenate and print files in reverse (last line first)")]
+#[command(
+    name = "tac",
+    about = "Concatenate and print files in reverse (last line first)"
+)]
 struct TacArgs {
     files: Vec<String>,
 }
@@ -1635,7 +1700,8 @@ struct TacArgs {
 pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = TacArgs::try_parse_from(args)?;
     let sources = InputSource::from_args(&parsed.files);
-    ctx.telemetry.set_strategy("mmap + memrchr reverse SIMD line scan");
+    ctx.telemetry
+        .set_strategy("mmap + memrchr reverse SIMD line scan");
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
@@ -1672,7 +1738,10 @@ pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 12. shuf — Fast Fisher-Yates shuffler for lines, numeric ranges (-i), or NDJSON!
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "shuf", about = "Generate random permutations of lines, ranges, or NDJSON objects")]
+#[command(
+    name = "shuf",
+    about = "Generate random permutations of lines, ranges, or NDJSON objects"
+)]
 struct ShufArgs {
     /// Treat each ARG as an input line
     #[arg(short = 'e', long = "echo")]
@@ -1694,7 +1763,8 @@ struct ShufArgs {
 
 pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = ShufArgs::try_parse_from(args)?;
-    ctx.telemetry.set_strategy("xorshift64* Fisher-Yates shuffle");
+    ctx.telemetry
+        .set_strategy("xorshift64* Fisher-Yates shuffle");
 
     // Seed from system time + pid
     let mut rng_state = std::time::SystemTime::now()
@@ -1789,7 +1859,11 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 13. query / filter — Dedicated NDJSON SQL-like pipeline tool (`where`, `sort`, `select`, `limit`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "query", visible_alias = "filter", about = "Filter, sort, and project NDJSON object streams (`dogfish ls -J | dogfish query -w \"size>1K\" -s size -d -f name,size`)")]
+#[command(
+    name = "query",
+    visible_alias = "filter",
+    about = "Filter, sort, and project NDJSON object streams (`dogfish ls -J | dogfish query -w \"size>1K\" -s size -d -f name,size`)"
+)]
 struct QueryArgs {
     /// Filter expression (`size>10K`, `kind=file`, `name~rs`, `lines>=100`)
     #[arg(short = 'w', long = "where")]
@@ -1818,7 +1892,8 @@ struct QueryArgs {
 
 pub fn run_query(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = QueryArgs::try_parse_from(args)?;
-    ctx.telemetry.set_strategy("NDJSON query engine (where + sort + select)");
+    ctx.telemetry
+        .set_strategy("NDJSON query engine (where + sort + select)");
 
     let all_lines = read_all_stdin_lines()?;
     let Some(mut objs) = read_ndjson_stdin(&all_lines) else {

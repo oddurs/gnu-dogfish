@@ -16,10 +16,7 @@ pub enum JournalAction {
     /// File or directory moved/renamed (`src` -> `dst`).
     Move { src: String, dst: String },
     /// File or directory created via `cp` or `mkdir` (`created_path`).
-    CopyCreate {
-        src: String,
-        created_path: String,
-    },
+    CopyCreate { src: String, created_path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +147,10 @@ impl UndoJournal {
                 fs::rename(dst, src)?;
                 format!("Moved '{}' back to '{}'", dst, src)
             }
-            JournalAction::CopyCreate { src: _, created_path } => {
+            JournalAction::CopyCreate {
+                src: _,
+                created_path,
+            } => {
                 let p = Path::new(created_path);
                 if p.is_dir() {
                     fs::remove_dir_all(p)?;

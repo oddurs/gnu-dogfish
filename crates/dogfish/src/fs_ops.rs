@@ -24,7 +24,10 @@ use crate::sys::{get_groupname_by_gid, get_username_by_uid};
 // 1. mkdir
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "mkdir", about = "Create directories if they do not already exist")]
+#[command(
+    name = "mkdir",
+    about = "Create directories if they do not already exist"
+)]
 struct MkdirArgs {
     /// No error if existing, make parent directories as needed
     #[arg(short = 'p', long = "parents")]
@@ -77,7 +80,10 @@ pub fn run_mkdir(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 2. touch
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "touch", about = "Update the access and modification times of each FILE to the current time")]
+#[command(
+    name = "touch",
+    about = "Update the access and modification times of each FILE to the current time"
+)]
 struct TouchArgs {
     /// Do not create any files
     #[arg(short = 'c', long = "no-create")]
@@ -387,7 +393,10 @@ fn chown_path(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
 // 6. stat — Visual inspection card + `--json` + `-c FORMAT`
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "stat", about = "Display file or file system status with a rich visual card or JSON")]
+#[command(
+    name = "stat",
+    about = "Display file or file system status with a rich visual card or JSON"
+)]
 struct StatArgs {
     /// Follow symbolic links
     #[arg(short = 'L', long = "dereference")]
@@ -580,7 +589,10 @@ pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 7. rm — Supports `--safe` (or `--undoable`) trash staging + parallel `-r`
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "rm", about = "Remove files or directories (supports --safe undoable trash staging)")]
+#[command(
+    name = "rm",
+    about = "Remove files or directories (supports --safe undoable trash staging)"
+)]
 struct RmArgs {
     /// Ignore nonexistent files and arguments, never prompt
     #[arg(short = 'f', long = "force")]
@@ -703,7 +715,10 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 8. cp — APFS `clonefile` zero-copy CoW + UndoJournal recording
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "cp", about = "Copy files and directories (uses zero-copy CoW clonefile when supported)")]
+#[command(
+    name = "cp",
+    about = "Copy files and directories (uses zero-copy CoW clonefile when supported)"
+)]
 struct CpArgs {
     /// Copy directories recursively
     #[arg(short = 'r', visible_short_alias = 'R', long = "recursive")]
@@ -811,7 +826,10 @@ fn copy_dir_cow(src: &Path, dst: &Path, verbose: bool, ctx: &DogfishContext) -> 
 // 9. mv — With UndoJournal recording (`dogfish undo` reverses `mv`!)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "mv", about = "Move (rename) files (undoable via `dogfish undo`)")]
+#[command(
+    name = "mv",
+    about = "Move (rename) files (undoable via `dogfish undo`)"
+)]
 struct MvArgs {
     /// Do not overwrite an existing file
     #[arg(short = 'n', long = "no-clobber")]
@@ -888,7 +906,10 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 10. df — Disk free space with Unicode sparkline bars & `--json`
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "df", about = "Report file system disk space usage with sparkline bars")]
+#[command(
+    name = "df",
+    about = "Report file system disk space usage with sparkline bars"
+)]
 struct DfArgs {
     /// Print sizes in powers of 1024 (e.g., 1023M)
     #[arg(short = 'h', long = "human-readable")]
@@ -937,11 +958,7 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     for m in &mounts {
         let ratio = (m.use_percent / 100.0).clamp(0.0, 1.0);
-        let usage_col = format!(
-            "{} {:>5.1}%",
-            sparkline_bar(ratio, 10, st),
-            m.use_percent
-        );
+        let usage_col = format!("{} {:>5.1}%", sparkline_bar(ratio, 10, st), m.use_percent);
         table.add_row(vec![
             st.bold(&m.filesystem),
             st.dim(&m.fs_type),
@@ -1104,7 +1121,10 @@ fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
 // 11. du — Parallel `jwalk` disk usage analyzer with sparklines & `--json`
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "du", about = "Estimate file space usage in parallel with sparkline bars")]
+#[command(
+    name = "du",
+    about = "Estimate file space usage in parallel with sparkline bars"
+)]
 struct DuArgs {
     /// Display only a total for each argument
     #[arg(short = 's', long = "summarize")]
@@ -1145,7 +1165,8 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         parsed.paths.clone()
     };
 
-    ctx.telemetry.set_strategy("jwalk work-stealing parallel traversal");
+    ctx.telemetry
+        .set_strategy("jwalk work-stealing parallel traversal");
     let mut records = Vec::new();
 
     for t in &targets {
@@ -1265,7 +1286,10 @@ fn compute_dir_size_parallel(root: &Path, apparent_bytes: bool) -> (u64, u64) {
 // 12. ls — Modernized directory lister (`-l`, `-a`, `--tree`, `-S`, `-t`, `--json`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "ls", about = "List directory contents with smart colors, tree view, and NDJSON output")]
+#[command(
+    name = "ls",
+    about = "List directory contents with smart colors, tree view, and NDJSON output"
+)]
 struct LsArgs {
     /// Do not ignore entries starting with .
     #[arg(short = 'a', long = "all")]
@@ -1344,7 +1368,16 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         let mut out = io::BufWriter::new(stdout.lock());
         for t in &targets {
             writeln!(out, "{}", st.bold_blue(t))?;
-            render_tree(Path::new(t), "", 0, parsed.level, parsed.all, &mut out, st, ctx)?;
+            render_tree(
+                Path::new(t),
+                "",
+                0,
+                parsed.level,
+                parsed.all,
+                &mut out,
+                st,
+                ctx,
+            )?;
         }
         ignore_broken_pipe(out.flush())?;
         return Ok(0);
@@ -1370,7 +1403,8 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry.add_items(all_entries.len() as u64);
 
     if parsed.json {
-        ctx.telemetry.set_strategy("NDJSON structured object stream");
+        ctx.telemetry
+            .set_strategy("NDJSON structured object stream");
         emit_objects_or_table(&all_entries, ctx, true, false)?;
         return Ok(0);
     }
@@ -1484,7 +1518,9 @@ fn sort_ls_entries(entries: &mut [LsEntry], args: &LsArgs) {
         } else if args.sort_time {
             b.modified_unix.cmp(&a.modified_unix)
         } else {
-            a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
         };
         if args.reverse { ord.reverse() } else { ord }
     });

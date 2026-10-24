@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{
-    ColumnAlign, DogfishContext, JournalAction, Table, UndoJournal, sparkline_bar,
-};
+use dogfish_core::{ColumnAlign, DogfishContext, JournalAction, Table, UndoJournal, sparkline_bar};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // 1. undo — Reverses the most recent `rm --safe`, `mv`, or `cp` operation
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "undo", about = "Undo the most recent reversible file operation (rm --safe, mv, cp)")]
+#[command(
+    name = "undo",
+    about = "Undo the most recent reversible file operation (rm --safe, mv, cp)"
+)]
 struct UndoArgs {
     /// Number of operations to undo
     #[arg(short = 'n', long = "count", default_value_t = 1)]
@@ -41,7 +42,10 @@ pub fn run_undo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 ctx.telemetry.add_items(1);
             }
             None => {
-                println!("{}", st.yellow("No more operations in Dogfish undo journal."));
+                println!(
+                    "{}",
+                    st.yellow("No more operations in Dogfish undo journal.")
+                );
                 break;
             }
         }
@@ -53,7 +57,10 @@ pub fn run_undo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 2. history — Inspect the Dogfish undo journal
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "history", about = "Display the Dogfish reversible operation journal")]
+#[command(
+    name = "history",
+    about = "Display the Dogfish reversible operation journal"
+)]
 struct HistoryArgs {
     #[arg(short = 'J', long = "json")]
     json: bool,
@@ -109,7 +116,10 @@ pub fn run_history(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 3. init — Outputs shell integration script (`eval "$(dogfish init zsh)"`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "init", about = "Output shell initialization script (eval \"$(dogfish init zsh)\")")]
+#[command(
+    name = "init",
+    about = "Output shell initialization script (eval \"$(dogfish init zsh)\")"
+)]
 struct InitArgs {
     /// Target shell: zsh, bash, or fish
     #[arg(default_value = "zsh")]
@@ -155,7 +165,10 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
         println!("function gnu-dogfish; \"{}\" $argv; end", exe_str);
         println!("function 'gnu/dogfish'; \"{}\" $argv; end", exe_str);
     } else {
-        println!("# Usage in zsh/bash: eval \"$(./target/release/dogfish init {} --safe-rm)\"", parsed.shell);
+        println!(
+            "# Usage in zsh/bash: eval \"$(./target/release/dogfish init {} --safe-rm)\"",
+            parsed.shell
+        );
         for &tool in tool_names {
             if matches!(
                 tool,
@@ -181,7 +194,10 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
 // 4. install-links — Creates BusyBox-style symlinks for all 40 utilities
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "install-links", about = "Create symlinks for all Dogfish utilities in TARGET_DIR")]
+#[command(
+    name = "install-links",
+    about = "Create symlinks for all Dogfish utilities in TARGET_DIR"
+)]
 struct InstallLinksArgs {
     /// Directory to create symlinks in (e.g. ./bin or ~/.local/bin)
     target_dir: String,
@@ -204,7 +220,10 @@ pub fn run_install_links(
 
     let mut count = 0;
     for &tool in tool_names {
-        if matches!(tool, "install-links" | "init" | "bench" | "undo" | "history") {
+        if matches!(
+            tool,
+            "install-links" | "init" | "bench" | "undo" | "history"
+        ) {
             continue;
         }
         let link_name = format!("{}{}", parsed.prefix, tool);
@@ -231,7 +250,10 @@ pub fn run_install_links(
 // 4. bench — Head-to-head benchmark suite vs system `/bin/*` & `/usr/bin/*`!
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "bench", about = "Run head-to-head benchmarks comparing Dogfish against system utilities")]
+#[command(
+    name = "bench",
+    about = "Run head-to-head benchmarks comparing Dogfish against system utilities"
+)]
 struct BenchArgs {
     /// Number of iterations per benchmark
     #[arg(short = 'n', long = "iterations", default_value_t = 7)]
@@ -308,7 +330,11 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // 2. cp (macOS APFS clonefile CoW / Linux FICLONE CoW vs /bin/cp)
     if Path::new("/bin/cp").exists() {
         let df_dur = time_cmd(&exe, &["cp", &p_str, &cp_df_str], parsed.iterations);
-        let sys_dur = time_cmd(Path::new("/bin/cp"), &[&p_str, &cp_sys_str], parsed.iterations);
+        let sys_dur = time_cmd(
+            Path::new("/bin/cp"),
+            &[&p_str, &cp_sys_str],
+            parsed.iterations,
+        );
         let cp_strat = if cfg!(target_os = "macos") {
             "APFS clonefile (CoW)"
         } else {
@@ -387,7 +413,11 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // 7. seq 1 1000000 vs /usr/bin/seq 1 1000000
     if Path::new("/usr/bin/seq").exists() {
         let df_dur = time_cmd(&exe, &["seq", "1", "1000000"], parsed.iterations);
-        let sys_dur = time_cmd(Path::new("/usr/bin/seq"), &["1", "1000000"], parsed.iterations);
+        let sys_dur = time_cmd(
+            Path::new("/usr/bin/seq"),
+            &["1", "1000000"],
+            parsed.iterations,
+        );
         results.push(make_bench_row(
             "seq 1 1,000,000",
             df_dur,

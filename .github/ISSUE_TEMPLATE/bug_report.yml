@@ -1,0 +1,35 @@
+name: Bug Report
+description: Report a bug, POSIX/GNU compatibility issue, or performance regression
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping make **GNU/Dogfish** better!
+  - type: input
+    id: utility
+    attributes:
+      label: Utility Name
+      description: Which utility is affected? (e.g. `ls`, `wc`, `sort`, `query`, `cp`)
+      placeholder: "wc"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the command you ran, what you expected, and what actually happened.
+      placeholder: |
+        Command: `dogfish wc -l file.txt --stats`
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating System & Architecture
+      placeholder: "macOS 15 (arm64) / Ubuntu 24.04 (x86_64)"
+    validations:
+      required: true

@@ -5,7 +5,7 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use crate::context::DogfishContext;
-use crate::format::{format_size, Style};
+use crate::format::{Style, format_size};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnAlign {
@@ -39,11 +39,7 @@ impl Table {
             return Ok(());
         }
         let cols = self.headers.len();
-        let mut widths: Vec<usize> = self
-            .headers
-            .iter()
-            .map(|(h, _)| visible_width(h))
-            .collect();
+        let mut widths: Vec<usize> = self.headers.iter().map(|(h, _)| visible_width(h)).collect();
 
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate().take(cols) {
@@ -332,7 +328,13 @@ pub fn eval_json_where(obj: &Value, expr: &str) -> bool {
             // String / bool comparison
             let s_lhs = match val {
                 Value::String(s) => s.as_str(),
-                Value::Bool(b) => if *b { "true" } else { "false" },
+                Value::Bool(b) => {
+                    if *b {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
                 _ => "",
             };
             return match op {

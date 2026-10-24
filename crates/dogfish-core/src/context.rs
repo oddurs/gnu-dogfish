@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::format::{format_duration_human, format_size, Style};
+use crate::format::{Style, format_duration_human, format_size};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -79,7 +79,10 @@ pub struct DogfishContext {
 impl DogfishContext {
     /// Intercepts global Dogfish flags (`--stats`, `--color=...`) while preserving remaining args
     /// for the individual utility's `clap` parser.
-    pub fn from_raw_args(tool_name: impl Into<String>, raw_args: Vec<String>) -> (Self, Vec<String>) {
+    pub fn from_raw_args(
+        tool_name: impl Into<String>,
+        raw_args: Vec<String>,
+    ) -> (Self, Vec<String>) {
         let stdin_is_tty = io::stdin().is_terminal();
         let stdout_is_tty = io::stdout().is_terminal();
         let stderr_is_tty = io::stderr().is_terminal();

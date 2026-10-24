@@ -9,8 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use dogfish_core::{
-    ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, Table,
-    io::ignore_broken_pipe,
+    ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, Table, io::ignore_broken_pipe,
     parse_duration_str,
 };
 use serde::Serialize;
@@ -32,7 +31,10 @@ pub fn run_false(_args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 2. yes — Page-aligned 64 KiB vector I/O
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "yes", about = "Repeatedly output a line with all specified STRING(s), or 'y'")]
+#[command(
+    name = "yes",
+    about = "Repeatedly output a line with all specified STRING(s), or 'y'"
+)]
 struct YesArgs {
     /// String(s) to repeat
     strings: Vec<String>,
@@ -75,7 +77,10 @@ pub fn run_echo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     while idx < args.len() {
         let arg = &args[idx];
-        if arg.starts_with('-') && arg.len() > 1 && arg[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+        if arg.starts_with('-')
+            && arg.len() > 1
+            && arg[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
+        {
             for ch in arg[1..].chars() {
                 match ch {
                     'n' => no_newline = true,
@@ -234,7 +239,11 @@ fn format_printf_spec(spec: &str, conv: char, val: &str) -> String {
     let raw = match conv {
         's' => val.to_string(),
         'b' => unescape_echo_str(val).0,
-        'c' => val.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+        'c' => val
+            .chars()
+            .next()
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
         'd' | 'i' => val.parse::<i64>().unwrap_or(0).to_string(),
         'u' => val.parse::<u64>().unwrap_or(0).to_string(),
         'x' => format!("{:x}", val.parse::<u64>().unwrap_or(0)),
@@ -271,7 +280,10 @@ fn format_printf_spec(spec: &str, conv: char, val: &str) -> String {
 // 5. sleep — Supports human durations (`500ms`, `1.5s`, `1m30s`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "sleep", about = "Pause for NUMBER seconds or human duration (e.g. 500ms, 1m30s)")]
+#[command(
+    name = "sleep",
+    about = "Pause for NUMBER seconds or human duration (e.g. 500ms, 1m30s)"
+)]
 struct SleepArgs {
     #[arg(required = true)]
     durations: Vec<String>,
@@ -447,7 +459,10 @@ pub fn run_whoami(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
     let uid = unsafe { libc::geteuid() };
     let username = get_username_by_uid(uid).unwrap_or_else(|| uid.to_string());
     if parsed.json {
-        println!("{}", serde_json::json!({ "uid": uid, "username": username }));
+        println!(
+            "{}",
+            serde_json::json!({ "uid": uid, "username": username })
+        );
     } else {
         println!("{}", username);
     }
@@ -595,7 +610,13 @@ pub fn run_id(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     if parsed.groups {
         let parts: Vec<String> = groups_info
             .iter()
-            .map(|(g, gn)| if parsed.name { gn.clone() } else { g.to_string() })
+            .map(|(g, gn)| {
+                if parsed.name {
+                    gn.clone()
+                } else {
+                    g.to_string()
+                }
+            })
             .collect();
         println!("{}", parts.join(" "));
         return Ok(0);
@@ -664,8 +685,12 @@ pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         return Ok(0);
     }
 
-    let any_specific =
-        parsed.all || parsed.sysname || parsed.nodename || parsed.release || parsed.version || parsed.machine;
+    let any_specific = parsed.all
+        || parsed.sysname
+        || parsed.nodename
+        || parsed.release
+        || parsed.version
+        || parsed.machine;
 
     let mut parts = Vec::new();
     if !any_specific || parsed.all || parsed.sysname {
@@ -711,7 +736,10 @@ fn get_uname_info() -> Result<UnameInfo> {
 // 10. env — Supports NDJSON / table view, `-0`, `-i`, `-u`, and command execution
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "env", about = "Run a program in a modified environment, or inspect environment variables")]
+#[command(
+    name = "env",
+    about = "Run a program in a modified environment, or inspect environment variables"
+)]
 struct EnvArgs {
     /// Start with an empty environment
     #[arg(short = 'i', long = "ignore-environment")]
@@ -854,7 +882,10 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         } else if let Ok(dt) = DateTime::parse_from_rfc3339(d) {
             dt.with_timezone(&Utc)
         } else {
-            return Err(anyhow!("unsupported -d date format '{}'; use @EPOCH or RFC3339", d));
+            return Err(anyhow!(
+                "unsupported -d date format '{}'; use @EPOCH or RFC3339",
+                d
+            ));
         }
     } else {
         Utc::now()
@@ -896,7 +927,10 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
 // 12. tee — Fast multi-file fanout writer
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "tee", about = "Read from standard input and write to standard output and files")]
+#[command(
+    name = "tee",
+    about = "Read from standard input and write to standard output and files"
+)]
 struct TeeArgs {
     /// Append to the given FILEs, do not overwrite
     #[arg(short = 'a', long = "append")]
@@ -937,8 +971,7 @@ pub fn run_tee(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         for f in &mut outputs {
             f.write_all(&buf[..n])?;
         }
-        ctx.telemetry
-            .add_written((n * (outputs.len() + 1)) as u64);
+        ctx.telemetry.add_written((n * (outputs.len() + 1)) as u64);
     }
     ignore_broken_pipe(out.flush())?;
     for f in &mut outputs {
@@ -951,7 +984,10 @@ pub fn run_tee(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 13. nproc — Print number of available processing units
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "nproc", about = "Print the number of processing units available")]
+#[command(
+    name = "nproc",
+    about = "Print the number of processing units available"
+)]
 struct NprocArgs {
     /// Ignore up to N processing units
     #[arg(long = "ignore", default_value_t = 0)]
@@ -991,7 +1027,10 @@ pub fn run_hostname(_args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
 // 15. printenv — Print values of all or specified environment variables
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "printenv", about = "Print the values of the specified environment VARIABLE(s)")]
+#[command(
+    name = "printenv",
+    about = "Print the values of the specified environment VARIABLE(s)"
+)]
 struct PrintenvArgs {
     #[arg(short = '0', long = "null")]
     null: bool,
@@ -1032,7 +1071,10 @@ pub fn run_printenv(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
 // 16. timeout — Run a command with a time limit (e.g. `timeout 500ms slow_cmd`)
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "timeout", about = "Start COMMAND, and kill it if still running after DURATION")]
+#[command(
+    name = "timeout",
+    about = "Start COMMAND, and kill it if still running after DURATION"
+)]
 struct TimeoutArgs {
     /// Duration before killing command (e.g. 5s, 500ms, 1m)
     duration: String,
@@ -1071,7 +1113,10 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // 17. watch — Execute a program periodically, showing fullscreen output with diff/timer
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
-#[command(name = "watch", about = "Execute a program periodically, showing output fullscreen")]
+#[command(
+    name = "watch",
+    about = "Execute a program periodically, showing output fullscreen"
+)]
 struct WatchArgs {
     /// Specify update interval (e.g. 2s, 500ms, or 1.5)
     #[arg(short = 'n', long = "interval", default_value = "2s")]

@@ -164,7 +164,8 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
         // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink
         const FICLONE: libc::c_ulong = 0x40049409;
         if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
-            let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+            let ret =
+                unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
             if ret == 0 {
                 if let Ok(meta) = src_file.metadata() {
                     let _ = dst_file.set_permissions(meta.permissions());
