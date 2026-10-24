@@ -78,22 +78,31 @@ impl Table {
     }
 }
 
-/// Strips ANSI escape sequences to compute accurate terminal column width.
+/// Strips ANSI escape sequences without heap allocation to compute accurate terminal column width.
 pub fn visible_width(s: &str) -> usize {
-    let mut stripped = String::with_capacity(s.len());
+    if !s.as_bytes().contains(&b'\x1b') {
+        return UnicodeWidthStr::width(s);
+    }
+    let mut total = 0;
     let mut in_escape = false;
-    for ch in s.chars() {
+    let mut seg_start = 0;
+    for (idx, ch) in s.char_indices() {
         if in_escape {
             if ch.is_ascii_alphabetic() {
                 in_escape = false;
+                seg_start = idx + ch.len_utf8();
             }
         } else if ch == '\x1b' {
+            if idx > seg_start {
+                total += UnicodeWidthStr::width(&s[seg_start..idx]);
+            }
             in_escape = true;
-        } else {
-            stripped.push(ch);
         }
     }
-    UnicodeWidthStr::width(stripped.as_str())
+    if !in_escape && seg_start < s.len() {
+        total += UnicodeWidthStr::width(&s[seg_start..]);
+    }
+    total
 }
 
 pub fn pad_visible(s: &str, width: usize, align: ColumnAlign) -> String {

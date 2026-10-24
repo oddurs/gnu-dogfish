@@ -86,12 +86,14 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 Ok(())
             })??;
         } else {
-            let buf_reader = reader.into_bufread();
-            for line_res in buf_reader.lines() {
-                let line = line_res?;
-                ctx.telemetry.add_read(line.len() as u64 + 1);
-                let is_blank = line.is_empty();
+            let mut buf_reader = reader.into_bufread();
+            let mut line = String::with_capacity(256);
+            while buf_reader.read_line(&mut line)? > 0 {
+                ctx.telemetry.add_read(line.len() as u64);
+                let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                let is_blank = trimmed.is_empty();
                 if parsed.squeeze_blank && is_blank && prev_blank {
+                    line.clear();
                     continue;
                 }
                 prev_blank = is_blank;
@@ -107,16 +109,17 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 }
 
                 if parsed.show_tabs {
-                    write!(out, "{}", line.replace('\t', "^I"))?;
+                    write!(out, "{}", trimmed.replace('\t', "^I"))?;
                 } else {
-                    write!(out, "{}", line)?;
+                    out.write_all(trimmed.as_bytes())?;
                 }
 
                 if parsed.show_ends {
-                    writeln!(out, "$")?;
+                    out.write_all(b"$\n")?;
                 } else {
-                    writeln!(out)?;
+                    out.write_all(b"\n")?;
                 }
+                line.clear();
             }
         }
     }
@@ -152,19 +155,34 @@ pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
     let mut line_no = 1_usize;
     let st = ctx.style();
+    let sep_bytes = parsed.separator.as_bytes();
+    let mut itoa_buf = itoa::Buffer::new();
 
     for src in &sources {
-        let reader = FastReader::open(src)?.into_bufread();
-        for line in reader.lines() {
-            let line = line?;
-            ctx.telemetry.add_read(line.len() as u64 + 1);
-            if line.is_empty() && !parsed.all {
-                writeln!(out)?;
+        let mut reader = FastReader::open(src)?.into_bufread();
+        let mut line = String::with_capacity(256);
+        while reader.read_line(&mut line)? > 0 {
+            ctx.telemetry.add_read(line.len() as u64);
+            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+            if trimmed.is_empty() && !parsed.all {
+                out.write_all(b"\n")?;
             } else {
-                let num_str = format!("{:>width$}", line_no, width = parsed.width);
-                writeln!(out, "{}{}{}", st.dim(&num_str), parsed.separator, line)?;
+                let num_s = itoa_buf.format(line_no);
+                let pad = parsed.width.saturating_sub(num_s.len());
+                if st.enabled {
+                    write!(out, "\x1b[2m{:>width$}\x1b[0m", num_s, width = parsed.width)?;
+                } else {
+                    for _ in 0..pad {
+                        out.write_all(b" ")?;
+                    }
+                    out.write_all(num_s.as_bytes())?;
+                }
+                out.write_all(sep_bytes)?;
+                out.write_all(trimmed.as_bytes())?;
+                out.write_all(b"\n")?;
                 line_no += 1;
             }
+            line.clear();
         }
     }
     ignore_broken_pipe(out.flush())?;
@@ -1076,77 +1094,97 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         _ => InputSource::Stdin,
     };
 
-    let reader = FastReader::open(&src)?.into_bufread();
-    let lines: Vec<String> = reader.lines().collect::<io::Result<_>>()?;
-
-    if let Some(objs) = read_ndjson_stdin(&lines) {
-        ctx.telemetry.set_strategy("NDJSON object deduplication");
-        let field = parsed.by_field.as_deref().unwrap_or("name");
-        let mut groups: Vec<(Value, usize)> = Vec::new();
-        for obj in objs {
-            if let Some((last, cnt)) = groups.last_mut() {
-                if compare_json_field(last, &obj, field) == std::cmp::Ordering::Equal {
-                    *cnt += 1;
-                    continue;
-                }
-            }
-            groups.push((obj, 1));
-        }
-        let filtered: Vec<Value> = groups
-            .into_iter()
-            .filter(|(_, c)| {
-                if parsed.repeated {
-                    *c > 1
-                } else if parsed.unique {
-                    *c == 1
-                } else {
-                    true
-                }
-            })
-            .map(|(mut val, c)| {
-                if parsed.count {
-                    if let Some(map) = val.as_object_mut() {
-                        map.insert("count".to_string(), serde_json::json!(c));
-                    }
-                }
-                val
-            })
-            .collect();
-        emit_objects_or_table(&filtered, ctx, parsed.json, !parsed.json)?;
+    let mut reader = FastReader::open(&src)?.into_bufread();
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line)? == 0 {
         return Ok(0);
     }
 
-    let mut groups: Vec<(String, usize)> = Vec::new();
-    for line in lines {
-        let matches_prev = groups.last().map_or(false, |(prev, _)| {
-            if parsed.ignore_case {
-                prev.eq_ignore_ascii_case(&line)
-            } else {
-                prev == &line
+    if first_line.trim_start().starts_with('{') || first_line.trim_start().starts_with('[') {
+        let mut lines = vec![first_line.trim_end_matches(&['\r', '\n'][..]).to_string()];
+        let mut buf = String::new();
+        while reader.read_line(&mut buf)? > 0 {
+            lines.push(buf.trim_end_matches(&['\r', '\n'][..]).to_string());
+            buf.clear();
+        }
+        if let Some(objs) = read_ndjson_stdin(&lines) {
+            ctx.telemetry.set_strategy("NDJSON object deduplication");
+            let field = parsed.by_field.as_deref().unwrap_or("name");
+            let mut groups: Vec<(Value, usize)> = Vec::new();
+            for obj in objs {
+                if let Some((last, cnt)) = groups.last_mut() {
+                    if compare_json_field(last, &obj, field) == std::cmp::Ordering::Equal {
+                        *cnt += 1;
+                        continue;
+                    }
+                }
+                groups.push((obj, 1));
             }
-        });
-        if matches_prev {
-            groups.last_mut().unwrap().1 += 1;
-        } else {
-            groups.push((line, 1));
+            let filtered: Vec<Value> = groups
+                .into_iter()
+                .filter(|(_, c)| {
+                    if parsed.repeated {
+                        *c > 1
+                    } else if parsed.unique {
+                        *c == 1
+                    } else {
+                        true
+                    }
+                })
+                .map(|(mut val, c)| {
+                    if parsed.count {
+                        if let Some(map) = val.as_object_mut() {
+                            map.insert("count".to_string(), serde_json::json!(c));
+                        }
+                    }
+                    val
+                })
+                .collect();
+            emit_objects_or_table(&filtered, ctx, parsed.json, !parsed.json)?;
+            return Ok(0);
         }
     }
 
+    // O(1) memory single-pass streaming deduplicator!
+    ctx.telemetry.set_strategy("O(1) memory streaming deduplicator");
     let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    for (line, count) in groups {
-        if parsed.repeated && count <= 1 {
-            continue;
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut prev = first_line.trim_end_matches(&['\r', '\n'][..]).to_string();
+    let mut count = 1usize;
+    let mut cur = String::with_capacity(256);
+
+    let emit_group = |out: &mut io::BufWriter<io::StdoutLock<'_>>, line: &str, cnt: usize| -> io::Result<()> {
+        if parsed.repeated && cnt <= 1 {
+            return Ok(());
         }
-        if parsed.unique && count != 1 {
-            continue;
+        if parsed.unique && cnt != 1 {
+            return Ok(());
         }
         if parsed.count {
-            ignore_broken_pipe(writeln!(out, "{:7} {}", count, line))?;
+            ignore_broken_pipe(writeln!(out, "{:7} {}", cnt, line))
         } else {
-            ignore_broken_pipe(writeln!(out, "{}", line))?;
+            ignore_broken_pipe(writeln!(out, "{}", line))
         }
+    };
+
+    while reader.read_line(&mut cur)? > 0 {
+        let trimmed = cur.trim_end_matches(&['\r', '\n'][..]);
+        let is_same = if parsed.ignore_case {
+            prev.eq_ignore_ascii_case(trimmed)
+        } else {
+            prev == trimmed
+        };
+        if is_same {
+            count += 1;
+        } else {
+            emit_group(&mut out, &prev, count)?;
+            prev.clear();
+            prev.push_str(trimmed);
+            count = 1;
+        }
+        cur.clear();
     }
+    emit_group(&mut out, &prev, count)?;
     ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
@@ -1230,9 +1268,29 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     for src in &sources {
-        let reader = FastReader::open(src)?.into_bufread();
-        let lines: Vec<String> = reader.lines().collect::<io::Result<_>>()?;
-        cut_lines(&lines, &parsed)?;
+        let reader = FastReader::open(src)?;
+        let mut buf_reader = reader.into_bufread();
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+        let out_delim = parsed
+            .output_delimiter
+            .as_deref()
+            .unwrap_or(&parsed.delimiter);
+        let pre_ranges = parsed
+            .bytes
+            .as_deref()
+            .or(parsed.chars.as_deref())
+            .or(parsed.fields.as_deref())
+            .map(parse_ranges_precomputed)
+            .unwrap_or_default();
+
+        let mut line = String::with_capacity(256);
+        while buf_reader.read_line(&mut line)? > 0 {
+            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+            cut_single_line(trimmed, &parsed, &pre_ranges, out_delim, &mut out)?;
+            line.clear();
+        }
+        ignore_broken_pipe(out.flush())?;
     }
     Ok(0)
 }
@@ -1244,46 +1302,77 @@ fn cut_lines(lines: &[String], parsed: &CutArgs) -> Result<i32> {
         .output_delimiter
         .as_deref()
         .unwrap_or(&parsed.delimiter);
+    let pre_ranges = parsed
+        .bytes
+        .as_deref()
+        .or(parsed.chars.as_deref())
+        .or(parsed.fields.as_deref())
+        .map(parse_ranges_precomputed)
+        .unwrap_or_default();
 
     for line in lines {
-        if let Some(ref b_spec) = parsed.bytes {
-            let indices = parse_range_spec(b_spec, line.len());
-            let selected: Vec<u8> = indices
-                .into_iter()
-                .filter_map(|i| line.as_bytes().get(i - 1).copied())
-                .collect();
-            ignore_broken_pipe(out.write_all(&selected))?;
-            ignore_broken_pipe(out.write_all(b"\n"))?;
-        } else if let Some(ref c_spec) = parsed.chars {
-            let chars: Vec<char> = line.chars().collect();
-            let indices = parse_range_spec(c_spec, chars.len());
-            let selected: String = indices
-                .into_iter()
-                .filter_map(|i| chars.get(i - 1).copied())
-                .collect();
-            ignore_broken_pipe(writeln!(out, "{}", selected))?;
-        } else if let Some(ref f_spec) = parsed.fields {
-            if !line.contains(&parsed.delimiter) {
-                if !parsed.only_delimited {
-                    ignore_broken_pipe(writeln!(out, "{}", line))?;
-                }
-                continue;
-            }
-            let parts: Vec<&str> = line.split(&parsed.delimiter).collect();
-            let indices = parse_range_spec(f_spec, parts.len());
-            let selected: Vec<&str> = indices
-                .into_iter()
-                .filter_map(|i| parts.get(i - 1).copied())
-                .collect();
-            ignore_broken_pipe(writeln!(out, "{}", selected.join(out_delim)))?;
-        }
+        cut_single_line(line, parsed, &pre_ranges, out_delim, &mut out)?;
     }
     ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
 
-/// Parses 1-indexed GNU range specifications (`1,3`, `2-5`, `-3`, `4-`).
-fn parse_range_spec(spec: &str, max_len: usize) -> Vec<usize> {
+fn cut_single_line<W: Write>(
+    line: &str,
+    parsed: &CutArgs,
+    ranges: &[(usize, usize)],
+    out_delim: &str,
+    out: &mut W,
+) -> io::Result<()> {
+    if parsed.bytes.is_some() {
+        let bytes = line.as_bytes();
+        for &(start, end) in ranges {
+            let e = end.min(bytes.len());
+            if start >= 1 && start <= e {
+                ignore_broken_pipe(out.write_all(&bytes[start - 1..e]))?;
+            }
+        }
+        ignore_broken_pipe(out.write_all(b"\n"))?;
+    } else if parsed.chars.is_some() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut selected = String::new();
+        for &(start, end) in ranges {
+            let e = end.min(chars.len());
+            if start >= 1 && start <= e {
+                for &ch in &chars[start - 1..e] {
+                    selected.push(ch);
+                }
+            }
+        }
+        ignore_broken_pipe(writeln!(out, "{}", selected))?;
+    } else if parsed.fields.is_some() {
+        if !line.contains(&parsed.delimiter) {
+            if !parsed.only_delimited {
+                ignore_broken_pipe(writeln!(out, "{}", line))?;
+            }
+            return Ok(());
+        }
+        let parts: Vec<&str> = line.split(&parsed.delimiter).collect();
+        let mut first = true;
+        for &(start, end) in ranges {
+            let e = end.min(parts.len());
+            if start >= 1 && start <= e {
+                for &part in &parts[start - 1..e] {
+                    if !first {
+                        ignore_broken_pipe(out.write_all(out_delim.as_bytes()))?;
+                    }
+                    first = false;
+                    ignore_broken_pipe(out.write_all(part.as_bytes()))?;
+                }
+            }
+        }
+        ignore_broken_pipe(out.write_all(b"\n"))?;
+    }
+    Ok(())
+}
+
+/// Pre-parses 1-indexed GNU range specifications (`1,3`, `2-5`, `-3`, `4-`) once before looping!
+fn parse_ranges_precomputed(spec: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
@@ -1294,18 +1383,16 @@ fn parse_range_spec(spec: &str, max_len: usize) -> Vec<usize> {
                 start_s.parse::<usize>().unwrap_or(1)
             };
             let end = if end_s.is_empty() {
-                max_len
+                usize::MAX
             } else {
-                end_s.parse::<usize>().unwrap_or(max_len).min(max_len)
+                end_s.parse::<usize>().unwrap_or(usize::MAX)
             };
-            for i in start..=end {
-                if i >= 1 {
-                    out.push(i);
-                }
+            if start >= 1 && start <= end {
+                out.push((start, end));
             }
         } else if let Ok(idx) = part.parse::<usize>() {
             if idx >= 1 {
-                out.push(idx);
+                out.push((idx, idx));
             }
         }
     }
@@ -1636,7 +1723,23 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         if lo > hi {
             return Err(anyhow!("shuf: invalid input range '{}'", range_str));
         }
-        (lo..=hi).map(|n| n.to_string()).collect()
+        let mut nums: Vec<i64> = (lo..=hi).collect();
+        let len = nums.len();
+        let count = parsed.head_count.unwrap_or(len).min(len);
+        for i in 0..count {
+            let j = i + (next_u64() as usize) % (len - i);
+            nums.swap(i, j);
+        }
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+        let mut itoa_buf = itoa::Buffer::new();
+        for &n in &nums[..count] {
+            ignore_broken_pipe(out.write_all(itoa_buf.format(n).as_bytes()))?;
+            ignore_broken_pipe(out.write_all(b"\n"))?;
+        }
+        ctx.telemetry.add_items(count as u64);
+        ignore_broken_pipe(out.flush())?;
+        return Ok(0);
     } else {
         let sources = InputSource::from_args(&parsed.args);
         let mut all = Vec::new();
@@ -1666,20 +1769,18 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let len = lines.len();
-    for i in (1..len).rev() {
-        let j = (next_u64() as usize) % (i + 1);
+    let count = parsed.head_count.unwrap_or(len).min(len);
+    for i in 0..count {
+        let j = i + (next_u64() as usize) % (len - i);
         lines.swap(i, j);
-    }
-    if let Some(n) = parsed.head_count {
-        lines.truncate(n);
     }
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
-    for line in &lines {
+    for line in &lines[..count] {
         ignore_broken_pipe(writeln!(out, "{}", line))?;
     }
-    ctx.telemetry.add_items(lines.len() as u64);
+    ctx.telemetry.add_items(count as u64);
     ignore_broken_pipe(out.flush())?;
     Ok(0)
 }

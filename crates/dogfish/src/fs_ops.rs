@@ -1161,11 +1161,22 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         } else {
             let root = Path::new(t);
             let mut subdirs: Vec<PathBuf> = Vec::new();
+            let mut root_direct_sz = 0_u64;
+            let mut root_direct_cnt = 0_u64;
             if root.is_dir() {
                 if let Ok(rd) = fs::read_dir(root) {
                     for e in rd.flatten() {
-                        if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                            subdirs.push(e.path());
+                        if let Ok(meta) = e.metadata() {
+                            if meta.is_dir() {
+                                subdirs.push(e.path());
+                            } else {
+                                root_direct_cnt += 1;
+                                root_direct_sz += if parsed.bytes {
+                                    meta.len()
+                                } else {
+                                    meta.blocks() * 512
+                                };
+                            }
                         }
                     }
                 }
@@ -1182,8 +1193,9 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     }
                 })
                 .collect();
-            sub_recs.sort_by(|a, b| b.size.cmp(&a.size));
-            let (total_sz, total_cnt) = compute_dir_size_parallel(root, parsed.bytes);
+            let total_sz: u64 = root_direct_sz + sub_recs.iter().map(|r| r.size).sum::<u64>();
+            let total_cnt: u64 = root_direct_cnt + sub_recs.iter().map(|r| r.files).sum::<u64>();
+            sub_recs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
             ctx.telemetry.add_items(total_cnt);
             records.extend(sub_recs);
             records.push(DuRecord {
