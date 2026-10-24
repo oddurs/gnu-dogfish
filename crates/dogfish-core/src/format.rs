@@ -280,3 +280,68 @@ pub fn system_time_to_unix(time: SystemTime) -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_size_human_and_raw() {
+        assert_eq!(format_size(0, true), "0 B");
+        assert_eq!(format_size(512, true), "512 B");
+        assert_eq!(format_size(1024, true), "1.00 KiB");
+        assert_eq!(format_size(1536, true), "1.50 KiB");
+        assert_eq!(format_size(15 * 1024, true), "15.0 KiB");
+        assert_eq!(format_size(250 * 1024, true), "250 KiB");
+        assert_eq!(format_size(1024 * 1024 * 5, true), "5.00 MiB");
+        assert_eq!(format_size(1024 * 1024 * 1024 * 2, true), "2.00 GiB");
+        assert_eq!(format_size(9876543, false), "9876543");
+    }
+
+    #[test]
+    fn test_parse_size_str_all_units() {
+        assert_eq!(parse_size_str("100").unwrap(), 100);
+        assert_eq!(parse_size_str("100B").unwrap(), 100);
+        assert_eq!(parse_size_str("2K").unwrap(), 2048);
+        assert_eq!(parse_size_str("2KiB").unwrap(), 2048);
+        assert_eq!(parse_size_str("1.5M").unwrap(), 1572864);
+        assert_eq!(parse_size_str("1G").unwrap(), 1073741824);
+        assert_eq!(parse_size_str("1T").unwrap(), 1099511627776);
+        assert!(parse_size_str("").is_err());
+        assert!(parse_size_str("12XYZ").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_str_human_and_compound() {
+        assert_eq!(parse_duration_str("500ns").unwrap(), Duration::from_nanos(500));
+        assert_eq!(parse_duration_str("250us").unwrap(), Duration::from_micros(250));
+        assert_eq!(parse_duration_str("100ms").unwrap(), Duration::from_millis(100));
+        assert_eq!(parse_duration_str("2.5s").unwrap(), Duration::from_millis(2500));
+        assert_eq!(parse_duration_str("3").unwrap(), Duration::from_secs(3));
+        assert_eq!(parse_duration_str("1m 30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration_str("1h30m").unwrap(), Duration::from_secs(5400));
+        assert!(parse_duration_str("-5s").is_err());
+        assert!(parse_duration_str("abc").is_err());
+    }
+
+    #[test]
+    fn test_format_mode_rwx_permissions_and_special_bits() {
+        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o755), "-rwxr-xr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o700), "drwx------");
+        assert_eq!(format_mode_rwx(libc::S_IFLNK as u32 | 0o777), "lrwxrwxrwx");
+        // SUID + SGID + Sticky
+        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o4755), "-rwsr-xr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o2755), "-rwxr-sr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o1777), "drwxrwxrwt");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o1776), "drwxrwxrwT");
+    }
+
+    #[test]
+    fn test_sparkline_bar_rendering() {
+        let st = Style::new(false);
+        assert_eq!(sparkline_bar(0.0, 10, st), "[░░░░░░░░░░]");
+        assert_eq!(sparkline_bar(0.5, 10, st), "[█████░░░░░]");
+        assert_eq!(sparkline_bar(1.0, 10, st), "[██████████]");
+        assert_eq!(sparkline_bar(2.5, 5, st), "[█████]"); // Clamped to 1.0
+    }
+}

@@ -206,20 +206,56 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let sources = InputSource::from_args(&parsed.files);
 
     // Adaptive NDJSON detection when reading from piped stdin!
-    if sources.len() == 1 && matches!(sources[0], InputSource::Stdin) && parsed.bytes.is_none() && !ctx.stdin_is_tty {
-        let all_lines = read_all_stdin_lines()?;
-        if let Some(objs) = read_ndjson_stdin(&all_lines) {
-            ctx.telemetry.set_strategy("NDJSON object stream + auto-table");
-            let slice = &objs[..objs.len().min(parsed.lines)];
-            ctx.telemetry.add_items(slice.len() as u64);
-            emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
+    if sources.len() == 1
+        && matches!(sources[0], InputSource::Stdin)
+        && parsed.bytes.is_none()
+        && !ctx.stdin_is_tty
+    {
+        // Peek the first line to see if it starts with '{' or '[' before reading all of stdin!
+        let stdin = io::stdin();
+        let mut reader = io::BufReader::with_capacity(DEFAULT_BUF_SIZE, stdin.lock());
+        let mut first_line = String::new();
+        let n = reader.read_line(&mut first_line)?;
+        if n == 0 {
             return Ok(0);
         }
-        // Plain text fallback for already-read lines
+        let trimmed_first = first_line.trim_start();
+        if trimmed_first.starts_with('{') || trimmed_first.starts_with('[') {
+            let mut all_lines = vec![first_line.trim_end_matches(&['\r', '\n'][..]).to_string()];
+            for l in reader.lines() {
+                all_lines.push(l?);
+            }
+            if let Some(objs) = read_ndjson_stdin(&all_lines) {
+                ctx.telemetry.set_strategy("NDJSON object stream + auto-table");
+                let slice = &objs[..objs.len().min(parsed.lines)];
+                ctx.telemetry.add_items(slice.len() as u64);
+                emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
+                return Ok(0);
+            }
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::new(stdout.lock());
+            for line in all_lines.into_iter().take(parsed.lines) {
+                ignore_broken_pipe(writeln!(out, "{}", line))?;
+            }
+            ignore_broken_pipe(out.flush())?;
+            return Ok(0);
+        }
+
+        // Plain text streaming fast-path: stop immediately after `parsed.lines`!
         let stdout = io::stdout();
         let mut out = io::BufWriter::new(stdout.lock());
-        for line in all_lines.into_iter().take(parsed.lines) {
-            ignore_broken_pipe(writeln!(out, "{}", line))?;
+        if parsed.lines > 0 {
+            ignore_broken_pipe(out.write_all(first_line.as_bytes()))?;
+            let mut count = 1usize;
+            let mut line = String::new();
+            while count < parsed.lines {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    break;
+                }
+                ignore_broken_pipe(out.write_all(line.as_bytes()))?;
+                count += 1;
+            }
         }
         ignore_broken_pipe(out.flush())?;
         return Ok(0);

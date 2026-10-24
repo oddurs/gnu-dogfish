@@ -345,3 +345,65 @@ pub fn read_all_stdin_lines() -> io::Result<Vec<String>> {
     let reader = io::BufReader::new(stdin.lock());
     reader.lines().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_visible_width_strips_ansi() {
+        let st = Style::new(true);
+        let colored = st.bold_cyan("dogfish");
+        assert!(colored.len() > 7);
+        assert_eq!(visible_width(&colored), 7);
+    }
+
+    #[test]
+    fn test_read_ndjson_stdin_objects_and_arrays() {
+        let lines = vec![
+            r#"{"name":"a.rs","size":120}"#.to_string(),
+            r#"{"name":"b.rs","size":450}"#.to_string(),
+        ];
+        let parsed = read_ndjson_stdin(&lines).unwrap();
+        assert_eq!(parsed.len(), 2);
+
+        let arr_lines = vec![
+            "[".to_string(),
+            r#"  {"name":"x","size":10},"#.to_string(),
+            r#"  {"name":"y","size":20}"#.to_string(),
+            "]".to_string(),
+        ];
+        let parsed_arr = read_ndjson_stdin(&arr_lines).unwrap();
+        assert_eq!(parsed_arr.len(), 2);
+
+        let plain_lines = vec!["hello world".to_string(), "not json".to_string()];
+        assert!(read_ndjson_stdin(&plain_lines).is_none());
+    }
+
+    #[test]
+    fn test_eval_json_where_operators_and_human_units() {
+        let obj = json!({
+            "name": "fs_ops.rs",
+            "kind": "file",
+            "size": 20480,
+            "executable": false
+        });
+        assert!(eval_json_where(&obj, "size>10K"));
+        assert!(eval_json_where(&obj, "size>=20K"));
+        assert!(!eval_json_where(&obj, "size>50K"));
+        assert!(eval_json_where(&obj, "kind=file"));
+        assert!(eval_json_where(&obj, "kind!=dir"));
+        assert!(eval_json_where(&obj, "name~ops"));
+        assert!(!eval_json_where(&obj, "name~main"));
+        assert!(eval_json_where(&obj, "executable=false"));
+    }
+
+    #[test]
+    fn test_compare_json_field_numeric_and_string() {
+        let a = json!({"name": "alpha", "size": 10});
+        let b = json!({"name": "beta", "size": 200});
+        assert_eq!(compare_json_field(&a, &b, "size"), std::cmp::Ordering::Less);
+        assert_eq!(compare_json_field(&a, &b, "name"), std::cmp::Ordering::Less);
+    }
+}
