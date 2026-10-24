@@ -1,94 +1,91 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 320" width="100%" height="100%">
-  <defs>
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0b132b" />
-      <stop offset="50%" stop-color="#1c2541" />
-      <stop offset="100%" stop-color="#0f172a" />
-    </linearGradient>
-    <linearGradient id="sharkGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#00f5d4" />
-      <stop offset="50%" stop-color="#00bbf9" />
-      <stop offset="100%" stop-color="#3a86ff" />
-    </linearGradient>
-    <linearGradient id="hornGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ffbe0b" />
-      <stop offset="100%" stop-color="#fb5607" />
-    </linearGradient>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 210" width="560" height="210">
+  <!-- Classic 1994 X11 / PostScript off-white parchment box with double black border -->
+  <rect x="4" y="4" width="552" height="202" fill="#f7f5eb" stroke="#000000" stroke-width="3" />
+  <rect x="9" y="9" width="542" height="192" fill="none" stroke="#000000" stroke-width="1" />
 
-  <!-- Background Banner -->
-  <rect width="800" height="320" rx="20" fill="url(#bgGrad)" stroke="#00bbf9" stroke-width="2" stroke-opacity="0.4"/>
+  <!-- Woodcut / Ink-Pen Lockup of the Bearded, Horned Dogfish Head (Etienne Suvasa 1991 vibe) -->
+  <g transform="translate(18, 16)" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Left & Right GNU Horns growing out of the fish skull -->
+    <path d="M 72 62 C 52 50, 22 44, 16 20 C 14 10, 26 6, 30 16 C 34 30, 56 32, 82 50 Z" fill="#e2dcc8" stroke-width="2.5" />
+    <path d="M 105 58 C 122 42, 152 36, 156 14 C 158 5, 146 4, 142 14 C 138 28, 118 30, 94 50 Z" fill="#e2dcc8" stroke-width="2.5" />
+    <!-- Horn ridges (cross-hatching lines) -->
+    <line x1="25" y1="26" x2="34" y2="21" stroke-width="1.5" />
+    <line x1="36" y1="35" x2="45" y2="28" stroke-width="1.5" />
+    <line x1="50" y1="43" x2="58" y2="35" stroke-width="1.5" />
+    <line x1="147" y1="22" x2="138" y2="18" stroke-width="1.5" />
+    <line x1="136" y1="31" x2="127" y2="25" stroke-width="1.5" />
+    <line x1="122" y1="39" x2="114" y2="32" stroke-width="1.5" />
 
-  <!-- Subtle Grid Lines -->
-  <g stroke="#ffffff" stroke-opacity="0.04" stroke-width="1">
-    <line x1="0" y1="80" x2="800" y2="80" />
-    <line x1="0" y1="160" x2="800" y2="160" />
-    <line x1="0" y1="240" x2="800" y2="240" />
-    <line x1="200" y1="0" x2="200" y2="320" />
-    <line x1="400" y1="0" x2="400" y2="320" />
-    <line x1="600" y1="0" x2="600" y2="320" />
+    <!-- Spiny Dorsal Fin with awkward venomous spine sticking out -->
+    <path d="M 65 55 L 55 15 L 63 18 L 78 52 Z" fill="#000000" />
+    <path d="M 76 52 C 84 26, 102 28, 110 54 Z" fill="#c9c2af" stroke-width="2.5" />
+    <line x1="86" y1="38" x2="84" y2="52" stroke-width="1.3" />
+    <line x1="95" y1="39" x2="94" y2="52" stroke-width="1.3" />
+
+    <!-- Lumpy, slightly derpy 90s Dogfish Head & Snout -->
+    <path d="M 32 105 C 28 76, 56 50, 92 50 C 128 50, 158 74, 168 95 C 174 106, 156 116, 138 116 C 125 116, 112 126, 88 126 C 60 126, 35 118, 32 105 Z" fill="#ffffff" stroke-width="3" />
+
+    <!-- Cross-hatching shading on the fish forehead -->
+    <line x1="65" y1="60" x2="55" y2="72" stroke-width="1.2" />
+    <line x1="75" y1="58" x2="63" y2="74" stroke-width="1.2" />
+    <line x1="85" y1="58" x2="72" y2="75" stroke-width="1.2" />
+    <line x1="95" y1="59" x2="84" y2="74" stroke-width="1.2" />
+    <line x1="105" y1="61" x2="96" y2="73" stroke-width="1.2" />
+
+    <!-- Big Bugged-Out Tired Hacker Eyes with bags under them + round wire spectacles -->
+    <circle cx="76" cy="86" r="14" fill="#ffffff" stroke-width="2.5" />
+    <circle cx="114" cy="86" r="14" fill="#ffffff" stroke-width="2.5" />
+    <!-- Spectacle bridge & earpieces -->
+    <path d="M 90 84 C 95 80, 95 80, 100 84" fill="none" stroke-width="2.5" />
+    <line x1="62" y1="84" x2="42" y2="78" stroke-width="2" />
+    <line x1="128" y1="84" x2="148" y2="78" stroke-width="2" />
+    <!-- Pupils looking slightly cross-eyed at a parentheses mismatch -->
+    <circle cx="80" cy="86" r="4" fill="#000000" />
+    <circle cx="110" cy="86" r="4" fill="#000000" />
+    <!-- Tired bags under eyes -->
+    <path d="M 66 96 C 72 101, 82 101, 86 96" fill="none" stroke-width="1.3" />
+    <path d="M 104 96 C 110 101, 120 101, 124 96" fill="none" stroke-width="1.3" />
+
+    <!-- Grumpy Fish Mouth & Sawtooth Shark Teeth -->
+    <path d="M 64 114 C 82 107, 114 107, 134 115" fill="none" stroke-width="2.5" />
+    <polyline points="72,112 76,118 80,111 85,118 90,110 95,118 100,110 105,118 110,111 115,118 120,112" fill="none" stroke-width="1.8" />
+
+    <!-- 5 Gill Slits on the left cheek -->
+    <line x1="42" y1="92" x2="40" y2="108" stroke-width="2" />
+    <line x1="47" y1="93" x2="45" y2="109" stroke-width="2" />
+    <line x1="52" y1="94" x2="50" y2="110" stroke-width="2" />
+
+    <!-- Tangled, Unkempt Stallman/GNU Beard hanging from the fish chin -->
+    <path d="M 55 118 C 46 138, 52 162, 64 172 C 62 158, 66 148, 70 144 C 68 158, 76 174, 88 178 C 86 164, 90 152, 94 146 C 96 162, 104 174, 116 176 C 114 162, 116 150, 120 144 C 124 158, 132 168, 140 166 C 144 150, 142 132, 132 116 Z" fill="#ffffff" stroke-width="2.5" />
+    <!-- Scraggly beard hair ink lines -->
+    <path d="M 66 122 C 60 136, 62 150, 65 162" fill="none" stroke-width="1.4" />
+    <path d="M 78 124 C 74 140, 78 156, 84 168" fill="none" stroke-width="1.4" />
+    <path d="M 92 125 C 90 142, 94 156, 98 166" fill="none" stroke-width="1.4" />
+    <path d="M 106 124 C 106 140, 110 154, 113 166" fill="none" stroke-width="1.4" />
+    <path d="M 120 121 C 124 136, 128 148, 132 158" fill="none" stroke-width="1.4" />
   </g>
 
-  <!-- Bearded GNU-horned Spiny Dogfish Emblem -->
-  <g transform="translate(55, 45)">
-    <!-- Outer Seal Ring (GNU-style Medallion) -->
-    <circle cx="115" cy="115" r="105" fill="#090d16" stroke="url(#sharkGrad)" stroke-width="3" />
-    <circle cx="115" cy="115" r="97" fill="none" stroke="#ffbe0b" stroke-width="1" stroke-dasharray="6,4" stroke-opacity="0.6" />
+  <!-- Vertical Separator Rule (Classic Lockup) -->
+  <line x1="206" y1="22" x2="206" y2="188" stroke="#000000" stroke-width="2" />
 
-    <!-- Spiny Dorsal Fin + Classic Spine -->
-    <path d="M 85 75 L 70 30 L 80 35 L 105 68 Z" fill="url(#hornGrad)" />
-    <path d="M 92 72 C 95 40, 120 38, 135 72 Z" fill="url(#sharkGrad)" />
-
-    <!-- Iconic GNU Curved Horns on the Dogfish Head! -->
-    <path d="M 155 78 C 165 45, 195 38, 182 22 C 174 35, 152 42, 142 74 Z" fill="url(#hornGrad)" />
-    <path d="M 145 75 C 148 48, 172 42, 165 26 C 158 38, 140 48, 134 74 Z" fill="url(#hornGrad)" opacity="0.85" />
-
-    <!-- Sleek Dogfish Body & Tail -->
-    <path d="M 28 115 L 5 80 L 22 105 L 48 108 C 85 70, 155 68, 198 105 C 175 130, 145 135, 110 132 C 80 130, 52 122, 28 115 L 8 148 L 24 120 Z" fill="url(#sharkGrad)" />
-
-    <!-- Underbelly & Pectoral Fin -->
-    <path d="M 75 124 C 115 136, 160 132, 192 108 C 165 118, 115 120, 75 124 Z" fill="#e2e8f0" />
-    <path d="M 122 124 L 102 162 L 138 128 Z" fill="#00bbf9" />
-
-    <!-- Fierce Hacker Eye & Gill Slits -->
-    <circle cx="170" cy="98" r="4.5" fill="#090d16" />
-    <circle cx="171.5" cy="96.5" r="1.8" fill="#ffbe0b" />
-    <line x1="142" y1="96" x2="139" y2="112" stroke="#090d16" stroke-width="2.2" stroke-linecap="round" />
-    <line x1="148" y1="97" x2="145" y2="113" stroke="#090d16" stroke-width="2.2" stroke-linecap="round" />
-    <line x1="154" y1="98" x2="151" y2="114" stroke="#090d16" stroke-width="2.2" stroke-linecap="round" />
-
-    <!-- Flowing RMS / GNU Hacker Beard under the Dogfish Chin! -->
-    <path d="M 168 120 C 175 142, 165 168, 182 182 C 160 178, 154 160, 156 142 C 150 162, 142 175, 155 186 C 135 178, 134 152, 144 126 Z" fill="#cbd5e1" opacity="0.9" />
-
-    <!-- Spiny Dogfish White Spots -->
-    <circle cx="95" cy="96" r="2.2" fill="#ffffff" opacity="0.8" />
-    <circle cx="112" cy="92" r="2.5" fill="#ffffff" opacity="0.8" />
-    <circle cx="128" cy="96" r="2.0" fill="#ffffff" opacity="0.8" />
-    <circle cx="78" cy="102" r="1.8" fill="#ffffff" opacity="0.8" />
-  </g>
-
-  <!-- Typography & Manifesto Header -->
-  <g transform="translate(305, 95)">
-    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="14" font-weight="bold" fill="#ffbe0b" letter-spacing="3">
-      THE FREE SOFTWARE COREUTILS PROJECT
-    </text>
-    <text x="0" y="58" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="64" font-weight="900" fill="#ffffff" letter-spacing="2">
-      DOGFISH
-    </text>
-    <text x="0" y="92" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="17" fill="#94a3b8">
-      GNU/Dogfish: Libre, High-Velocity, Object-Aware Coreutils
+  <!-- Classic 1990s Times / Courier Lockup Typography -->
+  <g transform="translate(224, 0)" fill="#000000">
+    <text x="0" y="48" font-family="Georgia, 'Times New Roman', Times, serif" font-size="16" font-style="italic" letter-spacing="1">
+      The Free Software Coreutils Project
     </text>
 
-    <!-- Feature Badges -->
-    <g transform="translate(0, 118)" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="bold">
-      <rect x="0" y="0" width="118" height="28" rx="6" fill="#00f5d4" fill-opacity="0.15" stroke="#00f5d4" stroke-width="1"/>
-      <text x="14" y="18" fill="#00f5d4">100% LIBRE</text>
+    <text x="0" y="106" font-family="Georgia, 'Times New Roman', Times, serif" font-size="56" font-weight="bold" letter-spacing="-1">
+      GNU/Dogfish
+    </text>
 
-      <rect x="130" y="0" width="142" height="28" rx="6" fill="#00bbf9" fill-opacity="0.15" stroke="#00bbf9" stroke-width="1"/>
-      <text x="144" y="18" fill="#00bbf9">NDJSON PIPES</text>
+    <line x1="0" y1="120" x2="312" y2="120" stroke="#000000" stroke-width="1.5" />
 
-      <rect x="284" y="0" width="150" height="28" rx="6" fill="#ffbe0b" fill-opacity="0.15" stroke="#ffbe0b" stroke-width="1"/>
-      <text x="298" y="18" fill="#ffbe0b">ZERO-COPY CoW</text>
-    </g>
+    <text x="0" y="144" font-family="'Courier New', Courier, monospace" font-size="13.5" font-weight="bold">
+       Dogfish&apos;s Own Gnu-style File &amp; I/O SHell-tools
+    </text>
+
+    <text x="0" y="172" font-family="Georgia, 'Times New Roman', Times, serif" font-size="13">
+      Copyleft (c) 1983, 2026 — &quot;Free as in Free Swimming&quot;
+    </text>
   </g>
 </svg>

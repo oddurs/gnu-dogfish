@@ -1,17 +1,5 @@
 <div align="center">
-  <img src="assets/dogfish-logo.svg" alt="GNU/Dogfish Logo" width="100%" />
-
-  <h1>🦈 The GNU/Dogfish Project</h1>
-  <p><strong>Libre, Hardware-Sympathetic, Object-Aware Coreutils in Rust</strong></p>
-
-  <p>
-    <a href="#the-gnu-dogfish-manifesto">Manifesto</a> •
-    <a href="#the-four-freedoms">The Four Freedoms</a> •
-    <a href="#benchmarks-vs-legacy-coreutils">Benchmarks</a> •
-    <a href="#the-5-killer-innovations">Innovations</a> •
-    <a href="#all-45-libre-utilities">45 Utilities</a> •
-    <a href="#installation--shell-integration">Install</a>
-  </p>
+  <img src="assets/dogfish-logo.svg" alt="GNU/Dogfish Lockup Logo" width="560" />
 </div>
 
 ---
