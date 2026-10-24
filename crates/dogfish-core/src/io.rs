@@ -10,13 +10,15 @@ pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyMethod {
     ClonefileCoW,
+    FicloneCoW,
     StandardCopy,
 }
 
 impl CopyMethod {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ClonefileCoW => "zero-copy CoW (clonefile)",
+            Self::ClonefileCoW => "zero-copy CoW (macOS clonefile)",
+            Self::FicloneCoW => "zero-copy CoW (Linux FICLONE)",
             Self::StandardCopy => "buffered kernel copy",
         }
     }
@@ -144,6 +146,22 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
             if ret == 0 {
                 let len = fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
                 return Ok((len, CopyMethod::ClonefileCoW));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink
+        const FICLONE: libc::c_ulong = 0x40049409;
+        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
+            let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+            if ret == 0 {
+                if let Ok(meta) = src_file.metadata() {
+                    let _ = dst_file.set_permissions(meta.permissions());
+                    return Ok((meta.len(), CopyMethod::FicloneCoW));
+                }
             }
         }
     }

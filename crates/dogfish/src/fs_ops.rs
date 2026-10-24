@@ -1007,7 +1007,95 @@ fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
     Ok(records)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
+    let mounts_content = fs::read_to_string("/proc/mounts")
+        .or_else(|_| fs::read_to_string("/etc/mtab"))
+        .unwrap_or_default();
+    let mut records = Vec::new();
+    let mut seen_mounts = std::collections::HashSet::new();
+
+    for line in mounts_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let fs_name = parts[0];
+        let mount_on = parts[1].replace("\\040", " ");
+        let fs_type = parts[2];
+
+        // Skip virtual/pseudo filesystems
+        if matches!(
+            fs_type,
+            "proc"
+                | "sysfs"
+                | "devtmpfs"
+                | "devpts"
+                | "cgroup"
+                | "cgroup2"
+                | "pstore"
+                | "securityfs"
+                | "debugfs"
+                | "tracefs"
+                | "configfs"
+                | "fusectl"
+                | "mqueue"
+                | "hugetlbfs"
+                | "autofs"
+                | "binfmt_misc"
+                | "bpf"
+                | "efivarfs"
+                | "nsfs"
+                | "ramfs"
+                | "squashfs"
+        ) {
+            continue;
+        }
+        if !seen_mounts.insert(mount_on.clone()) {
+            continue;
+        }
+
+        let Ok(c_mount) = CString::new(mount_on.as_bytes()) else {
+            continue;
+        };
+        let mut st_vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_mount.as_ptr(), &mut st_vfs) } != 0 {
+            continue;
+        }
+
+        let bsize = if st_vfs.f_frsize > 0 {
+            st_vfs.f_frsize as u64
+        } else {
+            st_vfs.f_bsize as u64
+        };
+        let total = (st_vfs.f_blocks as u64).saturating_mul(bsize);
+        if total == 0 {
+            continue;
+        }
+        let avail = (st_vfs.f_bavail as u64).saturating_mul(bsize);
+        let free = (st_vfs.f_bfree as u64).saturating_mul(bsize);
+        let used = total.saturating_sub(free);
+        let denom = used + avail;
+        let pct = if denom > 0 {
+            (used as f64 / denom as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        records.push(DfRecord {
+            filesystem: fs_name.to_string(),
+            fs_type: fs_type.to_string(),
+            total_bytes: total,
+            used_bytes: used,
+            available_bytes: avail,
+            use_percent: (pct * 10.0).round() / 10.0,
+            mount_point: mount_on,
+        });
+    }
+    Ok(records)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
     Ok(Vec::new())
 }

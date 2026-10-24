@@ -305,15 +305,20 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         ));
     }
 
-    // 2. cp (APFS clonefile CoW vs /bin/cp)
+    // 2. cp (macOS APFS clonefile CoW / Linux FICLONE CoW vs /bin/cp)
     if Path::new("/bin/cp").exists() {
         let df_dur = time_cmd(&exe, &["cp", &p_str, &cp_df_str], parsed.iterations);
         let sys_dur = time_cmd(Path::new("/bin/cp"), &[&p_str, &cp_sys_str], parsed.iterations);
+        let cp_strat = if cfg!(target_os = "macos") {
+            "APFS clonefile (CoW)"
+        } else {
+            "FICLONE / buffered copy"
+        };
         results.push(make_bench_row(
             &format!("cp ({} MiB file)", parsed.size_mb),
             df_dur,
             sys_dur,
-            "APFS clonefile (CoW)",
+            cp_strat,
         ));
     }
 

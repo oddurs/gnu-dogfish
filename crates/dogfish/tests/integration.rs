@@ -593,10 +593,17 @@ fn test_differential_vs_system_utilities() {
 
     // 2. Compare `base64 -w 0` against `/usr/bin/base64`
     let df_b64 = run(&["base64", "-w", "0", s_path]);
-    let sys_b64 = Command::new("/usr/bin/base64")
-        .args(["-i", s_path])
-        .output()
-        .unwrap();
+    let sys_b64 = if cfg!(target_os = "macos") {
+        Command::new("/usr/bin/base64")
+            .args(["-i", s_path])
+            .output()
+            .unwrap()
+    } else {
+        Command::new("/usr/bin/base64")
+            .args(["-w", "0", s_path])
+            .output()
+            .unwrap()
+    };
     assert_eq!(
         stdout_str(&df_b64).trim(),
         String::from_utf8_lossy(&sys_b64.stdout)
@@ -605,7 +612,7 @@ fn test_differential_vs_system_utilities() {
             .collect::<String>()
     );
 
-    // 3. Compare `md5sum` against `/sbin/md5 -q`
+    // 3. Compare `md5sum` against `/sbin/md5 -q` (macOS) or `/usr/bin/md5sum` (Linux)
     if std::path::Path::new("/sbin/md5").exists() {
         let df_md5 = run(&["md5sum", s_path]);
         let sys_md5 = Command::new("/sbin/md5")
@@ -615,13 +622,33 @@ fn test_differential_vs_system_utilities() {
         let df_hex = stdout_str(&df_md5).split_whitespace().next().unwrap().to_string();
         let sys_hex = String::from_utf8_lossy(&sys_md5.stdout).trim().to_string();
         assert_eq!(df_hex, sys_hex);
+    } else if std::path::Path::new("/usr/bin/md5sum").exists() {
+        let df_md5 = run(&["md5sum", s_path]);
+        let sys_md5 = Command::new("/usr/bin/md5sum")
+            .args([s_path])
+            .output()
+            .unwrap();
+        let df_hex = stdout_str(&df_md5).split_whitespace().next().unwrap().to_string();
+        let sys_hex = String::from_utf8_lossy(&sys_md5.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(df_hex, sys_hex);
     }
 
-    // 4. Compare `sha256sum` against `/usr/bin/shasum -a 256`
+    // 4. Compare `sha256sum` against `/usr/bin/shasum -a 256` or `/usr/bin/sha256sum`
     if std::path::Path::new("/usr/bin/shasum").exists() {
         let df_sha = run(&["sha256sum", s_path]);
         let sys_sha = Command::new("/usr/bin/shasum")
             .args(["-a", "256", s_path])
+            .output()
+            .unwrap();
+        assert_eq!(stdout_str(&df_sha).trim(), String::from_utf8_lossy(&sys_sha.stdout).trim());
+    } else if std::path::Path::new("/usr/bin/sha256sum").exists() {
+        let df_sha = run(&["sha256sum", s_path]);
+        let sys_sha = Command::new("/usr/bin/sha256sum")
+            .args([s_path])
             .output()
             .unwrap();
         assert_eq!(stdout_str(&df_sha).trim(), String::from_utf8_lossy(&sys_sha.stdout).trim());
