@@ -1,6 +1,4 @@
-<div align="center">
-  <img src="assets/dogfish-logo.svg" alt="GNU/Dogfish Lockup Logo" width="560" />
-</div>
+![GNU/Dogfish Lockup Logo](./assets/dogfish-logo.png)
 
 ---
 

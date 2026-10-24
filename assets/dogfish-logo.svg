@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 210" width="560" height="210">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 210" width="640" height="210">
   <!-- Classic 1994 X11 / PostScript off-white parchment box with double black border -->
-  <rect x="4" y="4" width="552" height="202" fill="#f7f5eb" stroke="#000000" stroke-width="3" />
-  <rect x="9" y="9" width="542" height="192" fill="none" stroke="#000000" stroke-width="1" />
+  <rect x="4" y="4" width="632" height="202" fill="#f7f5eb" stroke="#000000" stroke-width="3" />
+  <rect x="9" y="9" width="622" height="192" fill="none" stroke="#000000" stroke-width="1" />
 
   <!-- Woodcut / Ink-Pen Lockup of the Bearded, Horned Dogfish Head (Etienne Suvasa 1991 vibe) -->
   <g transform="translate(18, 16)" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
@@ -69,22 +69,22 @@
   <line x1="206" y1="22" x2="206" y2="188" stroke="#000000" stroke-width="2" />
 
   <!-- Classic 1990s Times / Courier Lockup Typography -->
-  <g transform="translate(224, 0)" fill="#000000">
-    <text x="0" y="48" font-family="Georgia, 'Times New Roman', Times, serif" font-size="16" font-style="italic" letter-spacing="1">
+  <g transform="translate(222, 0)" fill="#000000">
+    <text x="0" y="48" font-family="Georgia, 'Times New Roman', Times, serif" font-size="16" font-style="italic" letter-spacing="0.5">
       The Free Software Coreutils Project
     </text>
 
-    <text x="0" y="106" font-family="Georgia, 'Times New Roman', Times, serif" font-size="56" font-weight="bold" letter-spacing="-1">
+    <text x="0" y="102" font-family="Georgia, 'Times New Roman', Times, serif" font-size="50" font-weight="bold" letter-spacing="-1">
       GNU/Dogfish
     </text>
 
-    <line x1="0" y1="120" x2="312" y2="120" stroke="#000000" stroke-width="1.5" />
+    <line x1="0" y1="118" x2="388" y2="118" stroke="#000000" stroke-width="1.5" />
 
-    <text x="0" y="144" font-family="'Courier New', Courier, monospace" font-size="13.5" font-weight="bold">
-       Dogfish&apos;s Own Gnu-style File &amp; I/O SHell-tools
+    <text x="0" y="143" font-family="'Courier New', Courier, monospace" font-size="13" font-weight="bold">
+      Dogfish&apos;s Own Gnu-style File &amp; I/O SHell-tools
     </text>
 
-    <text x="0" y="172" font-family="Georgia, 'Times New Roman', Times, serif" font-size="13">
+    <text x="0" y="172" font-family="Georgia, 'Times New Roman', Times, serif" font-size="13.5">
       Copyleft (c) 1983, 2026 — &quot;Free as in Free Swimming&quot;
     </text>
   </g>
