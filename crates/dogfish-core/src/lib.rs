@@ -21,4 +21,6 @@ pub use format::{
 };
 pub use io::{copy_file_fast, CopyMethod, FastReader, InputSource, DEFAULT_BUF_SIZE};
 pub use journal::{JournalAction, JournalEntry, UndoJournal};
-pub use table::{emit_objects_or_table, read_ndjson_stdin, ColumnAlign, Table};
+pub use table::{
+    ColumnAlign, Table, emit_objects_or_table, eval_json_where, read_ndjson_stdin,
+};

@@ -1482,3 +1482,201 @@ fn render_tree<W: Write>(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 13. realpath
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "realpath", about = "Print the resolved absolute file path")]
+struct RealpathArgs {
+    /// Do not strip symlinks or require all components to exist (-m)
+    #[arg(short = 's', long = "strip", visible_short_alias = 'm')]
+    no_symlinks: bool,
+
+    #[arg(short = 'J', long = "json")]
+    json: bool,
+
+    #[arg(required = true)]
+    paths: Vec<String>,
+}
+
+pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = RealpathArgs::try_parse_from(args)?;
+    let mut exit_code = 0;
+    let mut results = Vec::new();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    for p_str in &parsed.paths {
+        let p = Path::new(p_str);
+        let resolved = if parsed.no_symlinks {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            }
+        } else {
+            match fs::canonicalize(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("realpath: {}: {}", p_str, e);
+                    exit_code = 1;
+                    continue;
+                }
+            }
+        };
+        ctx.telemetry.add_items(1);
+        let r_str = resolved.to_string_lossy().into_owned();
+        if parsed.json {
+            results.push(serde_json::json!({ "input": p_str, "realpath": r_str }));
+        } else {
+            println!("{}", r_str);
+        }
+    }
+    if parsed.json {
+        emit_objects_or_table(&results, ctx, true, false)?;
+    }
+    Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// 14. basename
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "basename", about = "Strip directory and suffix from filenames")]
+struct BasenameArgs {
+    /// Support multiple arguments and treat each as a NAME
+    #[arg(short = 'a', long = "multiple")]
+    multiple: bool,
+
+    /// Remove a trailing SUFFIX; implies -a
+    #[arg(short = 's', long = "suffix")]
+    suffix: Option<String>,
+
+    #[arg(required = true)]
+    names: Vec<String>,
+}
+
+pub fn run_basename(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = BasenameArgs::try_parse_from(args)?;
+    if !parsed.multiple && parsed.suffix.is_none() {
+        let name = &parsed.names[0];
+        let suf = parsed.names.get(1).map(|s| s.as_str());
+        println!("{}", compute_basename(name, suf));
+        ctx.telemetry.add_items(1);
+    } else {
+        let suf = parsed.suffix.as_deref();
+        for name in &parsed.names {
+            println!("{}", compute_basename(name, suf));
+            ctx.telemetry.add_items(1);
+        }
+    }
+    Ok(0)
+}
+
+fn compute_basename(path: &str, suffix: Option<&str>) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    let base = Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_string());
+    if let Some(suf) = suffix {
+        if base != suf && base.ends_with(suf) {
+            return base[..base.len() - suf.len()].to_string();
+        }
+    }
+    base
+}
+
+// ---------------------------------------------------------------------------
+// 15. dirname
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "dirname", about = "Strip last component from file name")]
+struct DirnameArgs {
+    #[arg(required = true)]
+    names: Vec<String>,
+}
+
+pub fn run_dirname(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = DirnameArgs::try_parse_from(args)?;
+    for name in &parsed.names {
+        let trimmed = name.trim_end_matches('/');
+        if trimmed.is_empty() {
+            println!("/");
+        } else {
+            let parent = Path::new(trimmed)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string());
+            if parent.is_empty() {
+                println!(".");
+            } else {
+                println!("{}", parent);
+            }
+        }
+        ctx.telemetry.add_items(1);
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 16. mktemp
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "mktemp", about = "Create a temporary file or directory safely")]
+struct MktempArgs {
+    /// Create a directory, not a file
+    #[arg(short = 'd', long = "directory")]
+    directory: bool,
+
+    /// Interpret TEMPLATE relative to DIR
+    #[arg(short = 'p', long = "tmpdir")]
+    tmpdir: Option<String>,
+
+    /// Optional template (e.g. tmp.XXXXXX)
+    template: Option<String>,
+}
+
+pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = MktempArgs::try_parse_from(args)?;
+    let base_dir = parsed
+        .tmpdir
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    fs::create_dir_all(&base_dir)?;
+
+    let tmpl = parsed
+        .template
+        .unwrap_or_else(|| "tmp.XXXXXXXXXX".to_string());
+    let prefix = tmpl.trim_end_matches('X');
+
+    let mut rng = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x12345678)
+        ^ (std::process::id() as u64);
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut rand_suffix = String::with_capacity(8);
+    for _ in 0..8 {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        let idx = (rng.wrapping_mul(0x2545F4914F6CDD1D) as usize) % ALPHABET.len();
+        rand_suffix.push(ALPHABET[idx] as char);
+    }
+
+    let final_path = base_dir.join(format!("{}{}", prefix, rand_suffix));
+    if parsed.directory {
+        fs::create_dir(&final_path)?;
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o700))?;
+    } else {
+        fs::File::create(&final_path)?;
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o600))?;
+    }
+    ctx.telemetry.add_items(1);
+    println!("{}", final_path.display());
+    Ok(0)
+}

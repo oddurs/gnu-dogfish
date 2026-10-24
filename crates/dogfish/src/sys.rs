@@ -920,3 +920,181 @@ pub fn run_tee(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(0)
 }
+
+// ---------------------------------------------------------------------------
+// 13. nproc — Print number of available processing units
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "nproc", about = "Print the number of processing units available")]
+struct NprocArgs {
+    /// Ignore up to N processing units
+    #[arg(long = "ignore", default_value_t = 0)]
+    ignore: usize,
+
+    #[arg(short = 'J', long = "json")]
+    json: bool,
+}
+
+pub fn run_nproc(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
+    let parsed = NprocArgs::try_parse_from(args)?;
+    let total = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let count = total.saturating_sub(parsed.ignore).max(1);
+    if parsed.json {
+        println!(
+            "{}",
+            serde_json::json!({ "available_cpus": count, "total_cpus": total })
+        );
+    } else {
+        println!("{}", count);
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 14. hostname — Print system network hostname
+// ---------------------------------------------------------------------------
+pub fn run_hostname(_args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
+    let info = get_uname_info()?;
+    println!("{}", info.nodename);
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 15. printenv — Print values of all or specified environment variables
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "printenv", about = "Print the values of the specified environment VARIABLE(s)")]
+struct PrintenvArgs {
+    #[arg(short = '0', long = "null")]
+    null: bool,
+
+    #[arg(short = 'J', long = "json")]
+    json: bool,
+
+    vars: Vec<String>,
+}
+
+pub fn run_printenv(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
+    let parsed = PrintenvArgs::try_parse_from(args)?;
+    let term = if parsed.null { "\0" } else { "\n" };
+
+    if parsed.vars.is_empty() {
+        let map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        if parsed.json {
+            println!("{}", serde_json::to_string_pretty(&map)?);
+        } else {
+            for (k, v) in map {
+                print!("{}={}{}", k, v, term);
+            }
+        }
+        return Ok(0);
+    }
+
+    let mut exit_code = 0;
+    for v in &parsed.vars {
+        match std::env::var(v) {
+            Ok(val) => print!("{}{}", val, term),
+            Err(_) => exit_code = 1,
+        }
+    }
+    Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// 16. timeout — Run a command with a time limit (e.g. `timeout 500ms slow_cmd`)
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "timeout", about = "Start COMMAND, and kill it if still running after DURATION")]
+struct TimeoutArgs {
+    /// Duration before killing command (e.g. 5s, 500ms, 1m)
+    duration: String,
+
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = TimeoutArgs::try_parse_from(args)?;
+    let limit = parse_duration_str(&parsed.duration).map_err(|e| anyhow!(e))?;
+    let cmd_name = &parsed.command[0];
+    let cmd_args = &parsed.command[1..];
+
+    ctx.telemetry.set_strategy(format!("timeout {:?}", limit));
+    let mut child = Command::new(cmd_name)
+        .args(cmd_args)
+        .spawn()
+        .with_context(|| format!("timeout: failed to run '{}'", cmd_name))?;
+
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.code().unwrap_or(1));
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(124); // Standard GNU timeout exit code
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 17. watch — Execute a program periodically, showing fullscreen output with diff/timer
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "watch", about = "Execute a program periodically, showing output fullscreen")]
+struct WatchArgs {
+    /// Specify update interval (e.g. 2s, 500ms, or 1.5)
+    #[arg(short = 'n', long = "interval", default_value = "2s")]
+    interval: String,
+
+    ///Iterations limit (useful for scripts/testing; 0 = infinite)
+    #[arg(short = 'c', long = "count", default_value_t = 0)]
+    count: usize,
+
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+pub fn run_watch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = WatchArgs::try_parse_from(args)?;
+    let interval = parse_duration_str(&parsed.interval).map_err(|e| anyhow!(e))?;
+    let cmd_str = parsed.command.join(" ");
+    let st = ctx.style();
+    let mut iter = 0usize;
+
+    loop {
+        iter += 1;
+        let start = std::time::Instant::now();
+        let output = Command::new("sh").arg("-c").arg(&cmd_str).output()?;
+        let elapsed = start.elapsed();
+
+        if ctx.stdout_is_tty {
+            print!("\x1b[2J\x1b[H"); // Clear screen & home cursor
+        }
+        let now = Local::now().format("%H:%M:%S").to_string();
+        println!(
+            "{} {}   {}   {}",
+            st.bold_cyan(&format!("Every {:?}:", interval)),
+            st.bold(&cmd_str),
+            st.dim(&format!(
+                "[last run: {}]",
+                dogfish_core::format_duration_human(elapsed)
+            )),
+            st.yellow(&now)
+        );
+        println!("{}", st.dim(&"─".repeat(72)));
+        io::stdout().write_all(&output.stdout)?;
+        io::stderr().write_all(&output.stderr)?;
+        io::stdout().flush()?;
+
+        if parsed.count > 0 && iter >= parsed.count {
+            break;
+        }
+        thread::sleep(interval);
+    }
+    Ok(0)
+}

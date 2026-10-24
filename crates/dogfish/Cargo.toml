@@ -9,10 +9,6 @@ description = "Dogfish: Modern, high-performance, object-aware coreutils in Rust
 name = "dogfish"
 path = "src/main.rs"
 
-[[bin]]
-name = "gnu-dogfish"
-path = "src/main.rs"
-
 [dependencies]
 dogfish-core = { path = "../dogfish-core" }
 clap.workspace = true

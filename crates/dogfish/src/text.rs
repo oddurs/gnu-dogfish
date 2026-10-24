@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use dogfish_core::{
     ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
-    emit_objects_or_table,
+    emit_objects_or_table, eval_json_where,
     io::ignore_broken_pipe,
     parse_size_str, read_ndjson_stdin, sparkline_bar,
     table::{compare_json_field, read_all_stdin_lines},
@@ -755,6 +755,10 @@ struct SortArgs {
     #[arg(long = "by")]
     by_field: Option<String>,
 
+    /// Filter NDJSON objects before sorting (e.g., `--where "size>10K"`)
+    #[arg(short = 'w', long = "where")]
+    where_expr: Option<String>,
+
     /// Emit JSON / NDJSON output
     #[arg(short = 'J', long = "json")]
     json: bool,
@@ -779,6 +783,9 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // Check if input is an NDJSON object stream!
     if let Some(mut objs) = read_ndjson_stdin(&all_lines) {
         ctx.telemetry.set_strategy("NDJSON field-aware parallel sort");
+        if let Some(ref expr) = parsed.where_expr {
+            objs.retain(|o| eval_json_where(o, expr));
+        }
         let field = parsed
             .by_field
             .clone()
@@ -990,6 +997,10 @@ struct CutArgs {
     #[arg(long = "output-delimiter")]
     output_delimiter: Option<String>,
 
+    /// Filter NDJSON objects before projecting (e.g., `--where "size>1K"`)
+    #[arg(short = 'w', long = "where")]
+    where_expr: Option<String>,
+
     #[arg(short = 'J', long = "json")]
     json: bool,
 
@@ -1003,7 +1014,10 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // Check for NDJSON named-field projection (e.g., `dogfish ls -J | dogfish cut -f name,size`)
     if sources.len() == 1 && matches!(sources[0], InputSource::Stdin) && !ctx.stdin_is_tty {
         let all_lines = read_all_stdin_lines()?;
-        if let Some(objs) = read_ndjson_stdin(&all_lines) {
+        if let Some(mut objs) = read_ndjson_stdin(&all_lines) {
+            if let Some(ref expr) = parsed.where_expr {
+                objs.retain(|o| eval_json_where(o, expr));
+            }
             if let Some(ref f_spec) = parsed.fields {
                 ctx.telemetry.set_strategy("NDJSON field projection");
                 let requested: Vec<&str> = f_spec.split(',').map(|s| s.trim()).collect();
@@ -1022,6 +1036,9 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     })
                     .collect();
                 emit_objects_or_table(&projected, ctx, parsed.json, !parsed.json)?;
+                return Ok(0);
+            } else if parsed.where_expr.is_some() {
+                emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
                 return Ok(0);
             }
         }
@@ -1301,5 +1318,233 @@ pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     ignore_broken_pipe(out.flush())?;
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 11. tac — Concatenate and print files in reverse (SIMD memrchr_iter)
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "tac", about = "Concatenate and print files in reverse (last line first)")]
+struct TacArgs {
+    files: Vec<String>,
+}
+
+pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = TacArgs::try_parse_from(args)?;
+    let sources = InputSource::from_args(&parsed.files);
+    ctx.telemetry.set_strategy("mmap + memrchr reverse SIMD line scan");
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+
+    for src in &sources {
+        let mut reader = FastReader::open(src)?;
+        reader.with_bytes(|bytes| -> io::Result<()> {
+            ctx.telemetry.add_read(bytes.len() as u64);
+            let mut end = bytes.len();
+            for pos in memrchr_iter(b'\n', bytes) {
+                if pos + 1 < end {
+                    ignore_broken_pipe(out.write_all(&bytes[pos + 1..end]))?;
+                    if bytes[end - 1] != b'\n' {
+                        ignore_broken_pipe(out.write_all(b"\n"))?;
+                    }
+                }
+                end = pos + 1;
+            }
+            if end > 0 {
+                ignore_broken_pipe(out.write_all(&bytes[..end]))?;
+                if bytes[end - 1] != b'\n' {
+                    ignore_broken_pipe(out.write_all(b"\n"))?;
+                }
+            }
+            ctx.telemetry.add_written(bytes.len() as u64);
+            Ok(())
+        })??;
+    }
+    ignore_broken_pipe(out.flush())?;
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 12. shuf — Fast Fisher-Yates shuffler for lines, numeric ranges (-i), or NDJSON!
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "shuf", about = "Generate random permutations of lines, ranges, or NDJSON objects")]
+struct ShufArgs {
+    /// Treat each ARG as an input line
+    #[arg(short = 'e', long = "echo")]
+    echo: bool,
+
+    /// Act as if input came from a file containing the range LO-HI
+    #[arg(short = 'i', long = "input-range")]
+    input_range: Option<String>,
+
+    /// Output at most COUNT lines/objects
+    #[arg(short = 'n', long = "head-count")]
+    head_count: Option<usize>,
+
+    #[arg(short = 'J', long = "json")]
+    json: bool,
+
+    args: Vec<String>,
+}
+
+pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = ShufArgs::try_parse_from(args)?;
+    ctx.telemetry.set_strategy("xorshift64* Fisher-Yates shuffle");
+
+    // Seed from system time + pid
+    let mut rng_state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xdeadbeef_cafebabe)
+        ^ (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+    if rng_state == 0 {
+        rng_state = 1;
+    }
+    let mut next_u64 = || -> u64 {
+        rng_state ^= rng_state >> 12;
+        rng_state ^= rng_state << 25;
+        rng_state ^= rng_state >> 27;
+        rng_state.wrapping_mul(0x2545F4914F6CDD1D)
+    };
+
+    let mut lines: Vec<String> = if parsed.echo {
+        parsed.args.clone()
+    } else if let Some(ref range_str) = parsed.input_range {
+        let (lo_s, hi_s) = range_str
+            .split_once('-')
+            .ok_or_else(|| anyhow!("shuf: invalid input range '{}'", range_str))?;
+        let lo: i64 = lo_s.parse()?;
+        let hi: i64 = hi_s.parse()?;
+        if lo > hi {
+            return Err(anyhow!("shuf: invalid input range '{}'", range_str));
+        }
+        (lo..=hi).map(|n| n.to_string()).collect()
+    } else {
+        let sources = InputSource::from_args(&parsed.args);
+        let mut all = Vec::new();
+        for s in &sources {
+            let r = FastReader::open(s)?.into_bufread();
+            for l in r.lines() {
+                all.push(l?);
+            }
+        }
+        all
+    };
+
+    if !parsed.echo && parsed.input_range.is_none() {
+        if let Some(mut objs) = read_ndjson_stdin(&lines) {
+            let len = objs.len();
+            for i in (1..len).rev() {
+                let j = (next_u64() as usize) % (i + 1);
+                objs.swap(i, j);
+            }
+            if let Some(n) = parsed.head_count {
+                objs.truncate(n);
+            }
+            ctx.telemetry.add_items(objs.len() as u64);
+            emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
+            return Ok(0);
+        }
+    }
+
+    let len = lines.len();
+    for i in (1..len).rev() {
+        let j = (next_u64() as usize) % (i + 1);
+        lines.swap(i, j);
+    }
+    if let Some(n) = parsed.head_count {
+        lines.truncate(n);
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    for line in &lines {
+        ignore_broken_pipe(writeln!(out, "{}", line))?;
+    }
+    ctx.telemetry.add_items(lines.len() as u64);
+    ignore_broken_pipe(out.flush())?;
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// 13. query / filter — Dedicated NDJSON SQL-like pipeline tool (`where`, `sort`, `select`, `limit`)
+// ---------------------------------------------------------------------------
+#[derive(Parser)]
+#[command(name = "query", visible_alias = "filter", about = "Filter, sort, and project NDJSON object streams (`dogfish ls -J | dogfish query -w \"size>1K\" -s size -d -f name,size`)")]
+struct QueryArgs {
+    /// Filter expression (`size>10K`, `kind=file`, `name~rs`, `lines>=100`)
+    #[arg(short = 'w', long = "where")]
+    where_expr: Vec<String>,
+
+    /// Sort by field name
+    #[arg(short = 's', long = "sort", visible_alias = "by")]
+    sort_by: Option<String>,
+
+    /// Sort descending
+    #[arg(short = 'd', long = "desc", visible_short_alias = 'r')]
+    desc: bool,
+
+    /// Comma-separated fields to select/project (`name,size,kind`)
+    #[arg(short = 'f', long = "select", visible_alias = "fields")]
+    select: Option<String>,
+
+    /// Limit number of output rows
+    #[arg(short = 'n', long = "limit")]
+    limit: Option<usize>,
+
+    /// Emit raw JSON / NDJSON instead of auto-table on TTY
+    #[arg(short = 'J', long = "json")]
+    json: bool,
+}
+
+pub fn run_query(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = QueryArgs::try_parse_from(args)?;
+    ctx.telemetry.set_strategy("NDJSON query engine (where + sort + select)");
+
+    let all_lines = read_all_stdin_lines()?;
+    let Some(mut objs) = read_ndjson_stdin(&all_lines) else {
+        return Err(anyhow!(
+            "query: stdin is not an NDJSON object stream. Tip: pass `-J` to the upstream command (e.g. `dogfish ls -J | dogfish query ...`)"
+        ));
+    };
+
+    for expr in &parsed.where_expr {
+        objs.retain(|o| eval_json_where(o, expr));
+    }
+
+    if let Some(ref field) = parsed.sort_by {
+        objs.par_sort_by(|a, b| {
+            let ord = compare_json_field(a, b, field);
+            if parsed.desc { ord.reverse() } else { ord }
+        });
+    }
+
+    if let Some(lim) = parsed.limit {
+        objs.truncate(lim);
+    }
+
+    if let Some(ref f_spec) = parsed.select {
+        let requested: Vec<&str> = f_spec.split(',').map(|s| s.trim()).collect();
+        objs = objs
+            .into_iter()
+            .map(|obj| {
+                let mut m = Map::new();
+                if let Some(orig) = obj.as_object() {
+                    for &k in &requested {
+                        if let Some(v) = orig.get(k) {
+                            m.insert(k.to_string(), v.clone());
+                        }
+                    }
+                }
+                Value::Object(m)
+            })
+            .collect();
+    }
+
+    ctx.telemetry.add_items(objs.len() as u64);
+    emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
     Ok(0)
 }

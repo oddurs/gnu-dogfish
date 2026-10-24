@@ -286,6 +286,60 @@ pub fn compare_json_field(a: &Value, b: &Value, field: &str) -> std::cmp::Orderi
     }
 }
 
+/// Parses a mini filter expression like `size>10K`, `kind=file`, `name~rs`, `lines>=100`
+/// and evaluates it against a JSON `Value`.
+pub fn eval_json_where(obj: &Value, expr: &str) -> bool {
+    let ops = [">=", "<=", "!=", "==", "=", ">", "<", "~"];
+    for op in ops {
+        if let Some((lhs, rhs)) = expr.split_once(op) {
+            let field = lhs.trim();
+            let rhs = rhs.trim().trim_matches(|c| c == '\'' || c == '"');
+            let Some(val) = obj.get(field) else {
+                return false;
+            };
+            if op == "~" {
+                let s = match val {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                return s.to_ascii_lowercase().contains(&rhs.to_ascii_lowercase());
+            }
+            // Numeric comparison (supports human size suffixes like `10K`, `2M` on the RHS!)
+            if let Some(num_lhs) = val.as_f64().or_else(|| val.as_u64().map(|u| u as f64)) {
+                let num_rhs = crate::format::parse_size_str(rhs)
+                    .map(|u| u as f64)
+                    .or_else(|_| rhs.parse::<f64>())
+                    .unwrap_or(0.0);
+                return match op {
+                    ">" => num_lhs > num_rhs,
+                    ">=" => num_lhs >= num_rhs,
+                    "<" => num_lhs < num_rhs,
+                    "<=" => num_lhs <= num_rhs,
+                    "=" | "==" => (num_lhs - num_rhs).abs() < 1e-9,
+                    "!=" => (num_lhs - num_rhs).abs() >= 1e-9,
+                    _ => false,
+                };
+            }
+            // String / bool comparison
+            let s_lhs = match val {
+                Value::String(s) => s.as_str(),
+                Value::Bool(b) => if *b { "true" } else { "false" },
+                _ => "",
+            };
+            return match op {
+                "=" | "==" => s_lhs.eq_ignore_ascii_case(rhs),
+                "!=" => !s_lhs.eq_ignore_ascii_case(rhs),
+                ">" => s_lhs > rhs,
+                ">=" => s_lhs >= rhs,
+                "<" => s_lhs < rhs,
+                "<=" => s_lhs <= rhs,
+                _ => false,
+            };
+        }
+    }
+    true
+}
+
 pub fn read_all_stdin_lines() -> io::Result<Vec<String>> {
     let stdin = io::stdin();
     let reader = io::BufReader::new(stdin.lock());

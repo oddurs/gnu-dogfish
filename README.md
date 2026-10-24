@@ -56,12 +56,17 @@ $ dogfish bench
 
 ## 🔥 The 5 Killer Innovations
 
-### 1. Adaptive NDJSON Object Pipelines + Auto-Table Rendering
-Pipe structured objects between standard Unix commands in `bash`, `zsh`, or `fish`—and let the final command automatically render a colorized terminal table when `stdout` is a TTY:
+### 1. Adaptive NDJSON Object Pipelines + `dogfish query` + Auto-Table Rendering
+Pipe structured objects between standard Unix commands in `bash`, `zsh`, or `fish`—and filter, sort, or project them using either standard commands (`sort --by`, `cut -f`, `head -n`) or the dedicated **`dogfish query`** SQL-like engine:
 
 ```bash
+# Single-stage SQL-like query on `ls -J` output:
 dogfish ls -J crates/dogfish/src \
-  | dogfish sort --by size --desc \
+  | dogfish query --where "size>10K" --sort size --desc --select name,size,kind,modified_relative
+
+# Or compose standard Unix tools with NDJSON flags:
+dogfish ls -J crates/dogfish/src \
+  | dogfish sort --where "size>1K" --by size --desc \
   | dogfish cut -f name,size,kind,modified_relative \
   | dogfish head -n 5
 ```
@@ -121,14 +126,14 @@ Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary th
 
 ---
 
-## 🧰 All 45 Libre Utilities
+## 🧰 All 57 Libre Utilities
 
 | Category | Utilities | Highlights |
 | :--- | :--- | :--- |
-| **File & Directory** (12) | `ls`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `stat`, `touch`, `df`, `du` | APFS `clonefile` CoW in `cp`; parallel `jwalk` in `du`; `--tree` & `-J` in `ls`; sparkline bars in `df`/`du`; visual card in `stat`; `--safe` trash in `rm`. |
-| **Text & Streaming** (10) | `cat`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `tr`, `paste`, `nl` | SIMD `bytecount`/`memchr`; NDJSON `--by <field>` in `sort`/`uniq`; field projection in `cut -f`; reverse `SeekFrom::End` in `tail`. |
+| **File & Directory** (16) | `ls`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `stat`, `touch`, `df`, `du`, `realpath`, `basename`, `dirname`, `mktemp` | APFS `clonefile` CoW in `cp`; parallel `jwalk` in `du`; `--tree` & `-J` in `ls`; sparkline bars in `df`/`du`; visual card in `stat`; `--safe` trash in `rm`. |
+| **Text & Streaming** (13) | `cat`, `tac`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `tr`, `paste`, `nl`, `shuf`, `query` | SIMD `bytecount`/`memchr`; SQL-like NDJSON `query` (`-w`, `-s`, `-f`, `-n`); `--where` & `--by <field>` in `sort`; reverse SIMD `tac`; Fisher-Yates `shuf`. |
 | **Hashing & Encoding** (5) | `b2sum`, `sha256sum`, `md5sum`, `base64`, `basenc` | Multi-threaded `rayon` file hashing; `-c` (`--check`) verifier; `base64url`, `base32`, `base16`/`hex`, `base2`/`bin` in `basenc`. |
-| **Shell & System** (13) | `echo`, `printf`, `env`, `id`, `uname`, `whoami`, `yes`, `true`, `false`, `sleep`, `seq`, `date`, `tee` | 64 KiB page-aligned vector output in `yes`; human durations (`500ms`, `1m30s`) in `sleep`; `--table` and `-J` in `env`. |
+| **Shell & System** (18) | `echo`, `printf`, `env`, `printenv`, `id`, `uname`, `hostname`, `nproc`, `whoami`, `yes`, `true`, `false`, `sleep`, `timeout`, `watch`, `seq`, `date`, `tee` | 64 KiB page-aligned vector output in `yes`; human durations (`500ms`, `1m30s`) in `sleep`, `timeout`, and `watch`; `--table` and `-J` in `env`. |
 | **Meta-Tools** (5) | `bench`, `undo`, `history`, `init`, `install-links` | Head-to-head benchmark suite, undo journal rollback, shell integration generator (`zsh`, `bash`, `fish`), and symlink installer. |
 
 ---

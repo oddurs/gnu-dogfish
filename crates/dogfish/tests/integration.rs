@@ -177,3 +177,103 @@ fn test_symlink_multicall_dispatch() {
         .unwrap();
     assert!(out.status.success());
 }
+
+#[test]
+fn test_ndjson_query_where_sort_select() {
+    let bin = dogfish_bin();
+    let ls_out = Command::new(&bin)
+        .args(["ls", "-J", "src"])
+        .output()
+        .unwrap();
+    assert!(ls_out.status.success());
+
+    let mut q_child = Command::new(&bin)
+        .args([
+            "query",
+            "-w",
+            "size>1K",
+            "-w",
+            "name~rs",
+            "-s",
+            "size",
+            "-d",
+            "-f",
+            "name,size",
+            "-n",
+            "3",
+            "-J",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        q_child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&ls_out.stdout)
+            .unwrap();
+    }
+    let q_out = q_child.wait_with_output().unwrap();
+    assert!(q_out.status.success());
+    let lines: Vec<&str> = std::str::from_utf8(&q_out.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    assert_eq!(lines.len(), 3);
+}
+
+#[test]
+fn test_tac_basename_dirname_nproc_timeout() {
+    let bin = dogfish_bin();
+
+    // basename
+    let b = Command::new(&bin)
+        .args(["basename", "/usr/local/bin/dogfish.rs", ".rs"])
+        .output()
+        .unwrap();
+    assert_eq!(std::str::from_utf8(&b.stdout).unwrap().trim(), "dogfish");
+
+    // dirname
+    let d = Command::new(&bin)
+        .args(["dirname", "/usr/local/bin/dogfish.rs"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&d.stdout).unwrap().trim(),
+        "/usr/local/bin"
+    );
+
+    // nproc
+    let np = Command::new(&bin).args(["nproc"]).output().unwrap();
+    let cpus: usize = std::str::from_utf8(&np.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(cpus >= 1);
+
+    // tac
+    let mut tac_child = Command::new(&bin)
+        .args(["tac"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        tac_child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"first\nsecond\nthird\n")
+            .unwrap();
+    }
+    let tac_out = tac_child.wait_with_output().unwrap();
+    assert_eq!(
+        std::str::from_utf8(&tac_out.stdout).unwrap(),
+        "third\nsecond\nfirst\n"
+    );
+}
