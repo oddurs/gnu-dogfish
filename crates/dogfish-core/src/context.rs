@@ -175,7 +175,7 @@ impl DogfishContext {
         let secs = elapsed.as_secs_f64().max(1e-9);
         let mut parts = vec![format!(
             "{} {}",
-            st.bold_cyan(&format!("⚡ dogfish {}", self.tool_name)),
+            st.bold_cyan(&format!("⚡ gnu/dogfish {}", self.tool_name)),
             st.bold_green(&format_duration_human(elapsed))
         )];
 

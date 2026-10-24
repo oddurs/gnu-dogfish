@@ -137,8 +137,8 @@ Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary th
 
 ### Build from Source
 ```bash
-git clone https://github.com/oddurs/dogfish.git
-cd dogfish
+git clone https://github.com/oddurs/gnu-dogfish.git
+cd gnu-dogfish
 cargo build --release
 ```
 

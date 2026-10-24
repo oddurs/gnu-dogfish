@@ -152,6 +152,8 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
         }
         println!("function undo; \"{}\" undo $argv; end", exe_str);
         println!("function dogfish; \"{}\" $argv; end", exe_str);
+        println!("function gnu-dogfish; \"{}\" $argv; end", exe_str);
+        println!("function 'gnu/dogfish'; \"{}\" $argv; end", exe_str);
     } else {
         println!("# Usage in zsh/bash: eval \"$(./target/release/dogfish init {} --safe-rm)\"", parsed.shell);
         for &tool in tool_names {
@@ -169,6 +171,8 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
         }
         println!("alias undo='\"{}\" undo'", exe_str);
         println!("alias dogfish='\"{}\"'", exe_str);
+        println!("alias gnu-dogfish='\"{}\"'", exe_str);
+        println!("alias 'gnu/dogfish'='\"{}\"'", exe_str);
     }
     Ok(0)
 }

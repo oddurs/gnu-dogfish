@@ -82,7 +82,9 @@ fn main() -> ExitCode {
         .unwrap_or(&argv0_name)
         .to_string();
 
-    let (tool_name, tool_args) = if stripped_argv0 != "dogfish" && is_known_tool(&stripped_argv0) {
+    let (tool_name, tool_args) = if !matches!(stripped_argv0.as_str(), "dogfish" | "gnu-dogfish")
+        && is_known_tool(&stripped_argv0)
+    {
         let mut a = raw_args;
         if !a.is_empty() {
             a[0] = stripped_argv0.clone();
@@ -95,7 +97,10 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Some("-V") | Some("--version") | Some("version") => {
-                println!("dogfish {} (modern Rust coreutils)", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "GNU/Dogfish (gnu-dogfish) {} — Libre, Object-Aware Coreutils",
+                    env!("CARGO_PKG_VERSION")
+                );
                 return ExitCode::SUCCESS;
             }
             Some("--list") | Some("list") => {
@@ -233,7 +238,7 @@ fn print_banner_and_help() {
     );
     println!(
         "  {}\n",
-        st.dim("Usage: dogfish <UTILITY> [ARGS]... [--stats] [--json|-J] [--color=auto|always|never]")
+        st.dim("Usage: gnu/dogfish <UTILITY> [ARGS]... [--stats] [--json|-J] [--color=auto|always|never]")
     );
 
     println!("  {}", st.bold_yellow("Killer Features:"));
