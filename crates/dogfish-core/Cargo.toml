@@ -1,0 +1,18 @@
+[package]
+name = "dogfish-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core engine for Dogfish coreutils: NDJSON pipelines, zero-copy I/O, telemetry, undo journal, and visual formatting"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memchr.workspace = true
+bytecount.workspace = true
+memmap2.workspace = true
+chrono.workspace = true
+libc.workspace = true
+unicode-width.workspace = true
+anyhow.workspace = true

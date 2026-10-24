@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dogfish-core",
+    "crates/dogfish",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Dogfish Contributors"]
+description = "Modern, high-performance, object-aware coreutils in Rust"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memchr = "2.7"
+bytecount = "0.6"
+memmap2 = "0.9"
+rayon = "1.10"
+jwalk = "0.8"
+blake2 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+base64 = "0.22"
+data-encoding = "2.6"
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+filetime = "0.2"
+unicode-width = "0.2"
+anyhow = "1.0"
+tempfile = "3.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
