@@ -371,15 +371,17 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             0
         };
         let mut first_item = true;
+        let mut itoa_buf = itoa::Buffer::new();
+        let sep_bytes = parsed.separator.as_bytes();
         while (inc > 0 && cur <= end) || (inc < 0 && cur >= end) {
             if !first_item {
-                ignore_broken_pipe(out.write_all(parsed.separator.as_bytes()))?;
+                ignore_broken_pipe(out.write_all(sep_bytes))?;
             }
             first_item = false;
             let res = if width > 0 {
                 write!(out, "{:0width$}", cur, width = width)
             } else {
-                write!(out, "{}", cur)
+                out.write_all(itoa_buf.format(cur).as_bytes())
             };
             if let Err(e) = res {
                 if e.kind() == io::ErrorKind::BrokenPipe {

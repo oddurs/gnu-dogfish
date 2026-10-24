@@ -73,9 +73,17 @@ impl FastReader {
             InputSource::File(path) => {
                 let file = File::open(path)?;
                 let meta = file.metadata()?;
-                if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 33) {
+                if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
                     // Safety: read-only memory map for fast sequential scan
                     if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::madvise(
+                                mmap.as_ptr() as *mut libc::c_void,
+                                mmap.len(),
+                                libc::MADV_SEQUENTIAL,
+                            );
+                        }
                         return Ok(Self::Mapped(mmap));
                     }
                 }

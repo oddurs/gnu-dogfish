@@ -43,13 +43,15 @@ Every copy of `dogfish` ships with a built-in head-to-head benchmark suite (`dog
 $ dogfish bench
 ⚡ dogfish bench: Generating 32 MiB synthetic benchmark corpus...
 
- BENCHMARK         DOGFISH   SYSTEM       SPEEDUP  RELATIVE    ENGINE STRATEGY           
- ────────────────────────────────────────────────────────────────────────────────────────
- wc -l (32 MiB)     5.30ms  33.01ms  6.23x faster  [████████]  mmap + SIMD bytecount     
- cp (32 MiB file)   3.01ms  27.83ms  9.25x faster  [████████]  APFS clonefile (CoW)      
- sort -r (32 MiB)  30.65ms  54.34ms  1.77x faster  [███░░░░░]  rayon par_sort_by         
- wc -lwc (32 MiB)  25.09ms  47.85ms  1.91x faster  [███░░░░░]  mmap + single-pass scanner
- md5sum (32 MiB)   45.17ms  53.59ms  1.19x faster  [██░░░░░░]  mmap + Rust md-5          
+ BENCHMARK           DOGFISH    SYSTEM        SPEEDUP  RELATIVE    ENGINE STRATEGY           
+ ────────────────────────────────────────────────────────────────────────────────────────────
+ wc -l (32 MiB)       4.05ms   29.24ms   7.23x faster  [████████]  mmap + SIMD bytecount     
+ cp (32 MiB file)     2.95ms    9.81ms   3.32x faster  [█████░░░]  APFS clonefile (CoW)      
+ sort -r (32 MiB)    10.20ms   50.37ms   4.94x faster  [████████]  zero-alloc mmap + rayon   
+ wc -lwc (32 MiB)     5.34ms   43.60ms   8.16x faster  [████████]  mmap + parallel SIMD scan 
+ md5sum (32 MiB)     46.35ms   47.97ms   1.03x faster  [██░░░░░░]  mmap + ASM md-5           
+ sha256sum (32 MiB)  17.71ms   74.35ms   4.20x faster  [███████░]  mmap + hardware SHA-256   
+ seq 1 1,000,000      8.80ms  114.05ms  12.96x faster  [████████]  itoa + 64KiB BufWriter    
 ```
 
 ---

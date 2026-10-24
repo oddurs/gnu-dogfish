@@ -677,40 +677,111 @@ fn count_source(
     let rec = reader.with_bytes(|bytes| {
         ctx.telemetry.add_read(bytes.len() as u64);
         ctx.telemetry.add_items(1);
-        let lines = bytecount::count(bytes, b'\n') as u64;
         let byte_count = bytes.len() as u64;
+
+        // Fast path 1: Only `-l` / `-c` requested -> pure SIMD `bytecount::count`
+        if !need_words && !need_chars && !need_max_len {
+            let lines = if bytes.len() >= 512 * 1024 {
+                bytes
+                    .par_chunks(256 * 1024)
+                    .map(|c| bytecount::count(c, b'\n') as u64)
+                    .sum()
+            } else {
+                bytecount::count(bytes, b'\n') as u64
+            };
+            return WcRecord {
+                file: src.display_name().to_string(),
+                lines,
+                words: 0,
+                chars: 0,
+                bytes: byte_count,
+                max_line_length: 0,
+            };
+        }
+
+        // Fast path 2: Parallel 256 KiB chunk scanner for words + lines + chars!
+        if !need_max_len && bytes.len() >= 256 * 1024 {
+            let chunk_size = 256 * 1024;
+            let chunks: Vec<&[u8]> = bytes.chunks(chunk_size).collect();
+            let stats: Vec<(u64, u64, u64, bool, bool)> = chunks
+                .par_iter()
+                .map(|c| {
+                    let l = bytecount::count(c, b'\n') as u64;
+                    let ch = if need_chars {
+                        bytecount::num_chars(c) as u64
+                    } else {
+                        0
+                    };
+                    let mut w = 0_u64;
+                    let mut in_w = false;
+                    // Auto-vectorizable branchless word transition count
+                    for &b in *c {
+                        let ws = matches!(b, b' ' | b'\n' | b'\t' | b'\r' | 0x0b | 0x0c);
+                        w += (!ws && !in_w) as u64;
+                        in_w = !ws;
+                    }
+                    let first_non_ws = c
+                        .first()
+                        .map(|&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r' | 0x0b | 0x0c))
+                        .unwrap_or(false);
+                    let last_non_ws = c
+                        .last()
+                        .map(|&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r' | 0x0b | 0x0c))
+                        .unwrap_or(false);
+                    (l, w, ch, first_non_ws, last_non_ws)
+                })
+                .collect();
+
+            let mut lines = 0;
+            let mut words = 0;
+            let mut chars = 0;
+            let mut prev_ended_in_word = false;
+            for (l, w, ch, first_non_ws, last_non_ws) in stats {
+                lines += l;
+                words += w;
+                chars += ch;
+                if prev_ended_in_word && first_non_ws {
+                    words -= 1; // Word spanned chunk boundary
+                }
+                prev_ended_in_word = last_non_ws;
+            }
+            return WcRecord {
+                file: src.display_name().to_string(),
+                lines,
+                words,
+                chars,
+                bytes: byte_count,
+                max_line_length: 0,
+            };
+        }
+
+        // Standard single-chunk pass
+        let lines = bytecount::count(bytes, b'\n') as u64;
         let chars = if need_chars {
             bytecount::num_chars(bytes) as u64
         } else {
             0
         };
-
         let mut words = 0_u64;
         let mut max_line = 0_u64;
-        if need_words || need_max_len {
-            let mut in_word = false;
-            let mut cur_line_len = 0_u64;
-            for &b in bytes {
-                if b == b'\n' {
-                    if cur_line_len > max_line {
-                        max_line = cur_line_len;
-                    }
-                    cur_line_len = 0;
-                    in_word = false;
-                } else {
-                    cur_line_len += 1;
-                    let is_ws = b.is_ascii_whitespace();
-                    if !is_ws && !in_word {
-                        words += 1;
-                        in_word = true;
-                    } else if is_ws {
-                        in_word = false;
-                    }
+        let mut in_word = false;
+        let mut cur_line_len = 0_u64;
+        for &b in bytes {
+            if b == b'\n' {
+                if cur_line_len > max_line {
+                    max_line = cur_line_len;
                 }
+                cur_line_len = 0;
+                in_word = false;
+            } else {
+                cur_line_len += 1;
+                let is_ws = matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c);
+                words += (!is_ws && !in_word) as u64;
+                in_word = !is_ws;
             }
-            if cur_line_len > max_line {
-                max_line = cur_line_len;
-            }
+        }
+        if cur_line_len > max_line {
+            max_line = cur_line_len;
         }
 
         WcRecord {
@@ -805,6 +876,83 @@ struct SortArgs {
 pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = SortArgs::try_parse_from(args)?;
     let sources = InputSource::from_args(&parsed.files);
+
+    // Fast zero-allocation mmap slice sort when reading from a single file and not NDJSON!
+    if sources.len() == 1 && matches!(sources[0], InputSource::File(_)) && parsed.by_field.is_none() && parsed.where_expr.is_none() {
+        let mut reader = FastReader::open(&sources[0])?;
+        if reader.is_mapped() {
+            let handled = reader.with_bytes(|bytes| -> Result<bool> {
+                if bytes.first().copied() == Some(b'{') || bytes.first().copied() == Some(b'[') {
+                    return Ok(false);
+                }
+                ctx.telemetry.add_read(bytes.len() as u64);
+                ctx.telemetry.set_strategy("zero-alloc mmap &[u8] + rayon par_sort_unstable");
+
+                let mut slices: Vec<&[u8]> = Vec::with_capacity(bytes.len() / 32 + 1);
+                let mut start = 0;
+                for pos in memchr_iter(b'\n', bytes) {
+                    slices.push(&bytes[start..pos]);
+                    start = pos + 1;
+                }
+                if start < bytes.len() {
+                    slices.push(&bytes[start..]);
+                }
+
+                let simple_lex = parsed.key.is_none()
+                    && !parsed.numeric
+                    && !parsed.human_numeric
+                    && !parsed.ignore_blanks
+                    && !parsed.ignore_case;
+
+                if simple_lex {
+                    if parsed.reverse {
+                        slices.par_sort_unstable_by(|a, b| b.cmp(a));
+                    } else {
+                        slices.par_sort_unstable();
+                    }
+                    if parsed.unique {
+                        slices.dedup();
+                    }
+                } else {
+                    slices.par_sort_unstable_by(|a, b| {
+                        let sa = std::str::from_utf8(a).unwrap_or("");
+                        let sb = std::str::from_utf8(b).unwrap_or("");
+                        let ka = extract_sort_key(sa, parsed.key, parsed.separator, parsed.ignore_blanks);
+                        let kb = extract_sort_key(sb, parsed.key, parsed.separator, parsed.ignore_blanks);
+                        let ord = if parsed.human_numeric {
+                            parse_size_str(ka).unwrap_or(0).cmp(&parse_size_str(kb).unwrap_or(0))
+                        } else if parsed.numeric {
+                            let na = ka.trim().parse::<f64>().unwrap_or(0.0);
+                            let nb = kb.trim().parse::<f64>().unwrap_or(0.0);
+                            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+                        } else if parsed.ignore_case {
+                            ka.to_ascii_lowercase().cmp(&kb.to_ascii_lowercase())
+                        } else {
+                            ka.cmp(kb)
+                        };
+                        if parsed.reverse { ord.reverse() } else { ord }
+                    });
+                    if parsed.unique {
+                        slices.dedup();
+                    }
+                }
+
+                let stdout = io::stdout();
+                let mut out = io::BufWriter::with_capacity(256 * 1024, stdout.lock());
+                for s in &slices {
+                    ignore_broken_pipe(out.write_all(s))?;
+                    ignore_broken_pipe(out.write_all(b"\n"))?;
+                }
+                ctx.telemetry.add_items(slices.len() as u64);
+                ctx.telemetry.add_written(bytes.len() as u64);
+                ignore_broken_pipe(out.flush())?;
+                Ok(true)
+            })??;
+            if handled {
+                return Ok(0);
+            }
+        }
+    }
 
     let mut all_lines = Vec::new();
     for src in &sources {
@@ -1202,6 +1350,37 @@ pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         set1 = comp;
     }
     let set2 = parsed.sets.get(1).map(|s| expand_tr_set(s)).unwrap_or_default();
+
+    // Fast path: 256-entry ASCII lookup table when all chars in set1 & set2 are ASCII
+    // and neither delete nor squeeze is set!
+    let is_ascii_only = set1.iter().all(|c| c.is_ascii()) && set2.iter().all(|c| c.is_ascii());
+    if is_ascii_only && !parsed.delete && !parsed.squeeze && !set2.is_empty() {
+        ctx.telemetry.set_strategy("256-byte O(1) ASCII LUT stream");
+        let mut lut: [u8; 256] = std::array::from_fn(|i| i as u8);
+        for (idx, &c1) in set1.iter().enumerate() {
+            let c2 = *set2.get(idx).unwrap_or_else(|| set2.last().unwrap());
+            lut[c1 as usize] = c2 as u8;
+        }
+        use std::io::Read;
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let mut buf = [0u8; DEFAULT_BUF_SIZE];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            ctx.telemetry.add_read(n as u64);
+            for b in &mut buf[..n] {
+                *b = lut[*b as usize];
+            }
+            ignore_broken_pipe(out.write_all(&buf[..n]))?;
+            ctx.telemetry.add_written(n as u64);
+        }
+        return Ok(0);
+    }
 
     let mut input = String::new();
     use std::io::Read;

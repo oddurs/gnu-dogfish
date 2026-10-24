@@ -361,7 +361,38 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             &format!("md5sum ({} MiB)", parsed.size_mb),
             df_dur,
             sys_dur,
-            "mmap + Rust md-5",
+            "mmap + ASM md-5",
+        ));
+    }
+
+    // 6. sha256sum vs /usr/bin/shasum -a 256 or /usr/bin/sha256sum
+    let sys_sha = if Path::new("/usr/bin/sha256sum").exists() {
+        Some((Path::new("/usr/bin/sha256sum"), vec![p_str.as_str()]))
+    } else if Path::new("/usr/bin/shasum").exists() {
+        Some((Path::new("/usr/bin/shasum"), vec!["-a", "256", &p_str]))
+    } else {
+        None
+    };
+    if let Some((sys_bin, sys_args)) = sys_sha {
+        let df_dur = time_cmd(&exe, &["sha256sum", &p_str], parsed.iterations);
+        let sys_dur = time_cmd(sys_bin, &sys_args, parsed.iterations);
+        results.push(make_bench_row(
+            &format!("sha256sum ({} MiB)", parsed.size_mb),
+            df_dur,
+            sys_dur,
+            "mmap + hardware SHA-256",
+        ));
+    }
+
+    // 7. seq 1 1000000 vs /usr/bin/seq 1 1000000
+    if Path::new("/usr/bin/seq").exists() {
+        let df_dur = time_cmd(&exe, &["seq", "1", "1000000"], parsed.iterations);
+        let sys_dur = time_cmd(Path::new("/usr/bin/seq"), &["1", "1000000"], parsed.iterations);
+        results.push(make_bench_row(
+            "seq 1 1,000,000",
+            df_dur,
+            sys_dur,
+            "itoa + 64KiB BufWriter",
         ));
     }
 

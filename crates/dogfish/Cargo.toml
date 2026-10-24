@@ -31,3 +31,4 @@ filetime.workspace = true
 unicode-width.workspace = true
 anyhow.workspace = true
 tempfile.workspace = true
+itoa.workspace = true
