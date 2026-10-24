@@ -556,3 +556,244 @@ fn test_df_du_ls_tree_and_install_links() {
         .unwrap();
     assert_eq!(stdout_str(&b_out).trim(), "dogfish");
 }
+
+// ===========================================================================
+// SPRINT 2: ADVERSARIAL, DIFFERENTIAL & EDGE-CASE TESTS
+// ===========================================================================
+
+#[test]
+fn test_differential_vs_system_utilities() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sample = tmp.path().join("sample.txt");
+    let text = "The GNU/Dogfish Project 1983-2026\nFree as in Free Swimming!\n\tTabbed\tLine\tHere\n1234567890\n";
+    fs::write(&sample, text).unwrap();
+    let s_path = sample.to_str().unwrap();
+
+    // 1. Compare `wc -l`, `wc -w`, `wc -c` against `/usr/bin/wc`
+    for flag in ["-l", "-w", "-c"] {
+        let df = run(&["wc", flag, s_path]);
+        let sys = Command::new("/usr/bin/wc")
+            .args([flag, s_path])
+            .output()
+            .unwrap();
+        let df_num: u64 = stdout_str(&df)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let sys_num: u64 = String::from_utf8_lossy(&sys.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(df_num, sys_num, "wc {} mismatch vs /usr/bin/wc", flag);
+    }
+
+    // 2. Compare `base64 -w 0` against `/usr/bin/base64`
+    let df_b64 = run(&["base64", "-w", "0", s_path]);
+    let sys_b64 = Command::new("/usr/bin/base64")
+        .args(["-i", s_path])
+        .output()
+        .unwrap();
+    assert_eq!(
+        stdout_str(&df_b64).trim(),
+        String::from_utf8_lossy(&sys_b64.stdout)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    );
+
+    // 3. Compare `md5sum` against `/sbin/md5 -q`
+    if std::path::Path::new("/sbin/md5").exists() {
+        let df_md5 = run(&["md5sum", s_path]);
+        let sys_md5 = Command::new("/sbin/md5")
+            .args(["-q", s_path])
+            .output()
+            .unwrap();
+        let df_hex = stdout_str(&df_md5).split_whitespace().next().unwrap().to_string();
+        let sys_hex = String::from_utf8_lossy(&sys_md5.stdout).trim().to_string();
+        assert_eq!(df_hex, sys_hex);
+    }
+
+    // 4. Compare `sha256sum` against `/usr/bin/shasum -a 256`
+    if std::path::Path::new("/usr/bin/shasum").exists() {
+        let df_sha = run(&["sha256sum", s_path]);
+        let sys_sha = Command::new("/usr/bin/shasum")
+            .args(["-a", "256", s_path])
+            .output()
+            .unwrap();
+        assert_eq!(stdout_str(&df_sha).trim(), String::from_utf8_lossy(&sys_sha.stdout).trim());
+    }
+}
+
+#[test]
+fn test_empty_files_and_no_trailing_newline_edge_cases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_f = tmp.path().join("empty.txt");
+    let no_nl_f = tmp.path().join("no_nl.txt");
+    fs::write(&empty_f, b"").unwrap();
+    fs::write(&no_nl_f, b"single line without newline").unwrap();
+
+    let e_str = empty_f.to_str().unwrap();
+    let n_str = no_nl_f.to_str().unwrap();
+
+    // Empty file checks
+    assert_eq!(stdout_str(&run(&["cat", e_str])), "");
+    assert_eq!(stdout_str(&run(&["tac", e_str])), "");
+    assert_eq!(stdout_str(&run(&["head", e_str])), "");
+    assert_eq!(stdout_str(&run(&["tail", e_str])), "");
+    assert_eq!(stdout_str(&run(&["sort", e_str])), "");
+    assert_eq!(stdout_str(&run(&["uniq", e_str])), "");
+    assert_eq!(stdout_str(&run(&["nl", e_str])), "");
+
+    let wc_empty: serde_json::Value =
+        serde_json::from_slice(&run(&["wc", "-J", e_str]).stdout).unwrap();
+    assert_eq!(wc_empty["lines"].as_u64(), Some(0));
+    assert_eq!(wc_empty["words"].as_u64(), Some(0));
+    assert_eq!(wc_empty["bytes"].as_u64(), Some(0));
+
+    // SHA-256 of empty file must be e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    let sha_empty = stdout_str(&run(&["sha256sum", e_str]));
+    assert!(sha_empty.starts_with("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+
+    // No trailing newline checks
+    let wc_no_nl: serde_json::Value =
+        serde_json::from_slice(&run(&["wc", "-J", n_str]).stdout).unwrap();
+    assert_eq!(wc_no_nl["lines"].as_u64(), Some(0));
+    assert_eq!(wc_no_nl["words"].as_u64(), Some(4));
+    assert_eq!(wc_no_nl["bytes"].as_u64(), Some(27));
+    assert_eq!(wc_no_nl["max_line_length"].as_u64(), Some(27));
+
+    assert_eq!(stdout_str(&run(&["head", "-n", "1", n_str])), "single line without newline");
+    assert_eq!(stdout_str(&run(&["tail", "-n", "1", n_str])), "single line without newline");
+}
+
+#[test]
+fn test_large_multi_chunk_tail_and_head() {
+    // Generate >200 KiB (>3 x 64 KiB chunks) to exercise multi-chunk reverse SeekFrom::End in `tail`
+    let tmp = tempfile::tempdir().unwrap();
+    let big = tmp.path().join("big.log");
+    let mut content = String::with_capacity(250_000);
+    for i in 1..=5000 {
+        content.push_str(&format!("2026-10-24T00:00:00Z event_index={:05} payload=0123456789abcdef\n", i));
+    }
+    fs::write(&big, &content).unwrap();
+    let b_str = big.to_str().unwrap();
+
+    // Verify `tail -n 2500` spans multiple 64 KiB chunks accurately
+    let t_out = run(&["tail", "-n", "2500", b_str]);
+    let t_text = stdout_str(&t_out);
+    let t_lines: Vec<&str> = t_text.lines().collect();
+    assert_eq!(t_lines.len(), 2500);
+    assert!(t_lines[0].contains("event_index=02501"));
+    assert!(t_lines[2499].contains("event_index=05000"));
+
+    // Verify `head -n 2500` spans multiple 64 KiB chunks accurately
+    let h_out = run(&["head", "-n", "2500", b_str]);
+    let h_text = stdout_str(&h_out);
+    let h_lines: Vec<&str> = h_text.lines().collect();
+    assert_eq!(h_lines.len(), 2500);
+    assert!(h_lines[0].contains("event_index=00001"));
+    assert!(h_lines[2499].contains("event_index=02500"));
+}
+
+#[test]
+fn test_unicode_multibyte_cut_wc_and_tr() {
+    let unicode_text = "🦈🦀🦬\nαβγδε\n";
+    let wc_j: serde_json::Value =
+        serde_json::from_slice(&run_stdin(&["wc", "-J"], unicode_text.as_bytes()).stdout).unwrap();
+    assert_eq!(wc_j["lines"].as_u64(), Some(2));
+    assert_eq!(wc_j["chars"].as_u64(), Some(10)); // 3 emojis + \n + 5 greek + \n = 10 chars
+    assert_eq!(wc_j["bytes"].as_u64(), Some(24)); // 12 + 1 + 10 + 1 = 24 bytes
+
+    // `cut -c 2-3` should slice by Unicode scalar character, not raw byte!
+    let cut_c = run_stdin(&["cut", "-c", "2-3"], unicode_text.as_bytes());
+    assert_eq!(stdout_str(&cut_c), "🦀🦬\nβγ\n");
+}
+
+#[test]
+fn test_chmod_complex_symbolic_clauses_and_recursive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("chmod_tree");
+    let sub = dir.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let f = sub.join("file.txt");
+    fs::write(&f, "test").unwrap();
+
+    // Set initial mode 0600
+    assert!(run(&["chmod", "600", f.to_str().unwrap()]).status.success());
+    // Apply compound symbolic mode: u+x,g+r,o+r -> 0744
+    assert!(run(&["chmod", "u+x,g+r,o+r", f.to_str().unwrap()]).status.success());
+    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o744);
+
+    // Apply =rw to all: a=rw -> 0666
+    assert!(run(&["chmod", "a=rw", f.to_str().unwrap()]).status.success());
+    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o666);
+
+    // Apply go-w -> 0644
+    assert!(run(&["chmod", "go-w", f.to_str().unwrap()]).status.success());
+    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o644);
+
+    // Recursive chmod -R 755 on directory
+    assert!(run(&["chmod", "-R", "755", dir.to_str().unwrap()]).status.success());
+    assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o755);
+}
+
+#[test]
+fn test_error_handling_and_exit_codes() {
+    // Non-existent files should return non-zero exit codes
+    assert!(!run(&["cat", "/nonexistent/dogfish_missing_file"]).status.success());
+    assert!(!run(&["ls", "/nonexistent/dogfish_missing_dir"]).status.success());
+    assert!(!run(&["stat", "/nonexistent/dogfish_missing_file"]).status.success());
+    assert!(!run(&["rm", "/nonexistent/dogfish_missing_file"]).status.success());
+    // But `rm -f` on nonexistent file must succeed (exit 0)
+    assert!(run(&["rm", "-f", "/nonexistent/dogfish_missing_file"]).status.success());
+
+    // `seq` with 0 step must fail
+    assert!(!run(&["seq", "1", "0", "10"]).status.success());
+
+    // Unknown subcommand must fail with exit 1
+    assert!(!run(&["definitely_not_a_utility"]).status.success());
+}
+
+#[test]
+fn test_global_stats_and_color_flags_on_every_category() {
+    // `--stats` should emit `[⚡ gnu/dogfish ...]` on stderr without polluting stdout
+    let out = run(&["echo", "--stats", "--no-color", "clean_stdout"]);
+    assert!(out.status.success());
+    assert_eq!(stdout_str(&out), "clean_stdout\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gnu/dogfish echo"));
+}
+
+#[test]
+fn test_all_57_tools_respond_to_help_cleanly() {
+    let list_out = run(&["--list"]);
+    assert!(list_out.status.success());
+    let tools: Vec<String> = stdout_str(&list_out)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(tools.len(), 57);
+
+    for tool in &tools {
+        if matches!(tool.as_str(), "true" | "false" | "echo" | "printf" | "hostname") {
+            continue;
+        }
+        let h_out = run(&[tool, "--help"]);
+        assert!(
+            h_out.status.success(),
+            "tool '{}' failed on --help with status {:?}",
+            tool,
+            h_out.status
+        );
+        assert!(
+            !stdout_str(&h_out).is_empty(),
+            "tool '{}' produced empty --help output",
+            tool
+        );
+    }
+}
