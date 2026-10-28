@@ -908,9 +908,14 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 #[derive(Parser)]
 #[command(
     name = "df",
-    about = "Report file system disk space usage with sparkline bars"
+    about = "Report file system disk space usage with sparkline bars",
+    disable_help_flag = true
 )]
 struct DfArgs {
+    /// Print help (`-h` is reserved for human-readable output, as in GNU)
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
+
     /// Print sizes in powers of 1024 (e.g., 1023M)
     #[arg(short = 'h', long = "human-readable")]
     human: bool,
@@ -1123,9 +1128,14 @@ fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
 #[derive(Parser)]
 #[command(
     name = "du",
-    about = "Estimate file space usage in parallel with sparkline bars"
+    about = "Estimate file space usage in parallel with sparkline bars",
+    disable_help_flag = true
 )]
 struct DuArgs {
+    /// Print help (`-h` is reserved for human-readable output, as in GNU)
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
+
     /// Display only a total for each argument
     #[arg(short = 's', long = "summarize")]
     summarize: bool,
@@ -1288,9 +1298,14 @@ fn compute_dir_size_parallel(root: &Path, apparent_bytes: bool) -> (u64, u64) {
 #[derive(Parser)]
 #[command(
     name = "ls",
-    about = "List directory contents with smart colors, tree view, and NDJSON output"
+    about = "List directory contents with smart colors, tree view, and NDJSON output",
+    disable_help_flag = true
 )]
 struct LsArgs {
+    /// Print help (`-h` is reserved for human-readable output, as in GNU)
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
+
     /// Do not ignore entries starting with .
     #[arg(short = 'a', long = "all")]
     all: bool,

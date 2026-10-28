@@ -866,9 +866,14 @@ fn print_wc_row(r: &WcRecord, args: &WcArgs, default_cols: bool, omit_filename: 
 #[derive(Parser)]
 #[command(
     name = "sort",
-    about = "Sort lines of text files or NDJSON object streams"
+    about = "Sort lines of text files or NDJSON object streams",
+    disable_help_flag = true
 )]
 struct SortArgs {
+    /// Print help (`-h` is reserved for human-readable output, as in GNU)
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
+
     /// Reverse the result of comparisons
     #[arg(short = 'r', long = "reverse", visible_alias = "desc")]
     reverse: bool,
