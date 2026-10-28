@@ -23,7 +23,7 @@ For forty years, `ls`, `cat`, `wc`, `cp`, `df`, and `sort` have stood as the bed
 - Accidentally typing `rm -rf` meant irreversible catastrophe with no journaled rollback.
 - Every command ran in complete silence with zero visibility into kernel strategy, memory bandwidth, or execution latency.
 
-**GNU/Dogfish** is our love letter to the Free Software movement, forged in **100% safe, libre Rust**:
+**GNU/Dogfish** is our love letter to the Free Software movement, forged in **libre Rust** (safe Rust everywhere except a small set of audited `libc` FFI calls — see [SECURITY.md](./SECURITY.md)):
 1. **Uncompromising User Freedom**: No telemetry servers, no proprietary blobs, no cloud lock-in, ever. When you pass `--stats`, the telemetry belongs **exclusively to you on your local `stderr`**.
 2. **Respect for Your Hardware**: Free software should not waste your CPU cycles. Every millisecond saved by SIMD vector scans (`memchr`, `bytecount`), memory-mapped I/O (`mmap`), work-stealing parallelism (`rayon`, `jwalk`), and zero-copy kernel clones (`clonefile`) returns power and time to the user.
 3. **Structured Freedom in the Shell**: Text streams are universal, but **JSON Lines (NDJSON)** are self-describing. GNU/Dogfish utilities speak both fluently.
@@ -43,7 +43,9 @@ GNU/Dogfish is Free Software (*"free" as in freedom, not merely "free beer"—th
 
 ## ⚡ Benchmarks vs. Legacy Coreutils
 
-Every copy of `dogfish` ships with a built-in head-to-head benchmark suite (`dogfish bench`) so you can verify its claims on your own hardware at any time:
+Every copy of `dogfish` ships with a built-in head-to-head benchmark suite (`dogfish bench`) so you can verify its claims on your own hardware at any time.
+
+> **Read these numbers with care.** The table below is a single run on an Apple Silicon laptop against the macOS system tools (BSD userland, not GNU coreutils), on a warm page cache, with a build tuned for that CPU. Your results will differ by OS, filesystem, CPU, and file size — run `dogfish bench` yourself before relying on any figure.
 
 ```text
 $ dogfish bench
@@ -132,6 +134,8 @@ Change: 2026-10-23 23:47:31 -0400
 ### 5. Single Multicall Binary + 40 Symlink Personalities
 Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary that dispatches either via subcommand (`dogfish ls`) or `argv[0]` symlink (`ls -> dogfish` or `df-ls -> dogfish`).
 
+> **Compatibility note:** Dogfish aims to match GNU behaviour for the flags it implements, and a differential test suite (`crates/dogfish/tests/gnu_compat.rs`) checks this against GNU coreutils on every Linux CI run. It does not implement every GNU flag yet, so review before aliasing it over your system tools.
+
 ---
 
 ## 🧰 All 57 Libre Utilities
@@ -153,6 +157,12 @@ Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary th
 git clone https://github.com/oddurs/gnu-dogfish.git
 cd gnu-dogfish
 cargo build --release
+```
+
+The default build targets your architecture's baseline CPU so binaries are portable. For a build tuned to the machine you're on (and the fastest benchmark numbers), opt in explicitly:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ### Option A: Instant Shell Integration (`fish`, `zsh`, `bash`)

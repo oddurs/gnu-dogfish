@@ -12,10 +12,12 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    cd gnu-dogfish
    cargo build --release
    ```
-2. **Run the Test Suite (39 Suites)**:
+2. **Run the Test Suite** (both profiles — debug builds enable clap's argument asserts and overflow checks, so CI runs both):
    ```bash
+   cargo test
    cargo test --release
    ```
+   On Linux with GNU coreutils installed, `tests/gnu_compat.rs` also diffs Dogfish against the system tools; on other platforms those cases are skipped.
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench
@@ -23,8 +25,9 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
 4. **Lint & Format**:
    ```bash
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets
+   cargo clippy --workspace --all-targets -- -D warnings
    ```
+   CI rejects any formatting diff or clippy warning.
 
 ---
 
@@ -52,7 +55,7 @@ The workspace consists of two crates:
 2. **Use `clap::Parser`** for flags, and support `-J` / `--json` (`emit_objects_or_table`) whenever the utility outputs structured records.
 3. **Record telemetry** via `ctx.telemetry.add_read(...)`, `ctx.telemetry.add_written(...)`, `ctx.telemetry.add_items(...)`, and `ctx.telemetry.set_strategy(...)`.
 4. **Register the utility** in `ALL_TOOLS` and `dispatch()` inside `crates/dogfish/src/main.rs`.
-5. **Add integration tests** in `crates/dogfish/tests/integration.rs` (and update the tool count in `test_all_57_tools_respond_to_help_cleanly`).
+5. **Add tests**: integration tests in `crates/dogfish/tests/integration.rs` (and update the tool count in `test_all_57_tools_respond_to_help_cleanly`), GNU differential cases in `tests/gnu_compat.rs`, and — for anything that writes, moves or deletes files — data-safety regressions in `tests/fs_safety.rs`.
 
 ---
 

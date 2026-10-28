@@ -9,8 +9,9 @@
 ## Security Model & Guarantees
 
 **GNU/Dogfish** is written in Rust with memory safety as a core priority:
-- The vast majority of utilities operate in 100% safe Rust.
-- `unsafe` blocks are strictly confined to audited OS/POSIX FFI boundaries (`libc::mmap` / `madvise`, `libc::clonefile` on macOS, `libc::ioctl(FICLONE)` on Linux, `libc::statvfs` / `getmntinfo`, and `getpwuid` / `getgrgid`).
+- Utilities are written in safe Rust, except for a small number of `unsafe` blocks confined to OS/POSIX FFI calls: `mmap` (via `memmap2`), `clonefile` (macOS) and `ioctl(FICLONE)` (Linux), `statvfs` / `getmntinfo`, `getpwnam` / `getgrnam` / `getpwuid` / `getgrgid`, `chown`, `flock` on the undo journal, and `signal(SIGPIPE)`.
+- Memory-mapped input (`mmap`) means a file truncated by another process *while* Dogfish reads it can raise `SIGBUS`, as with other mmap-based tools.
+- Destructive operations refuse same-file copies, directory-into-itself copies/moves, `rm` of `.`/`..` and recursive `rm` of `/`; `mktemp` uses OS randomness and exclusive creation. Regression tests live in `crates/dogfish/tests/fs_safety.rs`.
 - No network connections or external telemetry calls are ever made by any Dogfish utility.
 
 ## Reporting a Vulnerability

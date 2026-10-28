@@ -32,6 +32,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Test
+        run: cargo test --workspace --release --target ${{ matrix.target }}
+
+      # Built for the baseline CPU of the target (no `target-cpu=native`) so the
+      # binaries run on any machine of that architecture.
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -39,7 +44,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/dogfish dist/
-          cp README.md LICENSE CHANGELOG.md dist/
+          cp README.md LICENSE LICENSE-GPL LICENSE-MIT CHANGELOG.md dist/
           tar -czf ${{ matrix.archive_name }} -C dist .
           ./target/${{ matrix.target }}/release/dogfish sha256sum ${{ matrix.archive_name }} > ${{ matrix.archive_name }}.sha256
 
