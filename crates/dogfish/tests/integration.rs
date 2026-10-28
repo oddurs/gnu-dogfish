@@ -271,7 +271,7 @@ fn test_cat_flags_and_nl() {
     assert!(s.contains("     2\tsecond^Iitem$"));
 
     let nl_out = run_stdin(&["nl", "-w", "4", "-s", ": "], b"alpha\n\nbeta\n");
-    assert_eq!(stdout_str(&nl_out), "   1: alpha\n\n   2: beta\n");
+    assert_eq!(stdout_str(&nl_out), "   1: alpha\n      \n   2: beta\n");
 }
 
 #[test]

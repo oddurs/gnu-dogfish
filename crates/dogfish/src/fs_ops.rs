@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -10,7 +10,7 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use dogfish_core::{
     ColumnAlign, DogfishContext, JournalAction, Style, Table, UndoJournal, copy_file_fast,
-    emit_objects_or_table, format_mode_rwx, format_relative_time, format_size,
+    emit_objects_or_table, format_mode_rwx, format_relative_time, format_size, gnu_io_error,
     io::ignore_broken_pipe, move_path, same_file, sparkline_bar,
 };
 use filetime::FileTime;
@@ -19,15 +19,6 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::sys::{get_groupname_by_gid, get_username_by_uid};
-
-/// Formats an I/O error the way GNU coreutils does (no "(os error N)" suffix).
-fn gnu_io_error(e: &io::Error) -> String {
-    let s = e.to_string();
-    match s.find(" (os error") {
-        Some(i) => s[..i].to_string(),
-        None => s,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 1. mkdir

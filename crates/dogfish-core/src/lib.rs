@@ -16,8 +16,8 @@ pub mod table;
 
 pub use context::{ColorMode, DogfishContext, Telemetry};
 pub use format::{
-    Style, format_duration_human, format_mode_rwx, format_relative_time, format_size,
-    parse_duration_str, parse_size_str, sparkline_bar,
+    Style, format_duration_human, format_mode_rwx, format_relative_time, format_size, gnu_io_error,
+    parse_duration_str, parse_size_str, sparkline_bar, strip_os_error_suffix,
 };
 pub use io::{
     CopyMethod, DEFAULT_BUF_SIZE, FastReader, InputSource, copy_file_fast, copy_tree, move_path,

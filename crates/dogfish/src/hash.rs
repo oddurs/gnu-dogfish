@@ -7,7 +7,7 @@ use clap::Parser;
 use data_encoding::{BASE32, BASE32HEX, BASE64URL, HEXLOWER};
 use digest::Digest;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
     io::ignore_broken_pipe,
 };
 use md5::Md5;
@@ -136,14 +136,17 @@ fn compute_source_hash<D>(
 where
     D: Digest + Default,
 {
-    let mut reader = FastReader::open(src).map_err(|e| anyhow!("{}: {}", src.display_name(), e))?;
+    let gnu_err = |e: std::io::Error| anyhow!("{}: {}", src.display_name(), gnu_io_error(&e));
+    let mut reader = FastReader::open(src).map_err(gnu_err)?;
     let mut hasher = D::default();
     let mut bytes_len = 0_u64;
 
-    reader.with_bytes(|slice| {
-        bytes_len = slice.len() as u64;
-        hasher.update(slice);
-    })?;
+    reader
+        .with_bytes(|slice| {
+            bytes_len = slice.len() as u64;
+            hasher.update(slice);
+        })
+        .map_err(gnu_err)?;
 
     ctx.telemetry.add_read(bytes_len);
     ctx.telemetry.add_items(1);
@@ -281,7 +284,8 @@ pub fn run_base64(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         _ => InputSource::Stdin,
     };
 
-    let mut reader = FastReader::open(&src)?;
+    let mut reader = FastReader::open(&src)
+        .map_err(|e| anyhow!("{}: {}", src.display_name(), gnu_io_error(&e)))?;
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
 
@@ -359,7 +363,8 @@ pub fn run_basenc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         _ => InputSource::Stdin,
     };
 
-    let mut reader = FastReader::open(&src)?;
+    let mut reader = FastReader::open(&src)
+        .map_err(|e| anyhow!("{}: {}", src.display_name(), gnu_io_error(&e)))?;
     let stdout = io::stdout();
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
 
@@ -438,9 +443,13 @@ fn decode_base2(bits: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn write_wrapped<W: Write>(out: &mut W, data: &[u8], wrap: usize) -> io::Result<()> {
-    if wrap == 0 || data.is_empty() {
+    if data.is_empty() {
+        // GNU base64 emits nothing at all for empty input.
+        return Ok(());
+    }
+    if wrap == 0 {
         ignore_broken_pipe(out.write_all(data))?;
-        ignore_broken_pipe(out.write_all(b"\n"))?;
+        // GNU: `-w 0` disables wrapping and the trailing newline.
         return Ok(());
     }
     for chunk in data.chunks(wrap) {
