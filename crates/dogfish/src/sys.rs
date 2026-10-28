@@ -99,181 +99,549 @@ pub fn run_echo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    if interpret_escapes {
-        let (rendered, stop) = unescape_echo_str(&payload);
-        ignore_broken_pipe(out.write_all(rendered.as_bytes()))?;
-        ctx.telemetry.add_written(rendered.len() as u64);
-        if !no_newline && !stop {
-            ignore_broken_pipe(out.write_all(b"\n"))?;
-            ctx.telemetry.add_written(1);
-        }
+    let (rendered, stop) = if interpret_escapes {
+        unescape_echo_bytes(payload.as_bytes(), false)
     } else {
-        ignore_broken_pipe(out.write_all(payload.as_bytes()))?;
-        ctx.telemetry.add_written(payload.len() as u64);
-        if !no_newline {
-            ignore_broken_pipe(out.write_all(b"\n"))?;
-            ctx.telemetry.add_written(1);
-        }
+        (payload.into_bytes(), false)
+    };
+    ignore_broken_pipe(out.write_all(&rendered))?;
+    ctx.telemetry.add_written(rendered.len() as u64);
+    if !no_newline && !stop {
+        ignore_broken_pipe(out.write_all(b"\n"))?;
+        ctx.telemetry.add_written(1);
     }
     Ok(0)
 }
 
-pub fn unescape_echo_str(s: &str) -> (String, bool) {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('a') => out.push('\x07'),
-                Some('b') => out.push('\x08'),
-                Some('c') => return (out, true),
-                Some('e') | Some('E') => out.push('\x1b'),
-                Some('f') => out.push('\x0c'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('v') => out.push('\x0b'),
-                Some('\\') => out.push('\\'),
-                Some('x') => {
-                    let mut hex = String::new();
-                    for _ in 0..2 {
-                        if let Some(&c) = chars.peek() {
-                            if c.is_ascii_hexdigit() {
-                                hex.push(c);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
-                        out.push(v as char);
-                    }
-                }
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
+/// Expands echo-style escapes (also used by `printf %b`). Returns the bytes and
+/// whether `\c` requested that all further output stop.
+///
+/// `\0NNN` is octal; with `bare_octal` (printf `%b`), `\NNN` is octal too.
+pub fn unescape_echo_bytes(s: &[u8], bare_octal: bool) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let ch = s[i];
+        i += 1;
+        if ch != b'\\' || i >= s.len() {
             out.push(ch);
+            continue;
+        }
+        let e = s[i];
+        i += 1;
+        match e {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'c' => return (out, true),
+            b'e' | b'E' => out.push(0x1b),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'x' if i < s.len() && s[i].is_ascii_hexdigit() => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 2 && i < s.len() && s[i].is_ascii_hexdigit() {
+                    v = v * 16 + (s[i] as char).to_digit(16).unwrap();
+                    i += 1;
+                    n += 1;
+                }
+                out.push(v as u8);
+            }
+            b'0'..=b'7' if e == b'0' || bare_octal => {
+                let mut v = if e == b'0' { 0u32 } else { (e - b'0') as u32 };
+                let max = if e == b'0' { 3 } else { 2 };
+                let mut n = 0;
+                while n < max && i < s.len() && (b'0'..=b'7').contains(&s[i]) {
+                    v = v * 8 + (s[i] - b'0') as u32;
+                    i += 1;
+                    n += 1;
+                }
+                out.push(v as u8);
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other);
+            }
         }
     }
     (out, false)
 }
 
 // ---------------------------------------------------------------------------
-// 4. printf
+// 4. printf — GNU-compatible format engine
 // ---------------------------------------------------------------------------
-pub fn run_printf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    if args.len() < 2 {
-        return Err(anyhow!("usage: printf FORMAT [ARGUMENT]..."));
-    }
-    let fmt = &args[1];
-    let rest = &args[2..];
-    let mut arg_idx = 0;
-    let mut output = String::new();
+#[derive(Default, Clone, Copy)]
+struct PrintfFlags {
+    left: bool,
+    zero: bool,
+    plus: bool,
+    space: bool,
+    alt: bool,
+}
 
-    loop {
-        let start_arg_idx = arg_idx;
-        let mut chars = fmt.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '%' {
-                if chars.peek() == Some(&'%') {
-                    chars.next();
-                    output.push('%');
-                    continue;
-                }
-                let mut spec = String::new();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if matches!(c, 's' | 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'c' | 'b') {
-                        let val = rest.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
-                        arg_idx += 1;
-                        output.push_str(&format_printf_spec(&spec, c, val));
-                        break;
-                    } else {
-                        spec.push(c);
-                    }
-                }
-            } else if ch == '\\' {
-                match chars.next() {
-                    Some('n') => output.push('\n'),
-                    Some('t') => output.push('\t'),
-                    Some('r') => output.push('\r'),
-                    Some('\\') => output.push('\\'),
-                    Some('"') => output.push('"'),
-                    Some(other) => {
-                        output.push('\\');
-                        output.push(other);
-                    }
-                    None => output.push('\\'),
-                }
+/// State shared while rendering: diagnostics flip the exit status to 1.
+struct PrintfRun<'a> {
+    args: &'a [String],
+    next: usize,
+    failed: bool,
+}
+
+impl<'a> PrintfRun<'a> {
+    fn take(&mut self) -> Option<&'a str> {
+        let v = self.args.get(self.next).map(|s| s.as_str());
+        if v.is_some() {
+            self.next += 1;
+        }
+        v
+    }
+
+    /// Parses an integer argument like GNU (`'c` char codes, 0x hex, 0 octal).
+    fn int_arg(&mut self, s: Option<&str>) -> i128 {
+        let Some(raw) = s else { return 0 };
+        let t = raw.trim_start();
+        let b = t.as_bytes();
+        if let [b'\'' | b'"', rest @ ..] = b {
+            return std::str::from_utf8(rest)
+                .ok()
+                .and_then(|r| r.chars().next())
+                .map(|c| c as i128)
+                .unwrap_or_else(|| rest.first().copied().unwrap_or(0) as i128);
+        }
+        let (neg, body) = match b.first() {
+            Some(b'-') => (true, &t[1..]),
+            Some(b'+') => (false, &t[1..]),
+            _ => (false, t),
+        };
+        let (radix, digits) =
+            if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                (16, h)
+            } else if body.len() > 1 && body.starts_with('0') {
+                (8, &body[1..])
             } else {
-                output.push(ch);
+                (10, body)
+            };
+        let valid = digits
+            .bytes()
+            .take_while(|c| (*c as char).is_digit(radix))
+            .count();
+        let value = i128::from_str_radix(&digits[..valid], radix).unwrap_or(0);
+        let value = if neg { -value } else { value };
+        if valid == 0 && !(radix == 8 && digits.is_empty()) {
+            eprintln!("printf: '{}': expected a numeric value", raw);
+            self.failed = true;
+        } else if valid < digits.len() {
+            eprintln!("printf: '{}': value not completely converted", raw);
+            self.failed = true;
+        }
+        value
+    }
+
+    fn float_arg(&mut self, s: Option<&str>) -> f64 {
+        let Some(raw) = s else { return 0.0 };
+        let t = raw.trim();
+        if let [b'\'' | b'"', rest @ ..] = t.as_bytes() {
+            return rest.first().copied().unwrap_or(0) as f64;
+        }
+        match t.parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                // Accept the longest numeric prefix, reporting the rest.
+                let prefix_len = (1..=t.len())
+                    .rev()
+                    .find(|&n| t.is_char_boundary(n) && t[..n].parse::<f64>().is_ok())
+                    .unwrap_or(0);
+                if prefix_len == 0 {
+                    eprintln!("printf: '{}': expected a numeric value", raw);
+                } else {
+                    eprintln!("printf: '{}': value not completely converted", raw);
+                }
+                self.failed = true;
+                t[..prefix_len].parse().unwrap_or(0.0)
             }
         }
-        if arg_idx >= rest.len() || arg_idx == start_arg_idx {
+    }
+}
+
+fn pad_field(body: Vec<u8>, width: usize, flags: PrintfFlags, zero_ok: bool) -> Vec<u8> {
+    if body.len() >= width {
+        return body;
+    }
+    let pad = width - body.len();
+    if flags.left {
+        let mut v = body;
+        v.extend(std::iter::repeat_n(b' ', pad));
+        v
+    } else if flags.zero && zero_ok {
+        // Zeros go after any sign / 0x prefix.
+        let sign_len = match body.as_slice() {
+            [b'-' | b'+' | b' ', b'0', b'x' | b'X', ..] => 3,
+            [b'0', b'x' | b'X', ..] => 2,
+            [b'-' | b'+' | b' ', ..] => 1,
+            _ => 0,
+        };
+        let mut v = body[..sign_len].to_vec();
+        v.extend(std::iter::repeat_n(b'0', pad));
+        v.extend_from_slice(&body[sign_len..]);
+        v
+    } else {
+        let mut v = vec![b' '; pad];
+        v.extend(body);
+        v
+    }
+}
+
+/// C-style `%e` rendering of a non-negative finite value.
+fn c_exp(v: f64, prec: usize, upper: bool) -> String {
+    let s = format!("{:.prec$e}", v);
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let e = if upper { 'E' } else { 'e' };
+    format!(
+        "{}{}{}{:02}",
+        mant,
+        e,
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
+}
+
+fn strip_frac_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn format_float(v: f64, conv: u8, prec: Option<usize>, flags: PrintfFlags) -> (String, bool) {
+    let upper = conv.is_ascii_uppercase();
+    let sign = if v.is_sign_negative() && !v.is_nan() {
+        "-"
+    } else if flags.plus {
+        "+"
+    } else if flags.space {
+        " "
+    } else {
+        ""
+    };
+    let a = v.abs();
+    if !a.is_finite() {
+        let s = if a.is_nan() { "nan" } else { "inf" };
+        let s = if upper {
+            s.to_uppercase()
+        } else {
+            s.to_string()
+        };
+        return (format!("{}{}", sign, s), false);
+    }
+    let prec = prec.unwrap_or(6);
+    let body = match conv.to_ascii_lowercase() {
+        b'f' => {
+            let mut s = format!("{:.prec$}", a);
+            if flags.alt && prec == 0 {
+                s.push('.');
+            }
+            s
+        }
+        b'e' => {
+            let mut s = c_exp(a, prec, upper);
+            if flags.alt && prec == 0 {
+                let idx = s.find(['e', 'E']).unwrap_or(s.len());
+                s.insert(idx, '.');
+            }
+            s
+        }
+        _ => {
+            // %g
+            let p = if prec == 0 { 1 } else { prec };
+            let x: i32 = if a == 0.0 {
+                0
+            } else {
+                let e = c_exp(a, p - 1, false);
+                e[e.find('e').unwrap() + 1..].parse().unwrap_or(0)
+            };
+            if (x as i64) < p as i64 && x >= -4 {
+                let s = format!("{:.*}", (p as i64 - 1 - x as i64).max(0) as usize, a);
+                if flags.alt { s } else { strip_frac_zeros(&s) }
+            } else {
+                let s = c_exp(a, p - 1, upper);
+                if flags.alt {
+                    s
+                } else {
+                    let idx = s.find(['e', 'E']).unwrap();
+                    format!("{}{}", strip_frac_zeros(&s[..idx]), &s[idx..])
+                }
+            }
+        }
+    };
+    (format!("{}{}", sign, body), true)
+}
+
+fn format_int(v: i128, conv: u8, prec: Option<usize>, flags: PrintfFlags) -> String {
+    let (neg, mag): (bool, u128) = match conv {
+        b'd' | b'i' => (v < 0, v.unsigned_abs()),
+        // Unsigned conversions see the 64-bit two's complement value, as in C.
+        _ => (false, (v as i64 as u64) as u128),
+    };
+    let mut digits = match conv {
+        b'o' => format!("{:o}", mag),
+        b'x' => format!("{:x}", mag),
+        b'X' => format!("{:X}", mag),
+        _ => mag.to_string(),
+    };
+    if let Some(p) = prec {
+        if p == 0 && mag == 0 {
+            digits.clear();
+        }
+        while digits.len() < p {
+            digits.insert(0, '0');
+        }
+    }
+    let mut prefix = String::new();
+    if neg {
+        prefix.push('-');
+    } else if matches!(conv, b'd' | b'i') && flags.plus {
+        prefix.push('+');
+    } else if matches!(conv, b'd' | b'i') && flags.space {
+        prefix.push(' ');
+    }
+    if flags.alt {
+        match conv {
+            b'o' if !digits.starts_with('0') => digits.insert(0, '0'),
+            b'x' if mag != 0 => prefix.push_str("0x"),
+            b'X' if mag != 0 => prefix.push_str("0X"),
+            _ => {}
+        }
+    }
+    format!("{}{}", prefix, digits)
+}
+
+/// Renders the format once. Returns `false` if `\c` stopped all output.
+fn printf_once(
+    fmt: &[u8],
+    run: &mut PrintfRun<'_>,
+    out: &mut Vec<u8>,
+) -> std::result::Result<bool, ()> {
+    let mut i = 0;
+    while i < fmt.len() {
+        let ch = fmt[i];
+        if ch == b'\\' {
+            i += 1;
+            let Some(&e) = fmt.get(i) else {
+                out.push(b'\\');
+                break;
+            };
+            i += 1;
+            match e {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b'c' => return Ok(false),
+                b'e' => out.push(0x1b),
+                b'f' => out.push(0x0c),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'v' => out.push(0x0b),
+                b'0'..=b'7' => {
+                    let mut v = (e - b'0') as u32;
+                    let mut n = 1;
+                    while n < 3 && i < fmt.len() && (b'0'..=b'7').contains(&fmt[i]) {
+                        v = v * 8 + (fmt[i] - b'0') as u32;
+                        i += 1;
+                        n += 1;
+                    }
+                    out.push(v as u8);
+                }
+                b'x' | b'u' | b'U' => {
+                    let max = match e {
+                        b'x' => 2,
+                        b'u' => 4,
+                        _ => 8,
+                    };
+                    let st = i;
+                    while i < fmt.len() && i - st < max && fmt[i].is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                    if i == st {
+                        eprintln!("printf: missing hexadecimal number in escape");
+                        return Err(());
+                    }
+                    let v = u32::from_str_radix(std::str::from_utf8(&fmt[st..i]).unwrap(), 16)
+                        .unwrap_or(0);
+                    if e == b'x' {
+                        out.push(v as u8);
+                    } else {
+                        let c = char::from_u32(v).unwrap_or('\u{fffd}');
+                        out.extend_from_slice(c.to_string().as_bytes());
+                    }
+                }
+                other => {
+                    out.push(b'\\');
+                    out.push(other);
+                }
+            }
+            continue;
+        }
+        if ch != b'%' {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        let spec_start = i;
+        i += 1;
+        if fmt.get(i) == Some(&b'%') {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        let mut flags = PrintfFlags::default();
+        while let Some(&f) = fmt.get(i) {
+            match f {
+                b'-' => flags.left = true,
+                b'0' => flags.zero = true,
+                b'+' => flags.plus = true,
+                b' ' => flags.space = true,
+                b'#' => flags.alt = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        if fmt.get(i) == Some(&b'*') {
+            i += 1;
+            let w = run.take();
+            let w = run.int_arg(w);
+            if w < 0 {
+                flags.left = true;
+            }
+            width = w.unsigned_abs() as usize;
+        } else {
+            while let Some(d @ b'0'..=b'9') = fmt.get(i).copied() {
+                width = width * 10 + (d - b'0') as usize;
+                i += 1;
+            }
+        }
+        let mut prec: Option<usize> = None;
+        if fmt.get(i) == Some(&b'.') {
+            i += 1;
+            if fmt.get(i) == Some(&b'*') {
+                i += 1;
+                let p = run.take();
+                let p = run.int_arg(p);
+                prec = (p >= 0).then_some(p as usize);
+            } else {
+                let mut p = 0usize;
+                while let Some(d @ b'0'..=b'9') = fmt.get(i).copied() {
+                    p = p * 10 + (d - b'0') as usize;
+                    i += 1;
+                }
+                prec = Some(p);
+            }
+        }
+        // Length modifiers are accepted and ignored.
+        while matches!(
+            fmt.get(i),
+            Some(b'h' | b'l' | b'L' | b'q' | b'j' | b'z' | b't')
+        ) {
+            i += 1;
+        }
+        let Some(&conv) = fmt.get(i) else {
+            eprintln!(
+                "printf: {}: invalid conversion specification",
+                String::from_utf8_lossy(&fmt[spec_start..])
+            );
+            return Err(());
+        };
+        i += 1;
+        let field: Vec<u8> = match conv {
+            b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
+                let a = run.take();
+                let v = run.int_arg(a);
+                let s = format_int(v, conv, prec, flags);
+                pad_field(s.into_bytes(), width, flags, prec.is_none())
+            }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                let a = run.take();
+                let v = run.float_arg(a);
+                let (s, finite) = format_float(v, conv, prec, flags);
+                pad_field(s.into_bytes(), width, flags, finite)
+            }
+            b's' => {
+                let a = run.take().unwrap_or("").as_bytes();
+                let a = match prec {
+                    Some(p) => &a[..p.min(a.len())],
+                    None => a,
+                };
+                pad_field(a.to_vec(), width, flags, false)
+            }
+            b'b' => {
+                let a = run.take().unwrap_or("");
+                let (bytes, stop) = unescape_echo_bytes(a.as_bytes(), true);
+                let bytes = match prec {
+                    Some(p) => bytes[..p.min(bytes.len())].to_vec(),
+                    None => bytes,
+                };
+                out.extend(pad_field(bytes, width, flags, false));
+                if stop {
+                    return Ok(false);
+                }
+                continue;
+            }
+            b'c' => {
+                let a = run.take().unwrap_or("");
+                let c = a.as_bytes().first().copied().unwrap_or(0);
+                pad_field(vec![c], width, flags, false)
+            }
+            _ => {
+                eprintln!(
+                    "printf: {}: invalid conversion specification",
+                    String::from_utf8_lossy(&fmt[spec_start..i])
+                );
+                return Err(());
+            }
+        };
+        out.extend(field);
+    }
+    Ok(true)
+}
+
+pub fn run_printf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    if args.len() < 2 {
+        eprintln!("printf: missing operand\nTry 'printf --help' for more information.");
+        return Ok(1);
+    }
+    let fmt = args[1].as_bytes();
+    let mut run = PrintfRun {
+        args: &args[2..],
+        next: 0,
+        failed: false,
+    };
+    let mut output = Vec::new();
+    let mut ok = true;
+    loop {
+        let before = run.next;
+        match printf_once(fmt, &mut run, &mut output) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(()) => {
+                ok = false;
+                break;
+            }
+        }
+        if run.next >= run.args.len() || run.next == before {
             break;
         }
     }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    ignore_broken_pipe(out.write_all(output.as_bytes()))?;
+    ignore_broken_pipe(out.write_all(&output))?;
     ctx.telemetry.add_written(output.len() as u64);
-    Ok(0)
-}
-
-fn format_printf_spec(spec: &str, conv: char, val: &str) -> String {
-    let width: Option<usize> = spec
-        .trim_start_matches('-')
-        .trim_start_matches('0')
-        .split('.')
-        .next()
-        .and_then(|w| w.parse().ok());
-    let left_align = spec.starts_with('-');
-    let zero_pad = spec.starts_with('0') && !left_align;
-
-    let raw = match conv {
-        's' => val.to_string(),
-        'b' => unescape_echo_str(val).0,
-        'c' => val
-            .chars()
-            .next()
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
-        'd' | 'i' => val.parse::<i64>().unwrap_or(0).to_string(),
-        'u' => val.parse::<u64>().unwrap_or(0).to_string(),
-        'x' => format!("{:x}", val.parse::<u64>().unwrap_or(0)),
-        'X' => format!("{:X}", val.parse::<u64>().unwrap_or(0)),
-        'o' => format!("{:o}", val.parse::<u64>().unwrap_or(0)),
-        'f' => {
-            let prec = spec
-                .split('.')
-                .nth(1)
-                .and_then(|p| p.parse::<usize>().ok())
-                .unwrap_or(6);
-            let f = val.parse::<f64>().unwrap_or(0.0);
-            format!("{:.prec$}", f, prec = prec)
-        }
-        _ => val.to_string(),
-    };
-
-    if let Some(w) = width {
-        if raw.len() < w {
-            let pad_len = w - raw.len();
-            if left_align {
-                return format!("{}{}", raw, " ".repeat(pad_len));
-            } else if zero_pad {
-                return format!("{}{}", "0".repeat(pad_len), raw);
-            } else {
-                return format!("{}{}", " ".repeat(pad_len), raw);
-            }
-        }
-    }
-    raw
+    Ok(if ok && !run.failed { 0 } else { 1 })
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, io::install_sigpipe_handler};
+use dogfish_core::{
+    ColumnAlign, DogfishContext, Table, gnu_io_error, io::install_sigpipe_handler,
+    strip_os_error_suffix,
+};
 
 pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     // Tier 1: File & Directory
@@ -332,8 +335,15 @@ fn main() -> ExitCode {
                     _ => ExitCode::from(1),
                 };
             }
+            // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
+            let msg = match err.downcast_ref::<std::io::Error>() {
+                Some(io_err) => gnu_io_error(io_err),
+                None => strip_os_error_suffix(&err.to_string()),
+            };
+            let prefix = format!("{}: ", tool_name);
+            let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
             let st = ctx.stderr_style();
-            eprintln!("{} {}: {}", st.bold_red("error:"), st.bold(&tool_name), err);
+            eprintln!("{}: {}", st.bold(&tool_name), msg);
             ExitCode::from(1)
         }
     }

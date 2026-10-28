@@ -285,9 +285,49 @@ pub fn system_time_to_unix(time: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+/// Formats an [`std::io::Error`] the way GNU coreutils does: just the `strerror`
+/// text (`No such file or directory`), without Rust's ` (os error N)` suffix.
+pub fn gnu_io_error(err: &std::io::Error) -> String {
+    strip_os_error_suffix(&err.to_string())
+}
+
+/// Removes every ` (os error N)` fragment that Rust's `io::Error` `Display`
+/// appends, so wrapped/contextualized messages also read like GNU's.
+pub fn strip_os_error_suffix(msg: &str) -> String {
+    const MARK: &str = " (os error ";
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(idx) = rest.find(MARK) {
+        let after = &rest[idx + MARK.len()..];
+        let digits = after
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || *b == b'-')
+            .count();
+        if digits > 0 && after[digits..].starts_with(')') {
+            out.push_str(&rest[..idx]);
+            rest = &after[digits + 1..];
+        } else {
+            out.push_str(&rest[..idx + MARK.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gnu_io_error_strips_os_suffix() {
+        let e = std::io::Error::from_raw_os_error(2);
+        assert_eq!(gnu_io_error(&e), "No such file or directory");
+        assert_eq!(
+            strip_os_error_suffix("x: Permission denied (os error 13); y (os error z)"),
+            "x: Permission denied; y (os error z)"
+        );
+    }
 
     #[test]
     fn test_format_size_human_and_raw() {
