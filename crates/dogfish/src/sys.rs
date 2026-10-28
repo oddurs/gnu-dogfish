@@ -374,9 +374,19 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     if is_int {
-        let mut cur = first as i64;
-        let inc = step as i64;
-        let end = last as i64;
+        // Parse the integers directly: going through f64 loses precision past 2^53.
+        let ints: Vec<i64> = parsed
+            .nums
+            .iter()
+            .map(|n| n.parse())
+            .collect::<Result<_, _>>()?;
+        let (mut cur, inc, end) = match ints.as_slice() {
+            [l] => (1, 1, *l),
+            [f, l] => (*f, 1, *l),
+            [f, i, l] => (*f, *i, *l),
+            _ => unreachable!(),
+        };
+        let mut count = 0_u64;
         let width = if parsed.equal_width {
             parsed.nums.iter().map(|s| s.len()).max().unwrap_or(0)
         } else {
@@ -401,9 +411,14 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 }
                 return Err(e.into());
             }
-            ctx.telemetry.add_items(1);
-            cur += inc;
+            count += 1;
+            // Stop instead of wrapping around (which looped forever) near i64::MAX/MIN.
+            match cur.checked_add(inc) {
+                Some(next) => cur = next,
+                None => break,
+            }
         }
+        ctx.telemetry.add_items(count);
         if !first_item {
             ignore_broken_pipe(out.write_all(b"\n"))?;
         }
