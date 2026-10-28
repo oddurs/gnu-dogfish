@@ -94,8 +94,10 @@ pub fn run_history(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 original_path,
                 trash_path: _,
             } => format!("trashed '{}'", original_path),
-            JournalAction::Move { src, dst } => format!("'{}' -> '{}'", src, dst),
-            JournalAction::CopyCreate { src, created_path } => {
+            JournalAction::Move { src, dst, .. } => format!("'{}' -> '{}'", src, dst),
+            JournalAction::CopyCreate {
+                src, created_path, ..
+            } => {
                 format!("copied '{}' -> '{}'", src, created_path)
             }
         };

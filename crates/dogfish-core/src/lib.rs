@@ -19,6 +19,9 @@ pub use format::{
     Style, format_duration_human, format_mode_rwx, format_relative_time, format_size,
     parse_duration_str, parse_size_str, sparkline_bar,
 };
-pub use io::{CopyMethod, DEFAULT_BUF_SIZE, FastReader, InputSource, copy_file_fast};
+pub use io::{
+    CopyMethod, DEFAULT_BUF_SIZE, FastReader, InputSource, copy_file_fast, copy_tree, move_path,
+    same_file,
+};
 pub use journal::{JournalAction, JournalEntry, UndoJournal};
 pub use table::{ColumnAlign, Table, emit_objects_or_table, eval_json_where, read_ndjson_stdin};

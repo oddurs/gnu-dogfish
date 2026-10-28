@@ -134,9 +134,33 @@ impl FastReader {
     }
 }
 
+/// Returns true when `a` and `b` resolve to the same inode on the same device
+/// (same path, `./` aliases, symlinks, or hard links).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
 /// Copies a file using macOS APFS `clonefile` (zero-copy copy-on-write) when available,
 /// transparently falling back to `std::fs::copy`.
+///
+/// Refuses to copy a file onto itself: every strategy here truncates or unlinks
+/// the destination first, which would destroy the source.
 pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
+    if same_file(src, dst) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' and '{}' are the same file",
+                src.display(),
+                dst.display()
+            ),
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -177,6 +201,40 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
 
     let bytes = fs::copy(src, dst)?;
     Ok((bytes, CopyMethod::StandardCopy))
+}
+
+/// Recursively copies `src` to `dst`, recreating symlinks rather than following them.
+pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    let ty = meta.file_type();
+    if ty.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+    } else if ty.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        fs::set_permissions(dst, meta.permissions())
+    } else {
+        copy_file_fast(src, dst).map(|_| ())
+    }
+}
+
+/// Renames `src` to `dst`, falling back to copy + remove when they live on
+/// different filesystems (`EXDEV`).
+pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            copy_tree(src, dst)?;
+            if fs::symlink_metadata(src)?.is_dir() {
+                fs::remove_dir_all(src)
+            } else {
+                fs::remove_file(src)
+            }
+        }
+        res => res,
+    }
 }
 
 /// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.

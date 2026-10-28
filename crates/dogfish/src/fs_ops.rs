@@ -11,7 +11,7 @@ use clap::Parser;
 use dogfish_core::{
     ColumnAlign, DogfishContext, JournalAction, Style, Table, UndoJournal, copy_file_fast,
     emit_objects_or_table, format_mode_rwx, format_relative_time, format_size,
-    io::ignore_broken_pipe, sparkline_bar,
+    io::ignore_broken_pipe, move_path, same_file, sparkline_bar,
 };
 use filetime::FileTime;
 use jwalk::WalkDir;
@@ -19,6 +19,15 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::sys::{get_groupname_by_gid, get_username_by_uid};
+
+/// Formats an I/O error the way GNU coreutils does (no "(os error N)" suffix).
+fn gnu_io_error(e: &io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 1. mkdir
@@ -124,7 +133,11 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             if parsed.no_create {
                 continue;
             }
-            fs::File::create(path)?;
+            // Never truncate: another process may have created it since the check.
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
         }
         let meta = fs::metadata(path)?;
         let new_atime = if parsed.modify_only && !parsed.access_only {
@@ -177,8 +190,35 @@ pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         link_path.to_path_buf()
     };
 
-    if parsed.force && (final_link.exists() || final_link.symlink_metadata().is_ok()) {
-        let _ = fs::remove_file(&final_link);
+    // Resolve the target relative to the link's directory (how a symlink would) and
+    // refuse to replace a file with a link to itself: `ln -f a a` would delete `a`.
+    let target_from_link = final_link
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(&parsed.target);
+    let link_target = if parsed.symbolic {
+        target_from_link.as_path()
+    } else {
+        Path::new(&parsed.target)
+    };
+    let link_is_symlink = final_link
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    if !link_is_symlink && same_file(link_target, &final_link) {
+        return Err(anyhow!(
+            "ln: '{}' and '{}' are the same file",
+            parsed.target,
+            final_link.display()
+        ));
+    }
+    if parsed.force && final_link.symlink_metadata().is_ok() {
+        if final_link.symlink_metadata()?.is_dir() {
+            return Err(anyhow!(
+                "ln: '{}': cannot overwrite directory",
+                final_link.display()
+            ));
+        }
+        fs::remove_file(&final_link)?;
     }
 
     if parsed.symbolic {
@@ -614,6 +654,10 @@ struct RmArgs {
     #[arg(long = "safe", visible_alias = "trash")]
     safe: bool,
 
+    /// Do not treat '/' specially (dangerous)
+    #[arg(long = "no-preserve-root")]
+    no_preserve_root: bool,
+
     #[arg(required = true)]
     files: Vec<String>,
 }
@@ -643,6 +687,45 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 exit_code = 1;
             }
             continue;
+        }
+
+        if matches!(
+            f.trim_end_matches('/').rsplit('/').next(),
+            Some(".") | Some("..")
+        ) {
+            eprintln!(
+                "rm: refusing to remove '.' or '..' directory: skipping '{}'",
+                f
+            );
+            exit_code = 1;
+            continue;
+        }
+        if parsed.recursive
+            && !parsed.no_preserve_root
+            && p.symlink_metadata().is_ok_and(|m| m.is_dir())
+            && fs::canonicalize(p).is_ok_and(|c| c == Path::new("/"))
+        {
+            eprintln!("rm: it is dangerous to operate recursively on '{}'", f);
+            eprintln!("rm: use --no-preserve-root to override this failsafe");
+            exit_code = 1;
+            continue;
+        }
+        // `--safe` must refuse exactly what plain `rm` refuses.
+        if !parsed.recursive && p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
+            if !parsed.dir || !empty {
+                eprintln!(
+                    "rm: cannot remove '{}': {}",
+                    f,
+                    if parsed.dir {
+                        "Directory not empty"
+                    } else {
+                        "Is a directory"
+                    }
+                );
+                exit_code = 1;
+                continue;
+            }
         }
 
         if let Some(ref j) = journal {
@@ -750,6 +833,7 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let journal = UndoJournal::open().ok();
+    let mut exit_code = 0;
 
     for src_str in sources {
         let src = Path::new(src_str);
@@ -758,46 +842,138 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         } else {
             dst.to_path_buf()
         };
-
-        if parsed.no_clobber && target.exists() {
-            continue;
-        }
-
-        if src.is_dir() {
-            if !parsed.recursive {
-                eprintln!("cp: -r not specified; omitting directory '{}'", src_str);
-                return Ok(1);
-            }
-            copy_dir_cow(src, &target, parsed.verbose, ctx)?;
-        } else {
-            let (bytes, method) = copy_file_fast(src, &target)?;
-            ctx.telemetry.set_strategy(method.as_str());
-            ctx.telemetry.add_read(bytes);
-            ctx.telemetry.add_written(bytes);
-            ctx.telemetry.add_items(1);
-            if parsed.verbose {
-                println!(
-                    "'{}' -> '{}' ({})",
-                    src.display(),
-                    target.display(),
-                    method.as_str()
-                );
-            }
-        }
-
-        if let Some(ref j) = journal {
-            if let (Ok(abs_src), Ok(abs_dst)) = (fs::canonicalize(src), fs::canonicalize(&target)) {
-                let _ = j.record(
-                    "cp",
-                    JournalAction::CopyCreate {
-                        src: abs_src.to_string_lossy().into_owned(),
-                        created_path: abs_dst.to_string_lossy().into_owned(),
-                    },
-                );
-            }
+        if let Err(e) = cp_one(src, &target, &parsed, journal.as_ref(), ctx) {
+            eprintln!("cp: {}", e);
+            exit_code = 1;
         }
     }
-    Ok(0)
+    Ok(exit_code)
+}
+
+fn exists_no_follow(p: &Path) -> bool {
+    p.symlink_metadata().is_ok()
+}
+
+/// Absolute form of `target` with its parent resolved through symlinks, for
+/// "is this inside that directory?" checks on paths that may not exist yet.
+fn resolve_for_containment(target: &Path) -> PathBuf {
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match (fs::canonicalize(parent), target.file_name()) {
+        (Ok(p), Some(name)) => p.join(name),
+        _ => std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf()),
+    }
+}
+
+fn cp_one(
+    src: &Path,
+    target: &Path,
+    parsed: &CpArgs,
+    journal: Option<&UndoJournal>,
+    ctx: &DogfishContext,
+) -> Result<()> {
+    let src_meta = fs::metadata(src)
+        .map_err(|e| anyhow!("cannot stat '{}': {}", src.display(), gnu_io_error(&e)))?;
+    if same_file(src, target) {
+        return Err(anyhow!(
+            "'{}' and '{}' are the same file",
+            src.display(),
+            target.display()
+        ));
+    }
+    if parsed.no_clobber && exists_no_follow(target) {
+        return Ok(());
+    }
+
+    let target_is_dir = target.is_dir();
+    if src_meta.is_dir() {
+        if !parsed.recursive {
+            return Err(anyhow!(
+                "-r not specified; omitting directory '{}'",
+                src.display()
+            ));
+        }
+        if exists_no_follow(target) && !target_is_dir {
+            return Err(anyhow!(
+                "cannot overwrite non-directory '{}' with directory '{}'",
+                target.display(),
+                src.display()
+            ));
+        }
+        let abs_src = fs::canonicalize(src)?;
+        if resolve_for_containment(target).starts_with(&abs_src) {
+            return Err(anyhow!(
+                "cannot copy a directory, '{}', into itself, '{}'",
+                src.display(),
+                target.display()
+            ));
+        }
+    } else if target_is_dir {
+        return Err(anyhow!(
+            "cannot overwrite directory '{}' with non-directory",
+            target.display()
+        ));
+    }
+
+    // Preserve whatever we are about to overwrite so `dogfish undo` can bring it back.
+    // A directory copy merges into the existing tree, so it is backed up by copy;
+    // a file is moved aside (cheap rename) and then recreated.
+    let backup = match journal {
+        Some(j) => j
+            .backup_existing(target, src_meta.is_dir())
+            .with_context(|| format!("cannot back up '{}' before overwriting", target.display()))?,
+        None => None,
+    };
+
+    let result = if src_meta.is_dir() {
+        copy_dir_cow(src, target, parsed.verbose, ctx)
+    } else {
+        copy_file_fast(src, target)
+            .map(|(bytes, method)| {
+                ctx.telemetry.set_strategy(method.as_str());
+                ctx.telemetry.add_read(bytes);
+                ctx.telemetry.add_written(bytes);
+                ctx.telemetry.add_items(1);
+                if parsed.verbose {
+                    println!(
+                        "'{}' -> '{}' ({})",
+                        src.display(),
+                        target.display(),
+                        method.as_str()
+                    );
+                }
+            })
+            .map_err(|e| {
+                anyhow!(
+                    "cannot create regular file '{}': {}",
+                    target.display(),
+                    gnu_io_error(&e)
+                )
+            })
+    };
+
+    if let Err(e) = result {
+        // Put a moved-aside file back so a failed copy never loses the original.
+        if let (Some(b), false) = (&backup, src_meta.is_dir()) {
+            let _ = fs::remove_file(target);
+            let _ = move_path(Path::new(b), target);
+        }
+        return Err(e);
+    }
+
+    if let Some(j) = journal {
+        let _ = j.record(
+            "cp",
+            JournalAction::CopyCreate {
+                src: std::path::absolute(src)?.to_string_lossy().into_owned(),
+                created_path: std::path::absolute(target)?.to_string_lossy().into_owned(),
+                backup_path: backup,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn copy_dir_cow(src: &Path, dst: &Path, verbose: bool, ctx: &DogfishContext) -> Result<()> {
@@ -806,7 +982,13 @@ fn copy_dir_cow(src: &Path, dst: &Path, verbose: bool, ctx: &DogfishContext) -> 
         let entry = entry?;
         let ty = entry.file_type()?;
         let sub_dst = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            // Like GNU `cp -R`: copy symlinks as symlinks, never follow them.
+            if exists_no_follow(&sub_dst) {
+                fs::remove_file(&sub_dst)?;
+            }
+            symlink(fs::read_link(entry.path())?, &sub_dst)?;
+        } else if ty.is_dir() {
             copy_dir_cow(&entry.path(), &sub_dst, verbose, ctx)?;
         } else {
             let (bytes, method) = copy_file_fast(&entry.path(), &sub_dst)?;
@@ -819,6 +1001,7 @@ fn copy_dir_cow(src: &Path, dst: &Path, verbose: bool, ctx: &DogfishContext) -> 
             }
         }
     }
+    fs::set_permissions(dst, fs::metadata(src)?.permissions())?;
     Ok(())
 }
 
@@ -861,6 +1044,7 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let journal = UndoJournal::open().ok();
+    let mut exit_code = 0;
 
     for src_str in sources {
         let src = Path::new(src_str);
@@ -869,37 +1053,109 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         } else {
             dst.to_path_buf()
         };
-
-        if parsed.no_clobber && target.exists() {
-            continue;
-        }
-
-        let abs_src = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-        fs::rename(src, &target).with_context(|| {
-            format!(
-                "mv: cannot move '{}' to '{}'",
-                src.display(),
-                target.display()
-            )
-        })?;
-        let abs_dst = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-
-        if let Some(ref j) = journal {
-            let _ = j.record(
-                "mv",
-                JournalAction::Move {
-                    src: abs_src.to_string_lossy().into_owned(),
-                    dst: abs_dst.to_string_lossy().into_owned(),
-                },
-            );
-        }
-
-        ctx.telemetry.add_items(1);
-        if parsed.verbose {
-            println!("renamed '{}' -> '{}'", src.display(), target.display());
+        match mv_one(src, &target, &parsed, journal.as_ref()) {
+            Ok(true) => {
+                ctx.telemetry.add_items(1);
+                if parsed.verbose {
+                    println!("renamed '{}' -> '{}'", src.display(), target.display());
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("mv: {}", e);
+                exit_code = 1;
+            }
         }
     }
-    Ok(0)
+    Ok(exit_code)
+}
+
+/// Moves one source; returns `Ok(false)` when skipped by `--no-clobber`.
+fn mv_one(
+    src: &Path,
+    target: &Path,
+    parsed: &MvArgs,
+    journal: Option<&UndoJournal>,
+) -> Result<bool> {
+    let src_meta = src
+        .symlink_metadata()
+        .map_err(|e| anyhow!("cannot stat '{}': {}", src.display(), gnu_io_error(&e)))?;
+    if exists_no_follow(target) && same_file(src, target) {
+        return Err(anyhow!(
+            "'{}' and '{}' are the same file",
+            src.display(),
+            target.display()
+        ));
+    }
+    if parsed.no_clobber && exists_no_follow(target) {
+        return Ok(false);
+    }
+    if src_meta.is_dir() {
+        let abs_src = fs::canonicalize(src)?;
+        if resolve_for_containment(target).starts_with(&abs_src) {
+            return Err(anyhow!(
+                "cannot move '{}' to a subdirectory of itself, '{}'",
+                src.display(),
+                target.display()
+            ));
+        }
+    }
+    if let Ok(tm) = target.symlink_metadata() {
+        if tm.is_dir() {
+            if !src_meta.is_dir() {
+                return Err(anyhow!(
+                    "cannot overwrite directory '{}' with non-directory",
+                    target.display()
+                ));
+            }
+            if fs::read_dir(target)?.next().is_some() {
+                return Err(anyhow!(
+                    "cannot move '{}' to '{}': Directory not empty",
+                    src.display(),
+                    target.display()
+                ));
+            }
+        } else if src_meta.is_dir() {
+            return Err(anyhow!(
+                "cannot overwrite non-directory '{}' with directory '{}'",
+                target.display(),
+                src.display()
+            ));
+        }
+    }
+
+    let abs_src = std::path::absolute(src)?;
+    // Move an existing target aside first so `dogfish undo` can restore it.
+    let backup = match journal {
+        Some(j) => j
+            .backup_existing(target, false)
+            .with_context(|| format!("cannot back up '{}' before overwriting", target.display()))?,
+        None => None,
+    };
+
+    if let Err(e) = move_path(src, target) {
+        if let Some(b) = &backup {
+            let _ = move_path(Path::new(b), target);
+        }
+        return Err(anyhow!(
+            "cannot move '{}' to '{}': {}",
+            src.display(),
+            target.display(),
+            gnu_io_error(&e)
+        ));
+    }
+
+    if let Some(j) = journal {
+        let _ = j.record(
+            "mv",
+            JournalAction::Move {
+                src: abs_src.to_string_lossy().into_owned(),
+                dst: std::path::absolute(target)?.to_string_lossy().into_owned(),
+                backup_path: backup,
+            },
+        );
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,42 +2048,73 @@ struct MktempArgs {
 }
 
 pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    use std::io::Read;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     let parsed = MktempArgs::try_parse_from(args)?;
-    let base_dir = parsed
-        .tmpdir
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    fs::create_dir_all(&base_dir)?;
+    // Like GNU: an explicit TEMPLATE is relative to the current directory unless
+    // -p is given; with no template, use $TMPDIR (or /tmp).
+    let base_dir = match (&parsed.tmpdir, &parsed.template) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(_)) => PathBuf::new(),
+        (None, None) => std::env::temp_dir(),
+    };
 
     let tmpl = parsed
         .template
         .unwrap_or_else(|| "tmp.XXXXXXXXXX".to_string());
     let prefix = tmpl.trim_end_matches('X');
+    let x_count = tmpl.len() - prefix.len();
+    if x_count < 3 {
+        return Err(anyhow!("mktemp: too few X's in template '{}'", tmpl));
+    }
 
-    let mut rng = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x12345678)
-        ^ (std::process::id() as u64);
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut rand_suffix = String::with_capacity(8);
-    for _ in 0..8 {
-        rng ^= rng >> 12;
-        rng ^= rng << 25;
-        rng ^= rng >> 27;
-        let idx = (rng.wrapping_mul(0x2545F4914F6CDD1D) as usize) % ALPHABET.len();
-        rand_suffix.push(ALPHABET[idx] as char);
-    }
+    let mut urandom = fs::File::open("/dev/urandom").context("mktemp: cannot open /dev/urandom")?;
+    let mut bytes = vec![0u8; x_count];
 
-    let final_path = base_dir.join(format!("{}{}", prefix, rand_suffix));
-    if parsed.directory {
-        fs::create_dir(&final_path)?;
-        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o700))?;
-    } else {
-        fs::File::create(&final_path)?;
-        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o600))?;
+    // Names must be unpredictable and creation exclusive (O_EXCL, never following an
+    // existing symlink), with restrictive permissions applied atomically at creation.
+    for _ in 0..100 {
+        urandom.read_exact(&mut bytes)?;
+        let suffix: String = bytes
+            .iter()
+            .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+            .collect();
+        let final_path = base_dir.join(format!("{}{}", prefix, suffix));
+        let res = if parsed.directory {
+            fs::DirBuilder::new().mode(0o700).create(&final_path)
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&final_path)
+                .map(|_| ())
+        };
+        match res {
+            Ok(()) => {
+                ctx.telemetry.add_items(1);
+                println!("{}", final_path.display());
+                return Ok(0);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow!(
+                    "mktemp: failed to create {} via template '{}': {}",
+                    if parsed.directory {
+                        "directory"
+                    } else {
+                        "file"
+                    },
+                    base_dir.join(&tmpl).display(),
+                    gnu_io_error(&e)
+                ));
+            }
+        }
     }
-    ctx.telemetry.add_items(1);
-    println!("{}", final_path.display());
-    Ok(0)
+    Err(anyhow!(
+        "mktemp: failed to create a unique name from template '{}'",
+        tmpl
+    ))
 }
