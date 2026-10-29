@@ -3,12 +3,13 @@ id: 46
 uid: 4e2d6f2e-fb74-4589-a1ad-390812071a8a
 title: "ls: remaining GNU test failures (--dired, hyperlinks, LS_COLORS *.ext, ...)"
 type: bug
-status: backlog
+status: done
 milestone: "v1.0"
 depends_on:
 - 8
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p2
 effort: l
 area: compat
@@ -49,5 +50,5 @@ All listed tests pass; ROADMAP.md loses its `--dired` and `--hyperlink` lines.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
