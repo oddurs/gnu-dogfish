@@ -65,7 +65,7 @@ pub fn run_mkdir(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => return Ok(getopt_error("mkdir", &e)),
         };
         match o {
-            Mode => mode_arg = v.as_deref().map(lossy),
+            Mode => mode_arg = v,
             Parents => parents = true,
             Verbose => verbose = true,
             Context => {}
@@ -82,7 +82,7 @@ pub fn run_mkdir(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // ancestors under the umask minus u+wx.
     let umask = process_umask();
     let (mode, mode_bits) = match &mode_arg {
-        Some(m) => match mode_compile(m) {
+        Some(m) => match mode_compile(&lossy(m)) {
             Some(changes) => mode_adjust(S_IRWXUGO, true, umask, &changes),
             None => {
                 eprintln!("mkdir: invalid mode {}", quote_locale(m));

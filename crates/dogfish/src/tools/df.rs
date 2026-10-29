@@ -2,9 +2,10 @@
 
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -17,13 +18,13 @@ use serde::Serialize;
 
 use crate::common::file_info::find_mount_point;
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_B, HUMAN_BASE_1024, HUMAN_SI, HUMAN_SUPPRESS_POINT_ZERO, env_block_size,
     human_readable, parse_block_size,
 };
-use crate::common::quote::{Quoting, display_width, quote_bytes, quote_f};
+use crate::common::quote::{Quoting, locale_is_utf8, qf, quote_bytes, quote_f};
 
 const DF_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'a', "all", HasArg::No, "all"),
@@ -354,8 +355,8 @@ struct FsUsage {
 }
 
 impl FsUsage {
-    fn query(path: &str) -> io::Result<Self> {
-        let c_path = CString::new(path).map_err(io::Error::other)?;
+    fn query(path: impl AsRef<OsStr>) -> io::Result<Self> {
+        let c_path = CString::new(path.as_ref().as_bytes()).map_err(io::Error::other)?;
         // SAFETY: statvfs fills the zeroed struct for a valid C path.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `c_path` is a NUL-terminated path and `s` a writable statvfs;
@@ -406,8 +407,10 @@ impl DfConfig {
 struct DfRow {
     source: String,
     fs_type: String,
-    file: String,
-    target: String,
+    /// The operand as given (raw bytes), or `-`.
+    file: OsString,
+    /// The mount point (raw bytes when found by walking up from a file), or `-`/`total`.
+    target: OsString,
     usage: FsUsage,
     /// Placeholder row: every number prints as `-`.
     unknown: bool,
@@ -555,7 +558,7 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     let mounts = read_mount_table();
     let mut status = 0;
     let mut rows = Vec::new();
-    let operands = lossy_all(parsed.operands());
+    let operands = parsed.operands();
     if operands.is_empty() {
         df_all_rows(&mounts, &cfg, &mut rows, &mut status);
     } else {
@@ -588,7 +591,12 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             source: "total".into(),
             fs_type: "-".into(),
             file: "-".into(),
-            target: "-".into(),
+            // GNU labels the row in the target column when no source column shows it.
+            target: if cfg.fields.contains(&DfField::Source) {
+                "-".into()
+            } else {
+                "total".into()
+            },
             usage: sum,
             unknown: false,
         });
@@ -720,7 +728,7 @@ fn df_all_rows(mounts: &[MountEntry], cfg: &DfConfig, rows: &mut Vec<DfRow>, sta
             source: me.device.clone(),
             fs_type,
             file: "-".into(),
-            target: me.mount_dir.clone(),
+            target: me.mount_dir.clone().into(),
             usage,
             unknown,
         });
@@ -729,7 +737,7 @@ fn df_all_rows(mounts: &[MountEntry], cfg: &DfConfig, rows: &mut Vec<DfRow>, sta
 
 /// The row for the file system containing `name` (GNU `get_entry`/`get_point`).
 fn df_file_row(
-    name: &str,
+    name: &OsStr,
     mounts: &[MountEntry],
     cfg: &DfConfig,
     rows: &mut Vec<DfRow>,
@@ -738,7 +746,7 @@ fn df_file_row(
     let meta = match fs::metadata(name) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("df: {}: {}", quote_f(name), gnu_io_error(&e));
+            eprintln!("df: {}: {}", qf(name), gnu_io_error(&e));
             *status = 1;
             return;
         }
@@ -760,7 +768,7 @@ fn df_file_row(
     if best.is_none()
         && let Ok(resolved) = fs::canonicalize(name)
     {
-        let resolved = resolved.to_string_lossy().into_owned();
+        let resolved = resolved.as_os_str().as_bytes();
         let mut best_len = 0;
         for me in mounts {
             if me.fs_type == "lofs" || !(best.is_none_or(|b| b.dummy) || !me.dummy) {
@@ -770,8 +778,8 @@ fn df_file_row(
             if best_len <= len
                 && len <= resolved.len()
                 && (len == 1
-                    || ((len == resolved.len() || resolved.as_bytes()[len] == b'/')
-                        && resolved.starts_with(&me.mount_dir)))
+                    || ((len == resolved.len() || resolved[len] == b'/')
+                        && resolved.starts_with(me.mount_dir.as_bytes())))
             {
                 best = Some(me);
                 best_len = len;
@@ -796,19 +804,16 @@ fn df_file_row(
     let (device, mount_dir, fs_type, remote) = match best {
         Some(me) => (
             me.device.clone(),
-            me.mount_dir.clone(),
+            OsString::from(&me.mount_dir),
             me.fs_type.clone(),
             me.remote,
         ),
-        None => {
-            let mount_dir = find_mount_point(Path::new(name), &meta);
-            (
-                "-".to_string(),
-                mount_dir.to_string_lossy().into_owned(),
-                "-".to_string(),
-                false,
-            )
-        }
+        None => (
+            "-".to_string(),
+            find_mount_point(Path::new(name), &meta).into_os_string(),
+            "-".to_string(),
+            false,
+        ),
     };
     if (remote && cfg.local_only) || !cfg.type_selected(&fs_type) {
         return;
@@ -817,13 +822,13 @@ fn df_file_row(
         Ok(usage) => rows.push(DfRow {
             source: device,
             fs_type,
-            file: name.to_string(),
+            file: name.to_os_string(),
             target: mount_dir,
             usage,
             unknown: false,
         }),
         Err(e) => {
-            eprintln!("df: {}: {}", quote_f(name), gnu_io_error(&e));
+            eprintln!("df: {}: {}", qf(name), gnu_io_error(&e));
             *status = 1;
         }
     }
@@ -870,7 +875,7 @@ fn df_percent(f: &DfFigures) -> Option<u64> {
     Some((used100 / denom + u128::from(used100 % denom != 0)) as u64)
 }
 
-fn df_cell(row: &DfRow, cfg: &DfConfig, field: DfField) -> String {
+fn df_cell(row: &DfRow, cfg: &DfConfig, field: DfField) -> Vec<u8> {
     let inodes = matches!(
         field,
         DfField::ITotal | DfField::IUsed | DfField::IAvail | DfField::IPcent
@@ -883,11 +888,11 @@ fn df_cell(row: &DfRow, cfg: &DfConfig, field: DfField) -> String {
         let s = human_readable(n, cfg.human_opts, f.input_units, f.output_units);
         if negative { format!("-{s}") } else { s }
     };
-    match field {
+    let cell = match field {
         DfField::Source => row.source.clone(),
         DfField::FsType => row.fs_type.clone(),
-        DfField::File => row.file.clone(),
-        DfField::Target => row.target.clone(),
+        DfField::File => return row.file.clone().into_vec(),
+        DfField::Target => return row.target.clone().into_vec(),
         DfField::ITotal | DfField::Size => num(f.total, false),
         DfField::IUsed | DfField::Used => num(f.used, f.used_negative),
         DfField::IAvail | DfField::Avail => num(f.available, false),
@@ -895,7 +900,35 @@ fn df_cell(row: &DfRow, cfg: &DfConfig, field: DfField) -> String {
             Some(p) => format!("{p}%"),
             None => "-".into(),
         },
+    };
+    cell.into_bytes()
+}
+
+/// GNU `replace_control_chars` (what `df` does to every cell when stdout is not
+/// a terminal): each ASCII control character becomes `?`; other bytes, valid
+/// UTF-8 or not, are kept.
+fn replace_control_chars(cell: &mut [u8]) {
+    for b in cell.iter_mut().filter(|b| b.is_ascii_control()) {
+        *b = b'?';
     }
+}
+
+/// gnulib `mbswidth (cell, 0)`: columns of a cell with no control characters.
+/// Each byte that is not part of a valid character counts one column.
+fn cell_width(cell: &[u8]) -> usize {
+    if !locale_is_utf8() {
+        return cell.len();
+    }
+    cell.utf8_chunks()
+        .map(|chunk| {
+            let valid: usize = chunk
+                .valid()
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+            valid + chunk.invalid().len()
+        })
+        .sum()
 }
 
 /// GNU's header cell for `field` (`get_header`).
@@ -938,11 +971,20 @@ fn df_header(cfg: &DfConfig, field: DfField) -> String {
 }
 
 fn df_render_gnu<W: Write>(rows: &[DfRow], cfg: &DfConfig, out: &mut W) -> io::Result<()> {
-    let mut table: Vec<Vec<String>> = vec![cfg.fields.iter().map(|f| df_header(cfg, *f)).collect()];
+    let mut table: Vec<Vec<Vec<u8>>> = vec![
+        cfg.fields
+            .iter()
+            .map(|f| df_header(cfg, *f).into_bytes())
+            .collect(),
+    ];
     table.extend(
         rows.iter()
             .map(|r| cfg.fields.iter().map(|f| df_cell(r, cfg, *f)).collect()),
     );
+    table
+        .iter_mut()
+        .flatten()
+        .for_each(|c| replace_control_chars(c));
     let widths: Vec<usize> = cfg
         .fields
         .iter()
@@ -950,32 +992,38 @@ fn df_render_gnu<W: Write>(rows: &[DfRow], cfg: &DfConfig, out: &mut W) -> io::R
         .map(|(col, f)| {
             table
                 .iter()
-                .map(|row| display_width(row[col].as_bytes()))
+                .map(|row| cell_width(&row[col]))
                 .max()
                 .unwrap_or(0)
                 .max(f.header().1)
         })
         .collect();
     for row in &table {
-        let mut line = String::new();
+        let mut line = Vec::new();
         for (col, cell) in row.iter().enumerate() {
             if col > 0 {
-                line.push(' ');
+                line.push(b' ');
             }
-            let pad = widths[col].saturating_sub(display_width(cell.as_bytes()));
+            // GNU's `ambsalign` fails on a cell that is not valid in a UTF-8
+            // locale, and df then prints that cell unpadded.
+            let pad = if locale_is_utf8() && std::str::from_utf8(cell).is_err() {
+                0
+            } else {
+                widths[col].saturating_sub(cell_width(cell))
+            };
             let last = col + 1 == row.len();
             if cfg.fields[col].left_aligned() {
-                line.push_str(cell);
+                line.extend_from_slice(cell);
                 if !last {
-                    line.push_str(&" ".repeat(pad));
+                    line.resize(line.len() + pad, b' ');
                 }
             } else {
-                line.push_str(&" ".repeat(pad));
-                line.push_str(cell);
+                line.resize(line.len() + pad, b' ');
+                line.extend_from_slice(cell);
             }
         }
-        line.push('\n');
-        ignore_broken_pipe(out.write_all(line.as_bytes()))?;
+        line.push(b'\n');
+        ignore_broken_pipe(out.write_all(&line))?;
     }
     Ok(())
 }
@@ -999,7 +1047,7 @@ fn df_record(row: &DfRow) -> DfRecord {
         used_bytes: used,
         available_bytes: available,
         use_percent: (pct * 10.0).round() / 10.0,
-        mount_point: row.target.clone(),
+        mount_point: row.target.to_string_lossy().into_owned(),
     }
 }
 
