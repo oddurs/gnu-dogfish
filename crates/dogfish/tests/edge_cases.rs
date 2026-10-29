@@ -38,7 +38,7 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
     // A mapped input truncated by another process raises SIGBUS; deliver one directly
-    // so the test is deterministic, once `cat` has mapped the file and waits on
+    // so the test is deterministic, once `wc` has mapped the file and waits on
     // standard input.
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("mapped");
@@ -46,7 +46,7 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
     let data = b"mapped\n".repeat(4096);
     std::fs::write(&file, &data).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_dogfish"))
-        .arg("cat")
+        .arg("wc")
         .arg(&file)
         .arg("-")
         .stdin(Stdio::piped())
@@ -64,7 +64,7 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "cat: input file was truncated while being read\n"
+        "wc: input file was truncated while being read\n"
     );
 
     // A tool that maps nothing keeps the default action, as GNU's do (and
