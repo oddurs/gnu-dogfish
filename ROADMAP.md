@@ -11,7 +11,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 ## File & directory tools
 
-- **`ls`**: `--dired` (`-D`) is not implemented; `--hyperlink` is accepted and ignored. *(Colour output for `--color=always` is being added.)*
+- **`ls`**: `--dired` (`-D`) is not implemented; `--hyperlink=WHEN` is validated but no hyperlinks are emitted. `--color` follows GNU's built-in table and `LS_COLORS` exactly, except the `ca` (file capabilities) colour, which is never applied: the reference GNU build (Ubuntu) has no libcap and doesn't apply it either.
 - **`cp` / `mv`**
   - Copying or moving a directory into itself is refused before anything is copied, whereas GNU copies part of the tree first. The message and exit status match.
   - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour).

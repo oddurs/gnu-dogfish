@@ -22,7 +22,7 @@ This release makes Dogfish safe to use on real data and a drop-in for GNU coreut
 ### Fixed — GNU compatibility
 - `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds, because `-h` clashed with clap's help flag.
 - `ls`, `du`, `df` and `stat` printed decorated tables even when piped. They now produce GNU output when not on a terminal:
-  - **`ls`**: every sort and layout mode, `-l` with every `--time-style`, all quoting styles, `-R`.
+  - **`ls`**: every sort and layout mode, `-l` with every `--time-style`, all quoting styles, `-R`, and `--color` with GNU's built-in table and `LS_COLORS`.
   - **`du`**: block-based sizes with hard links counted once, every unit and depth option, GNU's traversal order.
   - **`df`**: FILE operands, `--output`, `-i`, `-T`, `--total`.
   - **`stat`**: the default, terse and `-f` formats, and every format directive.
@@ -57,7 +57,7 @@ This release makes Dogfish safe to use on real data and a drop-in for GNU coreut
 - Conventional-commit PR titles are enforced; pushed branches open draft PRs automatically; Dependabot patch and minor updates auto-merge behind CI.
 
 ### Tests
-- 1,700+ differential cases compared byte for byte against GNU coreutils (`tests/gnu_compat*.rs`), plus data-safety (`tests/fs_safety.rs`) and boundary (`tests/edge_cases.rs`) regressions. All suites also pass as an unprivileged user.
+- 1,800+ differential cases compared byte for byte against GNU coreutils (`tests/gnu_compat*.rs`), plus data-safety (`tests/fs_safety.rs`) and boundary (`tests/edge_cases.rs`) regressions. All suites also pass as an unprivileged user.
 
 ## [0.1.0] - 2026-10-24
 
