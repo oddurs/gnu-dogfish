@@ -1,18 +1,18 @@
 //! du — Parallel disk usage with sparklines on a TTY, GNU `du` otherwise
 
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use dogfish_core::{
     DogfishContext, emit_objects_or_table, format_size, gnu_io_error, io::ignore_broken_pipe,
     sparkline_bar,
 };
-use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names};
 use crate::common::fnmatch::fnmatch;
 use crate::common::gnu_getopt::{
     OptArg, OptSpec, gnu_getopt, gnu_usage_error, print_help_text, print_tool_version,
@@ -146,30 +146,64 @@ struct DuConfig {
     excludes: Vec<Vec<u8>>,
 }
 
+/// What `du` needs of a `stat`.
+#[derive(Clone, Copy)]
+struct DuStat {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    mode: u32,
+    size: u64,
+    blocks: u64,
+}
+
+impl DuStat {
+    #[allow(clippy::unnecessary_cast)] // the field types vary by platform
+    fn from_stat(st: &libc::stat) -> Self {
+        Self {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+            nlink: st.st_nlink as u64,
+            mode: st.st_mode as u32,
+            size: st.st_size as u64,
+            blocks: st.st_blocks as u64,
+        }
+    }
+
+    fn kind(&self) -> EntryType {
+        EntryType::from_mode(self.mode)
+    }
+
+    fn is_dir(&self) -> bool {
+        self.kind() == EntryType::Dir
+    }
+}
+
 impl DuConfig {
-    fn size_of(&self, meta: &fs::Metadata) -> u64 {
+    #[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
+    fn size_of(&self, st: &DuStat) -> u64 {
         if self.inodes {
             1
         } else if self.apparent {
-            let ft = meta.file_type();
-            if ft.is_file() || ft.is_symlink() {
-                meta.size()
+            let regular = st.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32;
+            if regular || st.kind() == EntryType::Symlink {
+                st.size
             } else {
                 0
             }
         } else {
-            meta.blocks() * 512
+            st.blocks * 512
         }
     }
 
     /// The (dev, ino) key under which a hard-linked entry is counted once.
-    fn dedup_key(&self, meta: &fs::Metadata) -> Option<(u64, u64)> {
-        let linked = if meta.is_dir() {
+    fn dedup_key(&self, st: &DuStat) -> Option<(u64, u64)> {
+        let linked = if st.is_dir() {
             self.hash_all
         } else {
-            self.hash_all || meta.nlink() > 1
+            self.hash_all || st.nlink > 1
         };
-        (linked && !self.count_links).then(|| (meta.dev(), meta.ino()))
+        (linked && !self.count_links).then_some((st.dev, st.ino))
     }
 
     /// GNU `exclude` matching without anchoring: the pattern may match the
@@ -186,42 +220,50 @@ impl DuConfig {
     }
 }
 
-/// A directory read during the parallel collection phase.
+/// A directory read during the collection phase.
 struct DuDir {
-    meta: fs::Metadata,
+    meta: DuStat,
     /// Combined size and count of entries that need neither printing nor
     /// de-duplication (single-link files without `-a`).
     plain_size: u64,
     plain_files: u64,
+    /// The names `entries` refer to.
+    names: Names,
     entries: Vec<DuEntry>,
     read_error: Option<io::Error>,
 }
 
 impl DuDir {
-    fn empty(meta: fs::Metadata) -> Self {
+    fn empty(meta: DuStat) -> Self {
         Self {
             meta,
             plain_size: 0,
             plain_files: 0,
+            names: Names::default(),
             entries: Vec::new(),
             read_error: None,
         }
     }
+
+    fn name(&self, index: usize) -> &[u8] {
+        self.names.get(index).0.to_bytes()
+    }
 }
 
+/// An entry of a [`DuDir`]; `name` indexes its `names`.
 enum DuEntry {
     File {
-        name: std::ffi::OsString,
-        meta: fs::Metadata,
+        name: usize,
+        meta: DuStat,
     },
     Dir {
-        name: std::ffi::OsString,
+        name: usize,
         dir: Box<DuDir>,
     },
     /// Could not be stat'ed; `None` is a dangling symlink under `-L`, which GNU
     /// reports without an error string.
     Unreadable {
-        name: std::ffi::OsString,
+        name: usize,
         error: Option<io::Error>,
     },
 }
@@ -234,9 +276,9 @@ fn du_access_error(path: &str, error: Option<&io::Error>) {
 }
 
 /// `stat` for `-L`: `Err(None)` marks a dangling symlink.
-fn du_stat_follow(path: &Path) -> std::result::Result<fs::Metadata, Option<io::Error>> {
-    fs::metadata(path).map_err(|e| match fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => None,
+fn du_stat_follow(at: At<'_>) -> std::result::Result<libc::stat, Option<io::Error>> {
+    at.stat(true).map_err(|e| match at.stat(false) {
+        Ok(st) if EntryType::of(&st) == EntryType::Symlink => None,
         _ => Some(e),
     })
 }
@@ -251,93 +293,254 @@ fn fts_join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-/// Reads `path` (whose printed name is `display`) and all its subdirectories,
-/// fanning subdirectories out across the rayon pool. Entry order is kept, so
-/// the sequential pass sees the same readdir order GNU's fts does.
-fn du_collect(
-    path: &Path,
-    display: &[u8],
-    meta: fs::Metadata,
-    cfg: &DuConfig,
+/// How to reach entry `name` of a directory: through its descriptor, or
+/// (deep down, where none is kept open) by its full path.
+fn entry_at<'a>(fd: Option<&DirFd>, name: &'a CStr, full: Option<&'a CStr>) -> At<'a> {
+    match (fd, full) {
+        (Some(fd), _) => At { dir: fd.fd(), name },
+        (None, Some(path)) => At::cwd(path),
+        // A path with a NUL cannot be reached; EBADF says so.
+        (None, None) => At { dir: -1, name },
+    }
+}
+
+/// A directory still to be read: how to reach and print it, its ancestors
+/// (for loop detection), its depth, and where its entry sits in the tree
+/// (entry indices from the operand down).
+struct DuJob {
+    display: Vec<u8>,
+    meta: DuStat,
+    lineage: Vec<(u64, u64)>,
+    depth: usize,
+    slot: Vec<usize>,
+}
+
+/// What reading a directory shares across the walk.
+struct DuCollect<'a> {
+    cfg: &'a DuConfig,
     root_dev: u64,
-    ancestors: &[(u64, u64)],
-) -> DuDir {
-    use std::os::unix::ffi::OsStrExt;
-    let mut dir = DuDir::empty(meta);
-    let reader = match fs::read_dir(path) {
-        Ok(r) => r,
-        Err(e) => {
-            dir.read_error = Some(e);
-            return dir;
-        }
-    };
-    let mut lineage = ancestors.to_vec();
-    lineage.push((dir.meta.dev(), dir.meta.ino()));
-    let mut pending: Vec<(usize, PathBuf, Vec<u8>, fs::Metadata)> = Vec::new();
-    for entry in reader {
-        let entry = match entry {
-            Ok(e) => e,
+    /// When set, subdirectories are left here as jobs instead of being read.
+    defer: Option<Vec<DuJob>>,
+}
+
+impl DuCollect<'_> {
+    /// Reads `at` (whose printed name is `display`) and its subdirectories,
+    /// each entry `stat`ed relative to its open directory. Entry order is
+    /// kept, so the sequential pass sees the same readdir order GNU's fts does.
+    fn dir(
+        &mut self,
+        at: At<'_>,
+        display: &[u8],
+        meta: DuStat,
+        ancestors: &[(u64, u64)],
+        depth: usize,
+        slot: &[usize],
+    ) -> DuDir {
+        let cfg = self.cfg;
+        let mut dir = DuDir::empty(meta);
+        // The operand was stat'ed through any symlink; below it, only -L follows.
+        let fd = match at.open_dir(depth > 0 && !cfg.follow_all) {
+            Ok(fd) => fd,
             Err(e) => {
                 dir.read_error = Some(e);
-                break;
+                return dir;
             }
         };
-        let name = entry.file_name();
-        let child = entry.path();
-        let meta = if cfg.follow_all {
-            du_stat_follow(&child)
-        } else {
-            entry.metadata().map_err(Some)
-        };
-        let meta = match meta {
-            Ok(m) => m,
-            Err(error) => {
-                dir.entries.push(DuEntry::Unreadable { name, error });
+        let mut names = Names::default();
+        if let Err(e) = fd.read_names(&mut names) {
+            dir.read_error = Some(e);
+        }
+        let mut lineage = ancestors.to_vec();
+        lineage.push((meta.dev, meta.ino));
+        // Deep down, entries are reached by full path, with no directory held open.
+        let fd = (depth < MAX_OPEN_DIRS).then_some(fd);
+        let mut subdirs: Vec<(usize, Vec<u8>)> = Vec::new();
+        for i in 0..names.len() {
+            let (name, _, _) = names.get(i);
+            let full = fd
+                .is_none()
+                .then(|| CString::new(fts_join(display, name.to_bytes())).ok())
+                .flatten();
+            let child = entry_at(fd.as_ref(), name, full.as_deref());
+            let st = if cfg.follow_all {
+                du_stat_follow(child)
+            } else {
+                child.stat(false).map_err(Some)
+            };
+            let meta = match st {
+                Ok(st) => DuStat::from_stat(&st),
+                Err(error) => {
+                    dir.entries.push(DuEntry::Unreadable { name: i, error });
+                    continue;
+                }
+            };
+            if cfg.one_file_system && meta.dev != self.root_dev {
                 continue;
             }
-        };
-        if cfg.one_file_system && meta.dev() != root_dev {
-            continue;
-        }
-        let needs_display = !cfg.excludes.is_empty() || meta.is_dir();
-        let child_display = if needs_display {
-            fts_join(display, name.as_bytes())
-        } else {
-            Vec::new()
-        };
-        if !cfg.excludes.is_empty() && cfg.excluded(&child_display) {
-            continue;
-        }
-        if meta.is_dir() {
-            // A directory that is its own ancestor (a symlink loop under -L)
-            // stays empty; the walk then skips it as already counted.
-            if !lineage.contains(&(meta.dev(), meta.ino())) {
-                pending.push((dir.entries.len(), child, child_display, meta.clone()));
+            let needs_display = !cfg.excludes.is_empty() || meta.is_dir();
+            let child_display = if needs_display {
+                fts_join(display, name.to_bytes())
+            } else {
+                Vec::new()
+            };
+            if !cfg.excludes.is_empty() && cfg.excluded(&child_display) {
+                continue;
             }
-            dir.entries.push(DuEntry::Dir {
-                name,
-                dir: Box::new(DuDir::empty(meta)),
-            });
-        } else if !cfg.all && cfg.dedup_key(&meta).is_none() {
-            dir.plain_size += cfg.size_of(&meta);
-            dir.plain_files += 1;
-        } else {
-            dir.entries.push(DuEntry::File { name, meta });
+            if meta.is_dir() {
+                // A directory that is its own ancestor (a symlink loop under -L)
+                // stays empty; the walk then skips it as already counted.
+                if !lineage.contains(&(meta.dev, meta.ino)) {
+                    subdirs.push((dir.entries.len(), child_display));
+                }
+                dir.entries.push(DuEntry::Dir {
+                    name: i,
+                    dir: Box::new(DuDir::empty(meta)),
+                });
+            } else if !cfg.all && cfg.dedup_key(&meta).is_none() {
+                dir.plain_size += cfg.size_of(&meta);
+                dir.plain_files += 1;
+            } else {
+                dir.entries.push(DuEntry::File { name: i, meta });
+            }
+        }
+        for (index, child_display) in subdirs {
+            let DuEntry::Dir { name, dir: sub } = &mut dir.entries[index] else {
+                continue;
+            };
+            let mut child_slot = slot.to_vec();
+            child_slot.push(index);
+            if let Some(jobs) = &mut self.defer {
+                jobs.push(DuJob {
+                    display: child_display,
+                    meta: sub.meta,
+                    lineage: lineage.clone(),
+                    depth: depth + 1,
+                    slot: child_slot,
+                });
+                continue;
+            }
+            let name = names.get(*name).0;
+            let full = fd
+                .is_none()
+                .then(|| CString::new(child_display.clone()).ok())
+                .flatten();
+            let child = entry_at(fd.as_ref(), name, full.as_deref());
+            let meta = sub.meta;
+            **sub = self.dir(
+                child,
+                &child_display,
+                meta,
+                &lineage,
+                depth + 1,
+                &child_slot,
+            );
+        }
+        dir.names = names;
+        dir
+    }
+
+    /// Reads a job's directory, reached by its full path.
+    fn job(&mut self, job: &DuJob) -> DuDir {
+        match CString::new(job.display.clone()) {
+            Ok(path) => self.dir(
+                At::cwd(&path),
+                &job.display,
+                job.meta,
+                &job.lineage,
+                job.depth,
+                &job.slot,
+            ),
+            Err(_) => {
+                let mut dir = DuDir::empty(job.meta);
+                dir.read_error = Some(io::Error::from_raw_os_error(libc::EINVAL));
+                dir
+            }
         }
     }
-    let collected: Vec<(usize, DuDir)> = pending
-        .into_par_iter()
-        .map(|(index, child, child_display, meta)| {
-            let sub = du_collect(&child, &child_display, meta, cfg, root_dev, &lineage);
-            (index, sub)
-        })
-        .collect();
-    for (index, sub) in collected {
-        if let DuEntry::Dir { dir: slot, .. } = &mut dir.entries[index] {
-            **slot = sub;
+}
+
+/// Puts a job's result into the tree, at the entry its slot names.
+fn du_place(root: &mut DuDir, slot: &[usize], result: DuDir) {
+    let mut dir = root;
+    for &index in slot {
+        match dir.entries.get_mut(index) {
+            Some(DuEntry::Dir { dir: sub, .. }) => dir = sub,
+            _ => return,
         }
     }
-    dir
+    *dir = result;
+}
+
+/// Subtrees read in parallel once a walk has this many; fewer, and the tree
+/// is read on one thread, as starting workers would cost more than they save.
+const PARALLEL_MIN_JOBS: usize = 16;
+
+/// Threads reading a large tree. More cut the wall time further but cost CPU
+/// time: parallel `stat`s of one tree contend in the kernel.
+const MAX_WORKERS: usize = 2;
+
+/// Reads the operand directory `at` and everything below it. The top levels
+/// are read on this thread until enough subdirectories are known; those
+/// subtrees then go to a few worker threads, each taking the next as it
+/// finishes. A small tree stays on one thread.
+fn du_collect(at: At<'_>, display: &[u8], meta: DuStat, cfg: &DuConfig, root_dev: u64) -> DuDir {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_WORKERS));
+    let mut c = DuCollect {
+        cfg,
+        root_dev,
+        defer: (workers > 1).then(Vec::new),
+    };
+    let mut root = c.dir(at, display, meta, &[], 0, &[]);
+    let Some(mut jobs) = c.defer.take() else {
+        return root;
+    };
+    // Breadth first, one level at a time, while there are too few subtrees
+    // to share.
+    let mut levels = 1;
+    while !jobs.is_empty() && jobs.len() < PARALLEL_MIN_JOBS && levels < 4 {
+        c.defer = Some(Vec::new());
+        for job in &jobs {
+            let result = c.job(job);
+            du_place(&mut root, &job.slot, result);
+        }
+        jobs = c.defer.take().unwrap_or_default();
+        levels += 1;
+    }
+    if jobs.len() < PARALLEL_MIN_JOBS {
+        for job in &jobs {
+            let result = c.job(job);
+            du_place(&mut root, &job.slot, result);
+        }
+        return root;
+    }
+    // Each worker (this thread among them) takes the next job until none is left.
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut c = DuCollect {
+            cfg,
+            root_dev,
+            defer: None,
+        };
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(job) = jobs.get(i) else { break };
+            done.push((i, c.job(job)));
+        }
+        done
+    };
+    let results: Vec<Vec<(usize, DuDir)>> = std::thread::scope(|s| {
+        let helpers: Vec<_> = (1..workers).map(|_| s.spawn(work)).collect();
+        let mut results = vec![work()];
+        for h in helpers {
+            results.push(h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        }
+        results
+    });
+    for (i, result) in results.into_iter().flatten() {
+        du_place(&mut root, &jobs[i].slot, result);
+    }
+    root
 }
 
 /// One line of output.
@@ -385,7 +588,7 @@ impl DuWalker<'_> {
     }
 
     /// First visit of an entry: false if it was already counted.
-    fn first_visit(&mut self, meta: &fs::Metadata) -> bool {
+    fn first_visit(&mut self, meta: &DuStat) -> bool {
         match self.cfg.dedup_key(meta) {
             Some(key) => self.seen.insert(key),
             None => true,
@@ -394,7 +597,6 @@ impl DuWalker<'_> {
 
     /// Walks a collected directory; returns (total size, file count) of the subtree.
     fn walk_dir(&mut self, dir: &DuDir, display: Vec<u8>, depth: usize) -> io::Result<(u64, u64)> {
-        use std::os::unix::ffi::OsStrExt;
         if let Some(e) = &dir.read_error {
             eprintln!(
                 "du: cannot read directory {}: {}",
@@ -416,7 +618,7 @@ impl DuWalker<'_> {
                     own += size;
                     files += 1;
                     if self.cfg.all && depth < self.max_depth {
-                        self.emit(fts_join(&display, name.as_bytes()), size, 1)?;
+                        self.emit(fts_join(&display, dir.name(*name)), size, 1)?;
                     }
                 }
                 DuEntry::Dir { name, dir: sub } => {
@@ -424,12 +626,12 @@ impl DuWalker<'_> {
                         continue;
                     }
                     let (size, n) =
-                        self.walk_dir(sub, fts_join(&display, name.as_bytes()), depth + 1)?;
+                        self.walk_dir(sub, fts_join(&display, dir.name(*name)), depth + 1)?;
                     sub_size += size;
                     files += n;
                 }
                 DuEntry::Unreadable { name, error } => {
-                    let path = fts_join(&display, name.as_bytes());
+                    let path = fts_join(&display, dir.name(*name));
                     du_access_error(&String::from_utf8_lossy(&path), error.as_ref());
                     self.status = 1;
                 }
@@ -662,18 +864,19 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         while display.len() > 2 && display.ends_with(b"//") {
             display.pop();
         }
-        let path = Path::new(target);
+        let Ok(c_target) = CString::new(target.as_bytes()) else {
+            continue;
+        };
+        let at = At::cwd(&c_target);
         let meta = if cfg.follow_all {
-            du_stat_follow(path)
+            du_stat_follow(at)
         } else if deref_args {
-            fs::metadata(path)
-                .or_else(|_| fs::symlink_metadata(path))
-                .map_err(Some)
+            at.stat(true).or_else(|_| at.stat(false)).map_err(Some)
         } else {
-            fs::symlink_metadata(path).map_err(Some)
+            at.stat(false).map_err(Some)
         };
         let meta = match meta {
-            Ok(m) => m,
+            Ok(st) => DuStat::from_stat(&st),
             Err(e) => {
                 du_access_error(target, e.as_ref());
                 walker.status = 1;
@@ -687,8 +890,7 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             continue;
         }
         let res = if meta.is_dir() {
-            let root_dev = meta.dev();
-            let tree = du_collect(path, &display, meta, &cfg, root_dev, &[]);
+            let tree = du_collect(at, &display, meta, &cfg, meta.dev);
             walker.walk_dir(&tree, display, 0)
         } else {
             let size = cfg.size_of(&meta);

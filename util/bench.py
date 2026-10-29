@@ -116,7 +116,7 @@ def benchmarks(p, scratch):
             os.path.exists(path) and os.remove(path))
 
     def tree_copy():
-        shutil.rmtree(out, ignore_errors=True)
+        fresh(out)()  # a file left by "cp 256M" when -k skips "cp -r"
         subprocess.run(["/usr/bin/cp", "-r", T, out], check=True)
 
     return [

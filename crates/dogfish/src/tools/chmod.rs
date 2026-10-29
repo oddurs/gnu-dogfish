@@ -1,16 +1,17 @@
 //! chmod — octal and full symbolic modes, -R, -c/-v/-f, --reference
 
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error};
 
+use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
 use crate::common::mode::{
     CHMOD_MODE_BITS, ModeChange, mode_adjust, mode_compile, process_umask, strmode9,
 };
-use crate::common::path::dir_names;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::quote::{qa, qf, quote_locale};
 use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
@@ -159,59 +160,81 @@ pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             ok = false;
             continue;
         }
-        ok &= chmod_path(Path::new(f), true, &run, ctx);
+        let Ok(c_path) = CString::new(f.as_bytes()) else {
+            continue;
+        };
+        let mut path = WalkPath::new(f.as_bytes());
+        ok &= chmod_path(At::cwd(&c_path), &mut path, 0, &run, ctx);
     }
     Ok(if ok { 0 } else { 1 })
 }
 
-fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext) -> bool {
-    let lmeta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
+/// Changes the mode of `at` (printed as `path`), then with `-R` of everything
+/// below it, each entry relative to its open directory. `depth` 0 is an
+/// operand, whose symlinks are followed; below, symlinks are left alone.
+fn chmod_path(
+    at: At<'_>,
+    path: &mut WalkPath,
+    depth: usize,
+    run: &ChmodRun,
+    ctx: &DogfishContext,
+) -> bool {
+    let top_level = depth == 0;
+    let lstat = match at.stat(false) {
+        Ok(st) => st,
         Err(e) => {
             if !run.quiet {
-                eprintln!("chmod: cannot access {}: {}", qa(path), gnu_io_error(&e));
+                eprintln!(
+                    "chmod: cannot access {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
             }
             if run.verbose {
-                println!("{} could not be accessed", qa(path));
+                println!("{} could not be accessed", qa(path.as_path()));
             }
             return false;
         }
     };
-    let meta = if lmeta.is_symlink() {
+    let st = if EntryType::of(&lstat) == EntryType::Symlink {
         if !top_level {
             // During -R traversal, symbolic links are not followed or changed.
             if run.verbose {
                 println!(
                     "neither symbolic link {} nor referent has been changed",
-                    qa(path)
+                    qa(path.as_path())
                 );
             }
             return true;
         }
-        match fs::metadata(path) {
-            Ok(m) => m,
+        match at.stat(true) {
+            Ok(st) => st,
             Err(_) => {
                 if !run.quiet {
-                    eprintln!("chmod: cannot operate on dangling symlink {}", qa(path));
+                    eprintln!(
+                        "chmod: cannot operate on dangling symlink {}",
+                        qa(path.as_path())
+                    );
                 }
                 if run.verbose {
-                    println!("{} could not be accessed", qa(path));
+                    println!("{} could not be accessed", qa(path.as_path()));
                 }
                 return false;
             }
         }
     } else {
-        lmeta
+        lstat
     };
 
-    let old = meta.mode() & CHMOD_MODE_BITS;
-    let is_dir = meta.is_dir();
+    #[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
+    let old = st.st_mode as u32 & CHMOD_MODE_BITS;
+    let is_dir = EntryType::of(&st) == EntryType::Dir;
     let new = match &run.changes {
         Some(c) => mode_adjust(old, is_dir, run.umask, c).0,
         None => run.reference_mode,
     };
     let mut ok = true;
-    let applied = match fs::set_permissions(path, fs::Permissions::from_mode(new)) {
+    let applied = match at.chmod(new) {
         Ok(()) => {
             ctx.telemetry.add_items(1);
             true
@@ -220,7 +243,7 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
             if !run.quiet {
                 eprintln!(
                     "chmod: changing permissions of {}: {}",
-                    qa(path),
+                    qa(path.as_path()),
                     gnu_io_error(&e)
                 );
             }
@@ -231,18 +254,13 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     let changed = applied && old != new;
     if run.verbose || (run.report_changes && changed) {
         let (o, n) = (strmode9(old), strmode9(new));
+        let p = qa(path.as_path());
         if !applied {
-            println!(
-                "failed to change mode of {} from {old:04o} ({o}) to {new:04o} ({n})",
-                qa(path)
-            );
+            println!("failed to change mode of {p} from {old:04o} ({o}) to {new:04o} ({n})");
         } else if changed {
-            println!(
-                "mode of {} changed from {old:04o} ({o}) to {new:04o} ({n})",
-                qa(path)
-            );
+            println!("mode of {p} changed from {old:04o} ({o}) to {new:04o} ({n})");
         } else {
-            println!("mode of {} retained as {new:04o} ({n})", qa(path));
+            println!("mode of {p} retained as {new:04o} ({n})");
         }
     }
     if applied
@@ -253,7 +271,7 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
         if new & !naive != 0 {
             eprintln!(
                 "chmod: {}: new permissions are {}, not {}",
-                qf(path),
+                qf(path.as_path()),
                 strmode9(new),
                 strmode9(naive)
             );
@@ -262,17 +280,33 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     }
 
     if run.recursive && is_dir {
-        match dir_names(path, false) {
-            Ok(names) => {
-                for name in names {
-                    ok &= chmod_path(&path.join(name), false, run, ctx);
+        let mut names = Names::default();
+        // An operand that is a symlink to a directory is followed.
+        let read = at
+            .open_dir(!top_level)
+            .and_then(|d| d.read_names(&mut names).map(|()| d));
+        match read {
+            Ok(dir) => {
+                // Deep down, entries are reached by full path, with no directory held open.
+                let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
+                for i in 0..names.len() {
+                    let (name, _, _) = names.get(i);
+                    let mark = path.push(name.to_bytes());
+                    ok &= match &dir {
+                        Some(d) => chmod_path(At { dir: d.fd(), name }, path, depth + 1, run, ctx),
+                        None => match path.c_path().map(CStr::to_owned) {
+                            Some(full) => chmod_path(At::cwd(&full), path, depth + 1, run, ctx),
+                            None => false,
+                        },
+                    };
+                    path.truncate(mark);
                 }
             }
             Err(e) => {
                 if !run.quiet {
                     eprintln!(
                         "chmod: cannot read directory {}: {}",
-                        qa(path),
+                        qa(path.as_path()),
                         gnu_io_error(&e)
                     );
                 }

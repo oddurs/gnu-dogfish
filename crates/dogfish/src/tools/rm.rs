@@ -1,5 +1,6 @@
 //! rm — GNU semantics plus `--safe` (or `--trash`) undoable trash staging
 
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::fs::MetadataExt;
@@ -8,10 +9,11 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
 
-use crate::common::file_info::file_type_description;
-use crate::common::path::{dir_names, last_component};
+use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
+use crate::common::file_info::{describe_mode, file_type_description};
+use crate::common::path::last_component;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
-use crate::common::prompt::{Interactive, ask, write_protected};
+use crate::common::prompt::{Interactive, ask};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
@@ -312,14 +314,20 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             continue;
         }
 
+        let Ok(c_operand) = CString::new(f.as_bytes()) else {
+            continue;
+        };
+        let at = At::cwd(&c_operand);
+        let info = Info::from_metadata(&meta);
+        let mut path = WalkPath::new(f.as_bytes());
         let status = if meta.is_dir() {
             if run.recursive {
-                rm_tree(p, &meta, meta.dev(), &run, ctx)
+                rm_tree(at, &mut path, Some(&info), 0, meta.dev(), &run, ctx)
             } else {
-                rm_empty_dir(p, &meta, &run, ctx)
+                rm_empty_dir(at, path.as_path(), Some(&info), &run, ctx)
             }
         } else {
-            rm_file(p, &meta, &run, ctx)
+            rm_file(at, path.as_path(), Some(&info), &run, ctx)
         };
         if status == RmStatus::Failed {
             exit_code = 1;
@@ -328,33 +336,84 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     Ok(exit_code)
 }
 
-/// Whether to ask before removing `p`: always with `-i`, and for write-protected
-/// files when stdin is a terminal (unless `-f`). Returns the write-protected flag.
-fn rm_prompt_needed(p: &Path, meta: &fs::Metadata, run: &RmRun) -> Option<bool> {
-    if run.interactive == Interactive::Never {
-        return None;
+/// What a prompt or `--one-file-system` needs to know about an entry.
+#[derive(Clone, Copy)]
+struct Info {
+    mode: u32,
+    size: u64,
+    dev: u64,
+}
+
+impl Info {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        Self {
+            mode: meta.mode(),
+            size: meta.len(),
+            dev: meta.dev(),
+        }
     }
-    let protected = !meta.is_symlink() && write_protected(p);
-    (run.interactive == Interactive::Always || (protected && run.stdin_tty)).then_some(protected)
+
+    #[allow(clippy::unnecessary_cast)] // the field types vary by platform
+    fn from_stat(st: &libc::stat) -> Self {
+        Self {
+            mode: st.st_mode as u32,
+            size: st.st_size as u64,
+            dev: st.st_dev as u64,
+        }
+    }
+
+    fn kind(&self) -> EntryType {
+        EntryType::from_mode(self.mode)
+    }
+}
+
+impl RmRun {
+    /// Whether removing an entry may prompt, so it must be `lstat`ed first:
+    /// always with `-i`, and for write-protected files when stdin is a
+    /// terminal (unless `-f`). Otherwise `readdir`'s file type suffices.
+    fn may_prompt(&self) -> bool {
+        match self.interactive {
+            Interactive::Never => false,
+            Interactive::Sometimes => self.stdin_tty,
+            Interactive::Always => true,
+        }
+    }
+}
+
+/// Whether to ask before removing `at`: always with `-i`, and for write-protected
+/// files when stdin is a terminal (unless `-f`). Returns the write-protected flag.
+/// `info` is known whenever [`RmRun::may_prompt`].
+fn rm_prompt_needed(at: At<'_>, info: Option<&Info>, run: &RmRun) -> Option<bool> {
+    let info = info.filter(|_| run.may_prompt())?;
+    let protected = info.kind() != EntryType::Symlink && at.write_protected();
+    (run.interactive == Interactive::Always || protected).then_some(protected)
 }
 
 fn protected_prefix(protected: bool) -> &'static str {
     if protected { "write-protected " } else { "" }
 }
 
-fn rm_file(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> RmStatus {
-    if let Some(protected) = rm_prompt_needed(p, meta, run) {
+fn rm_file(
+    at: At<'_>,
+    p: &Path,
+    info: Option<&Info>,
+    run: &RmRun,
+    ctx: &DogfishContext,
+) -> RmStatus {
+    if let Some(info) = info
+        && let Some(protected) = rm_prompt_needed(at, Some(info), run)
+    {
         let q = format!(
             "remove {}{} {}? ",
             protected_prefix(protected),
-            file_type_description(meta),
+            describe_mode(info.mode, info.size),
             qa(p)
         );
         if !ask("rm", &q) {
             return RmStatus::Declined;
         }
     }
-    match fs::remove_file(p) {
+    match at.unlink(false) {
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
@@ -369,8 +428,14 @@ fn rm_file(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> 
     }
 }
 
-fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> RmStatus {
-    if let Some(protected) = rm_prompt_needed(p, meta, run)
+fn rm_empty_dir(
+    at: At<'_>,
+    p: &Path,
+    info: Option<&Info>,
+    run: &RmRun,
+    ctx: &DogfishContext,
+) -> RmStatus {
+    if let Some(protected) = rm_prompt_needed(at, info, run)
         && !ask(
             "rm",
             &format!(
@@ -382,7 +447,7 @@ fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext
     {
         return RmStatus::Declined;
     }
-    match fs::remove_dir(p) {
+    match at.unlink(true) {
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
@@ -404,58 +469,98 @@ fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext
 /// Removes a directory tree depth-first in `readdir` order, like GNU's `fts`
 /// traversal. Symbolic links are removed, never followed. After an error inside
 /// a directory, its ancestors are left alone (GNU reports only the first error).
+///
+/// Entries are removed relative to their open directory, and `lstat`ed only
+/// when a prompt or `--one-file-system` needs more than `readdir`'s type.
+/// `path` is the printed name of `at` and is restored before returning.
 fn rm_tree(
-    p: &Path,
-    meta: &fs::Metadata,
+    at: At<'_>,
+    path: &mut WalkPath,
+    info: Option<&Info>,
+    depth: usize,
     top_dev: u64,
     run: &RmRun,
     ctx: &DogfishContext,
 ) -> RmStatus {
-    let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
-    if !empty {
-        if let Some(protected) = rm_prompt_needed(p, meta, run)
+    let mut names = Names::default();
+    // An unreadable directory is not empty: GNU asks to descend, then fails.
+    let dir = at
+        .open_dir(true)
+        .and_then(|d| d.read_names(&mut names).map(|()| d));
+    if dir.as_ref().is_err() || !names.is_empty() {
+        if let Some(protected) = rm_prompt_needed(at, info, run)
             && !ask(
                 "rm",
                 &format!(
                     "descend into {}directory {}? ",
                     protected_prefix(protected),
-                    qa(p)
+                    qa(path.as_path())
                 ),
             )
         {
             return RmStatus::Kept;
         }
-        let names = match dir_names(p, false) {
-            Ok(n) => n,
+        let dir = match dir {
+            Ok(d) => d,
             Err(e) => {
-                eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+                eprintln!(
+                    "rm: cannot remove {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
                 return RmStatus::Failed;
             }
         };
+        // Deep down, entries are reached by full path, with no directory held open.
+        let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
+        let need_info = run.may_prompt() || run.one_file_system;
         let (mut failed, mut kept) = (false, false);
-        for name in names {
-            let child = p.join(name);
-            let cmeta = match child.symlink_metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("rm: cannot remove {}: {}", qa(&child), gnu_io_error(&e));
-                    failed = true;
-                    continue;
+        for i in 0..names.len() {
+            let (name, kind, _) = names.get(i);
+            let mark = path.push(name.to_bytes());
+            let full;
+            let child = match &dir {
+                Some(d) => At { dir: d.fd(), name },
+                None => {
+                    full = path.c_path().map(CStr::to_owned);
+                    match &full {
+                        Some(c) => At::cwd(c),
+                        None => At { dir: -1, name },
+                    }
                 }
             };
-            let status = if cmeta.is_dir() {
-                if run.one_file_system && cmeta.dev() != top_dev {
+            let cinfo = if need_info || kind == EntryType::Unknown {
+                match child.stat(false) {
+                    Ok(st) => Some(Info::from_stat(&st)),
+                    Err(e) => {
+                        eprintln!(
+                            "rm: cannot remove {}: {}",
+                            qa(path.as_path()),
+                            gnu_io_error(&e)
+                        );
+                        failed = true;
+                        path.truncate(mark);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let is_dir = cinfo.map_or(kind, |i| i.kind()) == EntryType::Dir;
+            let status = if is_dir {
+                if run.one_file_system && cinfo.is_some_and(|i| i.dev != top_dev) {
                     eprintln!(
                         "rm: skipping {}, since it's on a different device",
-                        qa(&child)
+                        qa(path.as_path())
                     );
                     RmStatus::Failed
                 } else {
-                    rm_tree(&child, &cmeta, top_dev, run, ctx)
+                    rm_tree(child, path, cinfo.as_ref(), depth + 1, top_dev, run, ctx)
                 }
             } else {
-                rm_file(&child, &cmeta, run, ctx)
+                rm_file(child, path.as_path(), cinfo.as_ref(), run, ctx)
             };
+            path.truncate(mark);
             failed |= status == RmStatus::Failed;
             kept |= status == RmStatus::Kept;
         }
@@ -466,5 +571,5 @@ fn rm_tree(
             return RmStatus::Kept;
         }
     }
-    rm_empty_dir(p, meta, run, ctx)
+    rm_empty_dir(at, path.as_path(), info, run, ctx)
 }

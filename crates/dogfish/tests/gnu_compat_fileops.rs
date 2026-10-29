@@ -113,6 +113,14 @@ fn build_tree(root: &Path) {
     }
 }
 
+/// For the `deep` flag: a directory chain deeper than the recursive tools
+/// keep directories open (130 levels), with a file at the bottom.
+fn build_deep(root: &Path) {
+    let deep = (0..130).fold(root.join("deep"), |p, _| p.join("k"));
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("f"), b"bottom\n").unwrap();
+}
+
 fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -216,6 +224,8 @@ struct TreeCase<'a> {
     args: &'a [&'a str],
     stdin: Option<&'a [u8]>,
     tz: &'a str,
+    /// Add the [`build_deep`] chain to the tree.
+    deep: bool,
     cmp: Compare,
 }
 
@@ -236,6 +246,7 @@ impl TreeCase<'_> {
             "no_undo" => self.cmp.no_undo = true,
             "unordered" => self.cmp.unordered = true,
             "tz_new_york" => self.tz = TZ_NEW_YORK,
+            "deep" => self.deep = true,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -258,6 +269,9 @@ impl TreeCase<'_> {
         for dir in [&ours_dir, &gnu_dir] {
             fs::create_dir_all(dir).unwrap();
             build_tree(dir);
+            if self.deep {
+                build_deep(dir);
+            }
         }
 
         let mut ours = Command::new(dogfish_bin());
@@ -326,7 +340,7 @@ impl TreeCase<'_> {
 
 /// `name: tool [args...] (stdin b"...")? (=> flag, ...)?;` — runs the command in
 /// two fresh scratch trees and compares everything (see the module docs).
-/// Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`, `nostderr`, `unordered`,
+/// Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`, `nostderr`, `unordered`, `deep`,
 /// `tz_new_york`.
 macro_rules! tree_cases {
     ($(
@@ -347,6 +361,7 @@ macro_rules! tree_cases {
                     args: &[$($arg),*],
                     stdin: None,
                     tz: "UTC0",
+                    deep: false,
                     cmp: Compare::default(),
                 };
                 $( case.stdin = Some($input); )?
@@ -668,6 +683,8 @@ tree_cases! {
     chmod_x_if_any: "chmod" ["-v", "g-x,+X", "exe"];
     chmod_recursive: "chmod" ["-vR", "750", "d"];
     chmod_recursive_changes: "chmod" ["-cR", "o-r", "d"];
+    chmod_recursive_deep: "chmod" ["-vR", "u-w", "deep"] => deep;
+    chmod_recursive_operands: "chmod" ["-R", "g+w", "d", "ld", "p", "deep"] => deep;
     chmod_dir_keeps_setgid: "chmod" ["-v", "755", "sg"];
     chmod_dir_clears_setgid: "chmod" ["-v", "00755", "sg"];
     chmod_symlink_operand: "chmod" ["-v", "700", "la"];
@@ -718,6 +735,8 @@ tree_cases! {
     rm_dir_flag_empty: "rm" ["-dv", "e"];
     rm_recursive: "rm" ["-rv", "d"];
     rm_recursive_nested: "rm" ["-rv", "p"];
+    rm_recursive_deep: "rm" ["-rv", "deep"] => deep;
+    rm_recursive_quiet: "rm" ["-r", "d", "p", "p2", "deep"] => deep;
     rm_trailing_slash_file: "rm" ["a/"];
     rm_force_trailing_slash_file: "rm" ["-f", "a/"];
     rm_recursive_trailing_slash: "rm" ["-rfv", "d/"];

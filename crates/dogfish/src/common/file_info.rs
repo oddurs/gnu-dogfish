@@ -64,25 +64,30 @@ pub(crate) fn dev_minor(dev: u64) -> u64 {
 
 /// gnulib `file_type`: the `%F` description of a file.
 pub(crate) fn file_type_description(meta: &fs::Metadata) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    let ft = meta.file_type();
-    if ft.is_file() {
-        if meta.len() == 0 {
+    describe_mode(meta.mode(), meta.len())
+}
+
+/// [`file_type_description`] from a `stat` mode and size.
+#[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
+pub(crate) fn describe_mode(mode: u32, size: u64) -> &'static str {
+    let is = |t: libc::mode_t| mode & libc::S_IFMT as u32 == t as u32;
+    if is(libc::S_IFREG) {
+        if size == 0 {
             "regular empty file"
         } else {
             "regular file"
         }
-    } else if ft.is_dir() {
+    } else if is(libc::S_IFDIR) {
         "directory"
-    } else if ft.is_symlink() {
+    } else if is(libc::S_IFLNK) {
         "symbolic link"
-    } else if ft.is_fifo() {
+    } else if is(libc::S_IFIFO) {
         "fifo"
-    } else if ft.is_socket() {
+    } else if is(libc::S_IFSOCK) {
         "socket"
-    } else if ft.is_char_device() {
+    } else if is(libc::S_IFCHR) {
         "character special file"
-    } else if ft.is_block_device() {
+    } else if is(libc::S_IFBLK) {
         "block special file"
     } else {
         "weird file"
