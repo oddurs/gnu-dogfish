@@ -139,7 +139,10 @@ fn build_fixture(dir: &Path) {
 
     let at = |secs: i64, nanos: u32| FileTime::from_unix_time(secs, nanos);
     let set = |rel: &str, atime: FileTime, mtime: FileTime| {
-        filetime::set_file_times(p(rel), atime, mtime).unwrap();
+        // Path-based utimensat: `set_file_times` opens the file first, which fails
+        // on the mode-000 fixture unless the suite runs as root (CI runners don't).
+        // None of these entries are symlinks, so not following them is moot.
+        filetime::set_symlink_file_times(p(rel), atime, mtime).unwrap();
     };
     for rel in [
         "empty",
