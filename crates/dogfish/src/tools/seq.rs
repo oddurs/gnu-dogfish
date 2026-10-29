@@ -52,7 +52,7 @@ const SEQ_OPTS: &[OptSpec<&str>] = &[
     OptSpec::both(b's', "separator", HasArg::Required, "separator"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
-    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
 ];
 
 /// A scanned `seq` operand: its value and the output width and precision

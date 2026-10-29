@@ -80,7 +80,7 @@ const SPECS: &[OptSpec<RealpathOpt>] = &[
     OptSpec::both(b'P', "physical", HasArg::No, RealpathOpt::Physical),
     OptSpec::long("help", HasArg::No, RealpathOpt::Help),
     OptSpec::long("version", HasArg::No, RealpathOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, RealpathOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, RealpathOpt::Json).exact(),
 ];
 
 pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {

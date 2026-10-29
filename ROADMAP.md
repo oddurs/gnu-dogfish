@@ -6,7 +6,6 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 - **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`) is UTF-8 aware.
 - **Options** are parsed like glibc 2.39's `getopt_long` (permutation, `POSIXLY_CORRECT`, clustering, abbreviations, ambiguity, messages), but a GNU option Dogfish does not implement yet is refused with `TOOL: option 'X' is not supported yet` (exit 1) rather than ignored or emulated, e.g. `tac -b`, `nl -h`, `head -z`, `shuf -o`, `du --time`, `ls --dired`.
-- **`--stats`, `--color[=WHEN]` and `--no-color`** are taken by Dogfish before any tool parses its arguments (up to `--`), so e.g. `echo --color x` prints `x` where GNU prints `--color x`.
 - **Non-UTF-8 arguments.** Options and option arguments may be any bytes. File names that are not valid UTF-8 work for the tools that read files; `cp`, `mv`, `ln`, `mkdir` and `mktemp` refuse them.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
@@ -38,7 +37,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - Rich TTY output for `ls`, `df`, `du`, `stat`, `wc --table`, `env --table`.
 - `-J/--json` NDJSON output and `dogfish query`.
 - Human durations such as `500ms` or `1m30s` for `sleep`, `timeout` and `watch` (GNU rejects them).
-- `rm --safe`, `dogfish undo`, `dogfish history`, `--stats`.
+- `rm --safe`, `dogfish undo`, `dogfish history`, `--stats`. The switches `--stats`, `--no-color` and (for tools with rich terminal output that GNU gives no `--color`) `--color[=WHEN]` are accepted only when spelled in full, before `--` or a command, and never by `echo`, `printf`, `true`, `false` or `yes`, which keep GNU's behaviour; `DOGFISH_STATS=1` and `NO_COLOR` set them for every tool. Dogfish's own long options (`--json`, `ls --tree`, `rm --safe`, ...) are never abbreviated and never listed in GNU's ambiguity messages.
 - `ls -T` is GNU's tab size; the tree view is `ls --tree [-L DEPTH]`.
 
 ## Platforms

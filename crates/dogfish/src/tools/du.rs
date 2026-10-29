@@ -51,7 +51,7 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
     // Short-only options.
     OptSpec::short(b'H', HasArg::No, "dereference-args"),
     OptSpec::short(b'k', HasArg::No, "kilobytes"),

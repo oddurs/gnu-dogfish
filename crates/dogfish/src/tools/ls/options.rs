@@ -1,6 +1,6 @@
 //! `ls` options and their parsing.
 
-use dogfish_core::DogfishContext;
+use dogfish_core::ColorMode;
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -78,9 +78,9 @@ const LS_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::long("tree", HasArg::No, "tree"),
-    OptSpec::long("level", HasArg::Required, "level"),
-    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::long("tree", HasArg::No, "tree").exact(),
+    OptSpec::long("level", HasArg::Required, "level").exact(),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
     // Short-only options.
     OptSpec::short(b'c', HasArg::No, "ctime"),
     OptSpec::short(b'C', HasArg::No, "vertical"),
@@ -108,7 +108,7 @@ fn ls_option_table(args: &[OsString]) -> Vec<OptSpec<&'static str>> {
         .iter()
         .map(|a| a.as_bytes())
         .take_while(|a| *a != b"--")
-        .any(|a| a == b"--tree" || (a.len() > 3 && b"--tree".starts_with(a)));
+        .any(|a| a == b"--tree");
     LS_OPTIONS
         .iter()
         .map(|s| {
@@ -120,6 +120,7 @@ fn ls_option_table(args: &[OsString]) -> Vec<OptSpec<&'static str>> {
                     long: s.long,
                     arg: s.arg,
                     key: s.key,
+                    exact: s.exact,
                 }
             }
         })
@@ -286,6 +287,8 @@ pub(crate) struct LsOpts {
     pub(crate) eol: u8,
     /// GNU `print_with_color`, as `--color`, `-f` and `--zero` leave it.
     pub(crate) color: bool,
+    /// The last `--color=WHEN`, which also governs the rich terminal output.
+    pub(crate) color_mode: Option<ColorMode>,
     /// The colour table in effect for GNU-style output (`None`: no colour).
     pub(crate) colors: Option<LsColors>,
     /// GNU `check_symlink_mode`: follow symlinks to colour or group them.
@@ -390,6 +393,7 @@ pub(crate) fn parse_ls_args(
         tab_size: 8,
         eol: b'\n',
         color: false,
+        color_mode: None,
         colors: None,
         check_symlink_mode: false,
         tree: false,
@@ -476,6 +480,7 @@ pub(crate) fn parse_ls_args(
                 // Hyperlinks are accepted but not emitted.
                 if key == "color" {
                     o.color = when == "always" || (when == "auto" && stdout_is_tty);
+                    o.color_mode = ColorMode::from_when(when);
                 }
             }
             "directory" => o.immediate_dirs = true,
@@ -733,34 +738,6 @@ pub(crate) fn parse_ls_args(
     });
     o.hide_control = hide_control.unwrap_or(false);
     Ok((o, parsed.operands()))
-}
-
-/// `ls` parses `--color[=WHEN]` itself, like GNU (in argument order, so `-f`
-/// and `--zero` can turn it off again, and with GNU's diagnostics), so it takes
-/// its arguments from before the global-flag filtering, dropping only
-/// `--stats`; the Dogfish `--no-color` means `--color=never`.
-pub(crate) fn ls_args(ctx: &DogfishContext, filtered: Vec<OsString>) -> Vec<OsString> {
-    if ctx.raw_args.is_empty() {
-        return filtered;
-    }
-    let mut args = Vec::with_capacity(ctx.raw_args.len());
-    let mut operands_only = false;
-    for (i, arg) in ctx.raw_args.iter().enumerate() {
-        if i == 0 || operands_only {
-            args.push(arg.clone());
-            continue;
-        }
-        match arg.as_bytes() {
-            b"--" => {
-                operands_only = true;
-                args.push(arg.clone());
-            }
-            b"--stats" => {}
-            b"--no-color" => args.push("--color=never".into()),
-            _ => args.push(arg.clone()),
-        }
-    }
-    args
 }
 
 /// GNU `decode_line_length` (for `-w` and COLUMNS): a number in C syntax

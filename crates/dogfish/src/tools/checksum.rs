@@ -231,7 +231,7 @@ const B2SUM_SPECS: &[OptSpec<SumOpt>] = &[
     OptSpec::both(b't', "text", HasArg::No, SumOpt::Text),
     OptSpec::long("help", HasArg::No, SumOpt::Help),
     OptSpec::long("version", HasArg::No, SumOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, SumOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, SumOpt::Json).exact(),
 ];
 
 /// The options of a `*sum` tool, resolved the way GNU's option loop does

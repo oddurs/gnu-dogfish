@@ -25,6 +25,7 @@ This release makes Dogfish safe to use on real data and a drop-in for GNU coreut
 ### Fixed — GNU compatibility
 - `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds, because `-h` clashed with clap's help flag.
 - Every tool now parses options with one port of glibc's `getopt_long` instead of clap: GNU's permutation and `POSIXLY_CORRECT`, clustering, unique abbreviations, `option '--s' is ambiguous; possibilities: ...`, last-wins repeats, `--help`/`--version` anywhere, and GNU's usage exit status per tool. Arguments need not be UTF-8.
+- `--stats`, `--color` and `--no-color` were removed from every tool's arguments before it saw them, so `echo --color x`, `printf '%s' --stats` or `env cmd --stats` lost them. Each tool now parses them as its own (full spelling only), and `echo`, `printf`, `true`, `false` and `yes` behave exactly as GNU's. Dogfish's own long options no longer change GNU's abbreviations or ambiguity messages.
 - Output goes through one standard-output writer with GNU's `close_stdout` semantics: a failed write (`>/dev/full`, a closed stdout) is reported once, as `TOOL: write error: ...`, and fails the tool.
 - `ls`, `du`, `df` and `stat` printed decorated tables even when piped. They now produce GNU output when not on a terminal:
   - **`ls`**: every sort and layout mode, `-l` with every `--time-style`, all quoting styles, `-R`, and `--color` with GNU's built-in table and `LS_COLORS`.

@@ -64,7 +64,7 @@ const SPECS: &[OptSpec<ShufOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, ShufOpt::Unsupported),
     OptSpec::long("help", HasArg::No, ShufOpt::Help),
     OptSpec::long("version", HasArg::No, ShufOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, ShufOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, ShufOpt::Json).exact(),
 ];
 
 /// gnulib `xstrtoumax` on a prefix of `s`: the value (`None` on overflow)

@@ -100,7 +100,7 @@ const SPECS: &[OptSpec<NlOpt>] = &[
     ),
     OptSpec::long("help", HasArg::No, NlOpt::Help),
     OptSpec::long("version", HasArg::No, NlOpt::Version),
-    OptSpec::both(b'a', "all", HasArg::No, NlOpt::All),
+    OptSpec::both(b'a', "all", HasArg::No, NlOpt::All).exact(),
 ];
 
 /// Parses the command line; `Err` is the exit status after `--help`,

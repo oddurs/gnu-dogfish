@@ -921,7 +921,7 @@ const DATE_OPTS: &[OptSpec<&str>] = &[
     OptSpec::long("universal", HasArg::No, "utc"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
-    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
     OptSpec::short(b'I', HasArg::Optional, "iso-8601"),
     OptSpec::short(b'R', HasArg::No, "rfc-email"),
 ];

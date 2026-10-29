@@ -70,7 +70,7 @@ const SPECS: &[OptSpec<HeadOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, HeadOpt::Unsupported),
     OptSpec::long("help", HasArg::No, HeadOpt::Help),
     OptSpec::long("version", HasArg::No, HeadOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, HeadOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, HeadOpt::Json).exact(),
     digit(b'0'),
     digit(b'1'),
     digit(b'2'),

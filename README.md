@@ -96,7 +96,7 @@ Output:
 ```
 
 ### 2. Global `--stats` Local Telemetry
-Append `--stats` to **any** Dogfish utility to inspect wall-clock execution time, I/O throughput, item counts, and the active kernel/SIMD strategy:
+Append `--stats` to any Dogfish utility (or set `DOGFISH_STATS=1`; `echo`, `printf`, `true`, `false` and `yes` take their arguments as GNU does, so only the variable works there) to inspect wall-clock execution time, I/O throughput, item counts, and the active kernel/SIMD strategy:
 
 ```text
 $ dogfish ls --tree -L 2 --stats

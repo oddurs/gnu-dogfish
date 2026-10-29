@@ -42,7 +42,7 @@ const SPECS: &[OptSpec<PrintenvOpt>] = &[
     OptSpec::both(b'0', "null", HasArg::No, PrintenvOpt::Null),
     OptSpec::long("help", HasArg::No, PrintenvOpt::Help),
     OptSpec::long("version", HasArg::No, PrintenvOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, PrintenvOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, PrintenvOpt::Json).exact(),
     OptSpec::short(b'i', HasArg::No, PrintenvOpt::EnvOnly),
     OptSpec::short(b'u', HasArg::Required, PrintenvOpt::EnvOnly),
 ];

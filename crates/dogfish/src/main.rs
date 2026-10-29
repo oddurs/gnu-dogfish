@@ -363,8 +363,13 @@ fn run(raw_args: Vec<OsString>) -> u8 {
     };
 
     install_sigbus_handler(&tool_name);
-    let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
-    let res = dispatch(&tool_name, filtered_args, &ctx);
+    let ctx = DogfishContext::new(&tool_name);
+    // Each tool parses its own arguments, Dogfish's switches included.
+    common::getopt::install_switches(
+        common::getopt::switches_for(&tool_name),
+        ctx.switches.clone(),
+    );
+    let res = dispatch(&tool_name, tool_args, &ctx);
     ctx.finish();
 
     let code = match res {
@@ -505,7 +510,7 @@ fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32
 }
 
 fn print_banner_and_help() {
-    let (ctx, _) = DogfishContext::from_raw_args("dogfish", vec![]);
+    let ctx = DogfishContext::new("dogfish");
     let st = ctx.style();
     let logo = r#"
              .              /\

@@ -103,9 +103,9 @@ const SPECS: &[OptSpec<CutOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, CutOpt::Unsupported),
     OptSpec::long("help", HasArg::No, CutOpt::Help),
     OptSpec::long("version", HasArg::No, CutOpt::Version),
-    OptSpec::long("field", HasArg::Required, CutOpt::Fields),
-    OptSpec::both(b'w', "where", HasArg::Required, CutOpt::Where),
-    OptSpec::both(b'J', "json", HasArg::No, CutOpt::Json),
+    OptSpec::long("field", HasArg::Required, CutOpt::Fields).exact(),
+    OptSpec::both(b'w', "where", HasArg::Required, CutOpt::Where).exact(),
+    OptSpec::both(b'J', "json", HasArg::No, CutOpt::Json).exact(),
     OptSpec::short(b'n', HasArg::No, CutOpt::NoSplit),
 ];
 

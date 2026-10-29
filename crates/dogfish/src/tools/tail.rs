@@ -91,7 +91,7 @@ const SPECS: &[OptSpec<TailOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, TailOpt::Unsupported),
     OptSpec::long("help", HasArg::No, TailOpt::Help),
     OptSpec::long("version", HasArg::No, TailOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, TailOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, TailOpt::Json).exact(),
     OptSpec::short(b'f', HasArg::No, TailOpt::Follow),
     OptSpec::short(b'F', HasArg::No, TailOpt::Unsupported),
     digit(b'0'),

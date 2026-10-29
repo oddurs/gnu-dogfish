@@ -32,7 +32,7 @@ enum WhoamiOpt {
 const SPECS: &[OptSpec<WhoamiOpt>] = &[
     OptSpec::long("help", HasArg::No, WhoamiOpt::Help),
     OptSpec::long("version", HasArg::No, WhoamiOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, WhoamiOpt::Json),
+    OptSpec::both(b'J', "json", HasArg::No, WhoamiOpt::Json).exact(),
 ];
 
 pub fn run_whoami(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {

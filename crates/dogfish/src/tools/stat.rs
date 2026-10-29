@@ -39,7 +39,7 @@ const STAT_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
 ];
 
 const STAT_HELP: &str = "\

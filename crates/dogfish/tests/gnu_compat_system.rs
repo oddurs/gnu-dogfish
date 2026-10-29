@@ -786,6 +786,25 @@ gnu_cases! {
     flag_with_value_base64: "base64" ["--decode=1"];
     extra_operand_whoami: "whoami" ["a", "b"];
     extra_operand_base64: "basenc" ["--base64", "a.txt", "b.txt"];
+
+    // ------------------------------- Dogfish switches never change GNU's
+    echo_color_is_an_operand: "echo" ["--color", "x"];
+    echo_switches_are_operands: "echo" ["--stats", "--no-color", "--color=always", "x"];
+    printf_stats_is_the_format: "printf" ["--stats"];
+    printf_stats_is_an_argument: "printf" ["%s|", "--stats", "--color"];
+    true_ignores_switches: "true" ["--stats"];
+    false_ignores_switches: "false" ["--no-color"];
+    env_command_keeps_its_switches: "env" ["echo", "--color", "--stats", "x"];
+    env_assignment_then_command_switches: "env" ["A=1", "echo", "--no-color"];
+    timeout_command_keeps_its_switches: "timeout" ["5", "echo", "--stats", "--color=never"];
+    switch_after_double_dash_is_an_operand: "cat" ["--", "--stats"];
+    switch_is_never_abbreviated: "cat" ["--stat", "a.txt"];
+    switch_with_argument_is_unrecognized: "cat" ["--stats=1", "a.txt"];
+    color_only_where_granted: "cat" ["--color", "a.txt"];
+    extension_not_in_ambiguity_ls: "ls" ["--t", "a.txt"];
+    extension_not_abbreviated_ls: "ls" ["--tre", "a.txt"];
+    extension_not_in_ambiguity_sort: "sort" ["--b", "lines.txt"];
+    extension_not_shadowing_prefix_cut: "cut" ["--fi=1", "a.txt"];
 }
 
 // ------------------------------------------------------------------ yes
@@ -1029,6 +1048,17 @@ fn help_and_version_anywhere_like_gnu() {
             continue;
         };
         assert_eq!(ours, theirs, "{tool} {args:?}");
+    }
+}
+
+/// `yes` never ends when it works, so only its failures are compared.
+#[test]
+fn yes_takes_no_dogfish_switches() {
+    for args in [&["--stats"][..], &["--no-color", "x"], &["--color"]] {
+        let Some((ours, theirs)) = run_both("yes", args, &[], Stdio::null) else {
+            return;
+        };
+        assert_eq!(ours, theirs, "yes {args:?}");
     }
 }
 

@@ -5,11 +5,20 @@
 //!
 //! Arguments are `OsString`s: a command line need not be UTF-8, and option
 //! arguments and operands reach the tool byte for byte.
+//!
+//! Dogfish's own options never change what GNU accepts or how it words a
+//! diagnostic: a tool's extras are [`OptSpec::exact`] (never abbreviated, never
+//! listed as an ambiguity), and the switches every tool may take (`--stats`,
+//! `--no-color`, `--color`) are [`Switch`]es, granted per tool by
+//! [`switches_for`] and matched only when spelled in full.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::sync::{Arc, OnceLock};
+
+use dogfish_core::{ColorMode, Switches};
 
 use crate::common::quote::quote_locale;
 
@@ -24,13 +33,17 @@ pub(crate) enum HasArg {
 }
 
 /// One accepted option: a short option character, a long name, or both.
-/// `key` identifies it to the tool; long names sharing a key and `arg` are
-/// synonyms (their abbreviations are never ambiguous with each other).
+/// `key` identifies it to the tool; long names sharing a key, `arg` and short
+/// option are synonyms (their abbreviations are never ambiguous with each
+/// other).
 pub(crate) struct OptSpec<K> {
     pub(crate) short: Option<u8>,
     pub(crate) long: Option<&'static str>,
     pub(crate) arg: HasArg,
     pub(crate) key: K,
+    /// A Dogfish extension: its long name matches only in full, so GNU's
+    /// abbreviations and ambiguity diagnostics are unchanged.
+    pub(crate) exact: bool,
 }
 
 impl<K> OptSpec<K> {
@@ -41,6 +54,7 @@ impl<K> OptSpec<K> {
             long: Some(long),
             arg,
             key,
+            exact: false,
         }
     }
 
@@ -51,6 +65,7 @@ impl<K> OptSpec<K> {
             long: None,
             arg,
             key,
+            exact: false,
         }
     }
 
@@ -61,8 +76,71 @@ impl<K> OptSpec<K> {
             long: Some(long),
             arg,
             key,
+            exact: false,
         }
     }
+}
+
+impl<K: Copy> OptSpec<K> {
+    /// Marks a Dogfish extension (`--json`, `--tree`): GNU has no such
+    /// option, so its long name is never matched by a prefix.
+    pub(crate) const fn exact(self) -> Self {
+        Self {
+            exact: true,
+            ..self
+        }
+    }
+}
+
+/// The Dogfish switches a tool accepts on top of its own options.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Switch(u8);
+
+impl Switch {
+    pub(crate) const NONE: Self = Self(0);
+    /// `--stats`: the telemetry footer on stderr.
+    pub(crate) const STATS: Self = Self(1);
+    /// `--no-color`: plain output on a terminal.
+    pub(crate) const NO_COLOR: Self = Self(2);
+    /// `--color[=WHEN]`, for tools with rich terminal output and no GNU
+    /// `--color` of their own.
+    pub(crate) const COLOR: Self = Self(4);
+
+    pub(crate) const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub(crate) const fn has(self, other: Self) -> bool {
+        self.0 & other.0 == other.0 && other.0 != 0
+    }
+}
+
+/// Which Dogfish switches `tool` accepts. None for the tools whose GNU
+/// versions take every argument as an operand or ignore them all (`echo`,
+/// `printf`, `true`, `false`, `yes`): scripts rely on those. `ls` has GNU's
+/// own `--color`; the rest of the tools with rich terminal output take
+/// `--color[=WHEN]` as well.
+pub(crate) fn switches_for(tool: &str) -> Switch {
+    let common = Switch::STATS.with(Switch::NO_COLOR);
+    match tool {
+        "echo" | "printf" | "true" | "false" | "yes" => Switch::NONE,
+        "bench" | "b2sum" | "md5sum" | "sha256sum" | "cut" | "df" | "du" | "env" | "head"
+        | "history" | "id" | "install-links" | "nl" | "query" | "filter" | "realpath" | "rm"
+        | "shuf" | "sort" | "stat" | "tail" | "undo" | "uniq" | "watch" | "wc" => {
+            common.with(Switch::COLOR)
+        }
+        _ => common,
+    }
+}
+
+/// The switches the running tool accepts, and where they are recorded.
+static SWITCHES: OnceLock<(Switch, Arc<Switches>)> = OnceLock::new();
+
+/// Lets the running tool's parsers accept `allowed`, recording what they see
+/// in `into` (the tool's context). Called once, by `main`; without it (in
+/// unit tests) a parser accepts only the options it is given.
+pub(crate) fn install_switches(allowed: Switch, into: Arc<Switches>) {
+    let _ = SWITCHES.set((allowed, into));
 }
 
 /// How options and operands may be mixed (the first character of a getopt
@@ -143,6 +221,8 @@ pub(crate) struct Getopt<'a, K> {
     last: Option<(usize, bool)>,
     /// Index into `args` of the word that option came from.
     last_word: Option<usize>,
+    /// The Dogfish switches accepted, and where they are recorded.
+    switches: Option<(Switch, Arc<Switches>)>,
 }
 
 impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
@@ -167,7 +247,16 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             done: false,
             last: None,
             last_word: None,
+            switches: SWITCHES.get().cloned(),
         }
+    }
+
+    /// Accepts the Dogfish switches `allowed`, recording them in `into`,
+    /// instead of those installed for the running tool.
+    #[cfg(test)]
+    pub(crate) fn with_switches(mut self, allowed: Switch, into: Arc<Switches>) -> Self {
+        self.switches = Some((allowed, into));
+        self
     }
 
     /// The next option and its argument, `None` once options are exhausted,
@@ -278,10 +367,65 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             }
         }
         if arg[1] == b'-' {
+            match self.switch() {
+                Ok(true) => return self.step(),
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            }
             return Some(self.long_opt());
         }
         self.cluster = 1;
         Some(self.short_opt())
+    }
+
+    /// Handles `args[idx]` if it is a Dogfish switch the tool accepts, spelled
+    /// in full and not shadowed by one of the tool's own options.
+    fn switch(&mut self) -> Result<bool, GetoptError> {
+        let Some((allowed, into)) = &self.switches else {
+            return Ok(false);
+        };
+        let body = &self.args[self.idx].as_bytes()[2..];
+        let (name, when) = match body.iter().position(|&b| b == b'=') {
+            Some(eq) => (&body[..eq], Some(&body[eq + 1..])),
+            None => (body, None),
+        };
+        if self
+            .specs
+            .iter()
+            .any(|s| s.long.is_some_and(|l| l.as_bytes() == name))
+        {
+            return Ok(false);
+        }
+        match (name, when) {
+            (b"stats", None) if allowed.has(Switch::STATS) => into.set_stats(true),
+            (b"no-color", None) if allowed.has(Switch::NO_COLOR) => {
+                into.set_color(ColorMode::Never)
+            }
+            (b"color", when) if allowed.has(Switch::COLOR) => {
+                let mode = match when {
+                    None => ColorMode::Always,
+                    Some(w) => std::str::from_utf8(w)
+                        .ok()
+                        .filter(|w| !w.is_empty())
+                        .and_then(ColorMode::from_when)
+                        .ok_or_else(|| {
+                            let mut m = b"invalid argument ".to_vec();
+                            m.extend_from_slice(quote_locale(OsStr::from_bytes(w)).as_bytes());
+                            m.extend_from_slice(
+                                b" for '--color'\nValid arguments are:\n  \
+                                  - 'always', 'yes', 'force'\n  \
+                                  - 'never', 'no', 'none'\n  \
+                                  - 'auto', 'tty', 'if-tty'",
+                            );
+                            GetoptError(m)
+                        })?,
+                };
+                into.set_color(mode);
+            }
+            _ => return Ok(false),
+        }
+        self.idx += 1;
+        Ok(true)
     }
 
     fn long_opt(&mut self) -> Result<Arg<K>, GetoptError> {
@@ -312,14 +456,16 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
                 let mut first: Option<usize> = None;
                 let mut ambiguous: Vec<usize> = Vec::new();
                 for (i, l) in longs() {
-                    if !l.as_bytes().starts_with(name) {
+                    if self.specs[i].exact || !l.as_bytes().starts_with(name) {
                         continue;
                     }
                     match first {
                         None => first = Some(i),
                         Some(f) => {
                             let (a, b) = (&self.specs[f], &self.specs[i]);
-                            if a.key != b.key || a.arg != b.arg {
+                            // glibc compares `val`, which is the short option when
+                            // there is one: same key, argument and letter is a synonym.
+                            if a.key != b.key || a.arg != b.arg || a.short != b.short {
                                 if ambiguous.is_empty() {
                                     ambiguous.push(f);
                                 }
@@ -920,5 +1066,97 @@ mod tests {
         assert_eq!(exit_failure("ls"), 2);
         assert_eq!(exit_failure("env"), 125);
         assert_eq!(exit_failure("cat"), 1);
+    }
+
+    /// Parses `args` accepting the Dogfish switches `allowed`; returns the
+    /// parse and the switches it recorded.
+    fn parse_switches(
+        args: &[&str],
+        specs: &[OptSpec<K>],
+        allowed: Switch,
+    ) -> (Result<Parsed, String>, Arc<Switches>) {
+        let ctx = dogfish_core::DogfishContext::new("test");
+        ctx.switches.set_stats(false);
+        let mut g = Getopt::new(os(args), specs).with_switches(allowed, ctx.switches.clone());
+        let mut opts = Vec::new();
+        let res = loop {
+            match g.next() {
+                Some(Ok((k, v))) => opts.push((k, v.map(|v| lossy(&v)))),
+                Some(Err(e)) => break Err(e.to_string()),
+                None => break Ok(()),
+            }
+        };
+        (
+            res.map(|()| (opts, lossy_all(g.operands()))),
+            ctx.switches.clone(),
+        )
+    }
+
+    #[test]
+    fn switches_match_only_in_full() {
+        let all = Switch::STATS.with(Switch::NO_COLOR).with(Switch::COLOR);
+        let (res, sw) = parse_switches(&["--stats", "f", "--no-color", "-a"], SPECS, all);
+        assert_eq!(res.unwrap(), (vec![(K::All, None)], vec!["f".to_string()]));
+        assert!(sw.stats());
+        assert_eq!(sw.color(), ColorMode::Never);
+        // An abbreviation is left to the tool's own options, as in GNU.
+        let (res, sw) = parse_switches(&["--stat"], SPECS, all);
+        assert_eq!(res.unwrap_err(), "unrecognized option '--stat'");
+        assert!(!sw.stats());
+        let (res, sw) = parse_switches(&["--color=never", "--color"], SPECS, all);
+        assert!(res.is_ok());
+        assert_eq!(sw.color(), ColorMode::Always);
+        let (res, _) = parse_switches(&["--color=sometimes"], SPECS, all);
+        assert!(
+            res.unwrap_err()
+                .starts_with("invalid argument 'sometimes' for '--color'\n")
+        );
+    }
+
+    #[test]
+    fn switches_not_granted_are_gnu_errors_or_operands() {
+        let (res, sw) = parse_switches(&["--stats"], SPECS, Switch::NONE);
+        assert_eq!(res.unwrap_err(), "unrecognized option '--stats'");
+        assert!(!sw.stats());
+        let (res, _) = parse_switches(&["--color"], SPECS, Switch::STATS);
+        assert_eq!(res.unwrap_err(), "unrecognized option '--color'");
+        // After `--`, a switch is an operand.
+        let (res, sw) = parse_switches(&["--", "--stats"], SPECS, Switch::STATS);
+        assert_eq!(res.unwrap().1, ["--stats"]);
+        assert!(!sw.stats());
+    }
+
+    #[test]
+    fn a_tools_own_option_shadows_a_switch() {
+        const OWN: &[OptSpec<K>] = &[OptSpec::long("color", HasArg::Optional, K::Width)];
+        let (res, sw) = parse_switches(&["--color=never"], OWN, Switch::COLOR);
+        assert_eq!(res.unwrap().0, vec![(K::Width, some("never"))]);
+        assert_eq!(sw.color(), ColorMode::Auto);
+    }
+
+    #[test]
+    fn exact_specs_are_never_abbreviated_or_ambiguous() {
+        const EXT: &[OptSpec<K>] = &[
+            OptSpec::long("show-all", HasArg::No, K::ShowAll),
+            OptSpec::long("show-ends", HasArg::No, K::ShowEnds),
+            OptSpec::long("shout", HasArg::No, K::Tty).exact(),
+        ];
+        let first = |args: &[&str]| {
+            Getopt::new(os(args), EXT)
+                .next()
+                .map(|o| o.map(|(k, _)| k).map_err(|e| e.to_string()))
+        };
+        assert_eq!(first(&["--shout"]), Some(Ok(K::Tty)));
+        assert_eq!(
+            first(&["--shou"]),
+            Some(Err("unrecognized option '--shou'".into()))
+        );
+        assert_eq!(
+            first(&["--sh"]),
+            Some(Err(
+                "option '--sh' is ambiguous; possibilities: '--show-all' '--show-ends'".into()
+            ))
+        );
+        assert_eq!(first(&["--show-a"]), Some(Ok(K::ShowAll)));
     }
 }
