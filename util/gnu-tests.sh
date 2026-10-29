@@ -70,8 +70,10 @@ echo "gnu-tests: Dogfish provides $(wc -l <"$tools_file") GNU programs"
 assert_swapped() {
   local tool bad=""
   while read -r tool; do
-    [ -L "$src/src/$tool" ] && "$src/src/$tool" --version 2>/dev/null | grep -q 'GNU/Dogfish' \
-      || bad="$bad $tool"
+    # Capture first: `false --version` prints its version and still exits 1.
+    local banner
+    banner=$("$src/src/$tool" --version 2>/dev/null || true)
+    [ -L "$src/src/$tool" ] && [[ "$banner" == *GNU/Dogfish* ]] || bad="$bad $tool"
   done <"$tools_file"
   [ -z "$bad" ] || die "$1: not Dogfish:$bad"
 }
