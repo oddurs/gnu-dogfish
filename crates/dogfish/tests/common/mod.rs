@@ -125,19 +125,38 @@ pub fn locale_is_utf8(locale: &str) -> bool {
     })
 }
 
-/// Runs one case in `dir` through both implementations and asserts they match.
-pub fn check(dir: &Path, case: Case<'_>) {
-    let Some(gnu) = gnu_tool(case.tool) else {
+/// Like [`check`], but only builds the fixtures once the case is known to run, so a
+/// platform without GNU coreutils (e.g. macOS) never creates them — some fixtures
+/// (non-UTF-8 names, say) are not even representable on every filesystem.
+pub fn check_lazy(fixtures: impl FnOnce() -> &'static Path, case: Case<'_>) {
+    if !will_run(&case) {
+        return;
+    }
+    check(fixtures(), case);
+}
+
+/// Whether `case` can be compared here; prints why not when it can't.
+fn will_run(case: &Case<'_>) -> bool {
+    if gnu_tool(case.tool).is_none() {
         eprintln!(
             "note: skipping — system `{}` is missing or not GNU coreutils",
             case.tool
         );
-        return;
-    };
+        return false;
+    }
     if case.locale != "C" && !locale_is_utf8(case.locale) {
         eprintln!("note: skipping — locale `{}` is unavailable", case.locale);
+        return false;
+    }
+    true
+}
+
+/// Runs one case in `dir` through both implementations and asserts they match.
+pub fn check(dir: &Path, case: Case<'_>) {
+    if !will_run(&case) {
         return;
     }
+    let gnu = gnu_tool(case.tool).expect("checked by will_run");
 
     let mut ours = Command::new(dogfish_bin());
     ours.arg(case.tool).args(case.args);
@@ -199,7 +218,7 @@ macro_rules! gnu_cases {
                 #[allow(unused_mut, unused_assignments)]
                 let mut compare_stderr = true;
                 $( let _ = stringify!($nostderr); compare_stderr = false; )?
-                $crate::common::check(fixtures(), $crate::common::Case {
+                $crate::common::check_lazy(fixtures, $crate::common::Case {
                     tool: $tool,
                     args: &[$($arg),*],
                     stdin,

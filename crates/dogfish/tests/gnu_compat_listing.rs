@@ -108,8 +108,12 @@ fn build_fixture(dir: &Path) {
     common::write_files(dir, files);
     let p = |rel: &str| dir.join(rel);
 
-    // A name that is not valid UTF-8.
-    fs::write(dir.join(OsStr::from_bytes(b"names/bad\xffbyte")), b"").unwrap();
+    // A name that is not valid UTF-8. Some filesystems (APFS) refuse such names with
+    // EILSEQ; cases only run against GNU coreutils on Linux, so skip it there.
+    match fs::write(dir.join(OsStr::from_bytes(b"names/bad\xffbyte")), b"") {
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
+        res => res.unwrap(),
+    }
     fs::create_dir_all(p("empty_dir")).unwrap();
     fs::create_dir_all(p("sticky")).unwrap();
     fs::File::create(p("sparse.img"))
