@@ -276,6 +276,27 @@ gnu_cases! {
     mktemp_suffix_template_quoted: "mktemp" ["-d", "--suffix=aXXXXb", ""];
     mktemp_suffix_not_x: "mktemp" ["--suffix=b", "aXXa"];
     mktemp_quiet_create_failure: "mktemp" ["-q", "nonexist/fooXXXX"];
+    // --------------------------------------------------------------- shuf
+    shuf_single_range: "shuf" ["-i", "5-5"];
+    shuf_zero_terminated: "shuf" ["-z", "-i", "1-1"];
+    shuf_echo_one: "shuf" ["-e", "a"];
+    shuf_head_zero_unreadable: "shuf" ["-n0", "nonexist"];
+    shuf_repeat_head_zero: "shuf" ["-r", "-n", "0", "lines.txt"];
+    shuf_echo_and_range: "shuf" ["-i0-9", "-e", "A"];
+    shuf_bad_count: "shuf" ["-nA"];
+    shuf_two_ranges: "shuf" ["-i0-9", "-i8-90"];
+    shuf_range_no_dash: "shuf" ["-i1"];
+    shuf_range_no_hi: "shuf" ["-i1-"];
+    shuf_range_bad_hi: "shuf" ["-i1-A"];
+    shuf_range_reversed: "shuf" ["-i2-1"];
+    shuf_range_too_large: "shuf" ["-i1-99999999999999999999"];
+    shuf_range_operand: "shuf" ["-i0-0", "1"];
+    shuf_two_outputs: "shuf" ["-i0-9", "-o", "A", "-o", "B"];
+    shuf_two_random_sources: "shuf" ["-i0-9", "--random-source", "A", "--random-source", "B"];
+    shuf_echo_repeat_nothing: "shuf" ["-er"];
+    shuf_extra_operand: "shuf" ["lines.txt", "many.txt"];
+    shuf_missing_file: "shuf" ["nonexist"];
+    shuf_one_line_no_newline: "shuf" [] stdin b"x";
 }
 
 // ------------------------------------------------------- shell pipelines
@@ -376,4 +397,13 @@ shell_cases! {
     // ---------------------------------------------- echo / mktemp, POSIX
     echo_posixly_correct: ["echo"] "export POSIXLY_CORRECT=1; env echo -n -E 'foo\\n'; env echo -nE foo; env echo -E -n foo; env echo --version";
     mktemp_posixly_correct: ["mktemp"] "POSIXLY_CORRECT=1 mktemp aXXXX --suffix=b; echo $?";
+
+    // --------------------------------------------------------------- shuf
+    shuf_is_permutation: ["shuf"] "seq 100 > in; shuf in | sort -n | cmp - in && echo ok";
+    shuf_range_is_permutation: ["shuf"] "shuf -i 1-100 | sort -n | md5sum";
+    shuf_min_head_count: ["shuf"] "shuf -n10 -i0-9 -n3 -n20 | wc -l";
+    shuf_huge_range_subset: ["shuf"] "shuf -i1-18446744073709551615 -n2 | wc -l";
+    shuf_repeat_count: ["shuf"] "shuf --rep -i0-9 -n1000 | sort -nu | paste -s -d ' '";
+    shuf_repeat_forever: ["shuf"] "shuf --rep -e A B | head -n 1000 | wc -l";
+    shuf_closed_stdin_file: ["shuf"] "shuf /dev/null <&-; echo $?";
 }
