@@ -18,7 +18,7 @@ use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
     print_version, unsupported,
 };
-use crate::common::input::{close_stdin, safe_read, stdin_file};
+use crate::common::input::{close_stdin, safe_read, stdin_file, stdin_is_closed};
 use crate::common::locale::utf8_locale;
 use crate::common::quote::{qa, qf};
 
@@ -503,6 +503,10 @@ fn count_source(src: &InputSource, opts: &WcOpts, ctx: &DogfishContext) -> io::R
 
 /// (is_regular_file, size) of standard input.
 fn stdin_stat() -> Option<(bool, u64)> {
+    // GNU's fstat of a closed fd 0 fails; ours sees the /dev/null holding it.
+    if stdin_is_closed() {
+        return None;
+    }
     let meta = stdin_file().metadata().ok()?;
     Some((meta.is_file(), meta.len()))
 }

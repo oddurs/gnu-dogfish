@@ -130,10 +130,26 @@ fn paste_parallel<W: Write>(
     out: &mut W,
 ) -> io::Result<bool> {
     let mut ok = true;
-    let mut readers: Vec<Option<Box<dyn BufRead>>> = Vec::with_capacity(files.len());
+    // Every `-` reads the one standard input, as GNU's `stdin` stream:
+    // `readers[i]` indexes the open inputs in `inputs`.
+    let mut inputs: Vec<Box<dyn BufRead>> = Vec::with_capacity(files.len());
+    let mut stdin_index = None;
+    let mut readers: Vec<Option<usize>> = Vec::with_capacity(files.len());
     for name in files {
+        if name == "-"
+            && let Some(idx) = stdin_index
+        {
+            readers.push(Some(idx));
+            continue;
+        }
         match open(name) {
-            Ok(r) => readers.push(Some(r)),
+            Ok(r) => {
+                if name == "-" {
+                    stdin_index = Some(inputs.len());
+                }
+                readers.push(Some(inputs.len()));
+                inputs.push(r);
+            }
             Err(e) => {
                 out.flush()?;
                 eprintln!("paste: {}: {}", qf(name), gnu_io_error(&e));
@@ -156,7 +172,7 @@ fn paste_parallel<W: Write>(
                 break;
             }
             let mut sometodo = false;
-            if let Some(r) = readers[i].as_mut() {
+            if let Some(r) = readers[i].map(|idx| &mut inputs[idx]) {
                 let peeked = match r.fill_buf() {
                     Ok(b) => !b.is_empty(),
                     Err(e) => {

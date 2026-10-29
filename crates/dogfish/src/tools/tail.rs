@@ -286,13 +286,11 @@ fn open_tail_input(src: &InputSource) -> io::Result<FastReader> {
         let mut stdin = stdin_file();
         if stdin.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
             && stdin.stream_position().is_ok_and(|p| p == 0)
-        {
-            if let Ok(map @ FastReader::Mapped(_)) =
+            && let Ok(map @ FastReader::Mapped(_)) =
                 stdin.try_clone().and_then(FastReader::from_file)
-            {
-                let _ = stdin.seek(io::SeekFrom::End(0));
-                return Ok(map);
-            }
+        {
+            let _ = stdin.seek(io::SeekFrom::End(0));
+            return Ok(map);
         }
     }
     FastReader::open(src)

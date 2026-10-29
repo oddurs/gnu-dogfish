@@ -595,6 +595,7 @@ fn cut_objects(mut objs: Vec<Value>, parsed: &CutArgs, ctx: &DogfishContext) -> 
 #[cfg(test)]
 mod tests {
     use super::set_fields;
+    use crate::common::quote::quote_locale;
 
     #[test]
     fn lists() {
@@ -611,7 +612,10 @@ mod tests {
         );
         assert_eq!(
             set_fields("18446744073709551615", true, false),
-            Err("byte/character offset '18446744073709551615' is too large".to_string())
+            Err(format!(
+                "byte/character offset {} is too large",
+                quote_locale("18446744073709551615")
+            ))
         );
         assert!(set_fields("18446744073709551614-", true, false).is_ok());
     }

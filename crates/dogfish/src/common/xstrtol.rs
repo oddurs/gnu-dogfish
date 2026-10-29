@@ -188,17 +188,21 @@ mod tests {
         let e = "invalid number of lines";
         assert_eq!(
             xdectoumax("1x", 0, u64::MAX, HEAD, e),
-            Err("invalid number of lines: '1x'".to_string())
+            Err(format!("invalid number of lines: {}", quote_locale("1x")))
         );
         assert_eq!(
             xdectoumax("99999999999999999999", 0, u64::MAX, HEAD, e),
-            Err("invalid number of lines: '99999999999999999999': \
-                 Value too large for defined data type"
-                .to_string())
+            Err(format!(
+                "invalid number of lines: {}: Value too large for defined data type",
+                quote_locale("99999999999999999999")
+            ))
         );
         assert_eq!(
             xdectoumax("5", 1, 3, "", e),
-            Err("invalid number of lines: '5': Numerical result out of range".to_string())
+            Err(format!(
+                "invalid number of lines: {}: Numerical result out of range",
+                quote_locale("5")
+            ))
         );
     }
 }

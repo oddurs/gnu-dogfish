@@ -60,6 +60,12 @@ pub(crate) fn stdin_started_closed() {
     STDIN_CLOSED.store(true, Ordering::Relaxed);
 }
 
+/// Whether fd 0 was closed at start-up (and is held by `/dev/null`), so
+/// that `fstat` of it would fail in GNU.
+pub(crate) fn stdin_is_closed() -> bool {
+    STDIN_CLOSED.load(Ordering::Relaxed)
+}
+
 /// Closes standard input, as GNU tools do after reading it, so that a closed
 /// descriptor (`tool - <&-`) is reported.
 pub(crate) fn close_stdin() -> io::Result<()> {
