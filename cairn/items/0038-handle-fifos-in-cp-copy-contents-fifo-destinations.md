@@ -3,7 +3,10 @@ id: 38
 uid: eef8e6b4-2f2c-4ca6-9b54-7bbec4d7903e
 title: "Handle FIFOs in cp (--copy-contents, FIFO destinations)"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -38,5 +41,9 @@ permission order. All listed tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+Fixed by porting GNU's copy.c, cp-hash.c, ln.c, force-link.c and backupfile.c into `common/copy.rs` (shared by cp and mv) and ln: FIFO destinations and `--copy-contents` behave as GNU's, with the race-free permission order. Every listed GNU test passes (util/gnu-test-one.sh) and is in `util/gnu-baseline.json`; 104 new differential cases cover the cp/mv/ln changes, and the undo trash keeps every replaced destination (special files are recreated, never read).
