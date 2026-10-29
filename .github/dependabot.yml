@@ -33,3 +33,8 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+    ignore:
+      # The toolchain pins are deliberate: 1.88.0 is the MSRV the MSRV job
+      # tests, and the Clippy pin keeps new lints from failing unrelated PRs.
+      # Bump them by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
