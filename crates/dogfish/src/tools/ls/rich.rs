@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use dogfish_core::{DogfishContext, Style, format_mode_rwx, format_relative_time};
 use serde::Serialize;
 
-use crate::sys::{get_groupname_by_gid, get_username_by_uid};
+use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 use crate::tools::ls::lister::LsFile;
 
 #[derive(Serialize, Clone)]

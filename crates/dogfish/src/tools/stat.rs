@@ -27,7 +27,7 @@ use crate::common::gnu_getopt::{
 };
 use crate::common::quote::{Quoting, quote_af, quote_bytes, quote_bytes_raw};
 use crate::common::strftime::{Timespec, format_local_time};
-use crate::sys::{get_groupname_by_gid, get_username_by_uid};
+use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
 const STAT_OPTIONS: &[OptSpec] = &[
     OptSpec::new("dereference", Some('L'), Some("dereference"), OptArg::No),

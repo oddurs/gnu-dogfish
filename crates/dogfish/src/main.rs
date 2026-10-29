@@ -7,7 +7,6 @@
 mod common;
 mod hash;
 mod meta;
-mod sys;
 mod tools;
 
 use std::path::Path;
@@ -494,24 +493,24 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
         "basenc" => hash::run_basenc(args, ctx),
 
         // Tier 4: Shell & System
-        "echo" => sys::run_echo(args, ctx),
-        "printf" => sys::run_printf(args, ctx),
-        "env" => sys::run_env(args, ctx),
-        "printenv" => sys::run_printenv(args, ctx),
-        "id" => sys::run_id(args, ctx),
-        "uname" => sys::run_uname(args, ctx),
-        "hostname" => sys::run_hostname(args, ctx),
-        "nproc" => sys::run_nproc(args, ctx),
-        "whoami" => sys::run_whoami(args, ctx),
-        "yes" => sys::run_yes(args, ctx),
-        "true" => sys::run_true(args, ctx),
-        "false" => sys::run_false(args, ctx),
-        "sleep" => sys::run_sleep(args, ctx),
-        "timeout" => sys::run_timeout(args, ctx),
-        "watch" => sys::run_watch(args, ctx),
-        "seq" => sys::run_seq(args, ctx),
-        "date" => sys::run_date(args, ctx),
-        "tee" => sys::run_tee(args, ctx),
+        "echo" => tools::echo::run_echo(args, ctx),
+        "printf" => tools::printf::run_printf(args, ctx),
+        "env" => tools::env::run_env(args, ctx),
+        "printenv" => tools::printenv::run_printenv(args, ctx),
+        "id" => tools::id::run_id(args, ctx),
+        "uname" => tools::uname::run_uname(args, ctx),
+        "hostname" => tools::hostname::run_hostname(args, ctx),
+        "nproc" => tools::nproc::run_nproc(args, ctx),
+        "whoami" => tools::whoami::run_whoami(args, ctx),
+        "yes" => tools::yes::run_yes(args, ctx),
+        "true" => tools::true_false::run_true(args, ctx),
+        "false" => tools::true_false::run_false(args, ctx),
+        "sleep" => tools::sleep::run_sleep(args, ctx),
+        "timeout" => tools::timeout::run_timeout(args, ctx),
+        "watch" => tools::watch::run_watch(args, ctx),
+        "seq" => tools::seq::run_seq(args, ctx),
+        "date" => tools::date::run_date(args, ctx),
+        "tee" => tools::tee::run_tee(args, ctx),
 
         // Meta-Tools
         "bench" => meta::run_bench(args, ctx),

@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::common::strftime::Timespec;
-use crate::sys::{get_groupname_by_gid, get_username_by_uid};
+use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
 /// coreutils `find_mount_point`: the deepest ancestor of `path` (itself, if a
 /// directory) on the same device.

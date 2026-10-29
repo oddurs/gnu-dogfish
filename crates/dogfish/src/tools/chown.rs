@@ -12,7 +12,7 @@ use crate::common::path::dir_names;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
-use crate::sys::{get_groupname_by_gid, get_username_by_uid};
+use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
 const CHOWN_HELP: &str = "\
 Usage: chown [OPTION]... [OWNER][:[GROUP]] FILE...
