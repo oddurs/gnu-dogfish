@@ -162,3 +162,9 @@ pub fn run_nproc(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result
     }
     Ok(0)
 }
+
+/// nproc's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("nproc", NPROC_HELP, SPECS)
+}

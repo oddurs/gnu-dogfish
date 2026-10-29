@@ -113,3 +113,9 @@ pub fn run_install_links(
     );
     Ok(0)
 }
+
+/// install-links's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("install-links", INSTALL_LINKS_HELP, SPECS)
+}

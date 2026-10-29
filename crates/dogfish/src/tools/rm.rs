@@ -795,3 +795,12 @@ fn rm_entries(
         RmStatus::Removed
     }
 }
+
+/// rm's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("rm", RM_HELP, SPECS).choices(
+        "interactive",
+        ["never", "no", "none", "once", "always", "yes"],
+    )
+}

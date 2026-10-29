@@ -1025,3 +1025,10 @@ fn stat_card(
 fn selinux_enabled() -> bool {
     cfg!(target_os = "linux") && Path::new("/sys/fs/selinux/enforce").exists()
 }
+
+/// stat's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("stat", STAT_HELP, STAT_OPTIONS)
+        .choices("cached", ["default", "never", "always"])
+}

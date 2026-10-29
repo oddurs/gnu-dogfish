@@ -32,6 +32,12 @@ const BACKUP_ARGS: &[(&str, BackupMode)] = &[
     ("t", BackupMode::Numbered),
 ];
 
+/// The words `--backup=CONTROL` accepts, for the manual pages and
+/// completions.
+pub(crate) fn backup_words() -> impl Iterator<Item = &'static str> {
+    BACKUP_ARGS.iter().map(|(w, _)| *w)
+}
+
 /// The mode for `-b` / `--backup[=CONTROL]`: CONTROL, else `$VERSION_CONTROL`,
 /// else `existing`.
 pub(crate) fn backup_mode(tool: &str, arg: Option<&str>) -> std::result::Result<BackupMode, i32> {

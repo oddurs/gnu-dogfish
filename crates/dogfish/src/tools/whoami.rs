@@ -68,3 +68,9 @@ pub fn run_whoami(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// whoami's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("whoami", WHOAMI_HELP, SPECS)
+}

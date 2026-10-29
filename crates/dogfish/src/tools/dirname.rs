@@ -70,3 +70,9 @@ fn compute_dirname(path: &[u8]) -> &[u8] {
     }
     if len == 0 { b"." } else { &path[..len] }
 }
+
+/// dirname's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("dirname", DIRNAME_HELP, SPECS)
+}

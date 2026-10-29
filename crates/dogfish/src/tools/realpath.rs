@@ -203,3 +203,9 @@ pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(exit_code)
 }
+
+/// realpath's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("realpath", REALPATH_HELP, SPECS)
+}

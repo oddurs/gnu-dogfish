@@ -199,3 +199,9 @@ fn mkdir_one(
         Err(e) => Err(cannot(dir, gnu_io_error(&e))),
     }
 }
+
+/// mkdir's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("mkdir", MKDIR_HELP, SPECS)
+}

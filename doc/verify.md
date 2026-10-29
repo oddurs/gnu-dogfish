@@ -5,7 +5,7 @@ has these files:
 
 | File | What it is |
 | --- | --- |
-| `gnu-dogfish-linux-x86_64.tar.gz`, `gnu-dogfish-macos-arm64.tar.gz` | The `dogfish` binary with README, licenses and changelog. |
+| `gnu-dogfish-linux-x86_64.tar.gz`, `gnu-dogfish-macos-arm64.tar.gz` | The `dogfish` binary with README, licenses and changelog, and `share/`: manual pages and bash, zsh and fish completions. |
 | `<archive>.sha256` | The archive's SHA-256, in `sha256sum` format. |
 | `gnu-dogfish-linux-x86_64.cdx.json`, `gnu-dogfish-macos-arm64.cdx.json` | A [CycloneDX](https://cyclonedx.org/) SBOM per archive: every crate compiled into (or used to build) that binary, with version, license and package URL. |
 | `SHA256SUMS` | SHA-256 of every archive and SBOM. |

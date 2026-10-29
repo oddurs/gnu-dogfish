@@ -335,3 +335,9 @@ fn make_bench_row(name: &str, df: Duration, sys: Duration, strategy: &str) -> Be
         strategy: strategy.to_string(),
     }
 }
+
+/// bench's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("bench", BENCH_HELP, SPECS)
+}

@@ -499,6 +499,12 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     ok
 }
 
+/// chown's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("chown", CHOWN_HELP, SPECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

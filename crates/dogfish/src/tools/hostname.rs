@@ -62,3 +62,9 @@ pub fn run_hostname(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     outln!("{}", name);
     Ok(0)
 }
+
+/// hostname's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("hostname", HOSTNAME_HELP, SPECS)
+}

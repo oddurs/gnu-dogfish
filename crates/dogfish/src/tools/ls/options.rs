@@ -860,6 +860,51 @@ fn tab_size(opt: Option<usize>) -> usize {
     }
 }
 
+/// ls's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("ls", LS_HELP, LS_OPTIONS)
+        .choices("color", crate::manual::COLOR_WHEN.iter().copied())
+        .choices("hyperlink", crate::manual::COLOR_WHEN.iter().copied())
+        .choices("classify", crate::manual::COLOR_WHEN.iter().copied())
+        .choices(
+            "indicator-style",
+            ["none", "slash", "file-type", "classify"],
+        )
+        .choices(
+            "format",
+            [
+                "verbose",
+                "long",
+                "commas",
+                "horizontal",
+                "across",
+                "vertical",
+                "single-column",
+            ],
+        )
+        .choices("quoting-style", Quoting::NAMES)
+        .choices(
+            "sort",
+            ["none", "time", "size", "extension", "version", "width"],
+        )
+        .choices(
+            "time",
+            [
+                "atime",
+                "access",
+                "use",
+                "ctime",
+                "status",
+                "mtime",
+                "modification",
+                "birth",
+                "creation",
+            ],
+        )
+        .choices("time-style", ["full-iso", "long-iso", "iso", "locale"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
