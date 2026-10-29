@@ -172,6 +172,17 @@ GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's
 
 ## 🚀 Installation & Shell Integration
 
+### Prebuilt Binaries
+
+Linux (x86_64) and macOS (arm64) archives are on the [Releases page](https://github.com/oddurs/gnu-dogfish/releases), with `SHA256SUMS`, an SBOM, and signed build provenance. Check them before use:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify gnu-dogfish-linux-x86_64.tar.gz --repo oddurs/gnu-dogfish
+```
+
+[doc/verify.md](doc/verify.md) covers the details, including rebuilding a release bit for bit.
+
 ### Build from Source
 ```bash
 git clone https://github.com/oddurs/gnu-dogfish.git
