@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use dogfish_core::journal::inode;
-use dogfish_core::{JournalAction, JournalEntry, UndoJournal, crash_point, move_path};
+use dogfish_core::{JournalAction, JournalEntry, Take, UndoJournal, crash_point, move_path};
 
 use crate::common::getopt::argmatch;
 use crate::common::path::{absolute, base_len, c_path, last_component, rename_noreplace};
@@ -207,7 +207,7 @@ pub(crate) fn make_backup(
             None => None,
         };
         let saved = match (journal, &mut entry) {
-            (Some(j), Some(e)) if mode == BackupMode::Simple => j.take(e, &backup, false)?,
+            (Some(j), Some(e)) if mode == BackupMode::Simple => j.take(e, &backup, Take::Move)?,
             _ => None,
         };
         crash_point();

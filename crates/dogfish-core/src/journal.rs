@@ -384,6 +384,34 @@ fn line_id(line: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// How [`UndoJournal::take`] saves a target in the trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Moved there: the caller removes or replaces the target anyway.
+    Move,
+    /// Copied there, the target left in place: the caller writes into it
+    /// (e.g. `cp -r` merging into a directory).
+    Copy,
+    /// Hard-linked there (copied when it can't be), the target left in place:
+    /// the caller replaces it with one `rename`, so the name never goes missing
+    /// in between, as with GNU `mv`.
+    Link,
+}
+
+/// Saves `src` as the new trash slot `slot` without taking it away: a hard link
+/// (same inode, so its other links and timestamps stay as they are), or a copy
+/// for a directory or where linking is refused.
+fn link_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
+    let is_dir = fs::symlink_metadata(src)?.is_dir();
+    if !is_dir {
+        crash_point();
+        if fs::hard_link(src, slot).is_ok() {
+            return Ok(());
+        }
+    }
+    copy_into_slot(src, slot)
+}
+
 /// Copies `src` into the new trash slot `slot`, which appears only once complete.
 fn copy_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
     let mut part = slot.as_os_str().to_os_string();
@@ -844,14 +872,14 @@ impl UndoJournal {
 
     /// Saves whatever is at `target` (if anything) in the trash, as the backup of the
     /// pending `entry`, so an overwriting `cp`/`mv` can be undone. The trash slot is
-    /// recorded in the journal before anything moves. With `by_copy`, `target` is
-    /// left in place (needed when the caller writes into it, e.g. `cp -r` merging
-    /// into a directory). Returns the slot, or `None` when there is nothing to save.
+    /// recorded in the journal before anything moves; `how` says whether `target`
+    /// moves there or stays in place. Returns the slot, or `None` when there is
+    /// nothing to save.
     pub fn take(
         &self,
         entry: &mut JournalEntry,
         target: &Path,
-        by_copy: bool,
+        how: Take,
     ) -> io::Result<Option<PathBuf>> {
         if !exists_no_follow(target) {
             return Ok(None);
@@ -859,10 +887,10 @@ impl UndoJournal {
         let slot = self.trash_slot(target);
         entry.action.set_backup(Some(slot.clone()));
         self.update(entry)?;
-        let res = if by_copy {
-            copy_into_slot(target, &slot)
-        } else {
-            move_path(target, &slot)
+        let res = match how {
+            Take::Move => move_path(target, &slot),
+            Take::Copy => copy_into_slot(target, &slot),
+            Take::Link => link_into_slot(target, &slot),
         };
         match res {
             Ok(()) => {

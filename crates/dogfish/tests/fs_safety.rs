@@ -135,6 +135,30 @@ fn undo_of_overwriting_mv_restores_both_files() {
     assert_eq!(sb.read("b"), "B");
 }
 
+/// `mv a b` replaces `b` with one rename, as GNU's does: killed at any step,
+/// `b` is there with either its old or its new contents, never missing (a
+/// `tail -F b` would otherwise report it gone), and undo restores both files.
+#[cfg(debug_assertions)]
+#[test]
+fn overwriting_mv_never_leaves_the_destination_missing() {
+    for n in 1..100 {
+        let sb = Sandbox::new();
+        sb.write("a", "A");
+        sb.write("b", "B");
+        let n = n.to_string();
+        let out = sb.run_env(&["mv", "a", "b"], &[("DOGFISH_CRASH_AT", &n)]);
+        let b = sb.read("b");
+        assert!(b == "A" || b == "B", "crash at {n}: b = {b:?}");
+        assert!(sb.run(&["undo"]).status.success(), "crash at {n}");
+        assert_eq!(sb.read("a"), "A", "crash at {n}");
+        assert_eq!(sb.read("b"), "B", "crash at {n}");
+        if out.status.success() {
+            return;
+        }
+    }
+    panic!("mv a b never ran to completion");
+}
+
 #[test]
 fn undo_refuses_to_clobber_new_files() {
     let sb = Sandbox::new();

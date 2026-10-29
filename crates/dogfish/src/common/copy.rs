@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::outln;
 use dogfish_core::{
-    CopyMethod, DogfishContext, JournalAction, JournalEntry, UndoJournal, crash_point,
+    CopyMethod, DogfishContext, JournalAction, JournalEntry, Take, UndoJournal, crash_point,
     gnu_io_error, move_path,
 };
 
@@ -788,10 +788,10 @@ impl<'a> Copier<'a> {
         }
     }
 
-    /// Saves the top-level `dst` in the trash: moved there (it is about to be
-    /// replaced), or with `by_copy` copied (it is about to be written into).
+    /// Saves the top-level `dst` in the trash, as `how` says (see [`Take`]).
     /// The trash slot is in the journal before anything moves.
-    fn journal_save(&mut self, dst: &Path, by_copy: bool) -> io::Result<bool> {
+    fn journal_save(&mut self, dst: &Path, how: Take) -> io::Result<bool> {
+        let by_copy = how == Take::Copy;
         let Some(p) = &mut self.plan else {
             return Ok(false);
         };
@@ -808,7 +808,7 @@ impl<'a> Copier<'a> {
             return Err(io::Error::other("cannot record the operation for undo"));
         };
         entry.action = action;
-        match j.take(entry, dst, by_copy)? {
+        match j.take(entry, dst, how)? {
             Some(b) => {
                 p.backup = Some(b);
                 Ok(true)
@@ -826,7 +826,16 @@ impl<'a> Copier<'a> {
         if self.journal_wants(dst, top).is_none() {
             return Ok(false);
         }
-        self.journal_save(dst, false)
+        self.journal_save(dst, Take::Move)
+    }
+
+    /// As [`Self::journal_take`], but `dst` stays in place for a `rename` to
+    /// replace atomically.
+    fn journal_take_linked(&mut self, dst: &Path, top: bool) -> io::Result<bool> {
+        if self.journal_wants(dst, top).is_none() {
+            return Ok(false);
+        }
+        self.journal_save(dst, Take::Link)
     }
 
     /// Puts a destination saved by [`Self::journal_take`] back after the
@@ -845,7 +854,7 @@ impl<'a> Copier<'a> {
     /// Saves a copy of `real` (a regular file or a directory) before the
     /// operation writes into it.
     fn journal_copy(&mut self, real: &Path) -> io::Result<()> {
-        self.journal_save(real, true).map(|_| ())
+        self.journal_save(real, Take::Copy).map(|_| ())
     }
 
     fn journal_failed(&self, dst: &Path, e: &io::Error) {
@@ -1685,7 +1694,7 @@ impl<'a> Copier<'a> {
                     !d.is_dir() || fs::read_dir(dst).is_ok_and(|mut r| r.next().is_none())
                 });
                 if replaceable {
-                    match self.journal_take(dst, top) {
+                    match self.journal_take_linked(dst, top) {
                         Ok(s) => saved = s,
                         Err(e) => {
                             self.journal_failed(dst, &e);
