@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, Table, gnu_io_error, io::install_sigpipe_handler,
+    ColumnAlign, DogfishContext, Table, gnu_io_error,
+    io::{install_sigbus_handler, install_sigpipe_handler},
     strip_os_error_suffix,
 };
 
@@ -319,6 +320,7 @@ fn main() -> ExitCode {
         }
     };
 
+    install_sigbus_handler(&tool_name);
     let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
     let res = dispatch(&tool_name, filtered_args, &ctx);
     ctx.finish();

@@ -245,6 +245,35 @@ pub fn install_sigpipe_handler() {
     }
 }
 
+/// Message written by the `SIGBUS` handler; set once by [`install_sigbus_handler`].
+static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+extern "C" fn on_sigbus(_: libc::c_int) {
+    // Async-signal-safe only: write(2) a preformatted message, then _exit(2).
+    if let Some(msg) = SIGBUS_MSG.get() {
+        unsafe {
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        }
+    }
+    unsafe { libc::_exit(1) }
+}
+
+/// Turns `SIGBUS` into a clean `tool: ...` error and exit status 1.
+///
+/// [`FastReader`] memory-maps regular files; if another process truncates a file
+/// while it is mapped, touching the vanished pages raises `SIGBUS`, which would
+/// otherwise kill the process with no explanation.
+pub fn install_sigbus_handler(tool: &str) {
+    let _ =
+        SIGBUS_MSG.set(format!("{tool}: input file was truncated while being read\n").into_bytes());
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigbus as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
+    }
+}
+
 /// Helper to treat `ErrorKind::BrokenPipe` as a clean exit (`Ok(())`).
 pub fn ignore_broken_pipe(res: io::Result<()>) -> io::Result<()> {
     match res {

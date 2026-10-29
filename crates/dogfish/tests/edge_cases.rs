@@ -32,3 +32,24 @@ fn seq_large_integers_keep_full_precision() {
     let (out, _) = run(&["seq", "9007199254740993", "9007199254740994"]);
     assert_eq!(out, "9007199254740993\n9007199254740994\n");
 }
+
+#[test]
+fn sigbus_from_truncated_mmap_is_a_clean_error() {
+    // A mapped input truncated by another process raises SIGBUS; deliver one directly
+    // so the test is deterministic.
+    let child = Command::new(env!("CARGO_BIN_EXE_dogfish"))
+        .args(["sleep", "10"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGBUS);
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "sleep: input file was truncated while being read\n"
+    );
+}
