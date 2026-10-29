@@ -15,7 +15,15 @@ use dogfish_core::{
 use md5::Md5;
 use rayon::prelude::*;
 
-use crate::common::lines::{is_blank, looks_like_json, lossy_lines, split_lines};
+use crate::common::files0::{Files0From, extra_operand_error};
+use crate::common::lines::{is_blank, line_end, looks_like_json, lossy_lines, split_records};
+use crate::common::quote::{qa, qf};
+
+/// GNU's `field_sep`: the blanks that separate fields, which include newline
+/// (part of a record only with `-z`).
+fn field_sep(c: u8) -> bool {
+    is_blank(c) || c == b'\n'
+}
 
 #[derive(Parser)]
 #[command(
@@ -116,6 +124,14 @@ struct SortArgs {
     /// Emit JSON / NDJSON output
     #[arg(short = 'J', long = "json")]
     json: bool,
+
+    /// Line delimiter is NUL, not newline
+    #[arg(short = 'z', long = "zero-terminated")]
+    zero_terminated: bool,
+
+    /// Read input from the files specified by NUL-terminated names in file F
+    #[arg(long = "files0-from", value_name = "F")]
+    files0_from: Option<String>,
 
     files: Vec<String>,
 }
@@ -305,16 +321,16 @@ impl Sorter {
         } else {
             while p < lim && sword > 0 {
                 sword -= 1;
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
-                while p < lim && !is_blank(line[p]) {
+                while p < lim && !field_sep(line[p]) {
                     p += 1;
                 }
             }
         }
         if key.opts.skip_sblanks {
-            while p < lim && is_blank(line[p]) {
+            while p < lim && field_sep(line[p]) {
                 p += 1;
             }
         }
@@ -344,17 +360,17 @@ impl Sorter {
         } else {
             while p < lim && eword > 0 {
                 eword -= 1;
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
-                while p < lim && !is_blank(line[p]) {
+                while p < lim && !field_sep(line[p]) {
                     p += 1;
                 }
             }
         }
         if echar != 0 {
             if key.opts.skip_eblanks {
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
             }
@@ -439,7 +455,7 @@ struct SortNum<'a> {
 /// Parses the leading `[blanks][-]digits[.digits]` of a key, like GNU `strnumcmp`.
 fn parse_sort_num(s: &[u8]) -> SortNum<'_> {
     let mut i = 0;
-    while i < s.len() && is_blank(s[i]) {
+    while i < s.len() && field_sep(s[i]) {
         i += 1;
     }
     let mut neg = false;
@@ -493,7 +509,7 @@ fn numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
 /// GNU `find_unit_order`: signed SI-suffix magnitude of a human-readable number.
 fn human_unit_order(s: &[u8]) -> i32 {
     let mut i = 0;
-    while i < s.len() && is_blank(s[i]) {
+    while i < s.len() && field_sep(s[i]) {
         i += 1;
     }
     let neg = i < s.len() && s[i] == b'-';
@@ -656,7 +672,7 @@ fn key_filter<'a>(key: &'a [u8], o: &SortOpts) -> impl Iterator<Item = u8> + 'a 
         .copied()
         .filter(move |&c| {
             if dictionary {
-                c.is_ascii_alphanumeric() || is_blank(c)
+                c.is_ascii_alphanumeric() || field_sep(c)
             } else if nonprinting {
                 (0x20..0x7f).contains(&c)
             } else {
@@ -673,7 +689,7 @@ fn month_of(key: &[u8]) -> u8 {
         b"JAN", b"FEB", b"MAR", b"APR", b"MAY", b"JUN", b"JUL", b"AUG", b"SEP", b"OCT", b"NOV",
         b"DEC",
     ];
-    let start = key.iter().position(|&c| !is_blank(c)).unwrap_or(key.len());
+    let start = key.iter().position(|&c| !field_sep(c)).unwrap_or(key.len());
     let Some(abbr) = key[start..].get(..3) else {
         return 0;
     };
@@ -841,6 +857,25 @@ fn sort_random_seed(source: Option<&str>) -> std::result::Result<[u8; 16], Strin
     Ok(seed)
 }
 
+/// The inputs named in `--files0-from=FROM` (GNU reads them all first and
+/// stops at the first bad name), or GNU's message.
+fn files0_sources(from: &str) -> std::result::Result<Vec<InputSource>, String> {
+    let mut list = Files0From::open(from)
+        .map_err(|e| format!("open failed: {}: {}", qf(from), gnu_io_error(&e)))?;
+    let names = list
+        .read_all()
+        .map_err(|_| format!("cannot read file names from {}", qa(from)))?;
+    if names.is_empty() {
+        return Err(format!("no input from {}", qa(from)));
+    }
+    for (i, name) in names.iter().enumerate() {
+        if let Some(msg) = list.check_name(name, i as u64 + 1, false) {
+            return Err(msg);
+        }
+    }
+    Ok(names.into_iter().map(InputSource::File).collect())
+}
+
 pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = SortArgs::try_parse_from(args)?;
     let _ = parsed.help;
@@ -928,7 +963,22 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         random_seed,
     };
 
-    let sources = InputSource::from_args(&parsed.files);
+    let eol = line_end(parsed.zero_terminated);
+    let sources = match parsed.files0_from.as_deref() {
+        None => InputSource::from_args(&parsed.files),
+        Some(from) => {
+            if let Some(extra) = parsed.files.first() {
+                return Ok(extra_operand_error("sort", extra, 2));
+            }
+            match files0_sources(from) {
+                Ok(sources) => sources,
+                Err(msg) => {
+                    eprintln!("sort: {msg}");
+                    return Ok(2);
+                }
+            }
+        }
+    };
     let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
     for src in &sources {
         match FastReader::open(src).and_then(|r| r.into_bytes()) {
@@ -949,6 +999,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // Check if input is an NDJSON object stream!
     if !parsed.check
+        && !parsed.zero_terminated
         && bufs
             .iter()
             .find(|b| !b.is_empty())
@@ -978,7 +1029,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let mut lines: Vec<&[u8]> = bufs.iter().flat_map(|b| split_lines(b)).collect();
+    let mut lines: Vec<&[u8]> = bufs.iter().flat_map(|b| split_records(b, eol)).collect();
 
     if parsed.check {
         let name = sources[0].display_name();
@@ -1028,7 +1079,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut written = 0u64;
     for s in &lines {
         ignore_broken_pipe(out.write_all(s))?;
-        ignore_broken_pipe(out.write_all(b"\n"))?;
+        ignore_broken_pipe(out.write_all(&[eol]))?;
         written += s.len() as u64 + 1;
     }
     ctx.telemetry.add_items(lines.len() as u64);

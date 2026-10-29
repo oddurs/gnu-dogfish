@@ -16,6 +16,7 @@ pub(crate) mod escapes;
 pub(crate) mod exit_status;
 pub(crate) mod file_info;
 pub(crate) mod file_times;
+pub(crate) mod files0;
 pub(crate) mod fnmatch;
 pub(crate) mod getopt;
 pub(crate) mod gnu_getopt;
