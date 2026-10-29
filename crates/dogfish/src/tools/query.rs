@@ -97,7 +97,7 @@ fn parse_query_args(args: Vec<OsString>) -> std::result::Result<QueryArgs, i32> 
                 let usage = format!("Usage: {name} ");
                 return Err(print_help(&QUERY_HELP.replacen("Usage: query ", &usage, 1)));
             }
-            QueryOpt::Version => return Err(print_version("query")),
+            QueryOpt::Version => return Err(print_version(&name)),
         }
     }
     if let Some(extra) = opts.operands().first() {

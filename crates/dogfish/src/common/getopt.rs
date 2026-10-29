@@ -596,6 +596,21 @@ pub(crate) fn xdectoimax(
     Ok(n)
 }
 
+/// A count for a Dogfish option (`undo -n 2`): a decimal number, else a
+/// usage diagnostic naming the option.
+pub(crate) fn count_arg(tool: &str, option: &str, value: &str) -> Result<usize, i32> {
+    value.parse().map_err(|_| {
+        usage_error(
+            tool,
+            format!(
+                "invalid argument {} for {}",
+                quote_locale(value),
+                quote_locale(option)
+            ),
+        )
+    })
+}
+
 /// An argument as text, for tools whose logic works on `str`. Bytes that
 /// are not UTF-8 become U+FFFD; tools that must keep them use the bytes.
 pub(crate) fn lossy(arg: &OsStr) -> String {

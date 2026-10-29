@@ -1,4 +1,4 @@
-//! chown — USER[:GROUP], :GROUP, USER:, numeric ids, -R/-h/-H/-L/-P, --from
+//! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
 use std::ffi::{CString, OsString};
 use std::fs;

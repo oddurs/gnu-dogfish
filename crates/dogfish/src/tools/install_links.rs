@@ -4,30 +4,83 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{DogfishContext, outln};
 
-#[derive(Parser)]
-#[command(
-    name = "install-links",
-    about = "Create symlinks for all Dogfish utilities in TARGET_DIR"
-)]
-struct InstallLinksArgs {
-    /// Directory to create symlinks in (e.g. ./bin or ~/.local/bin)
-    target_dir: String,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
+};
+use crate::common::quote::quote_locale;
 
-    /// Optional prefix for symlink names (e.g. `df-` creates `df-ls`, `df-cat`)
-    #[arg(long = "prefix", default_value = "")]
+const INSTALL_LINKS_HELP: &str = "\
+Create symlinks for all Dogfish utilities in TARGET_DIR
+
+Usage: install-links [OPTIONS] <TARGET_DIR>
+
+Arguments:
+  <TARGET_DIR>  Directory to create symlinks in (e.g. ./bin or ~/.local/bin)
+
+Options:
+      --prefix <PREFIX>  Optional prefix for symlink names (e.g. `df-` creates `df-ls`, `df-cat`)
+                         [default: \"\"]
+  -h, --help             Print help
+";
+
+struct InstallLinksArgs {
+    target_dir: OsString,
     prefix: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallLinksOpt {
+    Prefix,
+    Help,
+    Version,
+}
+
+const SPECS: &[OptSpec<InstallLinksOpt>] = &[
+    OptSpec::long("prefix", HasArg::Required, InstallLinksOpt::Prefix),
+    OptSpec::both(b'h', "help", HasArg::No, InstallLinksOpt::Help),
+    OptSpec::long("version", HasArg::No, InstallLinksOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_install_links_args(args: Vec<OsString>) -> std::result::Result<InstallLinksArgs, i32> {
+    let mut prefix = String::new();
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("install-links", &e))?;
+        match o {
+            InstallLinksOpt::Prefix => prefix = v.as_deref().map(lossy).unwrap_or_default(),
+            InstallLinksOpt::Help => return Err(print_help(INSTALL_LINKS_HELP)),
+            InstallLinksOpt::Version => return Err(print_version("install-links")),
+        }
+    }
+    let mut operands = opts.operands().into_iter();
+    let Some(target_dir) = operands.next() else {
+        return Err(usage_error("install-links", "missing operand"));
+    };
+    if let Some(extra) = operands.next() {
+        return Err(usage_error(
+            "install-links",
+            format!("extra operand {}", quote_locale(&extra)),
+        ));
+    }
+    Ok(InstallLinksArgs { target_dir, prefix })
+}
+
 pub fn run_install_links(
-    args: Vec<String>,
+    args: Vec<OsString>,
     tool_names: &[&str],
     ctx: &DogfishContext,
 ) -> Result<i32> {
-    let parsed = InstallLinksArgs::try_parse_from(args)?;
+    let parsed = match parse_install_links_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let target = Path::new(&parsed.target_dir);
     fs::create_dir_all(target)?;
     let exe = std::env::current_exe()?;
