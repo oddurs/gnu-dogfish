@@ -1,12 +1,16 @@
 //! `dirname`
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
+};
 use crate::common::path::last_component;
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 
 const DIRNAME_HELP: &str = "\
 Usage: dirname [OPTION] NAME...
@@ -18,19 +22,37 @@ removed; if NAME contains no /'s, output '.' (meaning the current directory).
       --version  output version information and exit
 ";
 
-pub fn run_dirname(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    const SPECS: &[ToolOpt<()>] = &[opt("z", "zero", HasArg::No, ())];
-    let parsed = match parse_tool_args("dirname", &args, SPECS, DIRNAME_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
-    let zero = !parsed.opts.is_empty();
-    if parsed.operands.is_empty() {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirnameOpt {
+    Zero,
+    Help,
+    Version,
+}
+
+/// GNU's `longopts` and `"z"`.
+const SPECS: &[OptSpec<DirnameOpt>] = &[
+    OptSpec::both(b'z', "zero", HasArg::No, DirnameOpt::Zero),
+    OptSpec::long("help", HasArg::No, DirnameOpt::Help),
+    OptSpec::long("version", HasArg::No, DirnameOpt::Version),
+];
+
+pub fn run_dirname(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    let mut zero = false;
+    while let Some(opt) = opts.next() {
+        match opt {
+            Ok((DirnameOpt::Zero, _)) => zero = true,
+            Ok((DirnameOpt::Help, _)) => return Ok(print_help(DIRNAME_HELP)),
+            Ok((DirnameOpt::Version, _)) => return Ok(print_version("dirname")),
+            Err(e) => return Ok(getopt_error("dirname", &e)),
+        }
+    }
+    let operands = opts.operands();
+    if operands.is_empty() {
         return Ok(usage_error("dirname", "missing operand"));
     }
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    for name in &parsed.operands {
+    let mut out = io::BufWriter::new(stdout::stdout());
+    for name in &operands {
         out.write_all(compute_dirname(name.as_bytes()))?;
         out.write_all(if zero { b"\0" } else { b"\n" })?;
         ctx.telemetry.add_items(1);

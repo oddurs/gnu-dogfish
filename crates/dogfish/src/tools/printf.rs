@@ -1,12 +1,14 @@
 //! printf — GNU-compatible format engine
 
-use std::io::{self, Write};
+use std::ffi::OsString;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
-use crate::common::getopt::print_help;
+use crate::common::getopt::{lossy_all, print_help, print_version};
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 
@@ -370,21 +372,29 @@ and all C format specifications ending with one of diouxXfeEgGcs, with
 ARGUMENTs converted to proper type first.  Variable widths are handled.
 "#;
 
-pub fn run_printf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    if args.len() == 2 && args[1] == "--help" {
-        return print_help(PRINTF_HELP);
+pub fn run_printf(raw: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    // Like GNU, a lone `--help` or `--version` (exactly) is the only option.
+    if raw.len() == 2 {
+        if raw[1] == "--help" {
+            return Ok(print_help(PRINTF_HELP));
+        }
+        if raw[1] == "--version" {
+            return Ok(print_version("printf"));
+        }
     }
     // A leading "--" ends (the absent) options, as with getopt.
-    let first = if args.get(1).is_some_and(|a| a == "--") {
+    let first = if raw.get(1).is_some_and(|a| a == "--") {
         2
     } else {
         1
     };
-    if args.len() <= first {
+    if raw.len() <= first {
         eprintln!("printf: missing operand\nTry 'printf --help' for more information.");
         return Ok(1);
     }
-    let fmt = args[first].as_bytes();
+    let args = lossy_all(raw.clone());
+    // The format is used byte for byte.
+    let fmt = raw[first].as_bytes();
     let mut run = PrintfRun {
         args: &args[first + 1..],
         next: 0,
@@ -414,8 +424,7 @@ pub fn run_printf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     ignore_broken_pipe(out.write_all(&output))?;
     ctx.telemetry.add_written(output.len() as u64);
     Ok(if ok && !run.failed { 0 } else { 1 })

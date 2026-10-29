@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::{JournalAction, UndoJournal, move_path};
 
-use crate::common::path::{absolute_lossy, base_len, c_path, last_component, rename_noreplace};
-use crate::common::tool_args::argmatch;
+use crate::common::getopt::argmatch;
+use crate::common::path::{absolute, base_len, c_path, last_component, rename_noreplace};
 
 /// `--backup` version control, as in GNU `backupfile`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,8 +213,8 @@ pub(crate) fn make_backup(
             let _ = j.record(
                 tool,
                 JournalAction::Move {
-                    src: absolute_lossy(dst),
-                    dst: absolute_lossy(&backup),
+                    src: absolute(dst),
+                    dst: absolute(&backup),
                     backup_path: saved,
                 },
             );

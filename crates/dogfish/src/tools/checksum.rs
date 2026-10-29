@@ -1,20 +1,22 @@
 //! b2sum, sha256sum, md5sum — one engine, as in GNU (`md5sum.c`).
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, Read, Write};
 
 use anyhow::Result;
 use blake2::Blake2bVar;
-use clap::{ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser};
 use digest::{Digest, Update, VariableOutput};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    gnu_quote, gnu_quote_file, io::ignore_broken_pipe,
+    gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
 };
 use md5::Md5;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::common::arg_order::last_index;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version,
+};
 
 /// SHA-256 backed by `ring`, adapted to the RustCrypto [`Digest`] interface the hashing
 /// pipeline is generic over.
@@ -124,90 +126,116 @@ impl Hasher {
     }
 }
 
-#[derive(Args)]
-struct HashArgs {
-    /// Read in binary mode
-    #[arg(short = 'b', long = "binary", action = ArgAction::Count)]
-    binary: u8,
+const B2SUM_HELP: &str = "\
+Print or check BLAKE2b (512-bit) checksums. With no FILE, or when FILE is -, read standard input.
 
-    /// Read checksums from the FILEs and check them
-    #[arg(short = 'c', long = "check")]
-    check: bool,
+Usage: b2sum [OPTIONS] [FILES]...
 
-    /// Create a BSD-style checksum
-    #[arg(long = "tag", action = ArgAction::Count)]
-    tag: u8,
+Arguments:
+  [FILES]...  Files to hash (defaults to stdin `-`)
 
-    /// Read in text mode (default)
-    #[arg(short = 't', long = "text", action = ArgAction::Count)]
-    text: u8,
+Options:
+  -l, --length <BITS>   Digest length in bits; must not exceed the maximum for the blake2 algorithm
+                        and must be a multiple of 8
+  -b, --binary...       Read in binary mode
+  -c, --check           Read checksums from the FILEs and check them
+      --tag...          Create a BSD-style checksum
+  -t, --text...         Read in text mode (default)
+  -z, --zero            End each output line with NUL, not newline, and disable file name escaping
+      --ignore-missing  Don't fail or report status for missing files (with --check)
+      --quiet...        Don't print OK for each successfully verified file (with --check)
+      --status...       Don't output anything, status code shows success (with --check)
+      --strict          Exit non-zero for improperly formatted checksum lines (with --check)
+  -w, --warn...         Warn about improperly formatted checksum lines (with --check)
+  -J, --json            Emit structured JSON / NDJSON
+      --help            Display this help and exit
+";
 
-    /// End each output line with NUL, not newline, and disable file name escaping
-    #[arg(short = 'z', long = "zero")]
-    zero: bool,
+const SHA256SUM_HELP: &str = "\
+Print or check checksums. With no FILE, or when FILE is -, read standard input.
 
-    /// Don't fail or report status for missing files (with --check)
-    #[arg(long = "ignore-missing")]
-    ignore_missing: bool,
+Usage: sha256sum [OPTIONS] [FILES]...
 
-    /// Don't print OK for each successfully verified file (with --check)
-    #[arg(long = "quiet", action = ArgAction::Count)]
-    quiet: u8,
+Arguments:
+  [FILES]...  Files to hash (defaults to stdin `-`)
 
-    /// Don't output anything, status code shows success (with --check)
-    #[arg(long = "status", action = ArgAction::Count)]
-    status: u8,
+Options:
+  -b, --binary...       Read in binary mode
+  -c, --check           Read checksums from the FILEs and check them
+      --tag...          Create a BSD-style checksum
+  -t, --text...         Read in text mode (default)
+  -z, --zero            End each output line with NUL, not newline, and disable file name escaping
+      --ignore-missing  Don't fail or report status for missing files (with --check)
+      --quiet...        Don't print OK for each successfully verified file (with --check)
+      --status...       Don't output anything, status code shows success (with --check)
+      --strict          Exit non-zero for improperly formatted checksum lines (with --check)
+  -w, --warn...         Warn about improperly formatted checksum lines (with --check)
+  -J, --json            Emit structured JSON / NDJSON
+      --help            Display this help and exit
+";
 
-    /// Exit non-zero for improperly formatted checksum lines (with --check)
-    #[arg(long = "strict")]
-    strict: bool,
+const MD5SUM_HELP: &str = "\
+Print or check checksums. With no FILE, or when FILE is -, read standard input.
 
-    /// Warn about improperly formatted checksum lines (with --check)
-    #[arg(short = 'w', long = "warn", action = ArgAction::Count)]
-    warn: u8,
+Usage: md5sum [OPTIONS] [FILES]...
 
-    /// Emit structured JSON / NDJSON
-    #[arg(short = 'J', long = "json")]
-    json: bool,
+Arguments:
+  [FILES]...  Files to hash (defaults to stdin `-`)
 
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
+Options:
+  -b, --binary...       Read in binary mode
+  -c, --check           Read checksums from the FILEs and check them
+      --tag...          Create a BSD-style checksum
+  -t, --text...         Read in text mode (default)
+  -z, --zero            End each output line with NUL, not newline, and disable file name escaping
+      --ignore-missing  Don't fail or report status for missing files (with --check)
+      --quiet...        Don't print OK for each successfully verified file (with --check)
+      --status...       Don't output anything, status code shows success (with --check)
+      --strict          Exit non-zero for improperly formatted checksum lines (with --check)
+  -w, --warn...         Warn about improperly formatted checksum lines (with --check)
+  -J, --json            Emit structured JSON / NDJSON
+      --help            Display this help and exit
+";
 
-    /// Files to hash (defaults to stdin `-`)
-    files: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SumOpt {
+    Length,
+    Check,
+    IgnoreMissing,
+    Quiet,
+    Status,
+    Warn,
+    Strict,
+    Tag,
+    Zero,
+    Binary,
+    Text,
+    Json,
+    Help,
+    Version,
 }
 
-#[derive(Parser)]
-#[command(
-    about = "Print or check checksums. With no FILE, or when FILE is -, read standard input.",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
-struct PlainSumArgs {
-    #[command(flatten)]
-    common: HashArgs,
-}
+/// GNU's `long_options` (`--length` for b2sum only) and `"l:bctwz"` /
+/// `"bctwz"`, plus the Dogfish `-J, --json`.
+const B2SUM_SPECS: &[OptSpec<SumOpt>] = &[
+    OptSpec::both(b'l', "length", HasArg::Required, SumOpt::Length),
+    OptSpec::both(b'c', "check", HasArg::No, SumOpt::Check),
+    OptSpec::long("ignore-missing", HasArg::No, SumOpt::IgnoreMissing),
+    OptSpec::long("quiet", HasArg::No, SumOpt::Quiet),
+    OptSpec::long("status", HasArg::No, SumOpt::Status),
+    OptSpec::both(b'w', "warn", HasArg::No, SumOpt::Warn),
+    OptSpec::long("strict", HasArg::No, SumOpt::Strict),
+    OptSpec::long("tag", HasArg::No, SumOpt::Tag),
+    OptSpec::both(b'z', "zero", HasArg::No, SumOpt::Zero),
+    OptSpec::both(b'b', "binary", HasArg::No, SumOpt::Binary),
+    OptSpec::both(b't', "text", HasArg::No, SumOpt::Text),
+    OptSpec::long("help", HasArg::No, SumOpt::Help),
+    OptSpec::long("version", HasArg::No, SumOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, SumOpt::Json).exact(),
+];
 
-#[derive(Parser)]
-#[command(
-    about = "Print or check BLAKE2b (512-bit) checksums. With no FILE, or when FILE is -, \
-             read standard input.",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
-struct B2sumArgs {
-    /// Digest length in bits; must not exceed the maximum for the blake2 algorithm
-    /// and must be a multiple of 8
-    #[arg(short = 'l', long = "length", value_name = "BITS")]
-    length: Option<String>,
-
-    #[command(flatten)]
-    common: HashArgs,
-}
-
-/// The options whose meaning depends on which came last, resolved the way GNU
-/// does it (`--tag` implies binary mode; --status/--quiet/--warn override each other).
+/// The options of a `*sum` tool, resolved the way GNU's option loop does
+/// (`--tag` implies binary mode; --status/--quiet/--warn override each other).
 struct HashMode {
     check: bool,
     tag: bool,
@@ -220,30 +248,58 @@ struct HashMode {
     ignore_missing: bool,
     zero: bool,
     json: bool,
+    /// b2sum's digest length in bits.
+    bits: usize,
+    files: Vec<String>,
 }
 
 impl HashMode {
-    fn resolve(a: &HashArgs, m: &ArgMatches) -> Self {
-        let latest = |ids: &[&'static str]| {
-            ids.iter()
-                .filter_map(|id| last_index(m, id).map(|i| (i, *id)))
-                .max()
-                .map(|(_, id)| id)
+    /// Parses `tool`'s command line; `Err` is the exit status after
+    /// `--help`, `--version` or a diagnostic.
+    fn parse(tool: &str, args: Vec<OsString>, help: &str) -> std::result::Result<Self, i32> {
+        let mut m = HashMode {
+            check: false,
+            tag: false,
+            binary: None,
+            status_only: false,
+            quiet: false,
+            warn: false,
+            strict: false,
+            ignore_missing: false,
+            zero: false,
+            json: false,
+            bits: 512,
+            files: Vec::new(),
         };
-        let binary = latest(&["binary", "tag", "text"]).map(|id| id != "text");
-        let report = latest(&["status", "quiet", "warn"]);
-        Self {
-            check: a.check,
-            tag: a.tag > 0,
-            binary,
-            status_only: report == Some("status"),
-            quiet: report == Some("quiet"),
-            warn: report == Some("warn"),
-            strict: a.strict,
-            ignore_missing: a.ignore_missing,
-            zero: a.zero,
-            json: a.json,
+        let specs = if tool == "b2sum" {
+            B2SUM_SPECS
+        } else {
+            &B2SUM_SPECS[1..]
+        };
+        let mut opts = Getopt::new(args.into_iter().skip(1).collect(), specs);
+        while let Some(opt) = opts.next() {
+            let (o, v) = opt.map_err(|e| getopt_error(tool, &e))?;
+            match o {
+                SumOpt::Length => {
+                    m.bits = blake2_length(&v.as_deref().map(lossy).unwrap_or_default())?
+                }
+                SumOpt::Check => m.check = true,
+                SumOpt::IgnoreMissing => m.ignore_missing = true,
+                SumOpt::Status => (m.status_only, m.warn, m.quiet) = (true, false, false),
+                SumOpt::Warn => (m.status_only, m.warn, m.quiet) = (false, true, false),
+                SumOpt::Quiet => (m.status_only, m.warn, m.quiet) = (false, false, true),
+                SumOpt::Strict => m.strict = true,
+                SumOpt::Tag => (m.tag, m.binary) = (true, Some(true)),
+                SumOpt::Zero => m.zero = true,
+                SumOpt::Binary => m.binary = Some(true),
+                SumOpt::Text => m.binary = Some(false),
+                SumOpt::Json => m.json = true,
+                SumOpt::Help => return Err(print_help(help)),
+                SumOpt::Version => return Err(print_version(tool)),
+            }
         }
+        m.files = lossy_all(opts.operands());
+        Ok(m)
     }
 
     /// GNU's consistency checks, in GNU's order.
@@ -294,52 +350,50 @@ struct HashRecord {
     bytes: u64,
 }
 
-pub fn run_b2sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let matches = B2sumArgs::command().try_get_matches_from(args)?;
-    let parsed = B2sumArgs::from_arg_matches(&matches)?;
-    let mut bits = 512;
-    if let Some(l) = &parsed.length {
-        let detail = match l.trim_start().parse::<u64>() {
-            Err(_) => Some(None),
-            Ok(n) if n > 512 => Some(Some("maximum digest length for 'BLAKE2b' is 512 bits")),
-            Ok(n) if !n.is_multiple_of(8) => Some(Some("length is not a multiple of 8")),
-            Ok(0) => None,
-            Ok(n) => {
-                bits = n as usize;
-                None
-            }
-        };
-        if let Some(detail) = detail {
-            eprintln!("b2sum: invalid length: {}", gnu_quote(l));
-            if let Some(detail) = detail {
-                eprintln!("b2sum: {detail}");
-            }
-            return Ok(1);
-        }
+/// b2sum's `--length`: a multiple of 8 up to 512 bits, 0 meaning 512.
+fn blake2_length(l: &str) -> std::result::Result<usize, i32> {
+    let detail = match l.trim_start().parse::<u64>() {
+        Err(_) => None,
+        Ok(n) if n > 512 => Some("maximum digest length for 'BLAKE2b' is 512 bits"),
+        Ok(n) if !n.is_multiple_of(8) => Some("length is not a multiple of 8"),
+        Ok(0) => return Ok(512),
+        Ok(n) => return Ok(n as usize),
+    };
+    eprintln!("b2sum: invalid length: {}", gnu_quote(l));
+    if let Some(detail) = detail {
+        eprintln!("b2sum: {detail}");
     }
-    run_sum(Algo::Blake2b(bits), &parsed.common, &matches, ctx)
+    Err(1)
 }
 
-pub fn run_sha256sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let matches = PlainSumArgs::command().try_get_matches_from(args)?;
-    let parsed = PlainSumArgs::from_arg_matches(&matches)?;
-    run_sum(Algo::Sha256, &parsed.common, &matches, ctx)
+pub fn run_b2sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    match HashMode::parse("b2sum", args, B2SUM_HELP) {
+        Ok(mode) => run_sum(Algo::Blake2b(mode.bits), mode, ctx),
+        Err(code) => Ok(code),
+    }
 }
 
-pub fn run_md5sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let matches = PlainSumArgs::command().try_get_matches_from(args)?;
-    let parsed = PlainSumArgs::from_arg_matches(&matches)?;
-    run_sum(Algo::Md5, &parsed.common, &matches, ctx)
+pub fn run_sha256sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    match HashMode::parse("sha256sum", args, SHA256SUM_HELP) {
+        Ok(mode) => run_sum(Algo::Sha256, mode, ctx),
+        Err(code) => Ok(code),
+    }
 }
 
-fn run_sum(algo: Algo, args: &HashArgs, m: &ArgMatches, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_md5sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    match HashMode::parse("md5sum", args, MD5SUM_HELP) {
+        Ok(mode) => run_sum(Algo::Md5, mode, ctx),
+        Err(code) => Ok(code),
+    }
+}
+
+fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
     let tool = ctx.tool_name.as_str();
-    let mode = HashMode::resolve(args, m);
     if let Some(msg) = mode.validate() {
         eprintln!("{tool}: {msg}\nTry '{tool} --help' for more information.");
         return Ok(1);
     }
-    let sources = InputSource::from_args(&args.files);
+    let sources = InputSource::from_args(&mode.files);
 
     if mode.check {
         return verify_checksums(algo, &sources, &mode, ctx);
@@ -363,8 +417,7 @@ fn run_sum(algo: Algo, args: &HashArgs, m: &ArgMatches, ctx: &DogfishContext) ->
 
     let mut exit_code = 0;
     let mut records = Vec::with_capacity(results.len());
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     for (src, res) in sources.iter().zip(results) {
         match res {
             Ok(rec) => {
@@ -636,8 +689,7 @@ fn verify_checksums(
     ctx: &DogfishContext,
 ) -> Result<i32> {
     let tool = ctx.tool_name.as_str();
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let mut json_results = Vec::new();
     let mut all_ok = true;
     let mut style = LineStyle::Unknown;

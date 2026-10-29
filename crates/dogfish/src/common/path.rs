@@ -7,11 +7,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirEntryExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn absolute_lossy(p: &Path) -> String {
-    std::path::absolute(p)
-        .unwrap_or_else(|_| p.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+/// `p` made absolute (without resolving symlinks), as the undo journal
+/// records it.
+pub(crate) fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// gnulib `last_component`: the final name in `s`, ignoring trailing slashes
@@ -40,9 +39,9 @@ pub(crate) fn base_len(s: &[u8]) -> usize {
 }
 
 /// `dir/name` without doubling a trailing slash (gnulib `file_name_concat`).
-pub(crate) fn concat_path(dir: &str, name: &OsStr) -> PathBuf {
-    let mut s = OsString::from(dir);
-    if !dir.ends_with('/') {
+pub(crate) fn concat_path(dir: &OsStr, name: &OsStr) -> PathBuf {
+    let mut s = dir.to_os_string();
+    if dir.as_bytes().last() != Some(&b'/') {
         s.push("/");
     }
     s.push(name);
@@ -50,13 +49,16 @@ pub(crate) fn concat_path(dir: &str, name: &OsStr) -> PathBuf {
 }
 
 /// Strips trailing slashes, keeping a lone `/`.
-pub(crate) fn strip_trailing_slashes(s: &str) -> String {
-    let trimmed = s.trim_end_matches('/');
-    if trimmed.is_empty() && !s.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
+pub(crate) fn strip_trailing_slashes(s: &OsStr) -> OsString {
+    let b = s.as_bytes();
+    let mut len = b.len();
+    while len > 0 && b[len - 1] == b'/' {
+        len -= 1;
     }
+    if len == 0 && !b.is_empty() {
+        len = 1;
+    }
+    OsStr::from_bytes(&b[..len]).to_os_string()
 }
 
 /// True if `a` and `b` (already stat'ed) are the same inode.
@@ -81,8 +83,7 @@ pub(crate) fn c_path(p: &Path) -> io::Result<CString> {
 }
 
 /// Byte offsets where each non-final component of `path` ends.
-pub(crate) fn ancestor_ends(path: &str) -> Vec<usize> {
-    let b = path.as_bytes();
+pub(crate) fn ancestor_ends(b: &[u8]) -> Vec<usize> {
     let mut ends = Vec::new();
     let mut i = 0;
     while i < b.len() {

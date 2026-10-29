@@ -3,7 +3,10 @@ id: 26
 uid: 9921a997-5415-4b3f-a23f-e0deac847e4f
 title: "Handle write errors on standard output like GNU's close_stdout"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -49,5 +52,9 @@ The error path belongs in the `gnu::error` part of the compatibility layer (0011
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`dogfish-core/src/stdout.rs` is one buffered stdout writer that keeps the first error; `main.rs` reports it as GNU's close_stdout does (`TOOL: write error: ...`) with each tool's failure status. A C `main` (`no_main`) sees a closed stdout that the Rust runtime would otherwise reopen on /dev/null. GNU tests now passing and added to the baseline: help/help-version-getopt, misc/false-status, misc/close-stdout, misc/yes, misc/write-errors, head/head-write-error, rm/dangling-symlink, rm/dir-no-w, rm/empty-inacc, rm/interactive-once, rm/isatty. About 60 new differential cases (abbreviations, ambiguity, --help anywhere, POSIXLY_CORRECT, /dev/full, per-tool switches, 0xff names) and 25 parser unit tests; `cargo xtask ci` passes (6,453 tests).

@@ -4,57 +4,194 @@ use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::memchr_iter;
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, lossy_all, print_help, print_version,
+    unsupported,
+};
 use crate::common::head_tail::{
     header_name, last_lines_start, normalize_legacy_num_arg, parse_gnu_count, to_usize,
 };
 use crate::common::lines::{looks_like_json, lossy_lines};
 
-#[derive(Parser)]
-#[command(
-    name = "tail",
-    about = "Output the last part of files (or NDJSON object streams)"
-)]
+const TAIL_HELP: &str = "\
+Output the last part of files (or NDJSON object streams)
+
+Usage: tail [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+  -n, --lines <[+]NUM>  Output the last NUM lines (default 10); or use -n +NUM to skip NUM-1 lines
+                        at the start
+  -c, --bytes <[+]NUM>  Output the last NUM bytes; or use -c +NUM to output starting with byte NUM
+  -f, --follow          Output appended data as the file grows
+  -q, --quiet           [alias: --silent]
+  -v, --verbose         
+  -J, --json            
+      --help            Print help
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailOpt {
+    Bytes,
+    Follow,
+    FollowWhen,
+    Lines,
+    DisableInotify,
+    PresumeInputPipe,
+    Quiet,
+    Verbose,
+    Json,
+    Digit(u8),
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    Version,
+}
+
+const fn digit(c: u8) -> OptSpec<TailOpt> {
+    OptSpec::short(c, HasArg::No, TailOpt::Digit(c))
+}
+
+/// GNU's `long_options` and `"c:n:fFqs:vz0123456789"`, plus `-J, --json`.
+/// `---disable-inotify` and `---presume-input-pipe` are GNU's hidden test
+/// options.
+const SPECS: &[OptSpec<TailOpt>] = &[
+    OptSpec::both(b'c', "bytes", HasArg::Required, TailOpt::Bytes),
+    OptSpec::long("follow", HasArg::Optional, TailOpt::FollowWhen),
+    OptSpec::both(b'n', "lines", HasArg::Required, TailOpt::Lines),
+    OptSpec::long(
+        "max-unchanged-stats",
+        HasArg::Required,
+        TailOpt::Unsupported,
+    ),
+    OptSpec::long("-disable-inotify", HasArg::No, TailOpt::DisableInotify),
+    OptSpec::long("pid", HasArg::Required, TailOpt::Unsupported),
+    OptSpec::long("-presume-input-pipe", HasArg::No, TailOpt::PresumeInputPipe),
+    OptSpec::both(b'q', "quiet", HasArg::No, TailOpt::Quiet),
+    OptSpec::long("retry", HasArg::No, TailOpt::Unsupported),
+    OptSpec::long("silent", HasArg::No, TailOpt::Quiet),
+    OptSpec::both(
+        b's',
+        "sleep-interval",
+        HasArg::Required,
+        TailOpt::Unsupported,
+    ),
+    OptSpec::both(b'v', "verbose", HasArg::No, TailOpt::Verbose),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, TailOpt::Unsupported),
+    OptSpec::long("help", HasArg::No, TailOpt::Help),
+    OptSpec::long("version", HasArg::No, TailOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, TailOpt::Json).exact(),
+    OptSpec::short(b'f', HasArg::No, TailOpt::Follow),
+    OptSpec::short(b'F', HasArg::No, TailOpt::Unsupported),
+    digit(b'0'),
+    digit(b'1'),
+    digit(b'2'),
+    digit(b'3'),
+    digit(b'4'),
+    digit(b'5'),
+    digit(b'6'),
+    digit(b'7'),
+    digit(b'8'),
+    digit(b'9'),
+];
+
+/// What `tail` was asked for; as in GNU, the last `-c`/`-n` wins.
 struct TailArgs {
-    /// Output the last NUM lines (default 10); or use -n +NUM to skip NUM-1 lines at the start
-    #[arg(
-        short = 'n',
-        long = "lines",
-        value_name = "[+]NUM",
-        allow_hyphen_values = true
-    )]
-    lines: Option<String>,
-
-    /// Output the last NUM bytes; or use -c +NUM to output starting with byte NUM
-    #[arg(
-        short = 'c',
-        long = "bytes",
-        value_name = "[+]NUM",
-        allow_hyphen_values = true
-    )]
-    bytes: Option<String>,
-
-    /// Output appended data as the file grows
-    #[arg(short = 'f', long = "follow")]
+    by_bytes: bool,
+    from_start: bool,
+    count: u64,
     follow: bool,
-
-    #[arg(short = 'q', long = "quiet", visible_alias = "silent")]
+    /// `---disable-inotify`: follow by polling (all Dogfish does today).
+    disable_inotify: bool,
     quiet: bool,
-
-    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
-
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     files: Vec<String>,
+}
+
+/// Parses the command line; `Err` is the exit status after a diagnostic.
+fn parse_tail_args(args: Vec<OsString>) -> std::result::Result<TailArgs, i32> {
+    let mut a = TailArgs {
+        by_bytes: false,
+        from_start: false,
+        count: 10,
+        follow: false,
+        disable_inotify: false,
+        quiet: false,
+        verbose: false,
+        json: false,
+        files: Vec::new(),
+    };
+    let mut opts = Getopt::new(
+        normalize_legacy_num_arg(args).into_iter().skip(1).collect(),
+        SPECS,
+    );
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("tail", &e))?;
+        match o {
+            TailOpt::Bytes | TailOpt::Lines => {
+                // Like GNU, each count is checked as it is met.
+                a.by_bytes = o == TailOpt::Bytes;
+                let spec = v.as_deref().map(lossy).unwrap_or_default();
+                let (from_start, num_str) = match spec.strip_prefix('+') {
+                    Some(rest) => (true, rest),
+                    None => (false, spec.strip_prefix('-').unwrap_or(&spec)),
+                };
+                let Some(count) = parse_gnu_count(num_str) else {
+                    eprintln!(
+                        "tail: invalid number of {}: '{}'",
+                        if a.by_bytes { "bytes" } else { "lines" },
+                        spec
+                    );
+                    return Err(1);
+                };
+                (a.from_start, a.count) = (from_start, count);
+            }
+            TailOpt::Follow => a.follow = true,
+            TailOpt::FollowWhen => {
+                if let Some(how) = v {
+                    argmatch("tail", "--follow", how, &[("descriptor", 0), ("name", 1)])?;
+                }
+                a.follow = true;
+            }
+            TailOpt::DisableInotify => a.disable_inotify = true,
+            TailOpt::PresumeInputPipe => {}
+            TailOpt::Quiet => (a.quiet, a.verbose) = (true, false),
+            TailOpt::Verbose => (a.quiet, a.verbose) = (false, true),
+            TailOpt::Json => a.json = true,
+            TailOpt::Digit(c) => {
+                eprintln!("tail: option used in invalid context -- {}", char::from(c));
+                return Err(1);
+            }
+            TailOpt::Unsupported => return Err(unsupported("tail", &opts.last_spelling())),
+            TailOpt::Help => return Err(print_help(TAIL_HELP)),
+            TailOpt::Version => return Err(print_version("tail")),
+        }
+    }
+    a.files = lossy_all(opts.operands());
+    Ok(a)
+}
+
+/// Prints GNU's diagnostic for a failed write while copying; false for any
+/// other error.
+fn write_failed(e: &io::Error) -> bool {
+    if !stdout::is_write_error(e) {
+        return false;
+    }
+    stdout::mark_reported();
+    eprintln!("tail: error writing 'standard output': {}", gnu_io_error(e));
+    true
 }
 
 /// Offset at which tail output starts.
@@ -77,30 +214,16 @@ fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64) -> usi
     }
 }
 
-pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TailArgs::try_parse_from(normalize_legacy_num_arg(args))?;
-    let by_bytes = parsed.bytes.is_some();
-    let spec = parsed
-        .bytes
-        .as_deref()
-        .or(parsed.lines.as_deref())
-        .unwrap_or("10");
-    let (from_start, num_str) = match spec.strip_prefix('+') {
-        Some(rest) => (true, rest),
-        None => (false, spec.strip_prefix('-').unwrap_or(spec)),
+pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_tail_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
-    let Some(count) = parse_gnu_count(num_str) else {
-        eprintln!(
-            "tail: invalid number of {}: '{}'",
-            if by_bytes { "bytes" } else { "lines" },
-            spec
-        );
-        return Ok(1);
-    };
+    let _ = parsed.disable_inotify;
+    let (by_bytes, from_start, count) = (parsed.by_bytes, parsed.from_start, parsed.count);
     let sources = InputSource::from_args(&parsed.files);
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
 
     if sources.len() == 1
         && matches!(sources[0], InputSource::Stdin)
@@ -169,6 +292,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         match res {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
+            Err(e) if write_failed(&e) => return Ok(1),
             Err(e) => {
                 let _ = out.flush();
                 eprintln!(

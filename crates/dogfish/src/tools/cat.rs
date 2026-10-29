@@ -2,58 +2,78 @@
 
 use std::io::{self, BufRead, Write};
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 
-#[derive(Parser)]
-#[command(name = "cat", about = "Concatenate FILE(s) to standard output")]
-struct CatArgs {
-    /// Equivalent to -vET
-    #[arg(short = 'A', long = "show-all")]
-    show_all: bool,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version,
+};
 
-    /// Number nonempty output lines, overrides -n
-    #[arg(short = 'b', long = "number-nonblank")]
-    number_nonblank: bool,
+const CAT_HELP: &str = "\
+Concatenate FILE(s) to standard output
 
-    /// Equivalent to -vE
-    #[arg(short = 'e')]
-    show_nonprinting_ends: bool,
+Usage: cat [OPTIONS] [FILES]...
 
-    /// Display $ at end of each line
-    #[arg(short = 'E', long = "show-ends")]
-    show_ends: bool,
+Arguments:
+  [FILES]...  Files to concatenate
 
-    /// Number all output lines
-    #[arg(short = 'n', long = "number")]
-    number: bool,
+Options:
+  -A, --show-all          Equivalent to -vET
+  -b, --number-nonblank   Number nonempty output lines, overrides -n
+  -e                      Equivalent to -vE
+  -E, --show-ends         Display $ at end of each line
+  -n, --number            Number all output lines
+  -s, --squeeze-blank     Suppress repeated empty output lines
+  -t                      Equivalent to -vT
+  -T, --show-tabs         Display TAB characters as ^I
+  -u                      (ignored)
+  -v, --show-nonprinting  Use ^ and M- notation, except for LFD and TAB
+      --help              Print help
+";
 
-    /// Suppress repeated empty output lines
-    #[arg(short = 's', long = "squeeze-blank")]
-    squeeze_blank: bool,
-
-    /// Equivalent to -vT
-    #[arg(short = 't')]
-    show_nonprinting_tabs: bool,
-
-    /// Display TAB characters as ^I
-    #[arg(short = 'T', long = "show-tabs")]
-    show_tabs: bool,
-
-    /// (ignored)
-    #[arg(short = 'u')]
-    unbuffered: bool,
-
-    /// Use ^ and M- notation, except for LFD and TAB
-    #[arg(short = 'v', long = "show-nonprinting")]
-    show_nonprinting: bool,
-
-    /// Files to concatenate
-    files: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatOpt {
+    NumberNonblank,
+    Number,
+    Squeeze,
+    ShowNonprinting,
+    ShowEnds,
+    ShowTabs,
+    ShowAll,
+    /// `-e`: `-vE`.
+    NonprintingEnds,
+    /// `-t`: `-vT`.
+    NonprintingTabs,
+    Unbuffered,
+    Help,
+    Version,
 }
+
+/// GNU's `long_options` and `"benstuvAET"`.
+const SPECS: &[OptSpec<CatOpt>] = &[
+    OptSpec::both(b'b', "number-nonblank", HasArg::No, CatOpt::NumberNonblank),
+    OptSpec::both(b'n', "number", HasArg::No, CatOpt::Number),
+    OptSpec::both(b's', "squeeze-blank", HasArg::No, CatOpt::Squeeze),
+    OptSpec::both(
+        b'v',
+        "show-nonprinting",
+        HasArg::No,
+        CatOpt::ShowNonprinting,
+    ),
+    OptSpec::both(b'E', "show-ends", HasArg::No, CatOpt::ShowEnds),
+    OptSpec::both(b'T', "show-tabs", HasArg::No, CatOpt::ShowTabs),
+    OptSpec::both(b'A', "show-all", HasArg::No, CatOpt::ShowAll),
+    OptSpec::long("help", HasArg::No, CatOpt::Help),
+    OptSpec::long("version", HasArg::No, CatOpt::Version),
+    OptSpec::short(b'e', HasArg::No, CatOpt::NonprintingEnds),
+    OptSpec::short(b't', HasArg::No, CatOpt::NonprintingTabs),
+    OptSpec::short(b'u', HasArg::No, CatOpt::Unbuffered),
+];
 
 struct CatOpts {
     number: bool,
@@ -71,20 +91,60 @@ struct CatState {
     line_num: u64,
 }
 
-pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let p = CatArgs::try_parse_from(args)?;
-    let _ = p.unbuffered;
-    let opts = CatOpts {
-        number: p.number || p.number_nonblank,
-        number_nonblank: p.number_nonblank,
-        squeeze: p.squeeze_blank,
-        show_ends: p.show_ends || p.show_all || p.show_nonprinting_ends,
-        show_tabs: p.show_tabs || p.show_all || p.show_nonprinting_tabs,
-        show_nonprinting: p.show_nonprinting
-            || p.show_all
-            || p.show_nonprinting_ends
-            || p.show_nonprinting_tabs,
+pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut opts = CatOpts {
+        number: false,
+        number_nonblank: false,
+        squeeze: false,
+        show_ends: false,
+        show_tabs: false,
+        show_nonprinting: false,
     };
+    let mut getopt = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = getopt.next() {
+        match opt {
+            Ok((o, _)) => match o {
+                CatOpt::NumberNonblank => {
+                    opts.number = true;
+                    opts.number_nonblank = true;
+                }
+                CatOpt::Number => opts.number = true,
+                CatOpt::Squeeze => opts.squeeze = true,
+                CatOpt::ShowNonprinting => opts.show_nonprinting = true,
+                CatOpt::ShowEnds => opts.show_ends = true,
+                CatOpt::ShowTabs => opts.show_tabs = true,
+                CatOpt::ShowAll => {
+                    opts.show_nonprinting = true;
+                    opts.show_ends = true;
+                    opts.show_tabs = true;
+                }
+                CatOpt::NonprintingEnds => {
+                    opts.show_nonprinting = true;
+                    opts.show_ends = true;
+                }
+                CatOpt::NonprintingTabs => {
+                    opts.show_nonprinting = true;
+                    opts.show_tabs = true;
+                }
+                CatOpt::Unbuffered => {}
+                CatOpt::Help => return Ok(print_help(CAT_HELP)),
+                CatOpt::Version => return Ok(print_version("cat")),
+            },
+            Err(e) => return Ok(getopt_error("cat", &e)),
+        }
+    }
+    let files = lossy_all(getopt.operands());
+    // GNU checks standard output before reading anything.
+    // SAFETY: fstat writes into the zeroed buffer it is given.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on descriptor 1 with a properly sized, writable buffer.
+    if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) } < 0 {
+        eprintln!(
+            "cat: standard output: {}",
+            gnu_io_error(&io::Error::last_os_error())
+        );
+        return Ok(1);
+    }
     let plain =
         !(opts.number || opts.squeeze || opts.show_ends || opts.show_tabs || opts.show_nonprinting);
 
@@ -94,9 +154,8 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         "line-decorated stream"
     });
 
-    let sources = InputSource::from_args(&p.files);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let sources = InputSource::from_args(&files);
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let mut state = CatState {
         newlines: 0,
         line_num: 0,
@@ -114,6 +173,10 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         if let Err(e) = res {
             if e.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(exit_code);
+            }
+            // A failed write ends the run with GNU's `write error`.
+            if stdout::is_write_error(&e) {
+                return Err(e.into());
             }
             let _ = out.flush();
             eprintln!("cat: {}: {}", src.display_name(), gnu_io_error(&e));

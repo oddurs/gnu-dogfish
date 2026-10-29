@@ -1,17 +1,19 @@
-//! chown — USER[:GROUP], :GROUP, USER:, numeric ids, -R/-h/-H/-L/-P, --from
+//! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error};
+use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::path::dir_names;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::quote::{qa, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
 const CHOWN_HELP: &str = "\
@@ -64,7 +66,29 @@ enum ChownOpt {
     TraverseCmdline,
     TraverseAll,
     TraverseNone,
+    Help,
+    Version,
 }
+
+/// GNU's `long_options` and `"HLPRcfhv"`.
+const SPECS: &[OptSpec<ChownOpt>] = &[
+    OptSpec::both(b'R', "recursive", HasArg::No, ChownOpt::Recursive),
+    OptSpec::both(b'c', "changes", HasArg::No, ChownOpt::Changes),
+    OptSpec::long("dereference", HasArg::No, ChownOpt::Deref),
+    OptSpec::long("from", HasArg::Required, ChownOpt::From),
+    OptSpec::both(b'h', "no-dereference", HasArg::No, ChownOpt::NoDeref),
+    OptSpec::long("no-preserve-root", HasArg::No, ChownOpt::NoPreserveRoot),
+    OptSpec::long("preserve-root", HasArg::No, ChownOpt::PreserveRoot),
+    OptSpec::both(b'f', "quiet", HasArg::No, ChownOpt::Quiet),
+    OptSpec::long("silent", HasArg::No, ChownOpt::Quiet),
+    OptSpec::long("reference", HasArg::Required, ChownOpt::Reference),
+    OptSpec::both(b'v', "verbose", HasArg::No, ChownOpt::Verbose),
+    OptSpec::long("help", HasArg::No, ChownOpt::Help),
+    OptSpec::long("version", HasArg::No, ChownOpt::Version),
+    OptSpec::short(b'H', HasArg::No, ChownOpt::TraverseCmdline),
+    OptSpec::short(b'L', HasArg::No, ChownOpt::TraverseAll),
+    OptSpec::short(b'P', HasArg::No, ChownOpt::TraverseNone),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Traverse {
@@ -94,28 +118,9 @@ struct ChownRun {
     quiet: bool,
 }
 
-pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use ChownOpt::*;
-    const SPECS: &[ToolOpt<ChownOpt>] = &[
-        opt("c", "changes", HasArg::No, Changes),
-        opt("f", "silent", HasArg::No, Quiet),
-        opt("", "quiet", HasArg::No, Quiet),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("", "dereference", HasArg::No, Deref),
-        opt("h", "no-dereference", HasArg::No, NoDeref),
-        opt("", "from", HasArg::Required, From),
-        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
-        opt("", "preserve-root", HasArg::No, PreserveRoot),
-        opt("", "reference", HasArg::Required, Reference),
-        opt("R", "recursive", HasArg::No, Recursive),
-        opt("H", "", HasArg::No, TraverseCmdline),
-        opt("L", "", HasArg::No, TraverseAll),
-        opt("P", "", HasArg::No, TraverseNone),
-    ];
-    let parsed = match parse_tool_args("chown", &args, SPECS, CHOWN_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut run = ChownRun {
         spec: OwnerSpec::default(),
         from_uid: None,
@@ -128,14 +133,20 @@ pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         quiet: false,
     };
     let (mut deref, mut preserve_root, mut from, mut reference) = (None, false, None, None);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("chown", &e)),
+        };
         match o {
+            Help => return Ok(print_help(CHOWN_HELP)),
+            Version => return Ok(print_version("chown")),
             Changes => run.report_changes = true,
             Quiet => run.quiet = true,
             Verbose => run.verbose = true,
             Deref => deref = Some(true),
             NoDeref => deref = Some(false),
-            From => from = v,
+            From => from = v.as_deref().map(lossy),
             NoPreserveRoot => preserve_root = false,
             PreserveRoot => preserve_root = true,
             Reference => reference = v,
@@ -157,7 +168,7 @@ pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     run.affect_referent = deref != Some(false);
 
-    let mut files = parsed.operands;
+    let mut files = opts.operands();
     if let Some(r) = &reference {
         match fs::metadata(r) {
             Ok(m) => {
@@ -181,7 +192,7 @@ pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         if files.is_empty() {
             return Ok(usage_error("chown", "missing operand"));
         }
-        let spec = files.remove(0);
+        let spec = lossy(&files.remove(0));
         match parse_owner_spec(&spec) {
             Ok(s) => run.spec = s,
             Err(msg) => {
@@ -192,7 +203,7 @@ pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         if files.is_empty() {
             return Ok(usage_error(
                 "chown",
-                &format!("missing operand after {}", quote_locale(&spec)),
+                format!("missing operand after {}", quote_locale(&spec)),
             ));
         }
     }
@@ -331,8 +342,8 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
                 "group"
             };
             match &new_spec {
-                Some(s) => println!("failed to change {what} of {} to {s}", qa(path)),
-                None => println!("failed to change ownership of {}", qa(path)),
+                Some(s) => outln!("failed to change {what} of {} to {s}", qa(path)),
+                None => outln!("failed to change ownership of {}", qa(path)),
             }
         }
     };
@@ -444,16 +455,16 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
         let (old_s, new_s) = (old_spec.unwrap_or_default(), new_spec.unwrap_or_default());
         if failed {
             if what.is_empty() {
-                println!("failed to change ownership of {file}");
+                outln!("failed to change ownership of {file}");
             } else {
-                println!("failed to change {what} of {file} from {old_s} to {new_s}");
+                outln!("failed to change {what} of {file} from {old_s} to {new_s}");
             }
         } else if status_changed {
-            println!("changed {what} of {file} from {old_s} to {new_s}");
+            outln!("changed {what} of {file} from {old_s} to {new_s}");
         } else if what.is_empty() {
-            println!("ownership of {file} retained");
+            outln!("ownership of {file} retained");
         } else {
-            println!("{what} of {file} retained as {old_s}");
+            outln!("{what} of {file} retained as {old_s}");
         }
     }
     ok

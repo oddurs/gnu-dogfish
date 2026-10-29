@@ -786,6 +786,25 @@ gnu_cases! {
     flag_with_value_base64: "base64" ["--decode=1"];
     extra_operand_whoami: "whoami" ["a", "b"];
     extra_operand_base64: "basenc" ["--base64", "a.txt", "b.txt"];
+
+    // ------------------------------- Dogfish switches never change GNU's
+    echo_color_is_an_operand: "echo" ["--color", "x"];
+    echo_switches_are_operands: "echo" ["--stats", "--no-color", "--color=always", "x"];
+    printf_stats_is_the_format: "printf" ["--stats"];
+    printf_stats_is_an_argument: "printf" ["%s|", "--stats", "--color"];
+    true_ignores_switches: "true" ["--stats"];
+    false_ignores_switches: "false" ["--no-color"];
+    env_command_keeps_its_switches: "env" ["echo", "--color", "--stats", "x"];
+    env_assignment_then_command_switches: "env" ["A=1", "echo", "--no-color"];
+    timeout_command_keeps_its_switches: "timeout" ["5", "echo", "--stats", "--color=never"];
+    switch_after_double_dash_is_an_operand: "cat" ["--", "--stats"];
+    switch_is_never_abbreviated: "cat" ["--stat", "a.txt"];
+    switch_with_argument_is_unrecognized: "cat" ["--stats=1", "a.txt"];
+    color_only_where_granted: "cat" ["--color", "a.txt"];
+    extension_not_in_ambiguity_ls: "ls" ["--t", "a.txt"];
+    extension_not_abbreviated_ls: "ls" ["--tre", "a.txt"];
+    extension_not_in_ambiguity_sort: "sort" ["--b", "lines.txt"];
+    extension_not_shadowing_prefix_cut: "cut" ["--fi=1", "a.txt"];
 }
 
 // ------------------------------------------------------------------ yes
@@ -959,4 +978,139 @@ fn timeout_kills_grandchildren() {
         "{:?}",
         start.elapsed()
     );
+}
+
+// ---------------------------------------------------- getopt_long & stdout
+//
+// `--help` and `--version` text differs by design, so these compare exit
+// status and stderr: like glibc getopt_long, both are ordinary options that
+// may come anywhere (and be abbreviated), and the first one wins.
+
+/// Exit status and stderr of one run.
+type Outcome = (Option<i32>, String);
+
+/// Runs `tool args` through both implementations, with `env` set and stdout
+/// sent to `stdout`; returns `(dogfish, GNU)`, or `None` without GNU.
+fn run_both(
+    tool: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdout: impl Fn() -> Stdio,
+) -> Option<(Outcome, Outcome)> {
+    let Some(gnu) = gnu_tool(tool) else {
+        eprintln!("note: skipping — system `{tool}` is missing or not GNU coreutils");
+        return None;
+    };
+    let run = |mut cmd: Command| {
+        let out = cmd
+            .args(args)
+            .current_dir(fixtures())
+            .env("LC_ALL", "C")
+            .env_remove("POSIXLY_CORRECT")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(stdout())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut ours = Command::new(dogfish_bin());
+    ours.arg(tool);
+    let mut theirs = Command::new(gnu);
+    theirs.arg0(tool);
+    Some((run(ours), run(theirs)))
+}
+
+#[test]
+fn help_and_version_anywhere_like_gnu() {
+    let cases: &[(&str, &[&str])] = &[
+        ("sleep", &["100", "--help"]),
+        ("cat", &["nonexist", "--help"]),
+        ("head", &["--he"]),
+        ("tail", &["--vers"]),
+        ("yes", &["x", "--version"]),
+        ("seq", &["--help", "--bogus"]),
+        ("wc", &["--bogus", "--help"]),
+        ("sort", &["--help", "--version"]),
+        ("env", &["--version", "--help"]),
+        ("timeout", &["--he"]),
+        ("printenv", &["--he"]),
+        ("true", &["--help", "x"]),
+        ("false", &["--version"]),
+        ("echo", &["--help", "x"]),
+    ];
+    for (tool, args) in cases {
+        let Some((ours, theirs)) = run_both(tool, args, &[], Stdio::null) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "{tool} {args:?}");
+    }
+}
+
+/// `yes` never ends when it works, so only its failures are compared.
+#[test]
+fn yes_takes_no_dogfish_switches() {
+    for args in [&["--stats"][..], &["--no-color", "x"], &["--color"]] {
+        let Some((ours, theirs)) = run_both("yes", args, &[], Stdio::null) else {
+            return;
+        };
+        assert_eq!(ours, theirs, "yes {args:?}");
+    }
+}
+
+#[test]
+fn posixly_correct_stops_at_first_operand() {
+    let cases: &[(&str, &[&str])] = &[
+        ("cat", &["a.txt", "-n"]),
+        ("head", &["a.txt", "-n", "1"]),
+        ("wc", &["a.txt", "-l"]),
+        ("uniq", &["a.txt", "-c"]),
+    ];
+    for (tool, args) in cases {
+        let env = [("POSIXLY_CORRECT", "1")];
+        let Some((ours, theirs)) = run_both(tool, args, &env, Stdio::null) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "POSIXLY_CORRECT {tool} {args:?}");
+    }
+}
+
+/// Like GNU's `close_stdout`, a failed write to standard output is
+/// diagnosed once and fails the tool.
+#[test]
+fn write_error_like_gnu() {
+    if !Path::new("/dev/full").exists() {
+        eprintln!("note: skipping — no /dev/full");
+        return;
+    }
+    let full = || {
+        let f = std::fs::OpenOptions::new().write(true).open("/dev/full");
+        Stdio::from(f.expect("open /dev/full"))
+    };
+    let cases: &[(&str, &[&str])] = &[
+        ("cat", &["a.txt"]),
+        ("echo", &["hi"]),
+        ("printf", &["x"]),
+        ("seq", &["3"]),
+        ("head", &["a.txt"]),
+        ("tail", &["a.txt"]),
+        ("wc", &["a.txt"]),
+        ("md5sum", &["a.txt"]),
+        ("base64", &["a.txt"]),
+        ("date", &["-d", "@0"]),
+        ("id", &["-u"]),
+        ("uname", &[]),
+        ("cat", &["--help"]),
+        ("sleep", &["--version"]),
+    ];
+    for (tool, args) in cases {
+        let Some((ours, theirs)) = run_both(tool, args, &[("TZ", "UTC")], full) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "{tool} {args:?} >/dev/full");
+    }
 }

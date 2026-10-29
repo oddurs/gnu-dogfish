@@ -1,14 +1,13 @@
 //! Code shared by several tools.
 //!
-//! The file tools share GNU conventions: getopt-style option parsing
-//! ([`tool_args`]), quoting of file names in messages ([`quote`]), prompts,
-//! mode strings and backups. stat, df, du and ls share further GNU
-//! compatibility helpers: `getopt_long`-style option parsing ([`gnu_getopt`]),
+//! Every tool parses its options with one port of glibc's `getopt_long`
+//! ([`getopt`]). The file tools share further GNU conventions: quoting of
+//! file names in messages ([`quote`]), prompts, mode strings and backups.
+//! stat, df, du and ls share more GNU compatibility helpers:
 //! `human_readable` number formatting and `--block-size` parsing ([`human`]),
 //! `strftime` ([`strftime`]), `quotearg` file-name quoting and `fnmatch`
 //! patterns ([`fnmatch`]).
 
-pub(crate) mod arg_order;
 pub(crate) mod backup;
 pub(crate) mod canonicalize;
 pub(crate) mod copy;
@@ -19,7 +18,6 @@ pub(crate) mod file_info;
 pub(crate) mod file_times;
 pub(crate) mod fnmatch;
 pub(crate) mod getopt;
-pub(crate) mod gnu_getopt;
 pub(crate) mod head_tail;
 pub(crate) mod human;
 pub(crate) mod interval;
@@ -34,6 +32,5 @@ pub(crate) mod signals;
 pub(crate) mod strftime;
 pub(crate) mod strtod;
 pub(crate) mod targets;
-pub(crate) mod tool_args;
 pub(crate) mod uname_info;
 pub(crate) mod users;

@@ -45,10 +45,7 @@ const STEPS: &[(&str, &str)] = &[
         "macos",
         "type-check and lint for aarch64-apple-darwin from another OS",
     ),
-    (
-        "test",
-        "cargo test (debug: overflow checks and clap asserts on)",
-    ),
+    ("test", "cargo test (debug: overflow checks on)"),
     ("test-release", "cargo test --release"),
     (
         "unprivileged",
@@ -141,8 +138,8 @@ fn run_step(root: &Path, step: &str, args: &[String]) -> Step {
         ),
         "msrv" => msrv(root),
         "macos" => macos(root),
-        "test" => cargo(root, &["test", "--workspace", "--locked"]),
-        "test-release" => cargo(root, &["test", "--workspace", "--locked", "--release"]),
+        "test" => tests(root, &["test", "--workspace", "--locked"]),
+        "test-release" => tests(root, &["test", "--workspace", "--locked", "--release"]),
         "unprivileged" => unprivileged(root),
         "doc" => run(Command::new(cargo_bin())
             .args(["doc", "--workspace", "--no-deps", "--locked"])
@@ -210,6 +207,21 @@ fn asan(root: &Path) -> Step {
 
 fn cargo_bin() -> String {
     env::var("CARGO").unwrap_or_else(|_| "cargo".into())
+}
+
+/// Runs the test suites in the locale GitHub's runners have (`C.UTF-8`) unless
+/// the caller chose one: messages quoted by locale differ between C and UTF-8,
+/// and a test that only passes in one of them should fail here first.
+fn tests(root: &Path, args: &[&str]) -> Step {
+    let mut cmd = Command::new(cargo_bin());
+    cmd.args(args).current_dir(root);
+    if ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .all(|v| env::var_os(v).is_none())
+    {
+        cmd.env("LANG", "C.UTF-8");
+    }
+    run(&mut cmd)
 }
 
 fn cargo(root: &Path, args: &[&str]) -> Step {

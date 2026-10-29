@@ -459,6 +459,36 @@ gnu_cases! {
     cut_fields_empty_output_delim: "cut" ["-d,", "-f1,3", "--output-delimiter="] stdin b"a,b,c\n";
     cut_chars_with_delim: "cut" ["-c1", "-d,"] stdin b"a,b\n";
     cut_bytes_only_delimited: "cut" ["-b1", "-s"] stdin b"a,b\n";
+
+    // ------------------------------------------- getopt_long, like glibc's
+    getopt_cluster: "cat" ["-nE", "lines.txt"];
+    getopt_permute: "cat" ["lines.txt", "-n"];
+    getopt_double_dash: "cat" ["--", "-n"];
+    getopt_lone_dash_operand: "cat" ["-", "-n"] stdin b"x\n";
+    getopt_invalid_short: "cat" ["-Q", "lines.txt"];
+    getopt_invalid_short_in_cluster: "cat" ["-nQ", "lines.txt"];
+    getopt_unrecognized_long: "head" ["--bogus=1", "lines.txt"];
+    getopt_long_takes_no_argument: "cat" ["--number=3", "lines.txt"];
+    getopt_long_requires_argument: "head" ["lines.txt", "--lines"];
+    getopt_short_requires_argument: "head" ["lines.txt", "-n"];
+    getopt_short_attached_argument: "head" ["-n1", "lines.txt"];
+    getopt_long_separate_argument: "head" ["--lines", "1", "lines.txt"];
+    getopt_abbreviation: "cat" ["--number-n", "lines.txt"];
+    getopt_abbreviation_with_value: "cut" ["--out=:", "-c1-2,4", "lines.txt"];
+    getopt_abbreviation_separate_value: "head" ["--li", "2", "lines.txt"];
+    getopt_ambiguous: "cat" ["--s", "lines.txt"];
+    getopt_ambiguous_with_value: "cut" ["--o=:", "-c1", "lines.txt"];
+    getopt_ambiguous_sort: "sort" ["--vers", "lines.txt"];
+    getopt_ambiguous_tail: "tail" ["--s", "lines.txt"];
+    getopt_exact_beats_prefix: "sort" ["--version-sort", "lines.txt"];
+    getopt_last_wins_head: "head" ["-n", "1", "-n", "2", "lines.txt"];
+    getopt_last_wins_head_bytes: "head" ["-c", "3", "-n", "1", "lines.txt"];
+    getopt_last_wins_cut_delimiter: "cut" ["-d,", "-d:", "-f1"] stdin b"a:b,c\n";
+    getopt_in_place_sort: "sort" ["lines.txt", "-r"];
+    getopt_hidden_tail_disable_inotify: "tail" ["---dis", "lines.txt"];
+    getopt_hidden_tail_presume_pipe: "tail" ["---presume-input-pipe", "-n1", "lines.txt"];
+    getopt_hidden_head_presume_pipe: "head" ["---presume-input-pipe", "-n-1", "lines.txt"];
+    getopt_two_dash_hidden_is_unknown: "tail" ["--disable-inotify", "lines.txt"];
 }
 
 // ---------------------------------------------------------------- sort -R

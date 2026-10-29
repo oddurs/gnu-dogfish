@@ -91,12 +91,29 @@ and non-regular files are read with `read(2)` instead.
 | `copy_tree_recreates_fifos_inside_directories` | `mkfifo` (test) | C path. |
 | `umask` | `umask` read and restore (test) | No preconditions. |
 
+### `crates/dogfish-core/src/stdout.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `write_fd` | `write(2)` to descriptor 1 | The pointer and length describe the live `data` slice; a bad descriptor only makes the call fail. |
+
 ### `crates/dogfish-core/src/journal.rs`
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `drop` | `flock(LOCK_UN)` on the journal lock | Descriptor only (owned by the lock guard). |
 | `lock` | `flock(LOCK_EX)` on the journal lock | Descriptor only. |
+
+### `crates/dogfish/src/main.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `attribute` | `#[unsafe(no_mangle)]` on `main` | Exports the C entry point under its C name; no other symbol in the binary is called `main` (the Rust one is replaced by `#![no_main]`). |
+| `main` | `unsafe extern "C" fn main(argc, argv)` | Called only by the C runtime, which guarantees `argc` entries of `argv` (its documented `# Safety` contract). |
+| `main` | `fcntl(F_GETFD)` on descriptors 0 to 2 | Descriptor only; queries, never changes. |
+| `main` | `open("/dev/null")` to fill a closed 0, 1 or 2 | C path; the lowest free descriptor is the closed one, as GNU's stdopen does. |
+| `main` | read `argv[i]` | `i < argc`, and the C runtime passes `argc` valid pointers. |
+| `main` | `CStr::from_ptr(argv[i])` | Checked non-null; argv strings are NUL-terminated and live for the whole process. |
 
 ### `crates/dogfish/src/common/backup.rs`
 
@@ -197,6 +214,13 @@ and non-regular files are read with `read(2)` instead.
 | `lookup_user` | read `pw_uid`, `pw_gid` | Static storage; only dereferenced when non-null. |
 | `lookup_group` | `getgrnam` | C path (the name). |
 | `lookup_group` | read `gr_gid` | Static storage; only dereferenced when non-null. |
+
+### `crates/dogfish/src/tools/cat.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `run_cat` | `mem::zeroed::<stat>()` | Out-pointer (zeroed plain data). |
+| `run_cat` | `fstat(1)` | Descriptor only, plus the out-pointer. |
 
 ### `crates/dogfish/src/tools/cp.rs`
 

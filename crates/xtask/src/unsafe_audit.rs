@@ -179,7 +179,14 @@ pub fn scan(src: &str) -> Vec<Site> {
                         Some((_, Token::Ident(name))) => name.clone(),
                         _ => "fn".into(),
                     },
-                    Some((_, Token::Ident(n))) if n == "extern" => "extern".into(),
+                    // `unsafe extern "C" fn name` (the ABI string is not a
+                    // token) is a function; `unsafe extern "C" {` a block.
+                    Some((_, Token::Ident(n))) if n == "extern" => match toks.get(k + 2..k + 4) {
+                        Some([(_, Token::Ident(f)), (_, Token::Ident(name))]) if f == "fn" => {
+                            name.clone()
+                        }
+                        _ => "extern".into(),
+                    },
                     Some((_, Token::Ident(n))) if n == "impl" => "impl".into(),
                     Some((_, Token::Ident(n))) if n == "trait" => "trait".into(),
                     Some((_, Token::Punct('('))) => "attribute".into(),
@@ -359,7 +366,8 @@ mod tests {
 
     #[test]
     fn names_other_forms() {
-        let src = "unsafe extern \"C\" {\n    fn tzset();\n}\nunsafe fn raw() {}\nunsafe impl Send for X {}\n#[unsafe(no_mangle)]\nfn main() { unsafe { tzset() } }\n";
+        let src = "unsafe extern \"C\" {\n    fn tzset();\n}\nunsafe fn raw() {}\nunsafe impl Send for X {}\n#[unsafe(no_mangle)]\nfn main() { unsafe { tzset() } }\n\
+                   pub unsafe extern \"C\" fn entry(argc: i32) -> i32 { 0 }\n";
         assert_eq!(
             items(src),
             vec![
@@ -368,6 +376,7 @@ mod tests {
                 (5, "impl".to_string()),
                 (6, "attribute".to_string()),
                 (7, "main".to_string()),
+                (8, "entry".to_string()),
             ]
         );
     }
