@@ -83,7 +83,6 @@ and non-regular files are read with `read(2)` instead.
 | `copy_file_fast` | `clonefile` (macOS) | C paths. |
 | `copy_file_fast` | `ioctl(FICLONE)` (Linux) | Descriptor only (both files open for the call). |
 | `make_node_like` | `mknod` | C path. |
-| `install_sigpipe_handler` | `signal(SIGPIPE, SIG_DFL)` | Restores the default disposition; no handler code runs. |
 | `on_sigbus` | `write(2)` of the preformatted message | Async-signal-safe; the message is a `Vec` in a `OnceLock` that is never changed or freed once set, so pointer and length stay valid. |
 | `on_sigbus` | `_exit(1)` | Async-signal-safe; never returns. |
 | `install_sigbus_handler` | `sigaction(SIGBUS)` | Zeroed `sigaction` (no flags, empty mask); the handler is an `extern "C" fn(c_int)` and the message is set before it is installed. |
@@ -355,6 +354,28 @@ and non-regular files are read with `read(2)` instead.
 | `write_wait` | `poll(POLLOUT)` after `EAGAIN` | A pointer to one live `pollfd`. |
 | `run_tee` | `signal(SIGINT/SIGPIPE, SIG_IGN)` for `-i` and `--output-error` | Signals: dispositions only, before any I/O. |
 
+### `crates/dogfish/src/tools/tail/follow.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `kill0` | `kill(pid, 0)` | Signal 0 only checks that the process exists; no pointers. |
+| `fremote` | `mem::zeroed::<statfs>()` | Plain old data: a C struct of integers, for which all zeroes is valid. |
+| `fremote` | `fstatfs` | Descriptor only (owned by the `FileSpec`), writing one `statfs` to a live local. |
+| `set_blocking` | `fcntl(F_GETFL)` | Descriptor only. |
+| `set_blocking` | `fcntl(F_SETFL)` | Descriptor only, integer flags. |
+| `output_broken` | `poll` of standard output | One `pollfd` in a live local; a zero timeout. |
+| `die_pipe` | `raise(SIGPIPE)` | No pointers; the process ends, or the signal is ignored and it returns. |
+
+### `crates/dogfish/src/tools/tail/inotify.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `new` | `inotify_init1(IN_CLOEXEC)` | Flags only. |
+| `new` | `OwnedFd::from_raw_fd` | Descriptor only: the descriptor inotify_init1 just returned, owned by nothing else. |
+| `add_watch` | `inotify_add_watch` | C path, and the live inotify descriptor. |
+| `rm_watch` | `inotify_rm_watch` | Descriptor only, and a watch number (a stale one only fails). |
+| `tail_forever_inotify` | `poll` of the inotify descriptor and standard output | At most two `pollfd`s in a live local array. |
+
 ### `crates/dogfish/src/tools/timeout.rs`
 
 | Item | Operation | Why it is sound |
@@ -362,6 +383,7 @@ and non-regular files are read with `read(2)` instead.
 | `arm_timer` | `setitimer(ITIMER_REAL)` | Reads a fully initialised `itimerval`; async-signal-safe (also called from the handler). |
 | `timeout_on_signal` | the signal handler's `kill`, `write`, `signal`, `_exit` | Signals: atomics and async-signal-safe calls only; the verbose message is a `OnceLock` set before the handler is installed. |
 | `run_timeout` | `setpgid`, `sigaction`, `signal` setup | Signals: set up before the child exists; zeroed `sigaction` with an `extern "C"` handler. |
+| `run_timeout` | `sigaction` to read SIGPIPE's disposition | A null new action; the old one is written to a zeroed local `sigaction`. |
 | `run_timeout` | `CommandExt::pre_exec` | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
 | `run_timeout` | `getpid`, `getpgrp` | No preconditions. |
 | `run_timeout` | `setrlimit`, `signal`, `sigprocmask`, `raise` to die by the child's signal | Plain calls on this process with initialised arguments. |

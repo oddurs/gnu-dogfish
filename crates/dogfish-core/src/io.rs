@@ -282,15 +282,6 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.
-pub fn install_sigpipe_handler() {
-    // SAFETY: restores the default disposition; no handler code runs.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
 /// Message written by the `SIGBUS` handler; set once by [`install_sigbus_handler`].
 static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
