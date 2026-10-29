@@ -3,6 +3,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -206,10 +207,20 @@ impl<W: Write> Lister<'_, W> {
 
     fn gobble_entry(&mut self, dir: &Path, name: Vec<u8>, letter: u8) -> LsFile {
         let o = self.opts;
-        let path = if dir == Path::new(".") {
+        let d = path_bytes(dir);
+        // `dir == "."` component-wise (which also takes `./`), without
+        // parsing components for the usual paths that cannot match.
+        let path = if d == b"." || (d.first() == Some(&b'.') && dir == Path::new(".")) {
             bytes_path(&name).to_path_buf()
         } else {
-            dir.join(bytes_path(&name))
+            // `dir.join(name)`, in one allocation.
+            let mut p = Vec::with_capacity(d.len() + 1 + name.len());
+            p.extend_from_slice(d);
+            if !d.is_empty() && !d.ends_with(b"/") {
+                p.push(b'/');
+            }
+            p.extend_from_slice(&name);
+            PathBuf::from(std::ffi::OsString::from_vec(p))
         };
         // Like GNU (`gobble_file`), only stat when the output needs it, and
         // only follow a link (and report a dangling one) in that case.
@@ -391,6 +402,15 @@ impl<W: Write> Lister<'_, W> {
         use std::cmp::Ordering;
         let o = self.opts;
         if o.sort == LsSort::None {
+            return;
+        }
+        if o.sort == LsSort::Name && !o.dirs_first {
+            // The common case, without the general comparator's dispatch.
+            if o.reverse {
+                files.sort_by(|a, b| b.name.cmp(&a.name));
+            } else {
+                files.sort_by(|a, b| a.name.cmp(&b.name));
+            }
             return;
         }
         let by_name = |a: &LsFile, b: &LsFile| a.name.cmp(&b.name);
