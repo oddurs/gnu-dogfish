@@ -154,11 +154,26 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `local_time` | `localtime_r` and `tm_zone` | Out-pointer; a non-null `tm_zone` points at libc's zone-name storage and is copied before any other time call. |
 
+### `crates/dogfish/src/common/dirfd.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `stat` | `fstatat`, then `assume_init` | C name; the `stat` out-buffer is read only after the call succeeded and filled it. |
+| `open_dir` | `openat(O_DIRECTORY)`, `OwnedFd::from_raw_fd` | C name; the new descriptor is owned by nothing else. |
+| `unlink` | `unlinkat` | C name. |
+| `chmod` | `fchmodat` | C name. |
+| `write_protected` | `faccessat(W_OK)` | C name. |
+| `getdents` | `getdents64` (Linux) | Descriptor only; the kernel writes at most the buffer's length into it, and the records are parsed with bounds checks. |
+| `read_entries` | `fcntl(F_DUPFD_CLOEXEC)`, `fdopendir`, `close` (not Linux) | Descriptor only; the duplicate is owned by the stream, or closed once if `fdopendir` fails. |
+| `read_entries` | `readdir`, errno reset, `CStr::from_ptr(d_name)` (not Linux) | Open stream; a non-null entry is valid until the next `readdir` and its name is copied first. |
+| `read_entries` | `closedir` (not Linux) | The stream is open and closed exactly once. |
+
 ### `crates/dogfish/src/common/file_info.rs`
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `lgetxattr_bytes` | `lgetxattr` | C path and name; the buffer pointer and length describe the same `Vec`. |
+| `has_xattrs` | `llistxattr` with a null buffer and size 0 | C path; with size 0 the call writes nothing and returns the list's length. |
 
 ### `crates/dogfish/src/common/file_times.rs`
 
@@ -190,11 +205,12 @@ and non-regular files are read with `read(2)` instead.
 | `rename_noreplace` | `renameat2(RENAME_NOREPLACE)` (Linux) | C paths. |
 | `rename_noreplace` | `rename` (fallback) | C paths. |
 
-### `crates/dogfish/src/common/prompt.rs`
+### `crates/dogfish/src/common/sha256.rs`
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `write_protected` | `access(W_OK)` | C path. |
+| `blocks` | call of the `#[target_feature(enable = "avx2,bmi1,bmi2")]` `compress` | An `Avx2Sha256` is only made after `is_fastest` detected AVX2, BMI1 and BMI2. |
+| `store` | `_mm256_storeu_si256` | The destination is a 32-byte (8 × `u32`) subslice; the store is unaligned. |
 
 ### `crates/dogfish/src/common/strftime.rs`
 

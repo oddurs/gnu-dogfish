@@ -1,20 +1,20 @@
 //! chmod — octal and full symbolic modes, -R, -c/-v/-f, --reference
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
 use crate::common::mode::{
     CHMOD_MODE_BITS, ModeChange, mode_adjust, mode_compile, process_umask, strmode9,
 };
-use crate::common::path::dir_names;
 use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, qf, quote_locale};
 
@@ -204,65 +204,88 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut ok = true;
     for f in &files {
-        ok &= chmod_path(Path::new(f), true, &run, ctx);
+        let Ok(c_path) = CString::new(f.as_bytes()) else {
+            continue;
+        };
+        let mut path = WalkPath::new(f.as_bytes());
+        ok &= chmod_path(At::cwd(&c_path), &mut path, 0, &run, ctx);
     }
     Ok(if ok { 0 } else { 1 })
 }
 
-fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext) -> bool {
-    let lmeta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
+/// Changes the mode of `at` (printed as `path`), then with `-R` of everything
+/// below it, each entry relative to its open directory. `depth` 0 is an
+/// operand, whose symlinks are followed; below, symlinks are left alone.
+fn chmod_path(
+    at: At<'_>,
+    path: &mut WalkPath,
+    depth: usize,
+    run: &ChmodRun,
+    ctx: &DogfishContext,
+) -> bool {
+    let top_level = depth == 0;
+    let lstat = match at.stat(false) {
+        Ok(st) => st,
         Err(e) => {
             if !run.quiet {
-                eprintln!("chmod: cannot access {}: {}", qa(path), gnu_io_error(&e));
+                eprintln!(
+                    "chmod: cannot access {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
             }
             if run.verbose {
-                outln!("{} could not be accessed", qa(path));
+                outln!("{} could not be accessed", qa(path.as_path()));
             }
             return false;
         }
     };
-    let meta = if lmeta.is_symlink() {
+    let st = if EntryType::of(&lstat) == EntryType::Symlink {
         if !top_level {
             // During -R traversal, symbolic links are not followed or changed.
             if run.verbose {
                 outln!(
                     "neither symbolic link {} nor referent has been changed",
-                    qa(path)
+                    qa(path.as_path())
                 );
             }
             return true;
         }
-        match fs::metadata(path) {
-            Ok(m) => m,
+        match at.stat(true) {
+            Ok(st) => st,
             Err(_) => {
                 if !run.quiet {
-                    eprintln!("chmod: cannot operate on dangling symlink {}", qa(path));
+                    eprintln!(
+                        "chmod: cannot operate on dangling symlink {}",
+                        qa(path.as_path())
+                    );
                 }
                 if run.verbose {
-                    outln!("{} could not be accessed", qa(path));
+                    outln!("{} could not be accessed", qa(path.as_path()));
                 }
                 return false;
             }
         }
     } else {
-        lmeta
+        lstat
     };
-    // GNU `process_file`: checked on the stat the walk uses, so a command-line
-    // symlink to `/` (followed, as fts's FTS_COMFOLLOW does) is refused too.
-    if is_root_dev_ino(run.root_dev_ino, &meta) {
-        refuse_root("chmod", path);
+    // GNU `process_file`: checked on the stat the walk already made, so a
+    // command-line symlink to `/` (followed, as FTS_COMFOLLOW does) is refused
+    // too, and no directory below an operand can be `/` unnoticed.
+    if is_root_dev_ino(run.root_dev_ino, DevIno::of_stat(&st)) {
+        refuse_root("chmod", path.as_path());
         return false;
     }
 
-    let old = meta.mode() & CHMOD_MODE_BITS;
-    let is_dir = meta.is_dir();
+    #[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
+    let old = st.st_mode as u32 & CHMOD_MODE_BITS;
+    let is_dir = EntryType::of(&st) == EntryType::Dir;
     let new = match &run.changes {
         Some(c) => mode_adjust(old, is_dir, run.umask, c).0,
         None => run.reference_mode,
     };
     let mut ok = true;
-    let applied = match fs::set_permissions(path, fs::Permissions::from_mode(new)) {
+    let applied = match at.chmod(new) {
         Ok(()) => {
             ctx.telemetry.add_items(1);
             true
@@ -271,7 +294,7 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
             if !run.quiet {
                 eprintln!(
                     "chmod: changing permissions of {}: {}",
-                    qa(path),
+                    qa(path.as_path()),
                     gnu_io_error(&e)
                 );
             }
@@ -282,18 +305,13 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     let changed = applied && old != new;
     if run.verbose || (run.report_changes && changed) {
         let (o, n) = (strmode9(old), strmode9(new));
+        let p = qa(path.as_path());
         if !applied {
-            outln!(
-                "failed to change mode of {} from {old:04o} ({o}) to {new:04o} ({n})",
-                qa(path)
-            );
+            outln!("failed to change mode of {p} from {old:04o} ({o}) to {new:04o} ({n})");
         } else if changed {
-            outln!(
-                "mode of {} changed from {old:04o} ({o}) to {new:04o} ({n})",
-                qa(path)
-            );
+            outln!("mode of {p} changed from {old:04o} ({o}) to {new:04o} ({n})");
         } else {
-            outln!("mode of {} retained as {new:04o} ({n})", qa(path));
+            outln!("mode of {p} retained as {new:04o} ({n})");
         }
     }
     if applied
@@ -304,7 +322,7 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
         if new & !naive != 0 {
             eprintln!(
                 "chmod: {}: new permissions are {}, not {}",
-                qf(path),
+                qf(path.as_path()),
                 strmode9(new),
                 strmode9(naive)
             );
@@ -313,17 +331,33 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     }
 
     if run.recursive && is_dir {
-        match dir_names(path, false) {
-            Ok(names) => {
-                for name in names {
-                    ok &= chmod_path(&path.join(name), false, run, ctx);
+        let mut names = Names::default();
+        // An operand that is a symlink to a directory is followed.
+        let read = at
+            .open_dir(!top_level)
+            .and_then(|d| d.read_names(&mut names).map(|()| d));
+        match read {
+            Ok(dir) => {
+                // Deep down, entries are reached by full path, with no directory held open.
+                let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
+                for i in 0..names.len() {
+                    let (name, _, _) = names.get(i);
+                    let mark = path.push(name.to_bytes());
+                    ok &= match &dir {
+                        Some(d) => chmod_path(At { dir: d.fd(), name }, path, depth + 1, run, ctx),
+                        None => match path.c_path().map(CStr::to_owned) {
+                            Some(full) => chmod_path(At::cwd(&full), path, depth + 1, run, ctx),
+                            None => false,
+                        },
+                    };
+                    path.truncate(mark);
                 }
             }
             Err(e) => {
                 if !run.quiet {
                     eprintln!(
                         "chmod: cannot read directory {}: {}",
-                        qa(path),
+                        qa(path.as_path()),
                         gnu_io_error(&e)
                     );
                 }
@@ -337,12 +371,13 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::Path;
 
     // The --preserve-root walk is tested against a temporary directory standing
     // in for `/`, never against the real root (AGENTS.md).
-    fn run_with_root(root: Option<DevIno>) -> ChmodRun {
-        ChmodRun {
+    fn chmod_with_root(p: &Path, root: Option<DevIno>) -> bool {
+        let run = ChmodRun {
             changes: None,
             reference_mode: 0o700,
             umask: 0o022,
@@ -352,7 +387,11 @@ mod tests {
             quiet: true,
             diagnose_surprises: false,
             root_dev_ino: root,
-        }
+        };
+        let c_path = CString::new(p.as_os_str().as_bytes()).unwrap();
+        let mut path = WalkPath::new(p.as_os_str().as_bytes());
+        let ctx = DogfishContext::new("chmod");
+        chmod_path(At::cwd(&c_path), &mut path, 0, &run, &ctx)
     }
 
     #[test]
@@ -366,18 +405,24 @@ mod tests {
         fs::set_permissions(&inner, fs::Permissions::from_mode(0o644)).unwrap();
         let link = tmp.path().join("link");
         symlink(&fake_root, &link).unwrap();
+        let above = tmp.path().join("above");
+        fs::create_dir(&above).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().mode() & 0o7777;
-        let ctx = DogfishContext::new("chmod");
         let root = Some(DevIno::of(&fs::metadata(&fake_root).unwrap()));
 
         // Through the link (followed on the command line, like FTS_COMFOLLOW)
         // and named directly: refused, nothing changed.
-        assert!(!chmod_path(&link, true, &run_with_root(root), &ctx));
-        assert!(!chmod_path(&fake_root, true, &run_with_root(root), &ctx));
+        assert!(!chmod_with_root(&link, root));
+        assert!(!chmod_with_root(&fake_root, root));
         assert_eq!((mode(&fake_root), mode(&inner)), (0o755, 0o644));
+        // A directory reached below an operand is checked too.
+        assert!(!chmod_with_root(tmp.path(), root));
+        assert_eq!((mode(&fake_root), mode(&inner)), (0o755, 0o644));
+        // Elsewhere the walk is unaffected.
+        assert!(chmod_with_root(&above, root));
 
         // Without --preserve-root the same walk goes ahead.
-        assert!(chmod_path(&link, true, &run_with_root(None), &ctx));
+        assert!(chmod_with_root(&link, None));
         assert_eq!((mode(&fake_root), mode(&inner)), (0o700, 0o700));
     }
 }

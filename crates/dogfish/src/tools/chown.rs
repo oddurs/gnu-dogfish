@@ -387,7 +387,7 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     let traverse_dir = run.recursive && walked.is_dir();
     // GNU `change_file_owner`, FTS_D: every directory the walk would enter is
     // checked, the command-line operands and those reached through `-L` alike.
-    if traverse_dir && is_root_dev_ino(run.root_dev_ino, &walked) {
+    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of(&walked)) {
         refuse_root("chown", path);
         return false;
     }

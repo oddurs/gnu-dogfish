@@ -20,19 +20,21 @@ use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version,
 };
 use crate::common::quote::qf;
+use crate::common::sha256::Sha256;
 
-/// SHA-256 backed by `ring`, adapted to the RustCrypto [`Digest`] interface the hashing
-/// pipeline is generic over.
+/// SHA-256 ([`Sha256`]: `ring`, or an AVX2 path where that is faster), adapted
+/// to the RustCrypto [`Digest`] interface the hashing pipeline is generic over.
 ///
 /// `ring` carries the OpenSSL/BoringSSL assembly with runtime CPU dispatch (SHA-NI,
-/// AVX2+BMI2, SSSE3, ARMv8 crypto), the same code GNU `sha256sum` reaches through
-/// libcrypto. RustCrypto's `sha2` only accelerates SHA-NI and ARMv8, so it ran ~1.7x
-/// slower than GNU on CPUs without SHA extensions.
-struct RingSha256(ring::digest::Context);
+/// AVX, SSSE3, ARMv8 crypto); GNU `sha256sum` reaches OpenSSL's through libcrypto,
+/// including its AVX2 code, which [`Sha256`] matches. RustCrypto's `sha2` only
+/// accelerates SHA-NI and ARMv8, so it ran ~1.7x slower than GNU on CPUs without
+/// SHA extensions.
+struct RingSha256(Sha256);
 
 impl Default for RingSha256 {
     fn default() -> Self {
-        Self(ring::digest::Context::new(&ring::digest::SHA256))
+        Self(Sha256::new())
     }
 }
 
@@ -50,7 +52,7 @@ impl digest::Update for RingSha256 {
 
 impl digest::FixedOutput for RingSha256 {
     fn finalize_into(self, out: &mut digest::Output<Self>) {
-        out.copy_from_slice(self.0.finish().as_ref());
+        out.copy_from_slice(&self.0.finish());
     }
 }
 
@@ -459,7 +461,8 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
     });
 
     // If multiple file sources and none is stdin, hash in parallel using Rayon!
-    let can_parallel = sources.len() > 1 && sources.iter().all(|s| matches!(s, Source::File(_)));
+    let can_parallel =
+        sources.len() > 1 && sources.iter().all(|s| matches!(s, Source::File(_)));
     let hash_one = |src: &Source| compute_source_hash(algo, src, ctx);
     let results: Vec<io::Result<HashRecord>> = if can_parallel {
         sources.par_iter().map(hash_one).collect()
@@ -544,11 +547,7 @@ fn write_digest_line<W: Write>(
     } else {
         line.extend_from_slice(rec.digest.as_bytes());
         line.push(b' ');
-        line.push(if mode.binary == Some(true) {
-            b'*'
-        } else {
-            b' '
-        });
+        line.push(if mode.binary == Some(true) { b'*' } else { b' ' });
         line.extend_from_slice(name);
     }
     line.push(if mode.zero { b'\0' } else { b'\n' });

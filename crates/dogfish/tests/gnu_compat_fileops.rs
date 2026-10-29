@@ -208,6 +208,29 @@ fn snapshot(root: &Path, cmp: Compare) -> BTreeMap<String, String> {
     snap
 }
 
+/// Removes `path` even when a case left directories without write or search
+/// permission (`chmod -R u-w`): unprivileged, `remove_dir_all` cannot empty
+/// them, and the next run (the release build reuses these paths) would find
+/// the old tree.
+fn force_remove(path: &Path) {
+    fn open_up(p: &Path) {
+        if let Ok(m) = p.symlink_metadata()
+            && m.is_dir()
+        {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = fs::read_dir(p) {
+                for e in entries.flatten() {
+                    open_up(&e.path());
+                }
+            }
+        }
+    }
+    if fs::remove_dir_all(path).is_err() {
+        open_up(path);
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 fn scratch_root() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -318,6 +341,7 @@ impl TreeCase<'_> {
             self.name,
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        force_remove(&base);
         let (ours_dir, gnu_dir) = (base.join("dogfish"), base.join("gnu"));
         // The second file system's directory for each run (empty unless asked).
         let (ours_other, gnu_other) = if self.cmp.other_fs {
@@ -472,7 +496,7 @@ impl TreeCase<'_> {
                 panic!("resulting trees differ:\n{diff}{ctx}");
             }
         }
-        let _ = fs::remove_dir_all(&base);
+        force_remove(&base);
         if self.cmp.other_fs {
             let _ = fs::remove_dir_all(&ours_other);
             let _ = fs::remove_dir_all(&gnu_other);
@@ -852,6 +876,9 @@ tree_cases! {
     chmod_x_if_any: "chmod" ["-v", "g-x,+X", "exe"];
     chmod_recursive: "chmod" ["-vR", "750", "d"];
     chmod_recursive_changes: "chmod" ["-cR", "o-r", "d"];
+    // Deeper (130 levels) than the recursive tools keep directories open.
+    chmod_recursive_deep: "chmod" ["-vR", "u-w", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    chmod_recursive_operands: "chmod" ["-R", "g+w", "d", "ld", "p", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     chmod_dir_keeps_setgid: "chmod" ["-v", "755", "sg"];
     chmod_dir_clears_setgid: "chmod" ["-v", "00755", "sg"];
     chmod_symlink_operand: "chmod" ["-v", "700", "la"];
@@ -902,6 +929,9 @@ tree_cases! {
     rm_dir_flag_empty: "rm" ["-dv", "e"];
     rm_recursive: "rm" ["-rv", "d"];
     rm_recursive_nested: "rm" ["-rv", "p"];
+    // Deeper (130 levels) than rm keeps directories open.
+    rm_recursive_deep: "rm" ["-rv", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    rm_recursive_quiet: "rm" ["-r", "d", "p", "p2", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     rm_trailing_slash_file: "rm" ["a/"];
     rm_force_trailing_slash_file: "rm" ["-f", "a/"];
     rm_recursive_trailing_slash: "rm" ["-rfv", "d/"];

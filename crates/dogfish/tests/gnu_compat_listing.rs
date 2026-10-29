@@ -115,6 +115,19 @@ fn build_fixture(dir: &Path) {
         res => res.unwrap(),
     }
     fs::create_dir_all(p("empty_dir")).unwrap();
+    // Enough subdirectories for du to read them on several threads.
+    for i in 0..20 {
+        for (j, size) in [(0, 10), (1, 5000)] {
+            let sub = p(&format!("wide/w{i:02}/s{j}"));
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("f"), vec![b'w'; size * (i + 1)]).unwrap();
+        }
+    }
+    fs::hard_link(p("wide/w00/s0/f"), p("wide/w19/s1/link")).unwrap();
+    // Deeper than du keeps directories open (130 levels).
+    let deep = (0..130).fold(p("deep"), |d, _| d.join("k"));
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("f"), [b'd'; 3000]).unwrap();
     fs::create_dir_all(p("sticky")).unwrap();
     fs::File::create(p("sparse.img"))
         .unwrap()
@@ -466,6 +479,12 @@ gnu_cases! {
     du_all_dir: "du" ["-a", "dir"];
     du_human: "du" ["-h", "dir"];
     du_human_all: "du" ["-ah", "dir"];
+    du_wide: "du" ["wide"];
+    du_wide_all: "du" ["-a", "wide"];
+    du_wide_twice: "du" ["wide", "wide/w03"];
+    du_wide_depth: "du" ["-d", "1", "-c", "wide"];
+    du_deep: "du" ["deep"];
+    du_deep_all: "du" ["-ab", "deep"];
     du_si: "du" ["--si", "-a", "dir"];
     du_summarize: "du" ["-s"];
     du_summarize_many: "du" ["-sh", "dir", "names", "vers"];

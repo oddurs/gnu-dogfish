@@ -40,6 +40,15 @@ impl DevIno {
             ino: m.ino(),
         }
     }
+
+    /// From a raw `stat` (the `fstatat` a directory-fd walk already makes).
+    #[allow(clippy::unnecessary_cast)] // the field types differ between platforms
+    pub(crate) fn of_stat(st: &libc::stat) -> Self {
+        DevIno {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        }
+    }
 }
 
 /// GNU `get_root_dev_ino`: stats `/` (following a symlink, as GNU does).
@@ -48,12 +57,12 @@ pub(crate) fn root_dev_ino() -> io::Result<DevIno> {
 }
 
 /// GNU `ROOT_DEV_INO_CHECK`: true when `--preserve-root` recorded the root's
-/// identity in `root` and `st` describes that same directory. The walks of
-/// `chmod -R` and `chown -R` ask this of every entry they would enter, with `st`
-/// from the stat the traversal itself uses, so a symlink to `/` that `-H` or `-L`
-/// follows is caught, and one that is not followed stays just a link.
-pub(crate) fn is_root_dev_ino(root: Option<DevIno>, st: &Metadata) -> bool {
-    root.is_some_and(|r| r == DevIno::of(st))
+/// identity in `root` and `file` is that same directory. The walks of
+/// `chmod -R` and `chown -R` ask this of every entry they would enter, with
+/// `file` from the stat the traversal itself uses, so a symlink to `/` that
+/// `-H` or `-L` follows is caught, and one that is not followed stays just a link.
+pub(crate) fn is_root_dev_ino(root: Option<DevIno>, file: DevIno) -> bool {
+    root.is_some_and(|r| r == file)
 }
 
 /// True when `p` names the root directory itself (`/`, `//`, `/.`, `/usr/..`, a bind
@@ -86,17 +95,15 @@ mod tests {
         std::fs::create_dir(&fake_root).unwrap();
         let link = tmp.path().join("link");
         symlink(&fake_root, &link).unwrap();
-        let root = Some(DevIno::of(&fake_root.metadata().unwrap()));
-        assert!(is_root_dev_ino(root, &fake_root.metadata().unwrap()));
-        assert!(is_root_dev_ino(root, &link.metadata().unwrap()), "followed");
-        assert!(!is_root_dev_ino(root, &link.symlink_metadata().unwrap()));
-        assert!(!is_root_dev_ino(root, &tmp.path().metadata().unwrap()));
-        assert!(!is_root_dev_ino(None, &fake_root.metadata().unwrap()));
+        let id = |m: std::io::Result<Metadata>| DevIno::of(&m.unwrap());
+        let root = Some(id(fake_root.metadata()));
+        assert!(is_root_dev_ino(root, id(fake_root.metadata())));
+        assert!(is_root_dev_ino(root, id(link.metadata())), "followed");
+        assert!(!is_root_dev_ino(root, id(link.symlink_metadata())));
+        assert!(!is_root_dev_ino(root, id(tmp.path().metadata())));
+        assert!(!is_root_dev_ino(None, id(fake_root.metadata())));
         let real = root_dev_ino().unwrap();
-        assert!(is_root_dev_ino(
-            Some(real),
-            &Path::new("/").metadata().unwrap()
-        ));
+        assert!(is_root_dev_ino(Some(real), id(Path::new("/").metadata())));
     }
 
     #[test]
