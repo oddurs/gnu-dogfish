@@ -139,6 +139,34 @@ fn build_fixture(dir: &Path) {
     let deep = (0..130).fold(p("deep"), |d, _| d.join("k"));
     fs::create_dir_all(&deep).unwrap();
     fs::write(deep.join("f"), [b'd'; 3000]).unwrap();
+    // Deeper than PATH_MAX too (140 levels of 40-byte names), so made one
+    // level at a time, relative to the last.
+    // (Perl: a shell's `cd` may build the full path, which is too long.)
+    let status = Command::new("perl")
+        .args([
+            "-e",
+            "my $n = 'n' x 40; mkdir 'longdeep' and chdir 'longdeep' or die $!; \
+             for my $i (1..140) { mkdir $n and chdir $n or die $!; \
+             if ($i % 35 == 0) { open(my $f, '>', \"f$i\") or die $!; print $f '0' x $i; } } \
+             open(my $f, '>', 'f') or die $!; print $f \"bottom\\n\";",
+        ])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // `dotdot -> ..`: a cycle for -L.
+    fs::create_dir_all(p("cycle/sub")).unwrap();
+    fs::write(p("cycle/sub/f"), [b'c'; 2000]).unwrap();
+    symlink("..", p("cycle/sub/dotdot")).unwrap();
+    // --files0-from lists.
+    fs::create_dir_all(p("lists")).unwrap();
+    fs::write(
+        p("lists/names0"),
+        b"dir\0a.txt\0nonexist\0\0dir/sub\0hardlink",
+    )
+    .unwrap();
+    fs::write(p("lists/dash0"), b"a.txt\0-\0").unwrap();
+    fs::write(p("lists/empty0"), b"").unwrap();
     fs::create_dir_all(p("sticky")).unwrap();
     fs::File::create(p("sparse.img"))
         .unwrap()
@@ -618,6 +646,61 @@ gnu_cases! {
     du_huge_block_size: "du" ["-B", "99999999999999999999999"];
     du_bad_threshold: "du" ["-t", "x"];
     du_negative_zero_threshold: "du" ["--threshold=-0"];
+    du_negative_zero_threshold_short: "du" ["-t-0"];
+    du_negative_zero_threshold_suffix: "du" ["-t", "-0k"];
+    du_threshold_hex: "du" ["-a", "-t", "0x800", "dir"];
+    du_threshold_octal: "du" ["-a", "-t", "010000", "dir"];
+    du_long_deep: "du" ["longdeep"];
+    du_long_deep_all: "du" ["-ab", "longdeep"];
+    du_long_deep_summary: "du" ["-s", "longdeep", "deep"];
+    du_dereference_cycle: "du" ["-L", "cycle"];
+    du_dereference_cycle_count_links: "du" ["-lL", "cycle"];
+    du_dereference_cycle_all: "du" ["-aL", "cycle"];
+    du_cycle_excluded: "du" ["--exclude=dotdot", "cycle"];
+    du_triple_trailing_slash: "du" ["-a", "dir///"];
+    du_zero_length_name: "du" ["", "dir/sub"];
+
+    // ------------------------------------------------------------ du --time
+    du_time: "du" ["--time", "dir"];
+    du_time_all: "du" ["--time", "-a", "dir"];
+    du_time_full_iso: "du" ["--time", "--time-style=full-iso", "-a", "dir"];
+    du_time_iso: "du" ["--time", "--time-style=iso", "times"];
+    du_time_format: "du" ["--time", "--time-style=+%Y %j|%s.%N", "-a", "times"];
+    du_time_ctime: "du" ["--time=ctime", "-s", "times"];
+    du_time_status: "du" ["--time=status", "--time-style=long-iso", "times/t1"];
+    du_time_separate_dirs: "du" ["--time", "-S", "dir"];
+    du_time_total: "du" ["--time", "-c", "dir", "times"];
+    du_time_depth: "du" ["--time", "-d", "1", "dir"];
+    du_time_null: "du" ["--time", "-0", "dir/sub"];
+    du_time_hard_links: "du" ["--time", "-a", "a.txt", "hardlink", "dir"];
+    du_time_bad_word: "du" ["--time=mtime", "dir"];
+    du_time_bad_style: "du" ["--time", "--time-style=nope", "dir"];
+    du_time_style_without_time: "du" ["--time-style=nope", "dir/sub"];
+    du_time_style_env: "du" ["--time", "dir"] env [("TIME_STYLE", "posix-full-iso")];
+    du_time_style_env_locale: "du" ["--time", "dir"] env [("TIME_STYLE", "locale")];
+    du_time_style_env_format: "du" ["--time", "dir"] env [("TIME_STYLE", "+%Y\n%m")];
+    du_time_style_env_bad: "du" ["--time", "dir"] env [("TIME_STYLE", "nope")];
+    du_time_style_option_wins: "du" ["--time", "--time-style=iso", "dir"] env [("TIME_STYLE", "full-iso")];
+
+    // ----------------------------------------------------- du --files0-from
+    du_files0_from: "du" ["--files0-from=lists/names0"];
+    du_files0_from_total: "du" ["-c", "--files0-from=lists/names0"];
+    du_files0_from_summary_time: "du" ["-s", "--time", "--files0-from=lists/names0"];
+    du_files0_from_stdin: "du" ["--files0-from=-"] stdin b"dir/sub\0a.txt";
+    du_files0_from_stdin_dash: "du" ["--files0-from=-"] stdin b"a.txt\0-\0";
+    du_files0_from_file_dash: "du" ["--files0-from=lists/dash0"];
+    du_files0_from_empty: "du" ["--files0-from=lists/empty0"];
+    du_files0_from_dev_null: "du" ["--files0-from=/dev/null"];
+    du_files0_from_nul_only: "du" ["--files0-from=-"] stdin b"\0\0";
+    du_files0_from_extra_operand: "du" ["--files0-from=-", "dir"] stdin b"a.txt";
+    du_files0_from_missing: "du" ["--files0-from=nonexist"];
+    du_files0_from_directory: "du" ["--files0-from=dir"];
+    du_files0_from_non_utf8: "du" ["--files0-from=-"] stdin b"names/bad\xffbyte\0bad\xffdir";
+
+    // ------------------------------------------- du names that aren't UTF-8
+    du_non_utf8: "du" ["-a", "bad@xff@dir", "names/bad@xff@byte"];
+    du_non_utf8_missing: "du" ["no@xff@such", "dir/sub"];
+    du_non_utf8_exclude: "du" ["-a", "--exclude=f@xff@", "bad@xff@dir"];
 
     // ---------------------------------- df (only columns that cannot move)
     df_output_stable: "df" ["--output=source,fstype,itotal,size,file,target", "a.txt"];
