@@ -4934,7 +4934,7 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     let mut copier = Copier {
         o,
-        journal: UndoJournal::open().ok(),
+        journal: UndoJournal::open_for_recording(),
         umask: process_umask(),
         ctx,
         seen_sources: HashSet::new(),
@@ -5946,7 +5946,7 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "options --backup and --no-clobber are mutually exclusive",
         ));
     }
-    let journal = UndoJournal::open().ok();
+    let journal = UndoJournal::open_for_recording();
     let strip = |s: &str| {
         if strip_slashes {
             strip_trailing_slashes(s)

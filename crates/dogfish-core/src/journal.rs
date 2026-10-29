@@ -207,6 +207,22 @@ impl UndoJournal {
         Ok(journal)
     }
 
+    /// The journal `cp` and `mv` record into, or `None` when recording is off
+    /// (`DOGFISH_UNDO=off`, `0`, `false` or `no`) or the journal can't be opened.
+    ///
+    /// Turning it off skips the backups `cp`/`mv` keep of what they overwrite, so
+    /// overwrites cost what GNU's do — and can't be undone. `rm --safe` is an explicit
+    /// request for the trash and keeps using [`UndoJournal::open`].
+    pub fn open_for_recording() -> Option<Self> {
+        let disabled = std::env::var("DOGFISH_UNDO").is_ok_and(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        });
+        if disabled { None } else { Self::open().ok() }
+    }
+
     fn journal_path(&self) -> PathBuf {
         self.base_dir.join("journal.ndjson")
     }

@@ -480,3 +480,20 @@ fn touch_never_truncates() {
     assert!(sb.run(&["touch", "new"]).status.success());
     assert_eq!(sb.read("new"), "");
 }
+
+#[test]
+fn undo_recording_can_be_turned_off_but_rm_safe_still_trashes() {
+    let sb = Sandbox::new();
+    let off = [("DOGFISH_UNDO", "off")];
+    sb.write("src", "new");
+    sb.write("dst", "old");
+    assert!(sb.run_env(&["cp", "src", "dst"], &off).status.success());
+    assert!(sb.run_env(&["mv", "src", "moved"], &off).status.success());
+    assert_eq!(sb.read("dst"), "new");
+    assert!(!sb.exists(".dogfish/journal.ndjson"), "nothing recorded");
+
+    sb.write("f", "keep me");
+    assert!(sb.run_env(&["rm", "--safe", "f"], &off).status.success());
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("f"), "keep me");
+}

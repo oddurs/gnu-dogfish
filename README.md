@@ -126,6 +126,7 @@ Retention is bounded so the trash cannot grow forever:
 | :--- | :--- | :--- |
 | `DOGFISH_JOURNAL_MAX` | `500` | Operations kept for `undo`. Older entries — and anything they hold in the trash, including `rm --safe` files — are deleted. |
 | `DOGFISH_BACKUP_LIMIT` | `1G` | Total size of the automatic backups `cp`/`mv` keep of files they overwrite. Oldest backups are discarded first; the newest is always kept. `rm --safe` files never count against it. |
+| `DOGFISH_UNDO` | on | Set to `off` to stop `cp`/`mv` recording undo entries and keeping backups of what they overwrite (overwrites then cost what GNU's do, and can't be undone). `rm --safe` still uses the trash. |
 
 `undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it.
 
