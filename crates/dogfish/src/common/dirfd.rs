@@ -6,8 +6,11 @@
 //! entry; a directory's names are read in one pass into one buffer, with
 //! `readdir`'s file type, so that an entry need not be `stat`ed just to tell
 //! a directory. [`WalkPath`] keeps the printable path alongside for
-//! messages. A walk keeps at most [`MAX_OPEN_DIRS`] directories open; deeper
-//! down, entries are reached by full path.
+//! messages. A walk keeps at most [`MAX_OPEN_DIRS`] directories open. Deeper
+//! down, rm and du let go of a directory while reading a subdirectory and get
+//! it back through `..` ([`DirFd::open_parent`]), so no depth needs a path
+//! the kernel would have to resolve in one piece (`PATH_MAX`); chmod still
+//! reaches such entries by full path ([`WalkPath::c_path`]).
 
 use std::ffi::{CStr, OsStr};
 use std::io;
@@ -110,6 +113,48 @@ impl DirFd {
         names.clear();
         read_entries(self.fd(), names)
     }
+
+    /// This directory's (device, inode), from `fstat`.
+    pub(crate) fn id(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        // fstat through a `File` on a duplicate of the descriptor.
+        let meta = std::fs::File::from(self.0.try_clone()?).metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    /// Opens this directory's parent through `..`; it must be the directory
+    /// `expect` names (device, inode), or this fails with `ENOENT` as GNU's
+    /// fts does when a directory was moved during the walk. Deeper than
+    /// [`MAX_OPEN_DIRS`], a walk lets go of each directory while it reads a
+    /// subdirectory and climbs back up this way, so it holds only a few
+    /// descriptors and never needs a path longer than one name.
+    pub(crate) fn open_parent(&self, expect: (u64, u64)) -> io::Result<DirFd> {
+        use std::os::unix::fs::MetadataExt;
+        let parent = At {
+            dir: self.fd(),
+            name: c"..",
+        }
+        .open_dir(true)?;
+        // fstat through `File`, then take the descriptor back.
+        let file = std::fs::File::from(parent.0);
+        let meta = file.metadata()?;
+        if (meta.dev(), meta.ino()) != expect {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        Ok(DirFd(OwnedFd::from(file)))
+    }
+}
+
+/// How GNU's `fts_open` names a command-line operand: two or more trailing
+/// slashes become one (`a///` is `a/`, `///` is `/`).
+pub(crate) fn fts_root_name(arg: &[u8]) -> &[u8] {
+    let mut len = arg.len();
+    if len > 2 && arg[len - 1] == b'/' {
+        while len > 1 && arg[len - 2] == b'/' {
+            len -= 1;
+        }
+    }
+    &arg[..len]
 }
 
 /// `d_type` values: what readdir says an entry is, without a `stat`.
@@ -324,5 +369,48 @@ impl WalkPath {
         self.cbuf.extend_from_slice(&self.buf);
         self.cbuf.push(0);
         CStr::from_bytes_with_nul(&self.cbuf).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fts_keeps_one_trailing_slash() {
+        for (arg, name) in [
+            (&b"a///"[..], &b"a/"[..]),
+            (b"a/", b"a/"),
+            (b"a", b"a"),
+            (b"//", b"//"),
+            (b"///", b"/"),
+            (b"a//b//", b"a//b/"),
+            (b"", b""),
+        ] {
+            assert_eq!(fts_root_name(arg), name, "{arg:?}");
+        }
+    }
+
+    #[test]
+    fn climbs_back_to_the_parent() {
+        let dir = std::env::temp_dir().join(format!("dogfish-dirfd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let top = At::cwd(&c).open_dir(false).unwrap();
+        let sub = At {
+            dir: top.fd(),
+            name: c"sub",
+        }
+        .open_dir(true)
+        .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert!(sub.open_parent((meta.dev(), meta.ino())).is_ok());
+        let wrong = sub.open_parent((meta.dev(), meta.ino() + 1));
+        assert_eq!(
+            wrong.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ENOENT)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

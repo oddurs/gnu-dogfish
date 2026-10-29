@@ -1,8 +1,9 @@
 //! du — Parallel disk usage with sparklines on a TTY, GNU `du` otherwise
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -12,17 +13,18 @@ use dogfish_core::{
 };
 use serde::Serialize;
 
-use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names};
+use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names, fts_root_name};
+use crate::common::files0::{Files0From, extra_operand_error};
 use crate::common::fnmatch::fnmatch;
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, unsupported,
-    usage_error,
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
 };
 use crate::common::human::{
-    HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, SizeError, env_block_size, human_readable,
-    parse_block_size, parse_size_suffixed,
+    HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, human_readable, parse_block_size,
+    parse_size_suffixed,
 };
-use crate::common::quote::{Quoting, quote_af, quote_bytes, quote_f};
+use crate::common::quote::{Quoting, qa, qf, quote_bytes, quote_locale};
+use crate::common::strftime::{Timespec, format_local_time};
 
 const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'a', "all", HasArg::No, "all"),
@@ -34,7 +36,7 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'D', "dereference-args", HasArg::No, "dereference-args"),
     OptSpec::long("exclude", HasArg::Required, "exclude"),
     OptSpec::both(b'X', "exclude-from", HasArg::Required, "exclude-from"),
-    OptSpec::long("files0-from", HasArg::Required, "unsupported"),
+    OptSpec::long("files0-from", HasArg::Required, "files0-from"),
     OptSpec::both(b'h', "human-readable", HasArg::No, "human-readable"),
     OptSpec::long("inodes", HasArg::No, "inodes"),
     OptSpec::long("si", HasArg::No, "si"),
@@ -46,8 +48,8 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b's', "summarize", HasArg::No, "summarize"),
     OptSpec::both(b'c', "total", HasArg::No, "total"),
     OptSpec::both(b't', "threshold", HasArg::Required, "threshold"),
-    OptSpec::long("time", HasArg::Optional, "unsupported"),
-    OptSpec::long("time-style", HasArg::Required, "unsupported"),
+    OptSpec::long("time", HasArg::Optional, "time"),
+    OptSpec::long("time-style", HasArg::Required, "time-style"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
@@ -60,6 +62,7 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
 
 const DU_HELP: &str = "\
 Usage: du [OPTION]... [FILE]...
+  or:  du [OPTION]... --files0-from=F
 Summarize device usage of the set of FILEs, recursively for directories.
 
   -0, --null            end each output line with NUL, not newline
@@ -72,6 +75,9 @@ Summarize device usage of the set of FILEs, recursively for directories.
                           command line (also -H)
   -d, --max-depth=N     print the total for a directory only if it is N or
                           fewer levels below the command line argument
+      --files0-from=F   summarize device usage of the
+                          NUL-terminated file names specified in file F;
+                          if F is -, then read names from standard input
   -h, --human-readable  print sizes in human readable format (e.g., 1K 234M 2G)
       --inodes          list inode usage information instead of block usage
   -k                    like --block-size=1K
@@ -84,6 +90,13 @@ Summarize device usage of the set of FILEs, recursively for directories.
   -s, --summarize       display only a total for each argument
   -t, --threshold=SIZE  exclude entries smaller than SIZE if positive,
                           or entries greater than SIZE if negative
+      --time            show time of the last modification of any file in the
+                          directory, or any of its subdirectories
+      --time=WORD       show time as WORD instead of modification time:
+                          atime, access, use, ctime or status
+      --time-style=STYLE  show times using STYLE, which can be:
+                            full-iso, long-iso, iso, or +FORMAT;
+                            FORMAT is interpreted like in 'date'
   -X, --exclude-from=FILE  exclude files that match any pattern in FILE
       --exclude=PATTERN    exclude files that match PATTERN
   -x, --one-file-system    skip directories on different file systems
@@ -104,6 +117,14 @@ struct DuRecord {
     files: u64,
 }
 
+/// Which timestamp `--time` shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DuTime {
+    Mtime,
+    Atime,
+    Ctime,
+}
+
 /// What `du` measures and how it walks (shared by the parallel collectors).
 struct DuConfig {
     all: bool,
@@ -115,7 +136,15 @@ struct DuConfig {
     follow_all: bool,
     one_file_system: bool,
     excludes: Vec<Vec<u8>>,
+    /// `--time`: the timestamp to keep the latest of.
+    time: Option<DuTime>,
 }
+
+/// Earlier than any timestamp (GNU's `TYPE_MINIMUM (time_t), -1`).
+const NO_TIME: Timespec = Timespec {
+    sec: i64::MIN,
+    nsec: -1,
+};
 
 /// What `du` needs of a `stat`.
 #[derive(Clone, Copy)]
@@ -126,11 +155,19 @@ struct DuStat {
     mode: u32,
     size: u64,
     blocks: u64,
+    /// The `--time` timestamp (unset without `--time`).
+    time: Timespec,
 }
 
 impl DuStat {
     #[allow(clippy::unnecessary_cast)] // the field types vary by platform
-    fn from_stat(st: &libc::stat) -> Self {
+    fn from_stat(st: &libc::stat, time: Option<DuTime>) -> Self {
+        let (sec, nsec) = match time {
+            None => (0, 0),
+            Some(DuTime::Mtime) => (st.st_mtime as i64, st.st_mtime_nsec as i64),
+            Some(DuTime::Atime) => (st.st_atime as i64, st.st_atime_nsec as i64),
+            Some(DuTime::Ctime) => (st.st_ctime as i64, st.st_ctime_nsec as i64),
+        };
         Self {
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
@@ -138,6 +175,7 @@ impl DuStat {
             mode: st.st_mode as u32,
             size: st.st_size as u64,
             blocks: st.st_blocks as u64,
+            time: Timespec { sec, nsec },
         }
     }
 
@@ -194,14 +232,18 @@ impl DuConfig {
 /// A directory read during the collection phase.
 struct DuDir {
     meta: DuStat,
-    /// Combined size and count of entries that need neither printing nor
-    /// de-duplication (single-link files without `-a`).
+    /// Combined size, count and latest time of entries that need neither
+    /// printing nor de-duplication (single-link files without `-a`).
     plain_size: u64,
     plain_files: u64,
+    plain_time: Timespec,
     /// The names `entries` refer to.
     names: Names,
     entries: Vec<DuEntry>,
     read_error: Option<io::Error>,
+    /// The walk could not climb back into this directory after reading a
+    /// deep subdirectory (it was moved meanwhile): GNU's `fts_read` fails.
+    lost: Option<io::Error>,
 }
 
 impl DuDir {
@@ -210,10 +252,18 @@ impl DuDir {
             meta,
             plain_size: 0,
             plain_files: 0,
+            plain_time: NO_TIME,
             names: Names::default(),
             entries: Vec::new(),
             read_error: None,
+            lost: None,
         }
+    }
+
+    fn unreadable(meta: DuStat, error: io::Error) -> Self {
+        let mut dir = Self::empty(meta);
+        dir.read_error = Some(error);
+        dir
     }
 
     fn name(&self, index: usize) -> &[u8] {
@@ -239,10 +289,12 @@ enum DuEntry {
     },
 }
 
-fn du_access_error(path: &str, error: Option<&io::Error>) {
+/// GNU's message for a file that could not be `stat`ed.
+fn du_access_error(path: &[u8], error: Option<&io::Error>) -> String {
+    let path = OsStr::from_bytes(path);
     match error {
-        Some(e) => eprintln!("du: cannot access {}: {}", quote_af(path), gnu_io_error(e)),
-        None => eprintln!("du: cannot access {}", quote_af(path)),
+        Some(e) => format!("cannot access {}: {}", qa(path), gnu_io_error(e)),
+        None => format!("cannot access {}", qa(path)),
     }
 }
 
@@ -264,8 +316,8 @@ fn fts_join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-/// How to reach entry `name` of a directory: through its descriptor, or
-/// (deep down, where none is kept open) by its full path.
+/// How to reach entry `name` of a directory: through its descriptor, or by
+/// its full path (deep under -L, where none is kept open).
 fn entry_at<'a>(fd: Option<&DirFd>, name: &'a CStr, full: Option<&'a CStr>) -> At<'a> {
     match (fd, full) {
         (Some(fd), _) => At { dir: fd.fd(), name },
@@ -295,9 +347,8 @@ struct DuCollect<'a> {
 }
 
 impl DuCollect<'_> {
-    /// Reads `at` (whose printed name is `display`) and its subdirectories,
-    /// each entry `stat`ed relative to its open directory. Entry order is
-    /// kept, so the sequential pass sees the same readdir order GNU's fts does.
+    /// Opens and reads the directory `at` (whose printed name is `display`)
+    /// and its subdirectories.
     fn dir(
         &mut self,
         at: At<'_>,
@@ -307,29 +358,47 @@ impl DuCollect<'_> {
         depth: usize,
         slot: &[usize],
     ) -> DuDir {
+        // The operand was stat'ed through any symlink; below it, only -L follows.
+        match at.open_dir(depth > 0 && !self.cfg.follow_all) {
+            Ok(fd) => self.dir_fd(fd, display, meta, ancestors, depth, slot).0,
+            Err(e) => DuDir::unreadable(meta, e),
+        }
+    }
+
+    /// Reads the open directory `fd` and its subdirectories, each entry
+    /// `stat`ed relative to its directory. Entry order is kept, so the
+    /// sequential pass sees the same readdir order GNU's fts does.
+    ///
+    /// Gives the descriptor back for the caller to climb back up from, or
+    /// `None` if this directory was lost (see [`DuDir::lost`]).
+    fn dir_fd(
+        &mut self,
+        fd: DirFd,
+        display: &[u8],
+        meta: DuStat,
+        ancestors: &[(u64, u64)],
+        depth: usize,
+        slot: &[usize],
+    ) -> (DuDir, Option<DirFd>) {
         let cfg = self.cfg;
         let mut dir = DuDir::empty(meta);
-        // The operand was stat'ed through any symlink; below it, only -L follows.
-        let fd = match at.open_dir(depth > 0 && !cfg.follow_all) {
-            Ok(fd) => fd,
-            Err(e) => {
-                dir.read_error = Some(e);
-                return dir;
-            }
-        };
         let mut names = Names::default();
         if let Err(e) = fd.read_names(&mut names) {
             dir.read_error = Some(e);
         }
         let mut lineage = ancestors.to_vec();
         lineage.push((meta.dev, meta.ino));
-        // Deep down, entries are reached by full path, with no directory held open.
-        let fd = (depth < MAX_OPEN_DIRS).then_some(fd);
+        // Under -L, `..` is not where a followed link came from, so the walk
+        // cannot climb back up through it. Deep down, entries are then
+        // reached by full path instead, with no directory held open, as
+        // GNU's logical walk (FTS_NOCHDIR) reaches every entry; such a path
+        // can also fail as GNU's does (ELOOP, ENAMETOOLONG).
+        let by_path = cfg.follow_all && depth >= MAX_OPEN_DIRS;
+        let fd = (!by_path).then_some(fd);
         let mut subdirs: Vec<(usize, Vec<u8>)> = Vec::new();
         for i in 0..names.len() {
             let (name, _, _) = names.get(i);
-            let full = fd
-                .is_none()
+            let full = by_path
                 .then(|| CString::new(fts_join(display, name.to_bytes())).ok())
                 .flatten();
             let child = entry_at(fd.as_ref(), name, full.as_deref());
@@ -339,7 +408,7 @@ impl DuCollect<'_> {
                 child.stat(false).map_err(Some)
             };
             let meta = match st {
-                Ok(st) => DuStat::from_stat(&st),
+                Ok(st) => DuStat::from_stat(&st, cfg.time),
                 Err(error) => {
                     dir.entries.push(DuEntry::Unreadable { name: i, error });
                     continue;
@@ -358,11 +427,13 @@ impl DuCollect<'_> {
                 continue;
             }
             if meta.is_dir() {
-                // A directory that is its own ancestor (a symlink loop under -L)
-                // stays empty; the walk then skips it as already counted.
-                if !lineage.contains(&(meta.dev, meta.ino)) {
-                    subdirs.push((dir.entries.len(), child_display));
+                // A directory that is its own ancestor (a symlink loop under
+                // -L, a bind mount): GNU's fts reports FTS_DC, which du skips
+                // without counting it.
+                if lineage.contains(&(meta.dev, meta.ino)) {
+                    continue;
                 }
+                subdirs.push((dir.entries.len(), child_display));
                 dir.entries.push(DuEntry::Dir {
                     name: i,
                     dir: Box::new(DuDir::empty(meta)),
@@ -370,10 +441,17 @@ impl DuCollect<'_> {
             } else if !cfg.all && cfg.dedup_key(&meta).is_none() {
                 dir.plain_size += cfg.size_of(&meta);
                 dir.plain_files += 1;
+                dir.plain_time = dir.plain_time.max(meta.time);
             } else {
                 dir.entries.push(DuEntry::File { name: i, meta });
             }
         }
+        // Deeper than this (and not under -L), a subdirectory is read with
+        // this directory let go of, and this one is got back through the
+        // subdirectory's `..`.
+        let deep = depth + 1 >= MAX_OPEN_DIRS && !cfg.follow_all;
+        let mut fd = fd;
+        let mut lost = None;
         for (index, child_display) in subdirs {
             let DuEntry::Dir { name, dir: sub } = &mut dir.entries[index] else {
                 continue;
@@ -390,24 +468,66 @@ impl DuCollect<'_> {
                 });
                 continue;
             }
-            let name = names.get(*name).0;
-            let full = fd
-                .is_none()
-                .then(|| CString::new(child_display.clone()).ok())
-                .flatten();
-            let child = entry_at(fd.as_ref(), name, full.as_deref());
-            let meta = sub.meta;
-            **sub = self.dir(
-                child,
+            let sub_meta = sub.meta;
+            if by_path {
+                let full = CString::new(child_display.clone()).ok();
+                let child = entry_at(None, names.get(*name).0, full.as_deref());
+                **sub = self.dir(
+                    child,
+                    &child_display,
+                    sub_meta,
+                    &lineage,
+                    depth + 1,
+                    &child_slot,
+                );
+                continue;
+            }
+            let Some(this) = &fd else {
+                break;
+            };
+            let child = At {
+                dir: this.fd(),
+                name: names.get(*name).0,
+            };
+            if !deep {
+                **sub = self.dir(
+                    child,
+                    &child_display,
+                    sub_meta,
+                    &lineage,
+                    depth + 1,
+                    &child_slot,
+                );
+                continue;
+            }
+            let child_fd = match child.open_dir(true) {
+                Ok(child_fd) => child_fd,
+                Err(e) => {
+                    **sub = DuDir::unreadable(sub_meta, e);
+                    continue;
+                }
+            };
+            fd = None;
+            let (result, child_fd) = self.dir_fd(
+                child_fd,
                 &child_display,
-                meta,
+                sub_meta,
                 &lineage,
                 depth + 1,
                 &child_slot,
             );
+            **sub = result;
+            // A lost subdirectory has reported it; this one is lost with it.
+            if let Some(child_fd) = child_fd {
+                match child_fd.open_parent((meta.dev, meta.ino)) {
+                    Ok(parent) => fd = Some(parent),
+                    Err(e) => lost = Some(e),
+                }
+            }
         }
+        dir.lost = lost;
         dir.names = names;
-        dir
+        (dir, fd)
     }
 
     /// Reads a job's directory, reached by its full path.
@@ -421,11 +541,7 @@ impl DuCollect<'_> {
                 job.depth,
                 &job.slot,
             ),
-            Err(_) => {
-                let mut dir = DuDir::empty(job.meta);
-                dir.read_error = Some(io::Error::from_raw_os_error(libc::EINVAL));
-                dir
-            }
+            Err(_) => DuDir::unreadable(job.meta, io::Error::from_raw_os_error(libc::EINVAL)),
         }
     }
 }
@@ -519,10 +635,34 @@ struct DuLine {
     path: Vec<u8>,
     size: u64,
     files: u64,
+    time: Timespec,
 }
 
 /// Where streamed `du` lines go.
-type DuSink<'a> = &'a mut dyn FnMut(&DuLine) -> io::Result<()>;
+/// Where streamed `du` lines go; `None` asks it to flush what it holds.
+type DuSink<'a> = &'a mut dyn FnMut(Option<&DuLine>) -> io::Result<()>;
+
+/// What a walk adds up: size, file count and the latest `--time`.
+#[derive(Clone, Copy)]
+struct DuSum {
+    size: u64,
+    files: u64,
+    time: Timespec,
+}
+
+impl DuSum {
+    const ZERO: Self = Self {
+        size: 0,
+        files: 0,
+        time: NO_TIME,
+    };
+
+    fn add(&mut self, other: Self) {
+        self.size += other.size;
+        self.files += other.files;
+        self.time = self.time.max(other.time);
+    }
+}
 
 /// The sequential, GNU-ordered pass: de-duplication, depth and threshold
 /// filtering, and output.
@@ -538,8 +678,8 @@ struct DuWalker<'a> {
 }
 
 impl DuWalker<'_> {
-    fn emit(&mut self, path: Vec<u8>, size: u64, files: u64) -> io::Result<()> {
-        let size_i = i128::from(size);
+    fn emit(&mut self, path: Vec<u8>, sum: DuSum) -> io::Result<()> {
+        let size_i = i128::from(sum.size);
         let keep = if self.threshold >= 0 {
             size_i >= self.threshold
         } else {
@@ -548,14 +688,31 @@ impl DuWalker<'_> {
         if !keep {
             return Ok(());
         }
-        let line = DuLine { path, size, files };
+        let line = DuLine {
+            path,
+            size: sum.size,
+            files: sum.files,
+            time: sum.time,
+        };
         match self.sink.as_mut() {
-            Some(sink) => sink(&line),
+            Some(sink) => sink(Some(&line)),
             None => {
                 self.lines.push(line);
                 Ok(())
             }
         }
+    }
+
+    /// Reports a failure. Like gnulib's `error` (and GNU du, which flushes
+    /// each line), what was printed so far goes out first, so the two
+    /// streams interleave as GNU's do.
+    fn error(&mut self, msg: String) {
+        if let Some(sink) = self.sink.as_mut() {
+            // A failed flush shows up again on the next write.
+            let _ = sink(None);
+        }
+        eprintln!("du: {msg}");
+        self.status = 1;
     }
 
     /// First visit of an entry: false if it was already counted.
@@ -566,58 +723,165 @@ impl DuWalker<'_> {
         }
     }
 
-    /// Walks a collected directory; returns (total size, file count) of the subtree.
-    fn walk_dir(&mut self, dir: &DuDir, display: Vec<u8>, depth: usize) -> io::Result<(u64, u64)> {
-        if let Some(e) = &dir.read_error {
-            eprintln!(
-                "du: cannot read directory {}: {}",
-                quote_af(&String::from_utf8_lossy(&display)),
-                gnu_io_error(e)
-            );
-            self.status = 1;
+    /// What one entry counts for by itself.
+    fn own(&self, meta: &DuStat) -> DuSum {
+        DuSum {
+            size: self.cfg.size_of(meta),
+            files: 1,
+            time: meta.time,
         }
-        let mut own = self.cfg.size_of(&dir.meta) + dir.plain_size;
-        let mut files = dir.plain_files;
-        let mut sub_size = 0;
+    }
+
+    /// Walks a collected directory; returns what its subtree adds up to.
+    fn walk_dir(&mut self, dir: &DuDir, display: Vec<u8>, depth: usize) -> io::Result<DuSum> {
+        if let Some(e) = &dir.read_error {
+            self.error(format!(
+                "cannot read directory {}: {}",
+                qa(OsStr::from_bytes(&display)),
+                gnu_io_error(e)
+            ));
+        }
+        let mut own = DuSum {
+            size: self.cfg.size_of(&dir.meta) + dir.plain_size,
+            files: dir.plain_files,
+            time: dir.meta.time.max(dir.plain_time),
+        };
+        let mut sub = DuSum::ZERO;
         for entry in &dir.entries {
             match entry {
                 DuEntry::File { name, meta } => {
                     if !self.first_visit(meta) {
                         continue;
                     }
-                    let size = self.cfg.size_of(meta);
-                    own += size;
-                    files += 1;
+                    let file = self.own(meta);
+                    own.add(file);
                     if self.cfg.all && depth < self.max_depth {
-                        self.emit(fts_join(&display, dir.name(*name)), size, 1)?;
+                        self.emit(fts_join(&display, dir.name(*name)), file)?;
                     }
                 }
-                DuEntry::Dir { name, dir: sub } => {
-                    if !self.first_visit(&sub.meta) {
+                DuEntry::Dir { name, dir: subdir } => {
+                    if !self.first_visit(&subdir.meta) {
                         continue;
                     }
-                    let (size, n) =
-                        self.walk_dir(sub, fts_join(&display, dir.name(*name)), depth + 1)?;
-                    sub_size += size;
-                    files += n;
+                    let total =
+                        self.walk_dir(subdir, fts_join(&display, dir.name(*name)), depth + 1)?;
+                    sub.add(DuSum { files: 0, ..total });
+                    own.files += total.files;
                 }
                 DuEntry::Unreadable { name, error } => {
                     let path = fts_join(&display, dir.name(*name));
-                    du_access_error(&String::from_utf8_lossy(&path), error.as_ref());
-                    self.status = 1;
+                    self.error(du_access_error(&path, error.as_ref()));
                 }
             }
         }
-        let printed = if self.separate_dirs {
-            own
-        } else {
-            own + sub_size
-        };
-        if depth <= self.max_depth {
-            self.emit(display, printed, files)?;
+        if let Some(e) = &dir.lost {
+            self.error(format!(
+                "fts_read failed: {}: {}",
+                qf(OsStr::from_bytes(&display)),
+                gnu_io_error(e)
+            ));
         }
-        Ok((own + sub_size, files))
+        let mut printed = own;
+        if !self.separate_dirs {
+            printed.add(sub);
+        }
+        if depth <= self.max_depth {
+            self.emit(display, printed)?;
+        }
+        let mut total = own;
+        total.add(sub);
+        Ok(total)
     }
+
+    /// Counts one operand (GNU's `du_files` for one name); returns what it
+    /// adds to the grand total.
+    fn operand(
+        &mut self,
+        operand: &[u8],
+        deref_args: bool,
+        root: &mut Vec<usize>,
+    ) -> io::Result<DuSum> {
+        let cfg = self.cfg;
+        // fts keeps at most one of several trailing slashes.
+        let display = fts_root_name(operand).to_vec();
+        let Ok(c_target) = CString::new(display.clone()) else {
+            return Ok(DuSum::ZERO);
+        };
+        let at = At::cwd(&c_target);
+        let meta = if cfg.follow_all {
+            du_stat_follow(at)
+        } else if deref_args {
+            at.stat(true).or_else(|_| at.stat(false)).map_err(Some)
+        } else {
+            at.stat(false).map_err(Some)
+        };
+        let meta = match meta {
+            Ok(st) => DuStat::from_stat(&st, cfg.time),
+            Err(e) => {
+                self.error(du_access_error(&display, e.as_ref()));
+                return Ok(DuSum::ZERO);
+            }
+        };
+        if !cfg.excludes.is_empty() && cfg.excluded(&display) {
+            return Ok(DuSum::ZERO);
+        }
+        if !self.first_visit(&meta) {
+            return Ok(DuSum::ZERO);
+        }
+        let sum = if meta.is_dir() {
+            let tree = du_collect(at, &display, meta, cfg, meta.dev);
+            self.walk_dir(&tree, display, 0)?
+        } else {
+            let sum = self.own(&meta);
+            self.emit(display, sum)?;
+            sum
+        };
+        root.push(self.lines.len());
+        Ok(sum)
+    }
+}
+
+/// GNU du's `--time-style` (or TIME_STYLE) as a strftime format.
+fn du_time_format(style: Option<OsString>) -> std::result::Result<String, i32> {
+    let style = match style.map(|s| s.to_string_lossy().into_owned()) {
+        Some(s) => s,
+        None => match std::env::var_os("TIME_STYLE") {
+            // ls's "locale" means nothing here.
+            None => "long-iso".to_string(),
+            Some(s) if s == "locale" => "long-iso".to_string(),
+            Some(s) => {
+                let s = s.to_string_lossy().into_owned();
+                if let Some(format) = s.strip_prefix('+') {
+                    // Only the first line, as ls would use for old files.
+                    format!("+{}", format.split('\n').next().unwrap_or_default())
+                } else {
+                    let mut rest = s.as_str();
+                    while let Some(r) = rest.strip_prefix("posix-") {
+                        rest = r;
+                    }
+                    rest.to_string()
+                }
+            }
+        },
+    };
+    if let Some(format) = style.strip_prefix('+') {
+        return Ok(format.to_string());
+    }
+    let styles = [
+        ("full-iso", "%Y-%m-%d %H:%M:%S.%N %z"),
+        ("long-iso", "%Y-%m-%d %H:%M"),
+        ("iso", "%Y-%m-%d"),
+    ];
+    argmatch("du", "time style", &style, &styles).map(str::to_string)
+}
+
+/// A `--time` timestamp as GNU's `show_date` prints it.
+fn du_show_time(format: &str, t: Timespec) -> String {
+    format_local_time(format, t).unwrap_or_else(|| {
+        let secs = t.sec.to_string();
+        eprintln!("du: time {} is out of range", quote_locale(&secs));
+        secs
+    })
 }
 
 pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -633,6 +897,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         follow_all: false,
         one_file_system: false,
         excludes: Vec::new(),
+        time: None,
     };
     let mut null = false;
     let mut total = false;
@@ -642,13 +907,16 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     let mut separate_dirs = false;
     let mut threshold: i128 = 0;
     let mut json = false;
-    while let Some(item) = parsed.next_text() {
-        let opt = match item {
+    let mut files_from: Option<OsString> = None;
+    let mut time_style: Option<OsString> = None;
+    while let Some(item) = parsed.next() {
+        let (key, raw) = match item {
             Ok(o) => o,
             Err(e) => return Ok(getopt_error("du", &e)),
         };
-        let value = opt.value.clone().unwrap_or_default();
-        match opt.key {
+        let spelled = parsed.last_spelling();
+        let value = raw.as_deref().map(lossy).unwrap_or_default();
+        match key {
             "null" => null = true,
             "all" => cfg.all = true,
             "apparent-size" => cfg.apparent = true,
@@ -658,7 +926,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                     explicit_units = true;
                 }
                 Err(e) => {
-                    eprintln!("du: {}", e.message(&opt.spelled, &value));
+                    eprintln!("du: {}", e.message(&spelled, &value));
                     return Ok(1);
                 }
             },
@@ -710,9 +978,9 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                     None => (false, value.as_str()),
                 };
                 match parse_size_suffixed(digits) {
+                    // GNU names the option in full here, however it was spelled.
                     Ok(0) if negative => {
-                        let msg = SizeError::Invalid.message(&opt.spelled, &value);
-                        eprintln!("du: {msg}");
+                        eprintln!("du: invalid --threshold argument '-0'");
                         return Ok(1);
                     }
                     Ok(n) => {
@@ -723,18 +991,18 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                         }
                     }
                     Err(e) => {
-                        eprintln!("du: {}", e.message(&opt.spelled, &value));
+                        eprintln!("du: {}", e.message(&spelled, &value));
                         return Ok(1);
                     }
                 }
             }
-            "exclude" => cfg.excludes.push(value.into_bytes()),
+            "exclude" => cfg.excludes.push(raw.unwrap_or_default().into_vec()),
             "exclude-from" => {
                 let data = if value == "-" {
                     let mut buf = Vec::new();
                     io::Read::read_to_end(&mut io::stdin(), &mut buf).map(|_| buf)
                 } else {
-                    fs::read(&value)
+                    fs::read(raw.as_deref().unwrap_or_default())
                 };
                 match data {
                     Ok(data) => cfg.excludes.extend(
@@ -743,14 +1011,35 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                             .map(<[u8]>::to_vec),
                     ),
                     Err(e) => {
-                        eprintln!("du: {}: {}", quote_f(&value), gnu_io_error(&e));
+                        eprintln!(
+                            "du: {}: {}",
+                            qf(raw.as_deref().unwrap_or_default()),
+                            gnu_io_error(&e)
+                        );
                         return Ok(1);
                     }
                 }
             }
+            "files0-from" => files_from = raw.clone(),
+            "time" => {
+                let words = [
+                    ("atime", DuTime::Atime),
+                    ("access", DuTime::Atime),
+                    ("use", DuTime::Atime),
+                    ("ctime", DuTime::Ctime),
+                    ("status", DuTime::Ctime),
+                ];
+                cfg.time = Some(match &raw {
+                    None => DuTime::Mtime,
+                    Some(word) => match argmatch("du", "--time", word, &words) {
+                        Ok(t) => t,
+                        Err(status) => return Ok(status),
+                    },
+                });
+            }
+            "time-style" => time_style = raw.clone(),
             "one-file-system" => cfg.one_file_system = true,
             "json" => json = true,
-            "unsupported" => return Ok(unsupported("du", &opt.spelled)),
             "help" => return Ok(print_help(DU_HELP)),
             "version" => return Ok(print_version("du")),
             _ => unreachable!("unhandled du option"),
@@ -778,13 +1067,38 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         }
         block_size = 1;
     }
-    let operands = lossy_all(parsed.operands());
-    let targets = if operands.is_empty() {
-        vec![".".to_string()]
-    } else {
-        operands
+    let time_format = match cfg.time {
+        Some(_) => match du_time_format(time_style) {
+            Ok(f) => Some(f),
+            Err(status) => return Ok(status),
+        },
+        None => None,
     };
-    cfg.hash_all = targets.len() > 1 || cfg.follow_all;
+    let operands = parsed.operands();
+    // The names to count: the operands, or a --files0-from list read as it goes.
+    let mut list = None;
+    let mut targets: Vec<OsString> = Vec::new();
+    if let Some(from) = &files_from {
+        if let Some(extra) = operands.first() {
+            return Ok(extra_operand_error("du", extra, 1));
+        }
+        match Files0From::open(from) {
+            Ok(l) => list = Some(l),
+            Err(e) => {
+                eprintln!("du: {}", Files0From::open_error(from, &e));
+                return Ok(1);
+            }
+        }
+        // GNU cannot count the names up front, so assumes several.
+        cfg.hash_all = true;
+    } else {
+        targets = if operands.is_empty() {
+            vec![OsString::from(".")]
+        } else {
+            operands
+        };
+        cfg.hash_all = targets.len() > 1 || cfg.follow_all;
+    }
 
     // On a terminal, the default view is the Dogfish top-level breakdown.
     let rich = ctx.stdout_is_tty() && !json;
@@ -802,9 +1116,20 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     let mut out = io::BufWriter::new(stdout::stdout());
     let eol = if null { b'\0' } else { b'\n' };
     let format_size_gnu = |n: u64| human_readable(n, human_opts, 1, block_size);
-    let mut write_line = |line: &DuLine| -> io::Result<()> {
+    let mut write_line = |line: Option<&DuLine>| -> io::Result<()> {
+        let Some(line) = line else {
+            return out.flush();
+        };
         out.write_all(format_size_gnu(line.size).as_bytes())?;
         out.write_all(b"\t")?;
+        if let Some(format) = &time_format {
+            if format_local_time(format, line.time).is_none() {
+                // GNU's error() flushes what was printed first.
+                out.flush()?;
+            }
+            out.write_all(du_show_time(format, line.time).as_bytes())?;
+            out.write_all(b"\t")?;
+        }
         out.write_all(&line.path)?;
         out.write_all(&[eol])
     };
@@ -824,65 +1149,48 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         status: 0,
     };
 
-    let mut grand_total = 0;
-    let mut grand_files = 0;
+    let mut grand = DuSum::ZERO;
     let mut rich_groups: Vec<usize> = Vec::new();
-    for target in &targets {
-        // fts keeps at most one of several trailing slashes.
-        let mut display = target.as_bytes().to_vec();
-        while display.len() > 2 && display.ends_with(b"//") {
-            display.pop();
-        }
-        let Ok(c_target) = CString::new(target.as_bytes()) else {
-            continue;
+    let mut next_operand = targets.into_iter();
+    loop {
+        let name = match &mut list {
+            None => match next_operand.next() {
+                Some(name) => name,
+                None => break,
+            },
+            Some(list) => match list.next_os_name() {
+                Ok(Some(name)) => {
+                    if let Some(msg) = list.check_name(&name, list.count(), true) {
+                        walker.error(msg);
+                        continue;
+                    }
+                    name
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    walker.error(list.read_error(&e));
+                    break;
+                }
+            },
         };
-        let at = At::cwd(&c_target);
-        let meta = if cfg.follow_all {
-            du_stat_follow(at)
-        } else if deref_args {
-            at.stat(true).or_else(|_| at.stat(false)).map_err(Some)
-        } else {
-            at.stat(false).map_err(Some)
-        };
-        let meta = match meta {
-            Ok(st) => DuStat::from_stat(&st),
-            Err(e) => {
-                du_access_error(target, e.as_ref());
-                walker.status = 1;
-                continue;
-            }
-        };
-        if !cfg.excludes.is_empty() && cfg.excluded(&display) {
+        if name.is_empty() {
+            walker.error("invalid zero-length file name".to_string());
             continue;
         }
-        if !walker.first_visit(&meta) {
-            continue;
-        }
-        let res = if meta.is_dir() {
-            let tree = du_collect(at, &display, meta, &cfg, meta.dev);
-            walker.walk_dir(&tree, display, 0)
-        } else {
-            let size = cfg.size_of(&meta);
-            walker.emit(display, size, 1).map(|_| (size, 1))
-        };
-        match res {
-            Ok((size, files)) => {
-                grand_total += size;
-                grand_files += files;
-            }
+        match walker.operand(name.as_bytes(), deref_args, &mut rich_groups) {
+            Ok(sum) => grand.add(sum),
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
             Err(e) => return Err(e.into()),
         }
-        rich_groups.push(walker.lines.len());
     }
     if total {
-        let res = walker.emit(b"total".to_vec(), grand_total, grand_files);
+        let res = walker.emit(b"total".to_vec(), grand);
         ignore_broken_pipe(res)?;
     }
     let status = walker.status;
     let mut lines = std::mem::take(&mut walker.lines);
     drop(walker);
-    ctx.telemetry.add_items(grand_files);
+    ctx.telemetry.add_items(grand.files);
 
     if json {
         let records: Vec<DuRecord> = lines

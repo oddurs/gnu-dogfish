@@ -229,6 +229,24 @@ fn will_run(case: &Case<'_>) -> bool {
     true
 }
 
+/// A case argument as passed: `@xff@` in it stands for the byte 0xff, so
+/// that cases can name files that are not valid UTF-8.
+pub fn case_arg(arg: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let mut out = Vec::with_capacity(arg.len());
+    let mut rest = arg.as_bytes();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix(b"@xff@") {
+            out.push(0xff);
+            rest = after;
+        } else {
+            out.push(rest[0]);
+            rest = &rest[1..];
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
 /// Runs one case in `dir` through both implementations and asserts they match.
 pub fn check(dir: &Path, case: Case<'_>) {
     if !will_run(&case) {
@@ -236,15 +254,16 @@ pub fn check(dir: &Path, case: Case<'_>) {
     }
     let gnu = gnu_tool(case.tool).expect("checked by will_run");
 
+    let args: Vec<_> = case.args.iter().map(|a| case_arg(a)).collect();
     let mut ours = Command::new(dogfish_bin());
     ours.arg(case.tool)
-        .args(case.args)
+        .args(&args)
         .envs(case.env.iter().copied());
     let mut theirs = Command::new(&gnu);
     // GNU prints argv[0] in diagnostics; make it the bare tool name.
     theirs
         .arg0(case.tool)
-        .args(case.args)
+        .args(&args)
         .envs(case.env.iter().copied());
 
     let a = exec(ours, dir, case.stdin, case.locale);
