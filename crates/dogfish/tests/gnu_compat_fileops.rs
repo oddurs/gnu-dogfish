@@ -900,6 +900,8 @@ tree_cases! {
     chmod_missing_after_mode: "chmod" ["755"];
     chmod_no_operand: "chmod" [];
     chmod_bad_option: "chmod" ["-Q", "755", "a"];
+    // fts keeps one of several trailing slashes, in messages too.
+    chmod_recursive_collapsed_slashes: "chmod" ["-vR", "750", "d///", "nope//"];
 
     // -------------------------------------------------------------- chown
     chown_user: "chown" ["-v", "nobody", "a"];
@@ -925,6 +927,7 @@ tree_cases! {
     chown_missing_file: "chown" ["-v", "99", "nope"];
     chown_missing_after_spec: "chown" ["root"];
     chown_no_operand: "chown" [];
+    chown_recursive_collapsed_slashes: "chown" ["-vR", "99", "d///", "nope//"];
 
     // ----------------------------------------------------------------- rm
     rm_verbose: "rm" ["-v", "a", "b"];

@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
-use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath};
+use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath, fts_root_name};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
@@ -236,10 +236,12 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut ok = true;
     for f in &files {
-        let Ok(c_path) = CString::new(f.as_bytes()) else {
+        // Named as fts names it: `d//` is `d/`, in messages too.
+        let f = fts_root_name(f.as_bytes());
+        let Ok(c_path) = CString::new(f) else {
             continue;
         };
-        let mut path = WalkPath::new(f.as_bytes());
+        let mut path = WalkPath::new(f);
         match chown_path(&mut Parent::Cwd, &c_path, &mut path, 0, &run, ctx) {
             Ok(o) => ok &= o,
             Err(Lost) => {
