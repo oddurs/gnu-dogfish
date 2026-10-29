@@ -73,6 +73,11 @@ pub struct DogfishContext {
     pub show_stats: bool,
     pub force_json: bool,
     pub color_mode: ColorMode,
+    /// The utility's arguments as given, before the global flags were taken
+    /// out (`raw_args[0]` is the tool name). A utility with GNU semantics for
+    /// `--color[=WHEN]` (where its position and validity matter, as in `ls`)
+    /// parses it from here; empty when the context was built without arguments.
+    pub raw_args: Vec<String>,
     pub telemetry: Arc<Telemetry>,
 }
 
@@ -91,6 +96,7 @@ impl DogfishContext {
         let mut color_mode = ColorMode::Auto;
         let mut filtered = Vec::with_capacity(raw_args.len());
         let mut passthrough_rest = false;
+        let unfiltered = raw_args.clone();
 
         for (idx, arg) in raw_args.into_iter().enumerate() {
             if idx == 0 {
@@ -134,6 +140,7 @@ impl DogfishContext {
             show_stats,
             force_json: false,
             color_mode,
+            raw_args: unfiltered,
             telemetry: Arc::new(Telemetry::default()),
         };
 

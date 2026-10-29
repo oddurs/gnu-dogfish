@@ -8210,6 +8210,12 @@ struct LsOpts {
     line_length: usize,
     tab_size: usize,
     eol: u8,
+    /// GNU `print_with_color`, as `--color`, `-f` and `--zero` leave it.
+    color: bool,
+    /// The colour table in effect for GNU-style output (`None`: no colour).
+    colors: Option<LsColors>,
+    /// GNU `check_symlink_mode`: follow symlinks to colour or group them.
+    check_symlink_mode: bool,
     tree: bool,
     level: usize,
     json: bool,
@@ -8228,6 +8234,9 @@ struct LsFile {
     target_meta: Option<fs::Metadata>,
     /// A command-line directory to list, or a subdirectory to recurse into.
     list_as_dir: bool,
+    /// Whether GNU would have stat'ed this file (its `stat_ok`, given that the
+    /// stat succeeded): otherwise GNU colours it by its `readdir` type alone.
+    gnu_stat: bool,
 }
 
 impl LsFile {
@@ -8346,18 +8355,15 @@ fn parse_ls_args(
         line_length: 80,
         tab_size: 8,
         eol: b'\n',
+        color: false,
+        colors: None,
+        check_symlink_mode: false,
         tree: false,
         level: 3,
         json: false,
         now: std::cell::Cell::new(Timespec::now()),
     };
-    if let Some(cols) = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse::<usize>().ok())
-        .filter(|c| *c > 0)
-    {
-        o.line_length = cols;
-    }
+    let mut width_opt: Option<usize> = None;
     if let Some(tab) = std::env::var("TABSIZE")
         .ok()
         .and_then(|t| t.parse::<usize>().ok())
@@ -8415,12 +8421,34 @@ fn parse_ls_args(
             "one-per-line" if o.format != LsFormat::Long => o.format = LsFormat::OnePerLine,
             "one-per-line" => {}
             "long" => o.format = LsFormat::Long,
-            "color" | "hyperlink" => {}
+            "color" | "hyperlink" => {
+                let when = [
+                    ("always", "always"),
+                    ("yes", "always"),
+                    ("force", "always"),
+                    ("never", "never"),
+                    ("no", "never"),
+                    ("none", "never"),
+                    ("auto", "auto"),
+                    ("tty", "auto"),
+                    ("if-tty", "auto"),
+                ];
+                let when = match &opt.value {
+                    None => "always",
+                    Some(v) => gnu_argmatch("ls", &format!("--{}", opt.key), v, &when)
+                        .ok_or_else(|| try_help("ls", 1))?,
+                };
+                // Hyperlinks are accepted but not emitted.
+                if opt.key == "color" {
+                    o.color = when == "always" || (when == "auto" && stdout_is_tty);
+                }
+            }
             "directory" => o.immediate_dirs = true,
             "unsorted-all" => {
                 o.ignore = LsIgnore::Minimal;
                 o.sort = LsSort::None;
                 sort_specified = true;
+                o.color = false;
             }
             "classify" => {
                 let when = [
@@ -8595,9 +8623,21 @@ fn parse_ls_args(
             }
             "time-style" => time_style = Some(value),
             "tabsize" => o.tab_size = width_arg(&value, "tab size")?,
-            "width" => o.line_length = width_arg(&value, "line width")?,
+            "width" => match decode_line_length(&value) {
+                Some(n) => width_opt = Some(n),
+                None => {
+                    eprintln!(
+                        "ls: invalid line width: {}",
+                        quote_bytes(value.as_bytes(), Quoting::Locale)
+                    );
+                    return Err(2);
+                }
+            },
             "context" => o.context = true,
-            "zero" => o.eol = b'\0',
+            "zero" => {
+                o.eol = b'\0';
+                o.color = false;
+            }
             "tree" => o.tree = true,
             "level" => {
                 o.level = value.parse().map_err(|_| {
@@ -8620,6 +8660,31 @@ fn parse_ls_args(
             _ => unreachable!("unhandled ls option"),
         }
     }
+    if o.eol == b'\0' && o.format != LsFormat::Long {
+        o.format = LsFormat::OnePerLine;
+    }
+    // GNU consults COLUMNS only when the format or colouring needs a width.
+    o.line_length = match width_opt {
+        Some(n) => n,
+        None if o.color
+            || matches!(
+                o.format,
+                LsFormat::Columns | LsFormat::Across | LsFormat::Commas
+            ) =>
+        {
+            match std::env::var_os("COLUMNS").filter(|c| !c.is_empty()) {
+                Some(c) => decode_line_length(&c.to_string_lossy()).unwrap_or_else(|| {
+                    eprintln!(
+                        "ls: ignoring invalid width in environment variable COLUMNS: {}",
+                        quote_bytes(c.as_encoded_bytes(), Quoting::Locale)
+                    );
+                    80
+                }),
+                None => 80,
+            }
+        }
+        None => 80,
+    };
     if kibibytes && !explicit_sizes && std::env::var_os("LS_BLOCK_SIZE").is_none() {
         (o.human_opts, o.block_size) = (0, 1024);
     }
@@ -8643,14 +8708,40 @@ fn parse_ls_args(
             .unwrap_or(Quoting::Literal)
     });
     o.hide_control = hide_control.unwrap_or(false);
-    if o.eol == b'\0' && o.format != LsFormat::Long {
-        o.format = LsFormat::OnePerLine;
-    }
     Ok((o, parsed.operands))
 }
 
+/// `ls` parses `--color[=WHEN]` itself, like GNU (in argument order, so `-f`
+/// and `--zero` can turn it off again, and with GNU's diagnostics), so it takes
+/// its arguments from before the global-flag filtering, dropping only
+/// `--stats`; the Dogfish `--no-color` means `--color=never`.
+fn ls_args(ctx: &DogfishContext, filtered: Vec<String>) -> Vec<String> {
+    if ctx.raw_args.is_empty() {
+        return filtered;
+    }
+    let mut args = Vec::with_capacity(ctx.raw_args.len());
+    let mut operands_only = false;
+    for (i, arg) in ctx.raw_args.iter().enumerate() {
+        if i == 0 || operands_only {
+            args.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => {
+                operands_only = true;
+                args.push(arg.clone());
+            }
+            "--stats" => {}
+            "--no-color" => args.push("--color=never".into()),
+            _ => args.push(arg.clone()),
+        }
+    }
+    args
+}
+
 pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let (opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty) {
+    let args = ls_args(ctx, args);
+    let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty) {
         Ok(v) => v,
         Err(status) => return Ok(status),
     };
@@ -8688,6 +8779,18 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             opts.format,
             LsFormat::Long | LsFormat::OnePerLine | LsFormat::Columns
         );
+    // GNU colours (on the GNU-format path): LS_COLORS, else the built-in table.
+    if opts.color && !rich && !opts.json {
+        opts.colors = LsColors::from_env();
+    }
+    if let Some(c) = &opts.colors {
+        // GNU: no tabs in coloured output (some terminals mishandle them).
+        opts.tab_size = 0;
+        opts.check_symlink_mode = c.is_colored(C_ORPHAN)
+            || (c.is_colored(C_EXEC) && c.referent)
+            || (c.is_colored(C_MISSING) && opts.format == LsFormat::Long);
+    }
+    opts.check_symlink_mode |= opts.dirs_first;
     let stdout = io::stdout();
     let mut lister = Lister {
         opts: &opts,
@@ -8697,8 +8800,12 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         rich: rich.then_some(st),
         json: Vec::new(),
         active: Vec::new(),
+        used_color: std::cell::Cell::new(false),
     };
-    match lister.run(&targets) {
+    let res = lister
+        .run(&targets)
+        .and_then(|()| lister.restore_default_color());
+    match res {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(lister.status),
         res => res?,
     }
@@ -8780,6 +8887,8 @@ struct Lister<'a, W: Write> {
     json: Vec<LsEntry>,
     /// Directories being listed (for `-R` loop detection).
     active: Vec<(u64, u64)>,
+    /// GNU `used_color`: whether a colour sequence has been written yet.
+    used_color: std::cell::Cell<bool>,
 }
 
 impl<W: Write> Lister<'_, W> {
@@ -8843,6 +8952,7 @@ impl<W: Write> Lister<'_, W> {
             link_target: None,
             target_meta: None,
             list_as_dir,
+            gnu_stat: true,
         };
         self.inspect_link(&mut f);
         Some(f)
@@ -8855,15 +8965,30 @@ impl<W: Write> Lister<'_, W> {
         } else {
             dir.join(bytes_path(&name))
         };
-        // Like GNU, only follow a link (and report a dangling one) when the
-        // output needs the target's details.
+        // Like GNU (`gobble_file`), only stat when the output needs it, and
+        // only follow a link (and report a dangling one) in that case.
+        let colors = o.colors.as_ref();
+        let colored =
+            |which: &[usize]| colors.is_some_and(|c| which.iter().any(|i| c.is_colored(*i)));
         let needs_stat = o.format == LsFormat::Long
             || o.blocks
             || o.context
             || matches!(o.sort, LsSort::Time | LsSort::Size);
-        let needs_type = o.recursive || o.indicator != Indicator::None || o.dirs_first;
-        let follow = o.deref == LsDeref::Always
-            && (needs_stat || ((needs_type || o.inode) && matches!(letter, b'l' | b'?')));
+        let needs_type = !needs_stat
+            && (o.recursive || colors.is_some() || o.indicator != Indicator::None || o.dirs_first);
+        let gnu_stat = needs_stat
+            || (letter == b'd' && colored(&[C_OTHER_WRITABLE, C_STICKY, C_STICKY_OTHER_WRITABLE]))
+            || ((o.inode || needs_type)
+                && matches!(letter, b'l' | b'?')
+                && (o.deref == LsDeref::Always
+                    || colors.is_some_and(|c| c.referent)
+                    || o.check_symlink_mode))
+            || (needs_type
+                && (letter == b'?'
+                    || (letter == b'-'
+                        && (o.indicator == Indicator::Classify
+                            || colored(&[C_EXEC, C_SETUID, C_SETGID, C_CAP])))));
+        let follow = o.deref == LsDeref::Always && gnu_stat;
         let meta = if follow {
             match fs::metadata(&path) {
                 Ok(m) => Some(m),
@@ -8889,6 +9014,7 @@ impl<W: Write> Lister<'_, W> {
             link_target: None,
             target_meta: None,
             list_as_dir,
+            gnu_stat,
         };
         self.inspect_link(&mut f);
         f
@@ -8898,8 +9024,8 @@ impl<W: Write> Lister<'_, W> {
     fn inspect_link(&self, f: &mut LsFile) {
         let o = self.opts;
         let is_link = f.meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
-        // GNU also checks link targets for --group-directories-first.
-        let check_target = o.indicator >= Indicator::FileType || o.dirs_first;
+        // GNU also checks link targets for --group-directories-first and colours.
+        let check_target = o.indicator >= Indicator::FileType || o.check_symlink_mode;
         if !is_link || !(o.format == LsFormat::Long || check_target || self.rich.is_some()) {
             return;
         }
@@ -9070,6 +9196,201 @@ impl<W: Write> Lister<'_, W> {
         (q, changed)
     }
 
+    // ----- GNU colours (ls.c `print_name_with_quoting` and friends) -----
+
+    /// GNU `put_indicator`: the first sequence is preceded by
+    /// `prep_non_filename_text`, which resets the terminal's colours.
+    fn put_indicator(&self, c: &LsColors, buf: &mut Vec<u8>, seq: &[u8]) {
+        if !self.used_color.replace(true) {
+            self.prep_non_filename_text(c, buf);
+        }
+        buf.extend_from_slice(seq);
+    }
+
+    /// GNU `prep_non_filename_text`: `ec`, or `lc` `rs` `rc`.
+    fn prep_non_filename_text(&self, c: &LsColors, buf: &mut Vec<u8>) {
+        if let Some(end) = &c.ind[C_END] {
+            self.put_indicator(c, buf, end);
+        } else {
+            self.put_indicator(c, buf, c.seq(C_LEFT));
+            self.put_indicator(c, buf, c.seq(C_RESET));
+            self.put_indicator(c, buf, c.seq(C_RIGHT));
+        }
+    }
+
+    /// GNU `set_normal_color`, written before each entry.
+    fn set_normal_color(&self, c: &LsColors, buf: &mut Vec<u8>) {
+        if c.is_colored(C_NORM) {
+            self.put_indicator(c, buf, c.seq(C_LEFT));
+            self.put_indicator(c, buf, c.seq(C_NORM));
+            self.put_indicator(c, buf, c.seq(C_RIGHT));
+        }
+    }
+
+    /// GNU's final `restore_default_color`, skipped when it would be a no-op.
+    fn restore_default_color(&mut self) -> io::Result<()> {
+        let Some(c) = &self.opts.colors else {
+            return Ok(());
+        };
+        if self.used_color.get() && !(c.seq(C_LEFT) == b"\x1b[" && c.seq(C_RIGHT) == b"m") {
+            let mut buf = c.seq(C_LEFT).to_vec();
+            buf.extend_from_slice(c.seq(C_RIGHT));
+            self.out.write_all(&buf)?;
+        }
+        Ok(())
+    }
+
+    /// Appends the quoted name of `f` (or of its link target), with the
+    /// alignment space and, when colouring, GNU's colour sequences
+    /// (`print_name_with_quoting`). Returns GNU's length: the quoted name's
+    /// bytes plus the alignment space.
+    fn name_with_quoting(
+        &self,
+        colors: Option<&LsColors>,
+        buf: &mut Vec<u8>,
+        f: &LsFile,
+        w: &LsWidths,
+        target: bool,
+        start_col: usize,
+    ) -> usize {
+        let raw = if target {
+            f.link_target.as_deref().unwrap_or_default()
+        } else {
+            &f.name
+        };
+        let (name, quoted) = self.quoted_name(raw);
+        let pad = w.some_quoted && !quoted;
+        if pad && !target {
+            buf.push(b' ');
+        }
+        let len = name.len() + usize::from(pad);
+        let Some(c) = colors else {
+            buf.extend_from_slice(&name);
+            return len;
+        };
+        let color = self.color_of(c, f, target);
+        if let Some(seq) = color {
+            if c.is_colored(C_NORM) {
+                self.put_indicator(c, buf, c.seq(C_LEFT));
+                self.put_indicator(c, buf, c.seq(C_RIGHT));
+            }
+            self.put_indicator(c, buf, c.seq(C_LEFT));
+            self.put_indicator(c, buf, seq);
+            self.put_indicator(c, buf, c.seq(C_RIGHT));
+        }
+        buf.extend_from_slice(&name);
+        if color.is_some() || c.is_colored(C_NORM) {
+            self.prep_non_filename_text(c, buf);
+            // GNU clears to the end of the line when the name might wrap (it
+            // judges by bytes, not display width).
+            let ll = self.opts.line_length;
+            if ll != 0 && len != 0 && start_col / ll != (start_col + len - 1) / ll {
+                self.put_indicator(c, buf, c.seq(C_CLR_TO_EOL));
+            }
+        }
+        len
+    }
+
+    /// GNU `linkok`: the symlink's target was stat'ed (only done when needed).
+    fn link_ok(&self, f: &LsFile) -> bool {
+        let o = self.opts;
+        f.gnu_stat
+            && f.link_target.is_some()
+            && f.target_meta.is_some()
+            && f.meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
+            && (o.format == LsFormat::Long || o.check_symlink_mode)
+            && (o.indicator >= Indicator::FileType || o.check_symlink_mode)
+    }
+
+    /// GNU `get_color_indicator`: the sequence for `f`'s name, or for the
+    /// target of its symlink.
+    fn color_of<'c>(&self, c: &'c LsColors, f: &LsFile, target: bool) -> Option<&'c [u8]> {
+        let link_ok = self.link_ok(f);
+        let target_mode = || f.target_meta.as_ref().map_or(0, |m| m.mode());
+        let own_mode = || f.meta.as_ref().map_or(0, |m| m.mode());
+        // GNU's tri-state `linkok`: -1 for a missing target, else whether the
+        // link is known to be ok.
+        let (name, mode, linkok): (&[u8], u32, i8) = if target {
+            let mode = if link_ok { target_mode() } else { 0 };
+            let name = f.link_target.as_deref().unwrap_or_default();
+            (name, mode, if link_ok { 0 } else { -1 })
+        } else {
+            let mode = if c.referent && link_ok {
+                target_mode()
+            } else {
+                own_mode()
+            };
+            (&f.name, mode, i8::from(link_ok))
+        };
+        let stat_ok = f.gnu_stat && f.meta.is_some();
+        let mut kind = if linkok == -1 && c.is_colored(C_MISSING) {
+            C_MISSING
+        } else if !stat_ok {
+            match f.type_letter {
+                b'p' => C_FIFO,
+                b'c' => C_CHR,
+                b'd' => C_DIR,
+                b'b' => C_BLK,
+                b'-' => C_FILE,
+                b'l' => C_LINK,
+                b's' => C_SOCK,
+                _ => C_ORPHAN,
+            }
+        } else {
+            const S_ISUID: u32 = 0o4000;
+            const S_ISGID: u32 = 0o2000;
+            const S_ISVTX: u32 = 0o1000;
+            const S_IWOTH: u32 = 0o0002;
+            match mode & 0o170_000 {
+                0o100_000 => {
+                    let nlink = f.meta.as_ref().map_or(0, |m| m.nlink());
+                    if mode & S_ISUID != 0 && c.is_colored(C_SETUID) {
+                        C_SETUID
+                    } else if mode & S_ISGID != 0 && c.is_colored(C_SETGID) {
+                        C_SETGID
+                    } else if mode & 0o111 != 0 && c.is_colored(C_EXEC) {
+                        // `ca` would be checked first, but the reference GNU
+                        // build has no libcap and never reports capabilities.
+                        C_EXEC
+                    } else if nlink > 1 && c.is_colored(C_MULTIHARDLINK) {
+                        C_MULTIHARDLINK
+                    } else {
+                        C_FILE
+                    }
+                }
+                0o040_000 => {
+                    if mode & S_ISVTX != 0
+                        && mode & S_IWOTH != 0
+                        && c.is_colored(C_STICKY_OTHER_WRITABLE)
+                    {
+                        C_STICKY_OTHER_WRITABLE
+                    } else if mode & S_IWOTH != 0 && c.is_colored(C_OTHER_WRITABLE) {
+                        C_OTHER_WRITABLE
+                    } else if mode & S_ISVTX != 0 && c.is_colored(C_STICKY) {
+                        C_STICKY
+                    } else {
+                        C_DIR
+                    }
+                }
+                0o120_000 => C_LINK,
+                0o010_000 => C_FIFO,
+                0o140_000 => C_SOCK,
+                0o060_000 => C_BLK,
+                0o020_000 => C_CHR,
+                _ => C_ORPHAN,
+            }
+        };
+        if kind == C_FILE
+            && let Some(seq) = c.suffix_color(name)
+        {
+            return Some(seq);
+        }
+        if kind == C_LINK && linkok == 0 && (c.referent || c.is_colored(C_ORPHAN)) {
+            kind = C_ORPHAN;
+        }
+        c.ind[kind].as_deref()
+    }
+
     fn blocks_cell(&self, f: &LsFile) -> String {
         match &f.meta {
             Some(m) => human_readable(m.blocks(), self.opts.human_opts, 512, self.opts.block_size),
@@ -9214,7 +9535,7 @@ impl<W: Write> Lister<'_, W> {
             LsFormat::OnePerLine => {
                 for f in files {
                     let cell = self.short_cell(f, &w, false);
-                    self.out.write_all(&cell.0)?;
+                    self.write_cell(f, &w, false, 0, &cell.0)?;
                     self.out.write_all(&[o.eol])?;
                 }
             }
@@ -9231,7 +9552,7 @@ impl<W: Write> Lister<'_, W> {
                             self.out.write_all(&[b',', o.eol])?;
                         }
                     }
-                    self.out.write_all(&cell)?;
+                    self.write_cell(f, &w, true, pos, &cell)?;
                     pos += len;
                 }
                 if !files.is_empty() {
@@ -9314,7 +9635,7 @@ impl<W: Write> Lister<'_, W> {
                 let (mut col, mut fileno, mut pos) = (0, row, 0);
                 loop {
                     let (cell, len) = &cells[fileno];
-                    self.out.write_all(cell)?;
+                    self.write_cell(files[fileno], w, false, pos, cell)?;
                     let max = widths[col];
                     col += 1;
                     fileno += rows;
@@ -9328,7 +9649,7 @@ impl<W: Write> Lister<'_, W> {
             }
         } else {
             let mut pos = 0;
-            self.out.write_all(&cells[0].0)?;
+            self.write_cell(files[0], w, false, 0, &cells[0].0)?;
             let (mut len, mut max) = (cells[0].1, widths[0]);
             for (fileno, (cell, cell_len)) in cells.iter().enumerate().skip(1) {
                 let col = fileno % cols;
@@ -9339,7 +9660,7 @@ impl<W: Write> Lister<'_, W> {
                     indent(&mut self.out, pos + len, pos + max)?;
                     pos += max;
                 }
-                self.out.write_all(cell)?;
+                self.write_cell(files[fileno], w, false, pos, cell)?;
                 len = *cell_len;
                 max = widths[col];
             }
@@ -9351,6 +9672,47 @@ impl<W: Write> Lister<'_, W> {
     /// Inode, block count, context, name and indicator for the non-long formats,
     /// with the display width of the result.
     fn short_cell(&self, f: &LsFile, w: &LsWidths, commas: bool) -> (Vec<u8>, usize) {
+        let o = self.opts;
+        let mut cell = self.short_prefix(f, w, commas);
+        let (name, quoted) = self.quoted_name(&f.name);
+        if w.some_quoted && !quoted {
+            cell.push(b' ');
+        }
+        cell.extend_from_slice(&name);
+        if let Some(c) = indicator_char(o.indicator, f.meta.as_ref(), f.type_letter) {
+            cell.push(c);
+        }
+        let width = display_width(&cell);
+        (cell, width)
+    }
+
+    /// Writes one non-long entry starting at column `start_col`: `plain` as
+    /// [`Self::short_cell`] built it, or the same with GNU's colours
+    /// (`print_file_name_and_frills`).
+    fn write_cell(
+        &mut self,
+        f: &LsFile,
+        w: &LsWidths,
+        commas: bool,
+        start_col: usize,
+        plain: &[u8],
+    ) -> io::Result<()> {
+        let o = self.opts;
+        let Some(c) = &o.colors else {
+            return self.out.write_all(plain);
+        };
+        let mut buf = Vec::with_capacity(plain.len() + 24);
+        self.set_normal_color(c, &mut buf);
+        buf.extend_from_slice(&self.short_prefix(f, w, commas));
+        self.name_with_quoting(Some(c), &mut buf, f, w, false, start_col);
+        if let Some(ch) = indicator_char(o.indicator, f.meta.as_ref(), f.type_letter) {
+            buf.push(ch);
+        }
+        self.out.write_all(&buf)
+    }
+
+    /// The inode, block count and context columns before a non-long name.
+    fn short_prefix(&self, f: &LsFile, w: &LsWidths, commas: bool) -> Vec<u8> {
         let o = self.opts;
         let mut cell = Vec::new();
         let pad_left = |cell: &mut Vec<u8>, s: &str, width: usize| {
@@ -9375,16 +9737,7 @@ impl<W: Write> Lister<'_, W> {
             }
             cell.push(b' ');
         }
-        let (name, quoted) = self.quoted_name(&f.name);
-        if w.some_quoted && !quoted {
-            cell.push(b' ');
-        }
-        cell.extend_from_slice(&name);
-        if let Some(c) = indicator_char(o.indicator, f.meta.as_ref(), f.type_letter) {
-            cell.push(c);
-        }
-        let width = display_width(&cell);
-        (cell, width)
+        cell
     }
 
     fn long_line(&self, f: &LsFile, w: &LsWidths) -> Vec<u8> {
@@ -9475,16 +9828,20 @@ impl<W: Write> Lister<'_, W> {
             }
         }
         line.push(b' ');
-        let (name, quoted) = self.quoted_name(&f.name);
-        if w.some_quoted && !quoted {
-            line.push(b' ');
+        let colors = o.colors.as_ref();
+        let name_col = line.len();
+        if let Some(c) = colors {
+            let mut prefixed = Vec::with_capacity(line.len() + 32);
+            self.set_normal_color(c, &mut prefixed);
+            prefixed.append(&mut line);
+            line = prefixed;
         }
-        line.extend_from_slice(&name);
+        let name_len = self.name_with_quoting(colors, &mut line, f, w, false, name_col);
         let is_link = f.meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
         if is_link {
-            if let Some(target) = &f.link_target {
+            if f.link_target.is_some() {
                 line.extend_from_slice(b" -> ");
-                line.extend_from_slice(&self.quoted_name(target).0);
+                self.name_with_quoting(colors, &mut line, f, w, true, name_col + name_len + 4);
                 if o.indicator != Indicator::None
                     && let Some(tm) = &f.target_meta
                     && let Some(c) = indicator_char(o.indicator, Some(tm), b'?')
@@ -9595,6 +9952,371 @@ fn acl_marker(f: &LsFile) -> Option<u8> {
     } else {
         None
     }
+}
+
+// ----- GNU `ls` colours (LS_COLORS) ------------------------------------------
+
+/// Indices into [`LsColors::ind`], in GNU's `enum indicator_no` order.
+const C_LEFT: usize = 0;
+const C_RIGHT: usize = 1;
+const C_END: usize = 2;
+const C_RESET: usize = 3;
+const C_NORM: usize = 4;
+const C_FILE: usize = 5;
+const C_DIR: usize = 6;
+const C_LINK: usize = 7;
+const C_FIFO: usize = 8;
+const C_SOCK: usize = 9;
+const C_BLK: usize = 10;
+const C_CHR: usize = 11;
+const C_MISSING: usize = 12;
+const C_ORPHAN: usize = 13;
+const C_EXEC: usize = 14;
+const C_DOOR: usize = 15;
+const C_SETUID: usize = 16;
+const C_SETGID: usize = 17;
+const C_STICKY: usize = 18;
+const C_OTHER_WRITABLE: usize = 19;
+const C_STICKY_OTHER_WRITABLE: usize = 20;
+const C_CAP: usize = 21;
+const C_MULTIHARDLINK: usize = 22;
+const C_CLR_TO_EOL: usize = 23;
+
+/// The LS_COLORS key of each indicator (GNU `indicator_name`).
+const LS_COLOR_KEYS: [&str; 24] = [
+    "lc", "rc", "ec", "rs", "no", "fi", "di", "ln", "pi", "so", "bd", "cd", "mi", "or", "ex", "do",
+    "su", "sg", "st", "ow", "tw", "ca", "mh", "cl",
+];
+
+/// The `TERM` patterns of GNU's built-in dircolors database: without
+/// LS_COLORS, `ls` colours only for these terminals (or a non-empty COLORTERM).
+const LS_COLOR_TERMS: [&str; 25] = [
+    "Eterm",
+    "ansi",
+    "*color*",
+    "con[0-9]*x[0-9]*",
+    "cons25",
+    "console",
+    "cygwin",
+    "*direct*",
+    "dtterm",
+    "gnome",
+    "hurd",
+    "jfbterm",
+    "konsole",
+    "kterm",
+    "linux",
+    "linux-c",
+    "mlterm",
+    "putty",
+    "rxvt*",
+    "screen*",
+    "st",
+    "terminator",
+    "tmux*",
+    "vt100",
+    "xterm*",
+];
+
+/// A `*suffix=seq` entry of LS_COLORS (GNU `struct color_ext_type`).
+struct ColorExt {
+    suffix: Vec<u8>,
+    seq: Vec<u8>,
+    /// Compare case-sensitively (set when differently-cased suffixes differ).
+    exact: bool,
+    /// Shadowed by an entry of higher precedence.
+    ignored: bool,
+}
+
+/// GNU `ls`'s colour table: the indicators and the suffix list.
+struct LsColors {
+    ind: [Option<Vec<u8>>; 24],
+    /// Highest precedence (last defined) first.
+    exts: Vec<ColorExt>,
+    /// `ln=target`: colour symlinks like the file they point to.
+    referent: bool,
+}
+
+impl LsColors {
+    /// GNU's built-in `color_indicator` table.
+    fn defaults() -> Self {
+        let mut ind: [Option<Vec<u8>>; 24] = Default::default();
+        for (i, seq) in [
+            (C_LEFT, &b"\x1b["[..]),
+            (C_RIGHT, b"m"),
+            (C_RESET, b"0"),
+            (C_DIR, b"01;34"),
+            (C_LINK, b"01;36"),
+            (C_FIFO, b"33"),
+            (C_SOCK, b"01;35"),
+            (C_BLK, b"01;33"),
+            (C_CHR, b"01;33"),
+            (C_EXEC, b"01;32"),
+            (C_DOOR, b"01;35"),
+            (C_SETUID, b"37;41"),
+            (C_SETGID, b"30;43"),
+            (C_STICKY, b"37;44"),
+            (C_OTHER_WRITABLE, b"34;42"),
+            (C_STICKY_OTHER_WRITABLE, b"30;42"),
+            (C_CLR_TO_EOL, b"\x1b[K"),
+        ] {
+            ind[i] = Some(seq.to_vec());
+        }
+        LsColors {
+            ind,
+            exts: Vec::new(),
+            referent: false,
+        }
+    }
+
+    /// GNU `parse_ls_color`: the table to colour with, or `None` (after a
+    /// warning, for an unparsable LS_COLORS) when output stays uncoloured.
+    fn from_env() -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(spec) = std::env::var_os("LS_COLORS").filter(|v| !v.is_empty()) else {
+            let colorterm = std::env::var_os("COLORTERM").is_some_and(|v| !v.is_empty());
+            let known_term = std::env::var_os("TERM").is_some_and(|t| {
+                LS_COLOR_TERMS
+                    .iter()
+                    .any(|p| fnmatch(p.as_bytes(), t.as_bytes(), false))
+            });
+            return (colorterm || known_term).then(Self::defaults);
+        };
+        let parsed = Self::parse(spec.as_bytes());
+        if parsed.is_none() {
+            eprintln!("ls: unparsable value for LS_COLORS environment variable");
+        }
+        parsed
+    }
+
+    fn parse(spec: &[u8]) -> Option<Self> {
+        let at = |i: usize| spec.get(i).copied().unwrap_or(0);
+        let mut c = Self::defaults();
+        let mut exts = Vec::new();
+        let mut i = 0;
+        loop {
+            match at(i) {
+                0 => break,
+                b':' => i += 1,
+                b'*' => {
+                    i += 1;
+                    let suffix = ls_color_string(spec, &mut i, true)?;
+                    if at(i) != b'=' {
+                        return None;
+                    }
+                    i += 1;
+                    let seq = ls_color_string(spec, &mut i, false)?;
+                    exts.push(ColorExt {
+                        suffix,
+                        seq,
+                        exact: false,
+                        ignored: false,
+                    });
+                }
+                first => {
+                    let second = at(i + 1);
+                    if second == 0 || at(i + 2) != b'=' {
+                        return None;
+                    }
+                    let label = [first, second];
+                    i += 3;
+                    let slot = LS_COLOR_KEYS.iter().position(|k| k.as_bytes() == label);
+                    let value = slot.and_then(|_| ls_color_string(spec, &mut i, false));
+                    let (Some(slot), Some(value)) = (slot, value) else {
+                        // GNU says this for a malformed value of a known key too.
+                        eprintln!(
+                            "ls: unrecognized prefix: {}",
+                            quote_bytes(&label, Quoting::Locale)
+                        );
+                        return None;
+                    };
+                    c.ind[slot] = Some(value);
+                }
+            }
+        }
+        // Later definitions take precedence. Like GNU, drop entries that can
+        // never match, and compare case-sensitively only where suffixes that
+        // differ just in case have different sequences.
+        exts.reverse();
+        for a in 0..exts.len() {
+            let mut case_ignored = false;
+            for b in a + 1..exts.len() {
+                let (head, tail) = exts.split_at_mut(b);
+                let (e1, e2) = (&mut head[a], &mut tail[0]);
+                if e1.ignored || e2.ignored || e1.suffix.len() != e2.suffix.len() {
+                    continue;
+                }
+                if e1.suffix == e2.suffix {
+                    e2.ignored = true;
+                } else if e1.suffix.eq_ignore_ascii_case(&e2.suffix) {
+                    if case_ignored {
+                        e2.ignored = true;
+                    } else if e1.seq == e2.seq {
+                        e2.ignored = true;
+                        case_ignored = true;
+                    } else {
+                        e1.exact = true;
+                        e2.exact = true;
+                    }
+                }
+            }
+        }
+        c.exts = exts;
+        c.referent = c.ind[C_LINK].as_deref() == Some(b"target");
+        Some(c)
+    }
+
+    /// GNU `is_colored`: set to something other than empty, `0` or `00`.
+    fn is_colored(&self, i: usize) -> bool {
+        !matches!(self.ind[i].as_deref(), None | Some(b"" | b"0" | b"00"))
+    }
+
+    /// The sequence of indicator `i` (empty when unset).
+    fn seq(&self, i: usize) -> &[u8] {
+        self.ind[i].as_deref().unwrap_or_default()
+    }
+
+    /// The sequence of the first suffix entry matching `name`.
+    fn suffix_color(&self, name: &[u8]) -> Option<&[u8]> {
+        self.exts
+            .iter()
+            .filter(|e| !e.ignored && e.suffix.len() <= name.len())
+            .find(|e| {
+                let tail = &name[name.len() - e.suffix.len()..];
+                if e.exact {
+                    tail == e.suffix.as_slice()
+                } else {
+                    tail.eq_ignore_ascii_case(&e.suffix)
+                }
+            })
+            .map(|e| e.seq.as_slice())
+    }
+}
+
+/// GNU `get_funky_string`: decodes one LS_COLORS value (`\e`, `\033`, `\x1b`,
+/// `^[`, ...) from `spec[*i..]`, stopping at `:` or the end (or at `=` when
+/// `equals_end`). `None` for a malformed escape.
+fn ls_color_string(spec: &[u8], i: &mut usize, equals_end: bool) -> Option<Vec<u8>> {
+    enum State {
+        Ground,
+        Backslash,
+        Octal,
+        Hex,
+        Caret,
+    }
+    let mut out = Vec::new();
+    let mut state = State::Ground;
+    let mut num: u8 = 0;
+    loop {
+        let ch = spec.get(*i).copied().unwrap_or(0);
+        match state {
+            State::Ground => match ch {
+                0 | b':' => return Some(out),
+                b'=' if equals_end => return Some(out),
+                b'\\' => {
+                    state = State::Backslash;
+                    *i += 1;
+                }
+                b'^' => {
+                    state = State::Caret;
+                    *i += 1;
+                }
+                _ => {
+                    out.push(ch);
+                    *i += 1;
+                }
+            },
+            State::Backslash => {
+                match ch {
+                    0 => return None,
+                    b'0'..=b'7' => {
+                        state = State::Octal;
+                        num = ch - b'0';
+                    }
+                    b'x' | b'X' => {
+                        state = State::Hex;
+                        num = 0;
+                    }
+                    _ => {
+                        out.push(match ch {
+                            b'a' => 7,
+                            b'b' => 8,
+                            b'e' => 27,
+                            b'f' => 12,
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'v' => 11,
+                            b'?' => 127,
+                            b'_' => b' ',
+                            other => other,
+                        });
+                        state = State::Ground;
+                    }
+                }
+                *i += 1;
+            }
+            State::Octal => {
+                if (b'0'..=b'7').contains(&ch) {
+                    num = (num << 3).wrapping_add(ch - b'0');
+                    *i += 1;
+                } else {
+                    out.push(num);
+                    state = State::Ground;
+                }
+            }
+            State::Hex => match (ch as char).to_digit(16) {
+                Some(d) => {
+                    num = (num << 4).wrapping_add(d as u8);
+                    *i += 1;
+                }
+                None => {
+                    out.push(num);
+                    state = State::Ground;
+                }
+            },
+            State::Caret => {
+                state = State::Ground;
+                match ch {
+                    b'@'..=b'~' => {
+                        out.push(ch & 0o37);
+                        *i += 1;
+                    }
+                    // GNU does not consume the `?` of `^?`: it is output too.
+                    b'?' => out.push(127),
+                    _ => return None,
+                }
+            }
+        }
+    }
+}
+
+/// GNU `decode_line_length` (for `-w` and COLUMNS): a number in C syntax
+/// (decimal, `0x` hex or `0` octal), where too large means unlimited (0).
+fn decode_line_length(spec: &str) -> Option<usize> {
+    let s = spec.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = if let Some(hex) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (hex, 16)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (&s[1..], 8)
+    } else {
+        (s, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    Some(
+        u64::from_str_radix(digits, radix)
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n <= isize::MAX as usize)
+            .unwrap_or(0),
+    )
 }
 
 /// GNU `get_type_indicator`.
@@ -9976,7 +10698,7 @@ fn gnu_argmatch<'a>(
     }
     let matches: Vec<&'a str> = choices
         .iter()
-        .filter(|(word, _)| !value.is_empty() && word.starts_with(value))
+        .filter(|(word, _)| word.starts_with(value))
         .map(|(_, meaning)| *meaning)
         .collect();
     if let Some(first) = matches.first()

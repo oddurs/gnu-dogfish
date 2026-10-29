@@ -202,6 +202,61 @@ fn build_fixture(dir: &Path) {
     ] {
         set(rel, at(OLD, 0), at(OLD + 3600, 0));
     }
+    build_color_fixture(&dir.join("colors"));
+}
+
+/// `colors/`: what `ls --color` tells apart beyond the main tree — directory
+/// permission colours, links to each kind of file (and a link loop), hard links,
+/// suffixes in several cases, and a name long enough to wrap.
+fn build_color_fixture(dir: &Path) {
+    let long_name = format!("long_{}.txt", "n".repeat(90));
+    let files: &[(&str, &[u8])] = &[
+        ("plain", b"p"),
+        ("run.sh", b"#!/bin/sh\n"),
+        ("photo.JPG", b""),
+        ("photo.jpg", b""),
+        ("Photo.Jpg", b""),
+        ("archive.TAR.GZ", b""),
+        ("archive.tar.gz", b""),
+        ("notes.md", b""),
+        ("README", b""),
+        ("multi1", b"m"),
+        ("ow_dir/inner", b""),
+        ("st_dir/inner", b""),
+        ("tw_dir/inner", b""),
+        (&long_name, b""),
+    ];
+    common::write_files(dir, files);
+    let p = |rel: &str| dir.join(rel);
+    fs::hard_link(p("multi1"), p("multi2")).unwrap();
+    for (link, target) in [
+        ("to_ow", "ow_dir"),
+        ("to_plain", "plain"),
+        ("to_run", "run.sh"),
+        ("to_md", "notes.md"),
+        ("to_setuid", "../setuid"),
+        ("to_fifo", "../fifo"),
+        ("to_nowhere", "nowhere.txt"),
+        ("loop", "loop"),
+        ("to_link", "to_plain"),
+    ] {
+        symlink(target, p(link)).unwrap();
+    }
+    for (rel, mode) in [
+        ("run.sh", 0o755),
+        ("ow_dir", 0o777),
+        ("st_dir", 0o1755),
+        ("tw_dir", 0o1777),
+    ] {
+        fs::set_permissions(p(rel), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let old = FileTime::from_unix_time(OLD, 0);
+    for rel in files.iter().map(|(name, _)| *name).chain(["multi2"]) {
+        filetime::set_symlink_file_times(p(rel), old, old).unwrap();
+    }
+    for rel in ["ow_dir", "st_dir", "tw_dir", "."] {
+        filetime::set_symlink_file_times(p(rel), old, old).unwrap();
+    }
 }
 
 gnu_cases! {
@@ -555,6 +610,154 @@ gnu_cases! {
     stat_cached: "stat" ["--cached=never", "-c", "%n", "a.txt"];
     stat_cached_bad: "stat" ["--cached=bogus", "a.txt"];
     stat_invalid_option: "stat" ["-z", "a.txt"];
+
+    // ------------------------------------------------------------ ls --color
+    // Every case pins the colour environment: an empty LS_COLORS means GNU's
+    // built-in table, which GNU uses only for a known TERM (or a COLORTERM).
+    ls_color_default_cwd: "ls" ["--color=always"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_all: "ls" ["--color=always", "-a"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_colors_dir: "ls" ["--color=always", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_bare_flag: "ls" ["--color", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_yes: "ls" ["--color=yes", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_force: "ls" ["--color=force", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_prefix: "ls" ["--color=al", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_default_abbreviated_option: "ls" ["--colo=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_auto_not_tty: "ls" ["--color=auto", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_tty_not_tty: "ls" ["--color=tty", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_if_tty_not_tty: "ls" ["--color=if-tty", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_never: "ls" ["--color=never", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_none: "ls" ["--color=none", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_last_wins: "ls" ["--color=always", "--color=no", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_last_wins_always: "ls" ["--color=never", "--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_invalid: "ls" ["--color=x"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_empty_ambiguous: "ls" ["--color="] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_ambiguous_prefix: "ls" ["--color=n", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_hyperlink_invalid: "ls" ["--hyperlink=x", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_unsorted_after_disables: "ls" ["--color=always", "-f", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_unsorted_before_keeps: "ls" ["-f", "--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_zero_disables: "ls" ["--color=always", "--zero", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_zero_then_color: "ls" ["--zero", "--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_devices: "ls" ["--color=always", "/dev/null", "/dev/zero"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_devices_long: "ls" ["--color=always", "-l", "/dev/null"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_missing_operand: "ls" ["--color=always", "nonexist", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dir_operands: "ls" ["--color=always", "-d", "dir", ".", "..", "link_dir", "sticky", "colors/ow_dir", "colors/st_dir", "colors/tw_dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_symlink_dir_operand: "ls" ["--color=always", "link_dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_symlink_operands: "ls" ["--color=always", "colors/to_ow", "colors/to_run", "colors/loop", "colors/to_nowhere"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_recursive: "ls" ["--color=always", "-R", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_recursive_long: "ls" ["--color=always", "-lR", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_sorted_size: "ls" ["--color=always", "-S"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_sorted_time_reverse: "ls" ["--color=always", "-tr", "times"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_group_directories_first: "ls" ["--color=always", "--group-directories-first", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_group_directories_first_long: "ls" ["--color=always", "-l", "--group-directories-first", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dereference: "ls" ["--color=always", "-L", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dereference_long: "ls" ["--color=always", "-lL", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long: "ls" ["--color=always", "-l"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_colors: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_symlinks: "ls" ["--color=always", "-l", "link_dir", "link_dangling", "link_file", "dir/to_a"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_inode_size: "ls" ["--color=always", "-lis", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_narrow_clears_line: "ls" ["--color=always", "-l", "-w", "70", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_unlimited: "ls" ["--color=always", "-l", "-w", "0", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_quoted: "ls" ["--color=always", "-l", "--quoting-style=shell-escape", "colors", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_long_quote_name: "ls" ["--color=always", "-lQ", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_classify: "ls" ["--color=always", "-F"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_classify_colors: "ls" ["--color=always", "-F", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_classify_long: "ls" ["--color=always", "-lF", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_slash: "ls" ["--color=always", "-p"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_slash_long: "ls" ["--color=always", "-lp", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_file_type: "ls" ["--color=always", "--file-type", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_one_per_line_long_name: "ls" ["--color=always", "-1", "colors"] env [("LS_COLORS", "*.txt=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_one_per_line_columns: "ls" ["--color=always", "-1", "colors"] env [("LS_COLORS", "*.txt=31"), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "101")];
+    ls_color_one_per_line_narrow: "ls" ["--color=always", "-1", "-w", "3", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns: "ls" ["--color=always", "-C"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_env_width: "ls" ["--color=always", "-C"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "40")];
+    ls_color_columns_no_tabs: "ls" ["--color=always", "-C", "-T", "4", "-w", "40", "vers"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_narrow: "ls" ["--color=always", "-C", "-w", "10", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_wide_names: "ls" ["--color=always", "-C", "-w", "200", "colors"] env [("LS_COLORS", "*.txt=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_inode: "ls" ["--color=always", "-Ci", "-w", "60", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_unlimited: "ls" ["--color=always", "-C", "-w", "0", "vers"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_across: "ls" ["--color=always", "-x", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_across_env_width: "ls" ["--color=always", "-x"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "40")];
+    ls_color_commas: "ls" ["--color=always", "-m", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_commas_narrow: "ls" ["--color=always", "-m", "-w", "12", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_commas_long_name: "ls" ["--color=always", "-m", "colors"] env [("LS_COLORS", "*.txt=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_commas_size: "ls" ["--color=always", "-sm", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_columns_env_invalid: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "abc")];
+    ls_color_columns_env_invalid_grid: "ls" ["-C", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "abc")];
+    ls_color_columns_env_zero: "ls" ["--color=always", "-C", "vers"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "0")];
+    ls_color_columns_env_hex: "ls" ["-C", "vers"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("COLUMNS", "0x28")];
+    ls_color_quote_name: "ls" ["--color=always", "-Q", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_escape: "ls" ["--color=always", "-b", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_hide_control: "ls" ["--color=always", "-q", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_shell: "ls" ["--color=always", "--quoting-style=shell", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_shell_columns: "ls" ["--color=always", "-C", "--quoting-style=shell", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_c_commas: "ls" ["--color=always", "-m", "--quoting-style=c", "names"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_term_dumb: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "dumb"), ("COLORTERM", "")];
+    ls_color_term_unset_colorterm: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", ""), ("COLORTERM", "truecolor")];
+    ls_color_term_256color: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm-256color"), ("COLORTERM", "")];
+    ls_color_term_screen: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "screen.xterm-256color"), ("COLORTERM", "")];
+    ls_color_term_console_size: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "con80x25"), ("COLORTERM", "")];
+    ls_color_term_vt102: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "vt102"), ("COLORTERM", "")];
+    ls_color_term_dumb_ls_colors: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=35"), ("TERM", "dumb"), ("COLORTERM", "")];
+    ls_color_no_color_env_ignored: "ls" ["--color=always", "dir"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", ""), ("NO_COLOR", "1")];
+    ls_color_custom_types: "ls" ["--color=always"] env [("LS_COLORS", "di=35:ln=33:ex=4:pi=1:so=2:bd=3:cd=4:do=5"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_custom_devices: "ls" ["--color=always", "fifo", "/dev/null"] env [("LS_COLORS", "pi=1:cd=4"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_unrecognized_key: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=1:xx=3"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_missing_equals: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_one_letter: "ls" ["--color=always", "dir"] env [("LS_COLORS", "d"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_missing_equals: "ls" ["--color=always", "dir"] env [("LS_COLORS", "*.md"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_bad_escape_value: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=\\"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_bad_caret_value: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=^1"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_empty_entries: "ls" ["--color=always", "dir"] env [("LS_COLORS", ":::di=31:::"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_escapes: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=\\x41\\X4a\\101\\0\\a\\b\\e\\f\\n\\r\\t\\v\\?\\_\\:\\=\\q"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_escapes_overflow: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=\\777\\x1ff"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_caret_escapes: "ls" ["--color=always", "dir"] env [("LS_COLORS", "di=^[x^?^@"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_case_insensitive: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.jpg=35"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_case_split: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.jpg=35:*.JPG=36"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_case_same: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.jpg=35:*.JPG=35"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_case_three: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.jpg=35:*.JPG=35:*.Jpg=34"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_case_three_other: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.md=31:*.MD=31:*.Md=35:*.JPG=35:*.jpg=35:*.Jpg=34"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_longest_first: "ls" ["--color=always", "colors"] env [("LS_COLORS", "*.tar.gz=31:*.TAR.GZ=32:*.gz=33"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_later_wins: "ls" ["--color=always", "names", "vers"] env [("LS_COLORS", "*.tar.gz=32:*.gz=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_redefined: "ls" ["--color=always"] env [("LS_COLORS", "*.txt=31:*.txt=32"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_whole_name: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "*README=1:*.md=4"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_any: "ls" ["--color=always", "dir"] env [("LS_COLORS", "*=7"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_not_on_exec: "ls" ["--color=always", "exec.sh", "colors/run.sh"] env [("LS_COLORS", "*.sh=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_with_exec_off: "ls" ["--color=always", "exec.sh", "a.txt"] env [("LS_COLORS", "*.sh=31:ex=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_suffix_link_target: "ls" ["--color=always", "-l", "colors/to_md", "colors/to_plain"] env [("LS_COLORS", "*.md=4"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_file_color: "ls" ["--color=always"] env [("LS_COLORS", "fi=36:*.txt=0"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_normal_long: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "no=7:fi=33"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_normal_across: "ls" ["--color=always", "-x", "colors"] env [("LS_COLORS", "no=7:fi=33"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_normal_inode: "ls" ["--color=always", "-i", "dir"] env [("LS_COLORS", "no=7:fi=32"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_normal_reset_value: "ls" ["--color=always", "dir"] env [("LS_COLORS", "no=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_end_and_brackets: "ls" ["--color=always", "dir"] env [("LS_COLORS", "ec=X:lc=<:rc=>"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_brackets_restored_at_end: "ls" ["--color=always", "-l", "dir"] env [("LS_COLORS", "lc=<:rc=>"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_end_code: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "ec=\\e[m"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_empty_reset: "ls" ["--color=always", "colors"] env [("LS_COLORS", "rs=:ec="), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_clear_to_eol_custom: "ls" ["--color=always", "-w", "3", "dir"] env [("LS_COLORS", "cl=CLR"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_clear_to_eol_empty: "ls" ["--color=always", "-w", "3", "dir"] env [("LS_COLORS", "cl="), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_missing: "ls" ["--color=always", "-l", "link_dir", "link_dangling", "link_file"] env [("LS_COLORS", "or=31:mi=32"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_missing_colors: "ls" ["--color=always", "colors"] env [("LS_COLORS", "or=40;31;01:mi=05;37;41"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_missing_long: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "or=40;31;01:mi=05;37;41"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_missing_classify: "ls" ["--color=always", "-lF", "colors"] env [("LS_COLORS", "or=40;31;01:mi=05;37;41"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_missing_only_long: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "mi=05;37;41"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_missing_only_short: "ls" ["--color=always", "link_dangling", "link_dir", "colors"] env [("LS_COLORS", "mi=32"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_zero: "ls" ["--color=always", "-l", "link_dangling", "link_dir"] env [("LS_COLORS", "or=0"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_orphan_dereference: "ls" ["--color=always", "-L"] env [("LS_COLORS", "or=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_link_target: "ls" ["--color=always", "colors"] env [("LS_COLORS", "ln=target"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_link_target_long: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "ln=target"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_link_target_classify: "ls" ["--color=always", "-F", "colors"] env [("LS_COLORS", "ln=target:or=31"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_link_target_exec_off: "ls" ["--color=always", "colors"] env [("LS_COLORS", "ln=target:ex=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_link_target_operands: "ls" ["--color=always", "link_dir", "link_dangling", "link_file"] env [("LS_COLORS", "or=31:mi=32:ln=target"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_multi_hardlink: "ls" ["--color=always", "dir", "dir/sub", "colors"] env [("LS_COLORS", "mh=44"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_multi_hardlink_long: "ls" ["--color=always", "-l", "colors"] env [("LS_COLORS", "mh=44"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_multi_hardlink_unstated: "ls" ["--color=always", ".", "dir/sub"] env [("LS_COLORS", "mh=44:ex=00:su=00:sg=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_multi_hardlink_classify: "ls" ["--color=always", "-F", ".", "dir/sub"] env [("LS_COLORS", "mh=44:ex=00:su=00:sg=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_setid_off: "ls" ["--color=always", "setuid", "setgid"] env [("LS_COLORS", "su=00:sg=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_setid_exec_off: "ls" ["--color=always", "setuid", "setgid"] env [("LS_COLORS", "su=00:sg=00:ex=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dir_bits: "ls" ["--color=always", "-d", "sticky", "colors/ow_dir", "colors/st_dir", "colors/tw_dir"] env [("LS_COLORS", "st=1:ow=2:tw=3"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dir_bits_off: "ls" ["--color=always", "colors"] env [("LS_COLORS", "ow=00:tw=00:st=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_dir_sticky_writable_off: "ls" ["--color=always", "colors"] env [("LS_COLORS", "tw=00"), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_color_capability_unsupported: "ls" ["--color=always", "exec.sh", "a.txt"] env [("LS_COLORS", "ca=30;41"), ("TERM", "xterm"), ("COLORTERM", "")];
 }
 
 // ---------------------------------------------------------------------------
