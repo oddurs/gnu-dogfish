@@ -36,15 +36,18 @@ If -e is in effect, the following sequences are recognized:
 ";
 
 pub fn run_echo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    // Like GNU (without POSIXLY_CORRECT), only a lone `--help` is an option.
-    if args.len() == 2 && args[1] == "--help" {
+    // GNU: with POSIXLY_CORRECT, escapes are always interpreted and the only
+    // option is a leading `-n`; otherwise only a lone `--help` is an option.
+    let posixly_correct = std::env::var_os("POSIXLY_CORRECT").is_some();
+    let allow_options = !posixly_correct || args.get(1).is_some_and(|a| a == "-n");
+    if allow_options && args.len() == 2 && args[1] == "--help" {
         return print_help(ECHO_HELP);
     }
     let mut no_newline = false;
     let mut interpret_escapes = false;
     let mut idx = 1;
 
-    while idx < args.len() {
+    while allow_options && idx < args.len() {
         let arg = &args[idx];
         if arg.starts_with('-')
             && arg.len() > 1
@@ -68,8 +71,9 @@ pub fn run_echo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let (rendered, stop) = if interpret_escapes {
-        unescape_echo_bytes(payload.as_bytes(), false)
+    let (rendered, stop) = if interpret_escapes || posixly_correct {
+        // `\NNN` is octal as well as `\0NNN` (GNU echo).
+        unescape_echo_bytes(payload.as_bytes(), true)
     } else {
         (payload.into_bytes(), false)
     };

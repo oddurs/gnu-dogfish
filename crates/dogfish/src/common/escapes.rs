@@ -3,7 +3,8 @@
 /// Expands echo-style escapes (also used by `printf %b`). Returns the bytes and
 /// whether `\c` requested that all further output stop.
 ///
-/// `\0NNN` is octal; with `bare_octal` (printf `%b`), `\NNN` is octal too.
+/// `\0NNN` is octal; with `bare_octal` (echo and printf `%b`), `\NNN` is
+/// octal too.
 pub fn unescape_echo_bytes(s: &[u8], bare_octal: bool) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
@@ -20,7 +21,7 @@ pub fn unescape_echo_bytes(s: &[u8], bare_octal: bool) -> (Vec<u8>, bool) {
             b'a' => out.push(0x07),
             b'b' => out.push(0x08),
             b'c' => return (out, true),
-            b'e' | b'E' => out.push(0x1b),
+            b'e' => out.push(0x1b),
             b'f' => out.push(0x0c),
             b'n' => out.push(b'\n'),
             b'r' => out.push(b'\r'),

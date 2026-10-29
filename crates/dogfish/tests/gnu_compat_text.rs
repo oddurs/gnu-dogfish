@@ -249,6 +249,33 @@ gnu_cases! {
     printf_big_u_short: "printf" ["\\U0000"];
     printf_u_surrogate: "printf" ["\\ud800"];
     printf_u_ok: "printf" ["\\u0030"];
+    // --------------------------------------------------------------- echo
+    echo_octal_without_zero: "echo" ["-n", "-e", "\\x1b\\n\\e\\n\\33\\n\\033\\n\\0033\\n"];
+    echo_no_hex_digits: "echo" ["-e", "\\x"];
+    echo_capital_e_not_escape: "echo" ["-e", "\\E"];
+    echo_stop_output: "echo" ["-e", "foo\\n\\cbar"];
+    echo_dash: "echo" ["-"];
+
+    // -------------------------------------------------------------- paste
+    paste_zero: "paste" ["-z", "nul.txt", "nul.txt"];
+    paste_zero_serial: "paste" ["-z", "-s", "-d", " ", "nul.txt"];
+    paste_trailing_backslash: "paste" ["-d", "\\", "lines.txt"];
+    paste_trailing_backslash_after_text: "paste" ["-d", "ab\\", "lines.txt"];
+    paste_empty_delimiter: "paste" ["-d", "", "lines.txt", "many.txt"];
+    paste_delimiter_escapes: "paste" ["-d", "\\0\\t,", "lines.txt", "many.txt", "notrail.txt"];
+    paste_uneven: "paste" ["notrail.txt", "many.txt", "lines.txt"];
+    paste_serial_many: "paste" ["-s", "-d", ",:", "many.txt", "notrail.txt", "empty.txt"];
+    paste_stdin_twice: "paste" ["-", "-"] stdin b"1\n2\n3\n4\n5\n";
+    paste_serial_stdin_twice: "paste" ["-s", "-", "-"] stdin b"1\n2\n";
+    paste_missing: "paste" ["lines.txt", "nonexist"];
+    paste_serial_missing: "paste" ["-s", "nonexist", "lines.txt"];
+    paste_binary: "paste" ["-s"] stdin b"\xff\xfe\n\x80";
+
+    // ------------------------------------------------------------- mktemp
+    mktemp_quiet_too_few_x: "mktemp" ["-q", "foo.XX"];
+    mktemp_suffix_template_quoted: "mktemp" ["-d", "--suffix=aXXXXb", ""];
+    mktemp_suffix_not_x: "mktemp" ["--suffix=b", "aXXa"];
+    mktemp_quiet_create_failure: "mktemp" ["-q", "nonexist/fooXXXX"];
 }
 
 // ------------------------------------------------------- shell pipelines
@@ -345,4 +372,8 @@ shell_cases! {
     // ---------------------------------------------------------------- tac
     tac_closed_stdin: ["tac"] "tac - - <&-; echo $?";
     tac_pipe_twice: ["tac"] "printf 'x\\ny\\n' | tac - -";
+
+    // ---------------------------------------------- echo / mktemp, POSIX
+    echo_posixly_correct: ["echo"] "export POSIXLY_CORRECT=1; env echo -n -E 'foo\\n'; env echo -nE foo; env echo -E -n foo; env echo --version";
+    mktemp_posixly_correct: ["mktemp"] "POSIXLY_CORRECT=1 mktemp aXXXX --suffix=b; echo $?";
 }

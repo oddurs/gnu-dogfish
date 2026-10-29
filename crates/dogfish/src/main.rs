@@ -328,7 +328,11 @@ fn main() -> ExitCode {
     let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
     // Like every GNU utility (scripts probe `tool --version`), a lone `--version`
     // prints the version instead of being parsed as an operand or rejected.
-    if filtered_args.len() == 2 && filtered_args[1] == "--version" {
+    // (Under POSIXLY_CORRECT, GNU echo prints even `--version` as text.)
+    if filtered_args.len() == 2
+        && filtered_args[1] == "--version"
+        && !(tool_name == "echo" && std::env::var_os("POSIXLY_CORRECT").is_some())
+    {
         println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
         // GNU `false` fails even when asked for its version.
         return if tool_name == "false" {

@@ -12,7 +12,9 @@ use dogfish_core::{DogfishContext, gnu_io_error};
 
 use crate::common::path::{concat_path, last_component};
 use crate::common::quote::quote_locale;
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
+use crate::common::tool_args::{
+    HasArg, ToolOpt, opt, parse_tool_args, parse_tool_args_posix, usage_error,
+};
 
 const MKTEMP_HELP: &str = "\
 Usage: mktemp [OPTION]... [TEMPLATE]
@@ -60,7 +62,13 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         opt("t", "", HasArg::No, Deprecated),
         opt("", "suffix", HasArg::Required, Suffix),
     ];
-    let parsed = match parse_tool_args("mktemp", &args, SPECS, MKTEMP_HELP) {
+    // Under POSIXLY_CORRECT, options end at the first operand (glibc getopt).
+    let parse = if std::env::var_os("POSIXLY_CORRECT").is_some() {
+        parse_tool_args_posix
+    } else {
+        parse_tool_args
+    };
+    let parsed = match parse("mktemp", &args, SPECS, MKTEMP_HELP) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
@@ -83,7 +91,13 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Suffix => suffix_opt = v,
         }
     }
+    // -q hides only failures to create the file or directory; a bad
+    // template is always diagnosed (GNU).
     let fail = |msg: String| {
+        eprintln!("mktemp: {msg}");
+        Ok(1)
+    };
+    let fail_create = |msg: String| {
         if !quiet {
             eprintln!("mktemp: {msg}");
         }
@@ -102,11 +116,9 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let (template, suffix) = match &suffix_opt {
         Some(s) => {
             if !template.ends_with('X') {
-                let mut shown = template.clone();
-                shown.push_str(s);
                 return fail(format!(
                     "with --suffix, template {} must end in X",
-                    quote_locale(&shown)
+                    quote_locale(&template)
                 ));
             }
             (template.clone() + s, s.clone())
@@ -162,7 +174,7 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut urandom = match fs::File::open("/dev/urandom") {
         Ok(f) => f,
-        Err(e) => return fail(format!("cannot open /dev/urandom: {}", gnu_io_error(&e))),
+        Err(e) => return fail_create(format!("cannot open /dev/urandom: {}", gnu_io_error(&e))),
     };
     let mut random = vec![0u8; x_count];
     let kind = if directory { "directory" } else { "file" };
@@ -201,7 +213,7 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return fail(format!(
+                return fail_create(format!(
                     "failed to create {kind} via template {}: {}",
                     quote_locale(&full_template),
                     gnu_io_error(&e)
@@ -209,7 +221,7 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    fail(format!(
+    fail_create(format!(
         "failed to create {kind} via template {}: File exists",
         quote_locale(&full_template)
     ))
