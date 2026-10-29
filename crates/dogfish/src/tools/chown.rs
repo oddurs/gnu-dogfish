@@ -1,7 +1,8 @@
 //! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -9,10 +10,10 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
-use crate::common::path::dir_names;
 use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
@@ -235,7 +236,17 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut ok = true;
     for f in &files {
-        ok &= chown_path(Path::new(f), true, &run, ctx);
+        let Ok(c_path) = CString::new(f.as_bytes()) else {
+            continue;
+        };
+        let mut path = WalkPath::new(f.as_bytes());
+        match chown_path(&mut Parent::Cwd, &c_path, &mut path, 0, &run, ctx) {
+            Ok(o) => ok &= o,
+            Err(Lost) => {
+                ok = false;
+                break;
+            }
+        }
     }
     Ok(if ok { 0 } else { 1 })
 }
@@ -345,66 +356,84 @@ fn user_group_str(user: Option<&str>, group: Option<&str>) -> Option<String> {
     }
 }
 
-fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext) -> bool {
+/// With `-v`, what GNU reports for a file it could not even stat.
+fn describe_failure_without_old(path: &Path, new_spec: Option<&str>, run: &ChownRun) {
+    if run.verbose {
+        let what = if run.spec.user.is_some() {
+            "ownership"
+        } else {
+            "group"
+        };
+        match new_spec {
+            Some(s) => outln!("failed to change {what} of {} to {s}", qa(path)),
+            None => outln!("failed to change ownership of {}", qa(path)),
+        }
+    }
+}
+
+/// Changes the owner of `name` in `parent` (printed as `path`); with `-R`,
+/// of everything below it first, each entry relative to its open directory.
+/// `depth` 0 is an operand.
+fn chown_path(
+    parent: &mut Parent,
+    name: &CStr,
+    path: &mut WalkPath,
+    depth: usize,
+    run: &ChownRun,
+    ctx: &DogfishContext,
+) -> Result<bool, Lost> {
     let spec = &run.spec;
     let new_spec = user_group_str(spec.user.as_deref(), spec.group.as_deref());
-    let describe_failure_without_old = || {
-        if run.verbose {
-            let what = if spec.user.is_some() {
-                "ownership"
-            } else {
-                "group"
-            };
-            match &new_spec {
-                Some(s) => outln!("failed to change {what} of {} to {s}", qa(path)),
-                None => outln!("failed to change ownership of {}", qa(path)),
-            }
-        }
-    };
+    let at = parent.at(name);
     // The stat fts makes for the walk (`fts_statp`): `-L` follows every symlink,
     // `-H` those on the command line; a dangling one falls back to the link.
     // Whether a directory is entered depends on this alone, never on `-h`.
     let walk_follows =
-        run.traverse == Traverse::All || (top_level && run.traverse == Traverse::CommandLine);
+        run.traverse == Traverse::All || (depth == 0 && run.traverse == Traverse::CommandLine);
     let walked = if walk_follows {
-        fs::metadata(path).or_else(|e| match fs::symlink_metadata(path) {
-            Ok(m) if e.kind() == std::io::ErrorKind::NotFound => Ok(m),
+        at.stat(true).or_else(|e| match at.stat(false) {
+            Ok(st) if e.kind() == io::ErrorKind::NotFound => Ok(st),
             _ => Err(e),
         })
     } else {
-        fs::symlink_metadata(path)
+        at.stat(false)
     };
     let walked = match walked {
-        Ok(m) => m,
+        Ok(st) => st,
         Err(e) => {
             if !run.quiet {
-                eprintln!("chown: cannot access {}: {}", qa(path), gnu_io_error(&e));
+                eprintln!(
+                    "chown: cannot access {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
             }
-            describe_failure_without_old();
-            return false;
+            describe_failure_without_old(path.as_path(), new_spec.as_deref(), run);
+            return Ok(false);
         }
     };
-    let traverse_dir = run.recursive && walked.is_dir();
+    let walked_type = EntryType::of(&walked);
+    let traverse_dir = run.recursive && walked_type == EntryType::Dir;
     // GNU `change_file_owner`, FTS_D: every directory the walk would enter is
     // checked, the command-line operands and those reached through `-L` alike.
-    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of(&walked)) {
-        refuse_root("chown", path);
-        return false;
+    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of_stat(&walked)) {
+        refuse_root("chown", path.as_path());
+        return Ok(false);
     }
-    let follow = walked.is_symlink() && run.affect_referent;
-    let meta = if follow {
-        match fs::metadata(path) {
-            Ok(m) => m,
+    let follow = walked_type == EntryType::Symlink && run.affect_referent;
+    let st = if follow {
+        match at.stat(true) {
+            Ok(st) => st,
             Err(e) => {
                 if !run.quiet {
                     eprintln!(
                         "chown: cannot dereference {}: {}",
-                        qa(path),
+                        qa(path.as_path()),
                         gnu_io_error(&e)
                     );
                 }
-                describe_failure_without_old();
-                return false;
+                describe_failure_without_old(path.as_path(), new_spec.as_deref(), run);
+                return Ok(false);
             }
         }
     } else {
@@ -414,26 +443,10 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     let mut ok = true;
     // Like GNU (fts post-order), a directory's contents are changed before it.
     if traverse_dir {
-        match dir_names(path, false) {
-            Ok(names) => {
-                for name in names {
-                    ok &= chown_path(&path.join(name), false, run, ctx);
-                }
-            }
-            Err(e) => {
-                if !run.quiet {
-                    eprintln!(
-                        "chown: cannot read directory {}: {}",
-                        qa(path),
-                        gnu_io_error(&e)
-                    );
-                }
-                ok = false;
-            }
-        }
+        ok &= chown_dir(parent, name, path, depth, walk_follows, run, ctx)?;
     }
 
-    let (old_uid, old_gid) = (meta.uid(), meta.gid());
+    let (old_uid, old_gid) = (st.st_uid, st.st_gid);
     let matches =
         run.from_uid.is_none_or(|u| u == old_uid) && run.from_gid.is_none_or(|g| g == old_gid);
     let old_spec = user_group_str(
@@ -443,12 +456,11 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     let mut status_changed = false;
     let mut failed = false;
     if matches && (spec.uid.is_some() || spec.gid.is_some()) {
-        let res = if run.affect_referent {
-            std::os::unix::fs::chown(path, spec.uid, spec.gid)
-        } else {
-            std::os::unix::fs::lchown(path, spec.uid, spec.gid)
-        };
-        match res {
+        // `parent` may have been let go of and got back meanwhile.
+        match parent
+            .at(name)
+            .chown(spec.uid, spec.gid, run.affect_referent)
+        {
             Ok(()) => {
                 ctx.telemetry.add_items(1);
                 status_changed = spec.uid.is_some_and(|u| u != old_uid)
@@ -465,7 +477,7 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
                     };
                     eprintln!(
                         "chown: changing {what} of {}: {}",
-                        qa(path),
+                        qa(path.as_path()),
                         gnu_io_error(&e)
                     );
                 }
@@ -480,7 +492,7 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
         } else {
             ""
         };
-        let file = qa(path);
+        let file = qa(path.as_path());
         let (old_s, new_s) = (old_spec.unwrap_or_default(), new_spec.unwrap_or_default());
         if failed {
             if what.is_empty() {
@@ -496,7 +508,88 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
             outln!("{what} of {file} retained as {old_s}");
         }
     }
-    ok
+    Ok(ok)
+}
+
+/// With `-R`, changes the owners of the entries of directory `name` in
+/// `parent` (printed as `path`), `depth` levels below an operand; `follow`:
+/// the walk followed `name` if it is a symlink. A directory deep enough lets
+/// go of `parent` meanwhile and gets it back through its own `..`, so every
+/// entry is reached by one name from its open directory, at any depth.
+///
+/// `-L` is GNU's `FTS_LOGICAL`, which walks by full path (`FTS_NOCHDIR`): a
+/// directory may be reached through a symlink, whose `..` is not where the
+/// walk came from. So does this, failing where GNU's does (`PATH_MAX`, a
+/// symlink loop).
+fn chown_dir(
+    parent: &mut Parent,
+    name: &CStr,
+    path: &mut WalkPath,
+    depth: usize,
+    follow: bool,
+    run: &ChownRun,
+    ctx: &DogfishContext,
+) -> Result<bool, Lost> {
+    let by_path = run.traverse == Traverse::All;
+    let mut names = Names::default();
+    let this = parent
+        .at(name)
+        .open_dir(!follow)
+        .and_then(|d| d.read_names(&mut names).map(|()| d))
+        .and_then(|d| {
+            if by_path {
+                Ok(Parent::Cwd)
+            } else {
+                Parent::dir(d, depth)
+            }
+        });
+    let mut this = match this {
+        Ok(this) => this,
+        Err(e) => {
+            if !run.quiet {
+                eprintln!(
+                    "chown: cannot read directory {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
+            }
+            return Ok(false);
+        }
+    };
+    let released = parent.release_deep(depth);
+    let mut ok = true;
+    for i in 0..names.len() {
+        let (child, _, _) = names.get(i);
+        let mark = path.push(child.to_bytes());
+        let full = if by_path {
+            path.c_path().map(CStr::to_owned)
+        } else {
+            None
+        };
+        let status = chown_path(
+            &mut this,
+            full.as_deref().unwrap_or(child),
+            path,
+            depth + 1,
+            run,
+            ctx,
+        );
+        path.truncate(mark);
+        ok &= status?;
+    }
+    if released {
+        let got_back = match this.open_dir() {
+            Some(own) => parent.reacquire(own),
+            None => Err(io::Error::from_raw_os_error(libc::EBADF)),
+        };
+        if let Err(e) = got_back {
+            if !run.quiet {
+                eprintln!("chown: fts_read failed: {}", gnu_io_error(&e));
+            }
+            return Err(Lost);
+        }
+    }
+    Ok(ok)
 }
 
 #[cfg(test)]
@@ -527,6 +620,12 @@ mod tests {
         }
     }
 
+    fn walk(p: &Path, run: &ChownRun, ctx: &DogfishContext) -> bool {
+        let c_path = CString::new(p.as_os_str().as_bytes()).unwrap();
+        let mut path = WalkPath::new(p.as_os_str().as_bytes());
+        chown_path(&mut Parent::Cwd, &c_path, &mut path, 0, run, ctx).unwrap_or(false)
+    }
+
     #[test]
     fn preserve_root_checks_every_directory_the_walk_enters() {
         let tmp = tempfile::tempdir().unwrap();
@@ -543,32 +642,17 @@ mod tests {
         let (all, cmdline, none) = (Traverse::All, Traverse::CommandLine, Traverse::None);
 
         // -RLh and -RL: the walk follows d/slink-to-root, so it is refused.
-        assert!(!chown_path(&d, true, &run(all, false, root, gid), &ctx));
-        assert!(!chown_path(&d, true, &run(all, true, root, gid), &ctx));
+        assert!(!walk(&d, &run(all, false, root, gid), &ctx));
+        assert!(!walk(&d, &run(all, true, root, gid), &ctx));
         // -RHh and -RP: the link below the operand is not followed.
-        assert!(chown_path(&d, true, &run(cmdline, false, root, gid), &ctx));
-        assert!(chown_path(&d, true, &run(none, false, root, gid), &ctx));
+        assert!(walk(&d, &run(cmdline, false, root, gid), &ctx));
+        assert!(walk(&d, &run(none, false, root, gid), &ctx));
         // -RH on a command-line link to root, with or without -h: refused.
-        assert!(!chown_path(
-            &top_link,
-            true,
-            &run(cmdline, true, root, gid),
-            &ctx
-        ));
-        assert!(!chown_path(
-            &top_link,
-            true,
-            &run(cmdline, false, root, gid),
-            &ctx
-        ));
+        assert!(!walk(&top_link, &run(cmdline, true, root, gid), &ctx));
+        assert!(!walk(&top_link, &run(cmdline, false, root, gid), &ctx));
         // -RP: a command-line link is just a link.
-        assert!(chown_path(
-            &top_link,
-            true,
-            &run(none, false, root, gid),
-            &ctx
-        ));
+        assert!(walk(&top_link, &run(none, false, root, gid), &ctx));
         // Without --preserve-root, -RLh walks through.
-        assert!(chown_path(&d, true, &run(all, false, None, gid), &ctx));
+        assert!(walk(&d, &run(all, false, None, gid), &ctx));
     }
 }

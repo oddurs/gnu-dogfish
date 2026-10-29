@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
-use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names, WalkPath, fts_root_name};
+use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, Parent, WalkPath, fts_root_name};
 use crate::common::file_info::{describe_mode, file_type_description};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, print_help, print_version, try_help, usage_error,
@@ -578,49 +578,6 @@ fn rm_empty_dir(
             eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
             RmStatus::Failed
         }
-    }
-}
-
-/// The directory entries are removed from: the working directory (operands
-/// are paths from it) or an open directory, which a deep walk may let go of
-/// while it removes a subdirectory's contents.
-enum Parent {
-    Cwd,
-    Dir {
-        /// `None` while let go of.
-        fd: Option<DirFd>,
-        /// (device, inode), to check the directory got back through `..`;
-        /// known when a subdirectory may let go of it.
-        id: Option<(u64, u64)>,
-    },
-}
-
-impl Parent {
-    /// How to act on `name` in this directory.
-    fn at<'a>(&self, name: &'a CStr) -> At<'a> {
-        match self {
-            Parent::Cwd => At::cwd(name),
-            Parent::Dir { fd: Some(fd), .. } => At { dir: fd.fd(), name },
-            // Not reached: a directory is got back before it is used again.
-            // EBADF says so if it were.
-            Parent::Dir { fd: None, .. } => At { dir: -1, name },
-        }
-    }
-
-    /// Closes the directory for now; true if it was open.
-    fn release(&mut self) -> bool {
-        match self {
-            Parent::Dir { fd, id: Some(_) } => fd.take().is_some(),
-            _ => false,
-        }
-    }
-
-    /// Opens the directory again, as the `..` of `child`.
-    fn reacquire(&mut self, child: &DirFd) -> io::Result<()> {
-        if let Parent::Dir { fd, id: Some(id) } = self {
-            *fd = Some(child.open_parent(*id)?);
-        }
-        Ok(())
     }
 }
 

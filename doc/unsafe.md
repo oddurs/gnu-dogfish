@@ -177,6 +177,7 @@ with `read(2)` instead.
 | `open_dir` | `openat(O_DIRECTORY)`, `OwnedFd::from_raw_fd` | C name; the new descriptor is owned by nothing else. |
 | `unlink` | `unlinkat` | C name. |
 | `chmod` | `fchmodat` | C name. |
+| `chown` | `fchownat` | C name. |
 | `write_protected` | `faccessat(W_OK)` | C name. |
 | `getdents` | `getdents64` (Linux) | Descriptor only; the kernel writes at most the buffer's length into it, and the records are parsed with bounds checks. |
 | `read_entries` | `fcntl(F_DUPFD_CLOEXEC)`, `fdopendir`, `close` (not Linux) | Descriptor only; the duplicate is owned by the stream, or closed once if `fdopendir` fails. |

@@ -1478,3 +1478,123 @@ fn cp_backup_and_no_clobber_upstream() {
     );
     assert_eq!(fs::read(dir.join("b")).unwrap(), b"B\n");
 }
+
+/// `chmod -R` and `chown -R` (to the current user and group) on a tree deeper
+/// than `PATH_MAX`: 300 levels of 200-byte names, with a file and a symlink to
+/// `..` every 50 levels. Each command runs on its own copy of the tree, built
+/// the same way, against GNU's; stdout, stderr, the exit status and every
+/// entry's mode and owner (listed by `find`, which walks by descriptor too)
+/// must match. The trees are too deep for the tree cases' snapshot.
+#[test]
+fn recursive_mode_and_owner_deeper_than_path_max() {
+    let (Some(gnu_chmod), Some(gnu_chown)) = (gnu_tool("chmod"), gnu_tool("chown")) else {
+        eprintln!("note: skipping — system chmod/chown missing or not GNU coreutils");
+        return;
+    };
+    let base = scratch_root().join("deeper-than-path-max");
+    force_remove(&base);
+    fs::create_dir_all(&base).unwrap();
+    let me = fs::metadata(&base).unwrap();
+    let (user, group) = (me.uid().to_string(), me.gid().to_string());
+    let both = format!("{user}:{group}");
+    let colon_group = format!(":{group}");
+    // (Perl: a shell's `cd` may build the full path, which is too long.)
+    let build = "my $n = q(n) x 200; mkdir q(deep) and chdir q(deep) or die $!; \
+                 for my $i (1..300) { mkdir $n and chdir $n or die $!; \
+                 if ($i % 50 == 0) { open(my $f, q(>), qq(f$i)) or die $!; \
+                 symlink(q(..), qq(l$i)) or die $! } } \
+                 open(my $f, q(>), q(f)) or die $!";
+    let cases: &[(&str, &Path, &[&str])] = &[
+        ("chmod", &gnu_chmod, &["-cR", "g+w,o-rx", "deep"]),
+        ("chmod", &gnu_chmod, &["-vR", "u+w", "deep", "nope"]),
+        ("chmod", &gnu_chmod, &["-R", "go=", "deep"]),
+        ("chown", &gnu_chown, &["-cR", &both, "deep"]),
+        ("chown", &gnu_chown, &["-vhR", &colon_group, "deep"]),
+        ("chown", &gnu_chown, &["-HR", &user, "deep"]),
+        // -L walks by full path, as GNU's does: both fail past PATH_MAX.
+        ("chown", &gnu_chown, &["-LvR", &user, "deep"]),
+    ];
+    let listing = |dir: &Path| {
+        let mut find = Command::new("find");
+        find.args(["deep", "-printf", "%m %U:%G %y %d %f\\n"]);
+        let out = exec(find, dir, None, "C");
+        assert!(out.status.success(), "find failed in {}", dir.display());
+        out.stdout
+    };
+    for (i, (tool, gnu, args)) in cases.iter().enumerate() {
+        let ours_dir = base.join(format!("{i}-dogfish"));
+        let gnu_dir = base.join(format!("{i}-gnu"));
+        for dir in [&ours_dir, &gnu_dir] {
+            fs::create_dir_all(dir).unwrap();
+            let status = Command::new("perl")
+                .args(["-e", build])
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "building the deep tree failed");
+        }
+        let mut ours = Command::new(dogfish_bin());
+        ours.arg(tool)
+            .args(*args)
+            .env("DOGFISH_HOME", base.join("dogfish-home"));
+        let mut theirs = Command::new(gnu);
+        theirs.arg0(tool).args(*args);
+        let a = exec(ours, &ours_dir, None, "C");
+        let b = exec(theirs, &gnu_dir, None, "C");
+        // The outputs run to megabytes: report only where they part.
+        let first_difference = |x: &[u8], y: &[u8]| {
+            let at = x.iter().zip(y).take_while(|(p, q)| p == q).count();
+            let line = |s: &[u8]| {
+                let start = s[..at.min(s.len())]
+                    .iter()
+                    .rposition(|&c| c == b'\n')
+                    .map_or(0, |p| p + 1);
+                let rest = &s[start..];
+                let line = &rest[..rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len())];
+                String::from_utf8_lossy(&line[line.len().saturating_sub(160)..]).into_owned()
+            };
+            format!(
+                "{tool} {args:?}: {} vs {} bytes, first difference at byte {at}:\n  \
+                 dogfish: ...{}\n  GNU:     ...{}",
+                x.len(),
+                y.len(),
+                line(x),
+                line(y)
+            )
+        };
+        assert!(
+            a.stdout == b.stdout,
+            "stdout differs: {}",
+            first_difference(&a.stdout, &b.stdout)
+        );
+        assert!(
+            a.stderr == b.stderr,
+            "stderr differs: {}",
+            first_difference(&a.stderr, &b.stderr)
+        );
+        assert_eq!(
+            a.status.code(),
+            b.status.code(),
+            "exit status differs: {tool} {args:?}"
+        );
+        let (la, lb) = (listing(&ours_dir), listing(&gnu_dir));
+        assert!(
+            la == lb,
+            "resulting trees differ: {}",
+            first_difference(&la, &lb)
+        );
+        assert!(
+            la.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count() > 300,
+            "the tree is not as deep as meant"
+        );
+        // GNU's rm, which walks by descriptor at any depth.
+        if let Some(rm) = gnu_tool("rm") {
+            let _ = Command::new(rm)
+                .arg("-rf")
+                .arg(&ours_dir)
+                .arg(&gnu_dir)
+                .status();
+        }
+    }
+    force_remove(&base);
+}
