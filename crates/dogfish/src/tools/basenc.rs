@@ -1,13 +1,13 @@
 //! base64 / basenc
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 
 use anyhow::{Result, anyhow};
 use data_encoding::{BASE32, BASE32HEX, HEXUPPER};
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, gnu_quote,
-    gnu_quote_file, io::ignore_broken_pipe, stdout,
+    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
 };
 
 use crate::common::getopt::{
@@ -41,7 +41,7 @@ enum CodecError {
 }
 
 impl Encoding {
-    /// Whether `c` belongs to the alphabet (padding included), for `--ignore-garbage`.
+    /// Whether `c` belongs to the alphabet (padding included).
     fn in_alphabet(self, c: u8) -> bool {
         match self {
             Self::Base64 => STD_B64.contains(&c) || c == b'=',
@@ -94,39 +94,31 @@ impl Encoding {
         })
     }
 
-    /// Decodes like GNU: newlines are skipped (with `ignore_garbage`, everything
-    /// outside the alphabet), and on invalid input the bytes decoded so far are
-    /// returned along with the error.
-    fn decode(self, input: &[u8], ignore_garbage: bool) -> (Vec<u8>, Option<CodecError>) {
-        let clean: Vec<u8> = input
-            .iter()
-            .copied()
-            .filter(|&c| {
-                if ignore_garbage {
-                    self.in_alphabet(c)
-                } else {
-                    c != b'\n'
-                }
-            })
-            .collect();
-        let mut out = Vec::with_capacity(clean.len());
-        let ok = match self {
-            Self::Base64 => clean
-                .chunks(4)
-                .all(|group| decode_base64_group(group, STD_B64, &mut out)),
-            // GNU rejects the standard alphabet's '+' and '/' up front.
-            Self::Base64Url => {
-                !clean.iter().any(|c| matches!(c, b'+' | b'/'))
-                    && clean
-                        .chunks(4)
-                        .all(|group| decode_base64_group(group, URL_B64, &mut out))
-            }
+    /// Characters per encoded group: decoding works one whole group at a time.
+    fn group_len(self) -> usize {
+        match self {
+            Self::Base64 | Self::Base64Url => 4,
+            Self::Base32 | Self::Base32Hex | Self::Base2Msbf | Self::Base2Lsbf => 8,
+            Self::Base16 => 2,
+            Self::Z85 => 5,
+        }
+    }
+
+    /// Decodes `clean` (newlines, or with `--ignore-garbage` everything
+    /// outside the alphabet, already removed) group by group, as gnulib does,
+    /// appending to `out`. A trailing short group is decoded as far as it
+    /// goes and reported invalid; false means decoding stopped at an invalid
+    /// group, after emitting the bytes known good before it.
+    fn decode_groups(self, clean: &[u8], table: &DecodeTable, out: &mut Vec<u8>) -> bool {
+        match self {
+            Self::Base64 => decode_base64(clean, STD_B64, table, out),
+            Self::Base64Url => decode_base64(clean, URL_B64, table, out),
             Self::Base32 => clean
                 .chunks(8)
-                .all(|group| decode_base32_group(group, B32, &mut out)),
+                .all(|group| decode_base32_group(group, B32, out)),
             Self::Base32Hex => clean
                 .chunks(8)
-                .all(|group| decode_base32_group(group, B32_HEX, &mut out)),
+                .all(|group| decode_base32_group(group, B32_HEX, out)),
             Self::Base16 => clean.chunks(2).all(|pair| {
                 let nibble = |c: Option<&u8>| {
                     c.filter(|c| self.in_alphabet(**c))
@@ -165,9 +157,70 @@ impl Encoding {
                     _ => false,
                 }
             }),
-        };
-        (out, (!ok).then_some(CodecError::Invalid))
+        }
     }
+}
+
+/// A 256-entry map from byte to 6-bit base64 value, [`INVALID`] for anything
+/// else (padding included, which the per-group slow path handles).
+type DecodeTable = [u8; 256];
+
+const INVALID: u8 = 0x80;
+
+fn decode_table(alphabet: &[u8]) -> DecodeTable {
+    let mut table = [INVALID; 256];
+    for (value, &c) in alphabet.iter().enumerate() {
+        table[c as usize] = value as u8;
+    }
+    table
+}
+
+/// Decodes base64 groups: whole groups of four alphabet characters go
+/// through a table, anything else (padding, invalid characters, a trailing
+/// short group) through gnulib's per-group logic in [`decode_base64_group`].
+fn decode_base64(
+    clean: &[u8],
+    alphabet: &[u8; 64],
+    table: &DecodeTable,
+    out: &mut Vec<u8>,
+) -> bool {
+    let start = out.len();
+    // Room for every group decoded in full; truncated to what was written.
+    out.resize(start + clean.len().div_ceil(4) * 3, 0);
+    let mut w = start;
+    let (groups, tail) = clean.as_chunks::<4>();
+    let mut slow = Vec::with_capacity(3);
+    let mut ok = true;
+    for g in groups {
+        let (a, b, c, d) = (
+            table[g[0] as usize],
+            table[g[1] as usize],
+            table[g[2] as usize],
+            table[g[3] as usize],
+        );
+        if (a | b | c | d) & INVALID == 0 {
+            let n =
+                (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+            out[w..w + 3].copy_from_slice(&n.to_be_bytes()[1..]);
+            w += 3;
+            continue;
+        }
+        slow.clear();
+        ok = decode_base64_group(g, alphabet, &mut slow);
+        out[w..w + slow.len()].copy_from_slice(&slow);
+        w += slow.len();
+        if !ok {
+            break;
+        }
+    }
+    if ok && !tail.is_empty() {
+        slow.clear();
+        ok = decode_base64_group(tail, alphabet, &mut slow);
+        out[w..w + slow.len()].copy_from_slice(&slow);
+        w += slow.len();
+    }
+    out.truncate(w);
+    ok
 }
 
 /// gnulib's `decode_4`: one (possibly short) group of base64 characters,
@@ -203,7 +256,19 @@ fn decode_base64_group(g: &[u8], alphabet: &[u8; 64], out: &mut Vec<u8>) -> bool
 /// gnulib's `decode_8`: a group of eight base32 characters yields up to five
 /// bytes; a short group decodes nothing, a malformed one stops part way.
 fn decode_base32_group(g: &[u8], alphabet: &[u8; 32], out: &mut Vec<u8>) -> bool {
-    let val = |c: u8| alphabet.iter().position(|&a| a == c).map(|p| p as u64);
+    let val = |c: u8| {
+        alphabet
+            .iter()
+            .position(|&a| a == c)
+            .or_else(|| {
+                // GNU decodes base32hex by translating its alphabet to the
+                // standard one and passing anything else through, so the
+                // standard-only letters W-Z keep their standard values.
+                (alphabet == B32_HEX && (b'W'..=b'Z').contains(&c))
+                    .then(|| usize::from(c - b'W') + 22)
+            })
+            .map(|p| p as u64)
+    };
     if g.len() < 8 {
         return false;
     }
@@ -229,20 +294,252 @@ fn decode_base32_group(g: &[u8], alphabet: &[u8; 32], out: &mut Vec<u8>) -> bool
     true
 }
 
-fn write_wrapped<W: Write>(out: &mut W, data: &[u8], wrap: usize) -> io::Result<()> {
-    if data.is_empty() {
-        // GNU base64 emits nothing at all for empty input.
-        return Ok(());
+/// Bytes encoded per block. GNU's block (30720 bytes) is a multiple of 3, 4
+/// and 5, so no padding appears before the last block, and `--z85` reports a
+/// ragged length on the block that holds the tail, after writing the blocks
+/// before it; a multiple of it keeps both true here.
+const GNU_ENC_BLOCK: usize = 30 * 1024;
+const ENC_BLOCK: usize = 4 * GNU_ENC_BLOCK;
+
+/// Bytes read per decoding step.
+const DEC_BLOCK: usize = 128 * 1024;
+
+/// What `basenc --base64url -d` reads per step (`BASE_LENGTH (DEC_BLOCKSIZE)`):
+/// GNU rejects a whole step that holds a `+` or `/`, keeping what it decoded
+/// from the steps before.
+const GNU_URL_DEC_STEP: usize = 5600;
+
+/// Why streaming stopped early.
+enum StreamError {
+    Read(io::Error),
+    Write(io::Error),
+}
+
+/// Reads until `buf` is full or the input ends, as `fread` does.
+fn fill(input: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match input.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(n)
+}
+
+/// One `read`, retried on `EINTR`.
+fn read_some(input: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match input.read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            r => return r,
+        }
+    }
+}
+
+/// Two output characters for every 12-bit input value: one lookup per half
+/// of a 3-byte group.
+fn pair_table(alphabet: &[u8; 64]) -> Vec<[u8; 2]> {
+    (0..4096)
+        .map(|v| [alphabet[v >> 6], alphabet[v & 63]])
+        .collect()
+}
+
+/// Appends the base64 encoding of `data` (padded if its length is not a
+/// multiple of 3) to `out`.
+fn encode_base64(data: &[u8], alphabet: &[u8; 64], pairs: &[[u8; 2]], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + data.len().div_ceil(3) * 4, 0);
+    let (groups, rest) = data.as_chunks::<3>();
+    let (whole, tail) = out[start..].split_at_mut(groups.len() * 4);
+    for (g, o) in groups.iter().zip(whole.as_chunks_mut::<4>().0) {
+        let n = (usize::from(g[0]) << 16) | (usize::from(g[1]) << 8) | usize::from(g[2]);
+        let (hi, lo) = (pairs[n >> 12], pairs[n & 0xfff]);
+        *o = [hi[0], hi[1], lo[0], lo[1]];
+    }
+    if let [b0, more @ ..] = rest {
+        let b1 = more.first().copied().unwrap_or(0);
+        tail[0] = alphabet[usize::from(b0 >> 2)];
+        tail[1] = alphabet[usize::from(((b0 & 3) << 4) | (b1 >> 4))];
+        tail[2] = if more.is_empty() {
+            b'='
+        } else {
+            alphabet[usize::from((b1 & 15) << 2)]
+        };
+        tail[3] = b'=';
+    }
+}
+
+/// GNU's `wrap_write`: appends `data` to `out`, breaking lines at `wrap`
+/// columns. A line's newline is written only once more data follows it (or
+/// by the caller at the end), so `column` runs from 0 to `wrap`.
+fn wrap_into(data: &[u8], wrap: usize, column: &mut usize, out: &mut Vec<u8>) {
     if wrap == 0 {
-        // GNU: `-w 0` disables wrapping and the trailing newline.
-        return ignore_broken_pipe(out.write_all(data));
+        out.extend_from_slice(data);
+        return;
     }
-    for chunk in data.chunks(wrap) {
-        ignore_broken_pipe(out.write_all(chunk))?;
-        ignore_broken_pipe(out.write_all(b"\n"))?;
+    let mut rest = data;
+    while !rest.is_empty() {
+        if *column == wrap {
+            out.push(b'\n');
+            *column = 0;
+        }
+        let n = (wrap - *column).min(rest.len());
+        out.extend_from_slice(&rest[..n]);
+        *column += n;
+        rest = &rest[n..];
     }
-    Ok(())
+}
+
+/// GNU's `do_encode`: encodes `input` block by block. Returns the z85
+/// length error, if any, after writing what GNU writes before it.
+fn encode_stream(
+    encoding: Encoding,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    wrap: usize,
+    ctx: &DogfishContext,
+) -> std::result::Result<Option<CodecError>, StreamError> {
+    let mut inbuf = vec![0u8; ENC_BLOCK];
+    let mut outbuf = Vec::with_capacity(ENC_BLOCK * 2);
+    let alphabet = match encoding {
+        Encoding::Base64Url => URL_B64,
+        _ => STD_B64,
+    };
+    // With whole groups per line, base64 is encoded straight into its lines.
+    let direct =
+        matches!(encoding, Encoding::Base64 | Encoding::Base64Url) && wrap.is_multiple_of(4);
+    let pairs = if direct {
+        pair_table(alphabet)
+    } else {
+        Vec::new()
+    };
+    let mut column = 0;
+    let mut error = None;
+    loop {
+        let n = fill(input, &mut inbuf).map_err(StreamError::Read)?;
+        ctx.telemetry.add_read(n as u64);
+        let mut block = &inbuf[..n];
+        if encoding == Encoding::Z85 && !n.is_multiple_of(4) {
+            // GNU dies on its block holding the ragged tail, unwritten.
+            block = &block[..n / GNU_ENC_BLOCK * GNU_ENC_BLOCK];
+            error = Some(CodecError::Z85Length);
+        }
+        outbuf.clear();
+        if direct {
+            let mut rest = block;
+            while !rest.is_empty() {
+                let take = if wrap == 0 {
+                    rest.len()
+                } else {
+                    if column == wrap {
+                        outbuf.push(b'\n');
+                        column = 0;
+                    }
+                    ((wrap - column) / 4 * 3).min(rest.len())
+                };
+                encode_base64(&rest[..take], alphabet, &pairs, &mut outbuf);
+                column += take.div_ceil(3) * 4;
+                rest = &rest[take..];
+            }
+        } else if !block.is_empty() {
+            match encoding.encode(block) {
+                Ok(encoded) => wrap_into(&encoded, wrap, &mut column, &mut outbuf),
+                Err(e) => error = Some(e),
+            }
+        }
+        ignore_broken_pipe(out.write_all(&outbuf)).map_err(StreamError::Write)?;
+        ctx.telemetry.add_written(outbuf.len() as u64);
+        if error.is_some() {
+            return Ok(error);
+        }
+        if n < ENC_BLOCK {
+            break;
+        }
+    }
+    // When wrapping, terminate the last line.
+    if wrap != 0 && column > 0 {
+        ignore_broken_pipe(out.write_all(b"\n")).map_err(StreamError::Write)?;
+    }
+    Ok(None)
+}
+
+/// GNU's `do_decode`: filters and decodes `input` a block at a time, carrying
+/// a partial group from one block to the next, so memory stays bounded.
+fn decode_stream(
+    encoding: Encoding,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    ignore_garbage: bool,
+    ctx: &DogfishContext,
+) -> std::result::Result<Option<CodecError>, StreamError> {
+    // basenc --base64url rejects a whole GNU-sized step holding '+' or '/';
+    // reading in exactly those steps reproduces what it writes first. With
+    // --ignore-garbage those characters are filtered out instead.
+    let url_steps = encoding == Encoding::Base64Url && !ignore_garbage;
+    let mut raw = vec![
+        0u8;
+        if url_steps {
+            GNU_URL_DEC_STEP
+        } else {
+            DEC_BLOCK
+        }
+    ];
+    let mut clean: Vec<u8> = Vec::with_capacity(raw.len() + 8);
+    let mut outbuf = Vec::with_capacity(DEC_BLOCK);
+    // What --ignore-garbage keeps: GNU keeps '=' for every encoding, so it
+    // is invalid input, not garbage, for those without padding.
+    let mut keep = [false; 256];
+    for c in 0..=255u8 {
+        keep[usize::from(c)] = encoding.in_alphabet(c) || c == b'=';
+    }
+    let table = decode_table(match encoding {
+        Encoding::Base64Url => URL_B64,
+        _ => STD_B64,
+    });
+    let group = encoding.group_len();
+    loop {
+        let n = if url_steps {
+            fill(input, &mut raw)
+        } else {
+            read_some(input, &mut raw)
+        }
+        .map_err(StreamError::Read)?;
+        ctx.telemetry.add_read(n as u64);
+        let chunk = &raw[..n];
+        if url_steps && chunk.iter().any(|c| matches!(c, b'+' | b'/')) {
+            return Ok(Some(CodecError::Invalid));
+        }
+        if ignore_garbage {
+            clean.extend(chunk.iter().copied().filter(|&c| keep[usize::from(c)]));
+        } else {
+            let mut from = 0;
+            for nl in memchr::memchr_iter(b'\n', chunk) {
+                clean.extend_from_slice(&chunk[from..nl]);
+                from = nl + 1;
+            }
+            clean.extend_from_slice(&chunk[from..]);
+        }
+        // Decode the whole groups; at the end of input, the short one too.
+        let ready = if n == 0 {
+            clean.len()
+        } else {
+            clean.len() / group * group
+        };
+        outbuf.clear();
+        let ok = encoding.decode_groups(&clean[..ready], &table, &mut outbuf);
+        ignore_broken_pipe(out.write_all(&outbuf)).map_err(StreamError::Write)?;
+        ctx.telemetry.add_written(outbuf.len() as u64);
+        if !ok {
+            return Ok(Some(CodecError::Invalid));
+        }
+        clean.drain(..ready);
+        if n == 0 {
+            return Ok(None);
+        }
+    }
 }
 
 /// The options `base64` and `basenc` share.
@@ -264,53 +561,34 @@ fn run_codec(
         eprintln!("{tool}: invalid wrap size: {}", gnu_quote(opts.wrap));
         return Ok(1);
     };
-    let src = match opts.file {
-        Some(f) if f != "-" => InputSource::File(f.to_string()),
-        _ => InputSource::Stdin,
+    let wrap = usize::try_from(wrap).unwrap_or(usize::MAX);
+    let mut input: Box<dyn Read> = match opts.file {
+        Some(f) if f != "-" => Box::new(
+            File::open(f).map_err(|e| anyhow!("{}: {}", gnu_quote_file(f), gnu_io_error(&e)))?,
+        ),
+        _ => Box::new(io::stdin().lock()),
     };
-    let reader = FastReader::open(&src).map_err(|e| {
-        anyhow!(
-            "{}: {}",
-            gnu_quote_file(src.display_name()),
-            gnu_io_error(&e)
-        )
-    })?;
-    let input = match reader.into_bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{tool}: read error: {}", gnu_io_error(&e));
-            return Ok(1);
-        }
-    };
-    ctx.telemetry.add_read(input.len() as u64);
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
-    let error = if opts.decode {
-        let (bytes, err) = encoding.decode(&input, opts.ignore_garbage);
-        ignore_broken_pipe(out.write_all(&bytes))?;
-        ctx.telemetry.add_written(bytes.len() as u64);
-        err
+    let mut out = stdout::stdout();
+    let result = if opts.decode {
+        decode_stream(encoding, &mut *input, &mut out, opts.ignore_garbage, ctx)
     } else {
-        match encoding.encode(&input) {
-            Ok(encoded) => {
-                let wrap = usize::try_from(wrap).unwrap_or(usize::MAX);
-                write_wrapped(&mut out, &encoded, wrap)?;
-                ctx.telemetry.add_written(encoded.len() as u64);
-                None
-            }
-            Err(e) => Some(e),
-        }
+        encode_stream(encoding, &mut *input, &mut out, wrap, ctx)
     };
-    ignore_broken_pipe(out.flush())?;
-    match error {
-        None => Ok(0),
-        Some(CodecError::Invalid) => {
+    match result {
+        Ok(None) => Ok(0),
+        Ok(Some(CodecError::Invalid)) => {
             eprintln!("{tool}: invalid input");
             Ok(1)
         }
-        Some(CodecError::Z85Length) => {
+        Ok(Some(CodecError::Z85Length)) => {
             eprintln!("{tool}: invalid input (length must be multiple of 4 characters)");
             Ok(1)
         }
+        Err(StreamError::Read(e)) => {
+            eprintln!("{tool}: read error: {}", gnu_io_error(&e));
+            Ok(1)
+        }
+        Err(StreamError::Write(e)) => Err(e.into()),
     }
 }
 
