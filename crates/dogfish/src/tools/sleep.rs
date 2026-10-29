@@ -71,3 +71,9 @@ pub fn run_sleep(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     thread::sleep(total);
     Ok(0)
 }
+
+/// sleep's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("sleep", SLEEP_HELP, SPECS)
+}

@@ -588,3 +588,11 @@ fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Res
     emit_objects_or_table(&filtered, ctx, cfg.json, !cfg.json)?;
     Ok(0)
 }
+
+/// uniq's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("uniq", UNIQ_HELP, SPECS)
+        .choices("all-repeated", ["none", "prepend", "separate"])
+        .choices("group", ["prepend", "append", "separate", "both"])
+}

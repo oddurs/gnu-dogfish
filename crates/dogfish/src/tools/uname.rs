@@ -166,3 +166,9 @@ pub fn run_uname(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result
     outln!("{}", parts.join(" "));
     Ok(0)
 }
+
+/// uname's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("uname", UNAME_HELP, SPECS)
+}

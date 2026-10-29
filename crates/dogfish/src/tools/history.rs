@@ -105,3 +105,9 @@ pub fn run_history(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     tbl.render(&mut out, st)?;
     Ok(0)
 }
+
+/// history's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("history", HISTORY_HELP, SPECS)
+}

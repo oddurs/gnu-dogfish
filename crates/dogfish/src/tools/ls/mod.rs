@@ -6,6 +6,8 @@ mod options;
 mod rich;
 mod version_sort;
 
+pub(crate) use options::manual;
+
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

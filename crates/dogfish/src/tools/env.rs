@@ -616,3 +616,9 @@ fn print_env(
     ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
+
+/// env's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("env", ENV_HELP, ENV_OPTS)
+}

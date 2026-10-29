@@ -660,3 +660,9 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
+
+/// seq's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("seq", SEQ_HELP, SEQ_OPTS)
+}

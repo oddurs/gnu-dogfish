@@ -1222,3 +1222,9 @@ fn run(t: &mut Tail, files: &mut [FileSpec], n_units: u64) -> R<bool> {
     }
     Ok(ok)
 }
+
+/// tail's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("tail", TAIL_HELP, SPECS).choices("follow", ["descriptor", "name"])
+}

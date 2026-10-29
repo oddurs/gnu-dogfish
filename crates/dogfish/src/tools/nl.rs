@@ -464,3 +464,13 @@ pub fn run_nl(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ignore_broken_pipe(out.flush())?;
     Ok(exit_code)
 }
+
+/// nl's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("nl", NL_HELP, SPECS)
+        .choices("body-numbering", ["a", "t", "n"])
+        .choices("header-numbering", ["a", "t", "n"])
+        .choices("footer-numbering", ["a", "t", "n"])
+        .choices("number-format", ["ln", "rn", "rz"])
+}

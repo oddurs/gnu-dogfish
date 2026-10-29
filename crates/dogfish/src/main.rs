@@ -5,6 +5,7 @@
 #![cfg_attr(not(test), no_main)]
 
 mod common;
+mod manual;
 mod tools;
 
 use std::ffi::OsString;
@@ -406,6 +407,12 @@ fn run(raw_args: Vec<OsString>) -> u8 {
                     outln!("{}", name);
                 }
                 return finish("dogfish", 0);
+            }
+            // Manual pages and completion scripts, from the tools' own
+            // option tables (`cargo xtask docs-gen` writes them all).
+            Some("--generate") => {
+                let code = manual::generate(&raw_args[2..]);
+                return finish("dogfish", code);
             }
             Some(sub) => {
                 let sub_clean = sub.strip_prefix("df-").unwrap_or(sub).to_string();

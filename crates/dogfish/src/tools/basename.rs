@@ -120,3 +120,9 @@ fn compute_basename(path: &[u8], suffix: Option<&[u8]>) -> Vec<u8> {
     }
     name
 }
+
+/// basename's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("basename", BASENAME_HELP, SPECS)
+}

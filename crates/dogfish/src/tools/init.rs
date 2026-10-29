@@ -132,3 +132,9 @@ pub fn run_init(args: Vec<OsString>, tool_names: &[&str], _ctx: &DogfishContext)
     }
     Ok(0)
 }
+
+/// init's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("init", INIT_HELP, SPECS)
+}

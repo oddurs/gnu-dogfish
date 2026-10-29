@@ -8,7 +8,7 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
-use crate::common::getopt::{print_help, print_version};
+use crate::common::getopt::{HasArg, OptSpec, print_help, print_version};
 
 const ECHO_HELP: &str = "\
 Usage: echo [SHORT-OPTION]... [STRING]...
@@ -57,10 +57,7 @@ pub fn run_echo(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     while allow_options && idx < args.len() {
         let arg = args[idx].as_bytes();
-        if arg.len() > 1
-            && arg[0] == b'-'
-            && arg[1..].iter().all(|c| matches!(c, b'n' | b'e' | b'E'))
-        {
+        if is_option_cluster(arg) {
             for ch in &arg[1..] {
                 match ch {
                     b'n' => no_newline = true,
@@ -97,4 +94,57 @@ pub fn run_echo(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         ctx.telemetry.add_written(1);
     }
     Ok(0)
+}
+
+/// Whether `arg` is a cluster of echo's options (`-n`, `-neE`); anything
+/// else is the first word to echo.
+fn is_option_cluster(arg: &[u8]) -> bool {
+    arg.len() > 1 && arg[0] == b'-' && arg[1..].iter().all(|c| matches!(c, b'n' | b'e' | b'E'))
+}
+
+/// echo's options as a table, for its manual page and completions: echo
+/// itself parses them by hand (`run_echo`, [`is_option_cluster`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EchoDoc {
+    NoNewline,
+    Escapes,
+    NoEscapes,
+    Help,
+    Version,
+}
+
+const DOC_SPECS: &[OptSpec<EchoDoc>] = &[
+    OptSpec::short(b'n', HasArg::No, EchoDoc::NoNewline),
+    OptSpec::short(b'e', HasArg::No, EchoDoc::Escapes),
+    OptSpec::short(b'E', HasArg::No, EchoDoc::NoEscapes),
+    OptSpec::long("help", HasArg::No, EchoDoc::Help),
+    OptSpec::long("version", HasArg::No, EchoDoc::Version),
+];
+
+/// echo's options and help text, for its manual page and shell completions
+/// (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("echo", ECHO_HELP, DOC_SPECS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doc_specs_are_the_options_echo_accepts() {
+        // Every short option the table lists is one echo takes, and no other
+        // character is; the long ones are what run_echo compares with.
+        let listed: Vec<u8> = DOC_SPECS.iter().filter_map(|s| s.short).collect();
+        for c in 0x21..0x7fu8 {
+            assert_eq!(
+                is_option_cluster(&[b'-', c]),
+                listed.contains(&c),
+                "-{}",
+                char::from(c)
+            );
+        }
+        let longs: Vec<&str> = DOC_SPECS.iter().filter_map(|s| s.long).collect();
+        assert_eq!(longs, ["help", "version"]);
+    }
 }
