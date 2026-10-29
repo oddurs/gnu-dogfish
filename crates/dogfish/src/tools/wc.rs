@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::common::files0::{Files0From, extra_operand_error};
 use crate::common::getopt::argmatch;
 use crate::common::input::{close_stdin, safe_read, stdin_file};
+use crate::common::locale::utf8_locale;
 use crate::common::quote::{qa, qf};
 
 #[derive(Parser)]
@@ -93,7 +94,7 @@ fn is_unicode_space(c: char) -> bool {
 
 /// Single-pass GNU-compatible (UTF-8 locale) word/char/display-width scanner.
 /// The slice must start at a line boundary.
-fn wc_scan(bytes: &[u8]) -> WcScan {
+fn wc_scan(bytes: &[u8], utf8: bool) -> WcScan {
     let mut s = WcScan::default();
     let mut in_word = false;
     let mut linepos: u64 = 0;
@@ -131,6 +132,13 @@ fn wc_scan(bytes: &[u8]) -> WcScan {
                 }
                 _ => {} // other control characters: neither word nor separator
             }
+            continue;
+        }
+        if !utf8 {
+            // C locale: a byte above 0x7f is a character that is neither
+            // printable nor a separator.
+            i += 1;
+            s.chars += 1;
             continue;
         }
         let seq_len = match b {
@@ -182,17 +190,11 @@ fn line_aligned_chunks(bytes: &[u8], target: usize) -> Vec<&[u8]> {
     chunks
 }
 
-fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
+fn wc_count_bytes(bytes: &[u8], need_scan: bool, utf8: bool) -> WcScan {
     if !need_scan {
-        // Fast path: only `-l` / `-c` requested -> pure SIMD `bytecount::count`
-        let lines = if bytes.len() >= 512 * 1024 {
-            bytes
-                .par_chunks(256 * 1024)
-                .map(|c| bytecount::count(c, b'\n') as u64)
-                .sum()
-        } else {
-            bytecount::count(bytes, b'\n') as u64
-        };
+        // Fast path: only `-l` / `-c` requested -> SIMD `bytecount::count`,
+        // on one thread (more threads cost more CPU than they save).
+        let lines = bytecount::count(bytes, b'\n') as u64;
         return WcScan {
             lines,
             ..Default::default()
@@ -203,7 +205,7 @@ fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
         // so each chunk is independent.
         return line_aligned_chunks(bytes, 256 * 1024)
             .par_iter()
-            .map(|c| wc_scan(c))
+            .map(|c| wc_scan(c, utf8))
             .reduce(WcScan::default, |a, b| WcScan {
                 lines: a.lines + b.lines,
                 words: a.words + b.words,
@@ -211,7 +213,7 @@ fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
                 max_line: a.max_line.max(b.max_line),
             });
     }
-    wc_scan(bytes)
+    wc_scan(bytes, utf8)
 }
 
 /// What to count and print (GNU's `print_*` flags).
@@ -224,12 +226,16 @@ struct WcOpts {
     max_line_length: bool,
     /// Words, characters or widths are needed: run the full scanner.
     need_scan: bool,
+    /// The locale's characters are UTF-8 sequences; else `-m` counts bytes.
+    utf8: bool,
 }
 
 impl WcOpts {
-    /// Only `-c`: a regular file's size answers it without reading.
+    /// Only `-c` (or `-m` where characters are bytes): a regular file's
+    /// size answers it without reading.
     fn bytes_only(&self) -> bool {
-        self.bytes && !(self.lines || self.words || self.chars || self.max_line_length)
+        (self.bytes || (self.chars && !self.utf8))
+            && !(self.lines || self.words || (self.chars && self.utf8) || self.max_line_length)
     }
 
     fn columns(&self) -> usize {
@@ -338,7 +344,8 @@ fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) 
         file: name.to_string(),
         lines: s.lines,
         words: s.words,
-        chars: s.chars,
+        // GNU: where characters are bytes, -m reports the byte count.
+        chars: if opts.utf8 { s.chars } else { bytes },
         bytes,
         max_line_length: s.max_line,
     };
@@ -350,10 +357,39 @@ fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) 
             error,
         };
     }
+    if !opts.need_scan {
+        // Lines (and bytes): stream in large reads, as GNU's wc_lines does,
+        // rather than mapping or buffering the whole input.
+        let (mut lines, mut bytes) = (0u64, 0u64);
+        let mut buf = vec![0u8; 256 * 1024];
+        let error = loop {
+            match safe_read(handle, &mut buf) {
+                Ok(0) => break None,
+                Ok(n) => {
+                    lines += bytecount::count(&buf[..n], b'\n') as u64;
+                    bytes += n as u64;
+                }
+                Err(e) => break Some(e),
+            }
+        };
+        ctx.telemetry.add_read(bytes);
+        ctx.telemetry.add_items(1);
+        let scan = WcScan {
+            lines,
+            ..Default::default()
+        };
+        return Counted {
+            rec: record(bytes, scan),
+            error,
+        };
+    }
     let count = |data: &[u8]| {
         ctx.telemetry.add_read(data.len() as u64);
         ctx.telemetry.add_items(1);
-        record(data.len() as u64, wc_count_bytes(data, opts.need_scan))
+        record(
+            data.len() as u64,
+            wc_count_bytes(data, opts.need_scan, opts.utf8),
+        )
     };
     match file {
         // A file is mapped when possible; it was just opened, at offset 0.
@@ -522,6 +558,7 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     };
 
+    let utf8 = utf8_locale();
     let default_cols =
         !parsed.bytes && !parsed.chars && !parsed.lines && !parsed.words && !parsed.max_line_length;
     let opts = WcOpts {
@@ -532,10 +569,11 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         max_line_length: parsed.max_line_length,
         need_scan: default_cols
             || parsed.words
-            || parsed.chars
+            || (parsed.chars && utf8)
             || parsed.max_line_length
             || parsed.json
             || parsed.table,
+        utf8,
     };
 
     let mut names = match &parsed.files0_from {

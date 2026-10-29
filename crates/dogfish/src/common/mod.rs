@@ -26,6 +26,7 @@ pub(crate) mod human;
 pub(crate) mod input;
 pub(crate) mod interval;
 pub(crate) mod lines;
+pub(crate) mod locale;
 pub(crate) mod mode;
 pub(crate) mod path;
 pub(crate) mod posixver;
