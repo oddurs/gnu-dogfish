@@ -123,6 +123,12 @@ and non-regular files are read with `read(2)` instead.
 | `main` | read `argv[i]` | `i < argc`, and the C runtime passes `argc` valid pointers. |
 | `main` | `CStr::from_ptr(argv[i])` | Checked non-null; argv strings are NUL-terminated and live for the whole process. |
 
+### `crates/dogfish/src/fuzz_api.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `init` | `remove_var` / `set_var` of the locale and `TZ` (`fuzzing` feature only) | Runs once, from the fuzzer's only thread, before anything reads the environment. |
+
 ### `crates/dogfish/src/common/backup.rs`
 
 | Item | Operation | Why it is sound |

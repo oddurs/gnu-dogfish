@@ -464,3 +464,14 @@ pub fn run_nl(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ignore_broken_pipe(out.flush())?;
     Ok(exit_code)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_nl_args(args);
+    }
+}

@@ -663,3 +663,32 @@ mod tests {
         assert!(set_fields("18446744073709551614-", true, false).is_ok());
     }
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `cut -b`/`-f LIST` (with and without `--complement`): ranges come out
+    /// sorted, 1-based and non-empty.
+    pub fn list(spec: &str) {
+        for byte_mode in [false, true] {
+            for complement in [false, true] {
+                if let Ok(ranges) = set_fields(spec, byte_mode, complement) {
+                    for w in ranges.windows(2) {
+                        assert!(w[0].1 < w[1].0, "{spec:?}: {ranges:?}");
+                    }
+                    for &(lo, hi) in &ranges {
+                        assert!(1 <= lo && lo <= hi, "{spec:?}: {ranges:?}");
+                    }
+                    let _ = complement_ranges(&ranges);
+                }
+            }
+        }
+    }
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_cut_args(args);
+    }
+}

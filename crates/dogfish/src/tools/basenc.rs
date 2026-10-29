@@ -759,3 +759,43 @@ pub fn run_basenc(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     };
     run_codec("basenc", encoding, opts, ctx)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    const ALL: [Encoding; 8] = [
+        Encoding::Base64,
+        Encoding::Base64Url,
+        Encoding::Base32,
+        Encoding::Base32Hex,
+        Encoding::Base16,
+        Encoding::Base2Msbf,
+        Encoding::Base2Lsbf,
+        Encoding::Z85,
+    ];
+
+    /// Every encoding, through the streaming coder `base64`/`basenc` use:
+    /// decoding what was encoded (wrapped or not) gives back the data, and
+    /// decoding anything never panics.
+    pub fn round_trip(data: &[u8]) {
+        let ctx = DogfishContext::new("basenc");
+        for e in ALL {
+            for wrap in [0, 76] {
+                let mut enc = Vec::new();
+                let Ok(None) = encode_stream(e, &mut &data[..], &mut enc, wrap, &ctx) else {
+                    continue;
+                };
+                let mut dec = Vec::new();
+                let r = decode_stream(e, &mut &enc[..], &mut dec, false, &ctx);
+                assert!(matches!(r, Ok(None)), "{data:?} wrap {wrap}");
+                assert_eq!(dec, data, "wrap {wrap}");
+            }
+            for garbage in [false, true] {
+                let _ = decode_stream(e, &mut &data[..], &mut Vec::new(), garbage, &ctx);
+            }
+        }
+    }
+}

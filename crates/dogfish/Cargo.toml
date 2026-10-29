@@ -16,6 +16,19 @@ description = "Dogfish: Modern, high-performance, object-aware coreutils in Rust
 name = "dogfish"
 path = "src/main.rs"
 
+# Empty unless the `fuzzing` feature is on: then it exposes the parsers to
+# the fuzz targets in `fuzz/` (see src/lib.rs). The binary does not use it.
+[lib]
+name = "dogfish_internal"
+path = "src/lib.rs"
+doc = false
+test = false
+doctest = false
+bench = false
+
+[features]
+fuzzing = []
+
 [dependencies]
 dogfish-core = { path = "../dogfish-core", version = "0.1.0" }
 serde.workspace = true

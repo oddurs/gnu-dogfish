@@ -495,3 +495,14 @@ pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     Ok(exit_code)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_tail_args(args);
+    }
+}

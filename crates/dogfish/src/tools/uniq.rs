@@ -588,3 +588,14 @@ fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Res
     emit_objects_or_table(&filtered, ctx, cfg.json, !cfg.json)?;
     Ok(0)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_args(args);
+    }
+}
