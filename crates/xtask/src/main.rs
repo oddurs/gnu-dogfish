@@ -7,10 +7,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod dist;
+mod sha256;
+mod unsafe_audit;
+
+/// The cargo-deny version CI installs (.github/workflows/supply-chain.yml).
+const CARGO_DENY_VERSION: &str = "0.20.2";
+
+/// The nightly the AddressSanitizer job uses; supply-chain.yml installs the
+/// same one. Pinned by date so a nightly regression cannot fail the job.
+const ASAN_TOOLCHAIN: &str = "nightly-2026-10-20";
+
 /// The steps `ci` runs, in order: cheap and likely-to-fail first.
 const CI: &[&str] = &[
     "fmt",
     "clippy",
+    "unsafe-audit",
     "msrv",
     "macos",
     "test",
@@ -21,9 +33,10 @@ const CI: &[&str] = &[
 ];
 
 const STEPS: &[(&str, &str)] = &[
-    ("ci", "every step below except gnu, in order"),
+    ("ci", "fmt through package below, in order"),
     ("fmt", "cargo fmt --check"),
     ("clippy", "Clippy on every target, warnings denied"),
+    ("unsafe-audit", "every `unsafe` is listed in doc/unsafe.md"),
     (
         "msrv",
         "type-check with the rust-version toolchain (rustup)",
@@ -47,7 +60,26 @@ const STEPS: &[(&str, &str)] = &[
         "gnu",
         "GNU coreutils' own test suite (util/gnu-tests.sh; slow, non-root)",
     ),
+    (
+        "deny",
+        "cargo deny check: advisories, licenses, bans, sources (deny.toml)",
+    ),
+    (
+        "asan",
+        "the test suites under AddressSanitizer (pinned nightly + rust-src)",
+    ),
+    (
+        "dist",
+        "reproducible release archive in target/dist/out [--target T]",
+    ),
+    (
+        "repro",
+        "build the release twice in two trees, require identical output [--target T]",
+    ),
 ];
+
+/// Steps that take arguments; every other step takes none.
+const TAKES_ARGS: &[&str] = &["dist", "repro"];
 
 type Step = Result<(), String>;
 
@@ -58,10 +90,16 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let root = workspace_root();
+    let rest = &args[1..];
+    if !rest.is_empty() && !TAKES_ARGS.contains(&step.as_str()) {
+        eprintln!("xtask: {step} takes no arguments");
+        usage();
+        return ExitCode::from(2);
+    }
     let result = if step == "ci" {
-        CI.iter().try_for_each(|s| run_step(&root, s))
+        CI.iter().try_for_each(|s| run_step(&root, s, &[]))
     } else if STEPS.iter().any(|(name, _)| name == step) {
-        run_step(&root, step)
+        run_step(&root, step, rest)
     } else {
         usage();
         return ExitCode::from(2);
@@ -79,13 +117,13 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!("usage: cargo xtask <step>\n\nsteps:");
+    eprintln!("usage: cargo xtask <step> [args]\n\nsteps:");
     for (name, what) in STEPS {
         eprintln!("  {name:<14} {what}");
     }
 }
 
-fn run_step(root: &Path, step: &str) -> Step {
+fn run_step(root: &Path, step: &str, args: &[String]) -> Step {
     eprintln!("xtask: ==> {step}");
     let r = match step {
         "fmt" => cargo(root, &["fmt", "--all", "--check"]),
@@ -112,9 +150,62 @@ fn run_step(root: &Path, step: &str) -> Step {
             .current_dir(root)),
         "package" => package(root),
         "gnu" => run(Command::new(root.join("util/gnu-tests.sh")).current_dir(root)),
+        "unsafe-audit" => unsafe_audit::audit(root).map(|summary| eprintln!("xtask: {summary}")),
+        "deny" => deny(root),
+        "asan" => asan(root),
+        "dist" => dist::target_arg(args).and_then(|t| {
+            let epoch = dist::source_date_epoch(root)?;
+            dist::dist(root, &t, epoch).map(drop)
+        }),
+        "repro" => dist::target_arg(args).and_then(|t| dist::repro(root, &t)),
         _ => unreachable!("unknown step {step}"),
     };
     r.map_err(|e| format!("{step}: {e}"))
+}
+
+/// `cargo deny check`, with the advisory database fetched fresh.
+fn deny(root: &Path) -> Step {
+    let installed = Command::new(cargo_bin())
+        .args(["deny", "--version"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(version) = installed else {
+        return Err(format!(
+            "cargo-deny is not installed: `cargo install --locked cargo-deny@{CARGO_DENY_VERSION}`"
+        ));
+    };
+    let version = String::from_utf8_lossy(&version.stdout);
+    if !version.contains(CARGO_DENY_VERSION) {
+        eprintln!(
+            "xtask: deny: CI uses cargo-deny {CARGO_DENY_VERSION}; this is {}",
+            version.trim()
+        );
+    }
+    cargo(root, &["deny", "--locked", "check"])
+}
+
+/// Every test binary, built with AddressSanitizer, std included
+/// (`-Zbuild-std`, so std's own code is instrumented too). There are no
+/// doctests, so `--lib --bins --tests` is everything.
+fn asan(root: &Path) -> Step {
+    let target = dist::host_target()?;
+    // The rustup proxy, not $CARGO: only the proxy understands `+toolchain`.
+    run(Command::new("cargo")
+        .arg(format!("+{ASAN_TOOLCHAIN}"))
+        .args(["test", "-Zbuild-std", "--target", &target])
+        .args(["--workspace", "--locked", "--lib", "--bins", "--tests"])
+        .arg("--target-dir")
+        .arg(root.join("target/asan"))
+        .env("RUSTFLAGS", "-Zsanitizer=address")
+        .env("RUSTDOCFLAGS", "-Zsanitizer=address")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .current_dir(root))
+    .map_err(|e| {
+        format!(
+            "{e} (missing toolchain? `rustup toolchain install {ASAN_TOOLCHAIN} --component rust-src`)"
+        )
+    })
 }
 
 fn cargo_bin() -> String {
@@ -364,11 +455,17 @@ mod tests {
     }
 
     #[test]
-    fn ci_runs_only_known_steps_and_not_gnu() {
+    fn ci_runs_only_known_quick_steps() {
         for step in CI {
             assert!(STEPS.iter().any(|(name, _)| name == step), "{step}");
         }
-        assert!(!CI.contains(&"gnu"));
+        // Slow, or needing tools and network access a contributor may not have.
+        for step in ["gnu", "deny", "asan", "dist", "repro"] {
+            assert!(!CI.contains(&step), "{step}");
+        }
+        for step in TAKES_ARGS {
+            assert!(STEPS.iter().any(|(name, _)| name == step), "{step}");
+        }
     }
 
     #[test]
