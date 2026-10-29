@@ -331,9 +331,105 @@ pub fn strip_os_error_suffix(msg: &str) -> String {
     out
 }
 
+/// The C escape GNU uses for a byte that is not printable ASCII (`\n`, `\001`).
+fn c_escape(c: u8) -> String {
+    match c {
+        0x07 => "\\a".into(),
+        0x08 => "\\b".into(),
+        0x0c => "\\f".into(),
+        b'\n' => "\\n".into(),
+        b'\r' => "\\r".into(),
+        b'\t' => "\\t".into(),
+        0x0b => "\\v".into(),
+        _ => format!("\\{c:03o}"),
+    }
+}
+
+fn is_printable(c: u8) -> bool {
+    (0x20..0x7f).contains(&c)
+}
+
+/// Quotes an argument for a diagnostic like GNU's `quote` in the C locale:
+/// always in single quotes, with C escapes (`'a\'b'`, `'x\ty'`).
+pub fn gnu_quote(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for &c in arg.as_bytes() {
+        match c {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            c if is_printable(c) => out.push(c as char),
+            c => out.push_str(&c_escape(c)),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Quotes a file name for a diagnostic like GNU's `quotef` (shell-escape
+/// style, only when needed): `a b` becomes `'a b'`, a newline becomes
+/// `'x'$'\n''y'`, and names that need no quoting are returned unchanged.
+pub fn gnu_quote_file(name: &str) -> std::borrow::Cow<'_, str> {
+    let b = name.as_bytes();
+    let shell_special = |i: usize, c: u8| match c {
+        b'#' | b'~' => i == 0,
+        b' ' | b'!' | b'"' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b':' | b';' | b'<'
+        | b'=' | b'>' | b'?' | b'[' | b'\\' | b'^' | b'`' | b'|' => true,
+        _ => false,
+    };
+    let unprintable = b.iter().any(|&c| !is_printable(c));
+    if !b.is_empty() && !unprintable && !b.iter().enumerate().any(|(i, &c)| shell_special(i, c)) {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    if !unprintable {
+        if b.contains(&b'\'') && !b.iter().any(|c| b"$`\\\"!".contains(c)) {
+            return format!("\"{name}\"").into();
+        }
+        return format!("'{}'", name.replace('\'', "'\\''")).into();
+    }
+    let mut out = String::from("'");
+    let mut escaping = false;
+    for &c in b {
+        if is_printable(c) {
+            if escaping {
+                out.push_str("''");
+                escaping = false;
+            }
+            if c == b'\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(c as char);
+            }
+        } else {
+            if !escaping {
+                out.push_str("'$'");
+                escaping = true;
+            }
+            out.push_str(&c_escape(c));
+        }
+    }
+    out.push('\'');
+    out.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gnu_quote_styles() {
+        assert_eq!(gnu_quote("a'b\\c\t\u{e9}"), "'a\\'b\\\\c\\t\\303\\251'");
+        assert_eq!(gnu_quote_file("plain-name.txt"), "plain-name.txt");
+        assert_eq!(gnu_quote_file("a b"), "'a b'");
+        assert_eq!(gnu_quote_file("a'b"), "\"a'b\"");
+        assert_eq!(gnu_quote_file("a'$b"), "'a'\\''$b'");
+        assert_eq!(gnu_quote_file(""), "''");
+        assert_eq!(gnu_quote_file("x\ny"), "'x'$'\\n''y'");
+        assert_eq!(gnu_quote_file("\ty"), "''$'\\t''y'");
+        assert_eq!(gnu_quote_file("a\u{1}"), "'a'$'\\001'");
+        assert_eq!(gnu_quote_file("a~#"), "a~#");
+        assert_eq!(gnu_quote_file("~a"), "'~a'");
+    }
 
     #[test]
     fn test_gnu_io_error_strips_os_suffix() {
