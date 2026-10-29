@@ -13,7 +13,39 @@ use dogfish_core::{
 use md5::Md5;
 use rayon::prelude::*;
 use serde::Serialize;
-use sha2::Sha256;
+
+/// SHA-256 backed by `ring`, adapted to the RustCrypto [`Digest`] interface the hashing
+/// pipeline is generic over.
+///
+/// `ring` carries the OpenSSL/BoringSSL assembly with runtime CPU dispatch (SHA-NI,
+/// AVX2+BMI2, SSSE3, ARMv8 crypto), the same code GNU `sha256sum` reaches through
+/// libcrypto. RustCrypto's `sha2` only accelerates SHA-NI and ARMv8, so it ran ~1.7x
+/// slower than GNU on CPUs without SHA extensions.
+struct RingSha256(ring::digest::Context);
+
+impl Default for RingSha256 {
+    fn default() -> Self {
+        Self(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+}
+
+impl digest::HashMarker for RingSha256 {}
+
+impl digest::OutputSizeUser for RingSha256 {
+    type OutputSize = digest::consts::U32;
+}
+
+impl digest::Update for RingSha256 {
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+}
+
+impl digest::FixedOutput for RingSha256 {
+    fn finalize_into(self, out: &mut digest::Output<Self>) {
+        out.copy_from_slice(self.0.finish().as_ref());
+    }
+}
 
 #[derive(Parser)]
 #[command(about = "Compute and check cryptographic message digests")]
@@ -51,7 +83,7 @@ pub fn run_b2sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 pub fn run_sha256sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    run_generic_hash::<Sha256>("SHA256", args, ctx)
+    run_generic_hash::<RingSha256>("SHA256", args, ctx)
 }
 
 pub fn run_md5sum(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

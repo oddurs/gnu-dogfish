@@ -185,22 +185,31 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink
+        // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink.
+        // One open of each file serves both the reflink attempt and the fallback.
         const FICLONE: libc::c_ulong = 0x40049409;
-        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
-            let ret =
-                unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
-            if ret == 0
-                && let Ok(meta) = src_file.metadata()
-            {
-                let _ = dst_file.set_permissions(meta.permissions());
-                return Ok((meta.len(), CopyMethod::FicloneCoW));
-            }
-        }
+        let src_file = File::open(src)?;
+        let meta = src_file.metadata()?;
+        let dst_file = File::create(dst)?;
+        let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+        let (bytes, method) = if ret == 0 {
+            (meta.len(), CopyMethod::FicloneCoW)
+        } else {
+            // std specializes File-to-File `io::copy` to copy_file_range(2) / sendfile(2).
+            (
+                io::copy(&mut &src_file, &mut &dst_file)?,
+                CopyMethod::StandardCopy,
+            )
+        };
+        dst_file.set_permissions(meta.permissions())?;
+        Ok((bytes, method))
     }
 
-    let bytes = fs::copy(src, dst)?;
-    Ok((bytes, CopyMethod::StandardCopy))
+    #[cfg(not(target_os = "linux"))]
+    {
+        let bytes = fs::copy(src, dst)?;
+        Ok((bytes, CopyMethod::StandardCopy))
+    }
 }
 
 /// Recursively copies `src` to `dst`, recreating symlinks rather than following them.

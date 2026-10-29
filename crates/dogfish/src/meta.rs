@@ -425,7 +425,7 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             &format!("sha256sum ({} MiB)", parsed.size_mb),
             df_dur,
             sys_dur,
-            "mmap + hardware SHA-256",
+            "mmap + ring SHA-256 (OpenSSL asm)",
         ));
     }
 

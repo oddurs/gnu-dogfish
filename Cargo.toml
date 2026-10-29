@@ -27,7 +27,6 @@ memmap2 = "0.9"
 rayon = "1.10"
 jwalk = "0.8"
 blake2 = "0.10"
-sha2 = { version = "0.10", features = ["asm"] }
 md-5 = { version = "0.10", features = ["asm"] }
 digest = "0.10"
 base64 = "0.22"
@@ -39,6 +38,7 @@ unicode-width = "0.2"
 anyhow = "1.0"
 tempfile = "3.12"
 itoa = "1.0"
+ring = "0.17"
 
 [profile.release]
 opt-level = 3
