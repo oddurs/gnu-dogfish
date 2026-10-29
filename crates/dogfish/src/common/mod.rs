@@ -10,6 +10,7 @@
 
 pub(crate) mod backup;
 pub(crate) mod canonicalize;
+pub(crate) mod copy;
 pub(crate) mod date_format;
 pub(crate) mod escapes;
 pub(crate) mod exit_status;

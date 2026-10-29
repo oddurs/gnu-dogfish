@@ -7,8 +7,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirEntryExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use dogfish_core::same_file;
-
 pub(crate) fn absolute_lossy(p: &Path) -> String {
     std::path::absolute(p)
         .unwrap_or_else(|_| p.to_path_buf())
@@ -39,12 +37,6 @@ pub(crate) fn base_len(s: &[u8]) -> usize {
         len -= 1;
     }
     len
-}
-
-/// The file name a source keeps inside a target directory (`d/` → `d`).
-pub(crate) fn operand_base(src: &str) -> OsString {
-    let last = last_component(src.as_bytes());
-    OsString::from_vec(last[..base_len(last)].to_vec())
 }
 
 /// `dir/name` without doubling a trailing slash (gnulib `file_name_concat`).
@@ -107,13 +99,40 @@ pub(crate) fn ancestor_ends(path: &str) -> Vec<usize> {
     ends
 }
 
-/// True when `a` and `b` name the same directory entry (same parent, same name).
+/// gnulib `dir_name`: everything before the last component of `p`, without
+/// trailing slashes (`.` when there is no directory part, `/` for `/x`).
+pub(crate) fn dir_name(p: &Path) -> PathBuf {
+    let s = p.as_os_str().as_bytes();
+    let prefix = usize::from(s.first() == Some(&b'/'));
+    let mut len = s.len() - last_component(s).len();
+    while prefix < len && s[len - 1] == b'/' {
+        len -= 1;
+    }
+    if len == 0 {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(OsStr::from_bytes(&s[..len]))
+    }
+}
+
+/// gnulib `same_name`: true when `a` and `b` name the same directory entry —
+/// equal last components (ignoring trailing slashes) in the same directory,
+/// compared without following a symlink in the last place.
 pub(crate) fn same_name(a: &Path, b: &Path) -> bool {
-    let parent = |p: &Path| match p.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => PathBuf::from("."),
+    let base = |p: &Path| {
+        let last = last_component(p.as_os_str().as_bytes());
+        last[..base_len(last)].to_vec()
     };
-    a.file_name() == b.file_name() && same_file(&parent(a), &parent(b))
+    if base(a) != base(b) {
+        return false;
+    }
+    match (
+        fs::symlink_metadata(dir_name(a)),
+        fs::symlink_metadata(dir_name(b)),
+    ) {
+        (Ok(x), Ok(y)) => same_inode(&x, &y),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,4 +140,60 @@ pub(crate) enum Deref {
     Never,
     CommandLine,
     Always,
+}
+
+/// `renameat2(RENAME_NOREPLACE)`, as gnulib's `renameatu`: fails with `EEXIST`
+/// when `dst` exists (even as a dangling symlink). Where the kernel or file
+/// system lacks the flag, an `lstat` check stands in for it.
+pub(crate) fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    let (s, d) = (c_path(src)?, c_path(dst)?);
+    #[cfg(target_os = "linux")]
+    {
+        let r = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                s.as_ptr(),
+                libc::AT_FDCWD,
+                d.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return Err(e);
+        }
+    }
+    match fs::symlink_metadata(dst) {
+        Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        Err(_) => {
+            if unsafe { libc::rename(s.as_ptr(), d.as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+}
+
+/// gnulib `file_name_concat`: `dir/base` (trailing slashes of `dir` dropped,
+/// `/./base` under the root), and the offset where `base` starts in it.
+pub(crate) fn file_name_concat(dir: &[u8], base: &[u8]) -> (PathBuf, usize) {
+    let dirbase = last_component(dir);
+    let dirbaselen = base_len(dirbase);
+    let dirlen = dir.len() - dirbase.len() + dirbaselen;
+    let mut s = dir[..dirlen].to_vec();
+    if dirbaselen > 0 {
+        if dir[dirlen - 1] != b'/' && base.first() != Some(&b'/') {
+            s.push(b'/');
+        }
+    } else if base.first() == Some(&b'/') {
+        s.push(b'.');
+    }
+    let offset = s.len();
+    s.extend_from_slice(base);
+    (PathBuf::from(OsString::from_vec(s)), offset)
 }

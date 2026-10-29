@@ -1,21 +1,25 @@
-//! `ln`
+//! `ln` — a port of GNU ln.c
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, outln, same_file};
+use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
+use crate::common::copy::{force_linkat, force_symlinkat};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
     utf8_operands,
 };
-use crate::common::path::{concat_path, operand_base, same_inode, same_name};
+use crate::common::path::{
+    base_len, c_path, dir_name, file_name_concat, last_component, same_inode, same_name,
+};
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf};
 
@@ -96,6 +100,17 @@ struct LnOpts {
     relative: bool,
     symbolic: bool,
     verbose: bool,
+    /// `-d`: hard links to directories may be attempted.
+    hard_dir_link: bool,
+}
+
+/// State for one `ln` invocation (ln.c's globals).
+struct Linker<'a> {
+    o: LnOpts,
+    ctx: &'a DogfishContext,
+    /// The hard links made so far (GNU's `dest_set`), to refuse replacing one
+    /// with another in the same run.
+    dest_set: Option<HashMap<(u64, u64), Vec<PathBuf>>>,
 }
 
 pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -110,9 +125,10 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         relative: false,
         symbolic: false,
         verbose: false,
+        hard_dir_link: false,
     };
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
-    let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None, false);
+    let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None::<String>, false);
     while let Some(opt) = opts.next() {
         let (opt, v) = match opt {
             Ok(o) => o,
@@ -127,7 +143,7 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 want_backup = true;
                 backup_arg = v;
             }
-            Directory => {}
+            Directory => o.hard_dir_link = true,
             Force => {
                 o.force = true;
                 o.interactive = false;
@@ -145,11 +161,95 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 want_backup = true;
                 suffix = v;
             }
-            TargetDir => target_dir = v,
+            TargetDir => {
+                // GNU checks -t while parsing, so this comes before any
+                // diagnostic for a later option.
+                if target_dir.is_some() {
+                    eprintln!("ln: multiple target directories specified");
+                    return Ok(1);
+                }
+                let d = v.unwrap_or_default();
+                match fs::metadata(&d) {
+                    Err(e) => {
+                        eprintln!("ln: failed to access {}: {}", qa(&d), gnu_io_error(&e));
+                        return Ok(1);
+                    }
+                    Ok(m) if !m.is_dir() => {
+                        eprintln!("ln: target {} is not a directory", qa(&d));
+                        return Ok(1);
+                    }
+                    Ok(_) => {}
+                }
+                target_dir = Some(d);
+            }
             NoTargetDir => no_target_dir = true,
             Verbose => o.verbose = true,
         }
     }
+    let mut files = match utf8_operands("ln", opts.operands()) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    if files.is_empty() {
+        return Ok(usage_error("ln", "missing file operand"));
+    }
+    if o.relative && !o.symbolic {
+        eprintln!("ln: cannot do --relative without --symbolic");
+        return Ok(1);
+    }
+
+    // `None`: no attempt at the link yet.
+    let mut link_res: Option<io::Result<()>> = None;
+    if no_target_dir {
+        if target_dir.is_some() {
+            eprintln!("ln: cannot combine --target-directory and --no-target-directory");
+            return Ok(1);
+        }
+        if files.len() != 2 {
+            let msg = if files.len() < 2 {
+                format!("missing destination file operand after {}", qa(&files[0]))
+            } else {
+                format!("extra operand {}", qa(&files[2]))
+            };
+            return Ok(usage_error("ln", msg));
+        }
+    } else if files.len() < 2 && target_dir.is_none() {
+        target_dir = Some(".".to_string());
+    } else {
+        // With two operands, try the link first: DEST is a directory only if
+        // that fails.
+        if files.len() == 2 && target_dir.is_none() {
+            link_res = atomic_link(&o, Path::new(&files[0]), Path::new(&files[1]));
+        }
+        let retry_as_dir = match &link_res {
+            None => true,
+            Some(Ok(())) => false,
+            Some(Err(e)) => matches!(
+                e.raw_os_error(),
+                Some(libc::EEXIST | libc::ENOTDIR | libc::EINVAL)
+            ),
+        };
+        if retry_as_dir {
+            let d = target_dir
+                .clone()
+                .unwrap_or_else(|| files[files.len() - 1].clone());
+            match open_dir(Path::new(&d), no_deref) {
+                Ok(()) => {
+                    if target_dir.is_none() {
+                        files.pop();
+                    }
+                    target_dir = Some(d);
+                }
+                Err(e) => {
+                    if !(files.len() == 2 && target_dir.is_none()) {
+                        eprintln!("ln: target {}: {}", qa(&d), gnu_io_error(&e));
+                        return Ok(1);
+                    }
+                }
+            }
+        }
+    }
+
     if want_backup {
         o.backup = match backup_mode("ln", backup_arg.as_deref()) {
             Ok(m) => m,
@@ -157,252 +257,288 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         };
     }
     o.suffix = backup_suffix(suffix);
-    if o.relative && !o.symbolic {
-        eprintln!("ln: cannot do --relative without --symbolic");
-        return Ok(1);
-    }
 
-    let mut files = match utf8_operands("ln", opts.operands()) {
-        Ok(o) => o,
-        Err(code) => return Ok(code),
+    let mut ln = Linker {
+        o,
+        ctx,
+        dest_set: None,
     };
-    let is_dir = |p: &str| {
-        let m = if no_deref {
-            fs::symlink_metadata(p)
-        } else {
-            fs::metadata(p)
-        };
-        m.is_ok_and(|m| m.is_dir())
-    };
-    let target_dir = match (target_dir, no_target_dir) {
-        (Some(_), true) => {
-            eprintln!("ln: cannot combine --target-directory and --no-target-directory");
-            return Ok(1);
-        }
-        (Some(d), false) => {
-            if let Err(e) = fs::metadata(&d).and_then(|m| {
-                if m.is_dir() {
-                    Ok(())
-                } else {
-                    Err(io::Error::from_raw_os_error(libc::ENOTDIR))
-                }
-            }) {
-                eprintln!("ln: target directory {}: {}", qa(&d), gnu_io_error(&e));
-                return Ok(1);
-            }
-            if files.is_empty() {
-                return Ok(usage_error("ln", "missing file operand"));
-            }
-            Some(d)
-        }
-        (None, true) => {
-            match files.len() {
-                0 => return Ok(usage_error("ln", "missing file operand")),
-                1 => {
-                    return Ok(usage_error(
-                        "ln",
-                        format!("missing destination file operand after {}", qa(&files[0])),
-                    ));
-                }
-                2 => {}
-                _ => {
-                    return Ok(usage_error(
-                        "ln",
-                        format!("extra operand {}", qa(&files[2])),
-                    ));
-                }
-            }
-            None
-        }
-        (None, false) => match files.len() {
-            0 => return Ok(usage_error("ln", "missing file operand")),
-            1 => Some(".".to_string()),
-            n if is_dir(&files[n - 1]) => files.pop(),
-            2 => None,
-            n => {
-                let last = &files[n - 1];
-                let meta = if no_deref {
-                    fs::symlink_metadata(last)
-                } else {
-                    fs::metadata(last)
-                };
-                let err = meta
-                    .err()
-                    .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOTDIR));
-                eprintln!("ln: target {}: {}", qa(last), gnu_io_error(&err));
-                return Ok(1);
-            }
-        },
-    };
-
-    let mut status = 0;
-    match target_dir {
+    let ok = match target_dir {
         Some(dir) => {
+            // Only replacing one just-made hard link with another loses data.
+            if files.len() >= 2
+                && ln.o.force
+                && !ln.o.symbolic
+                && ln.o.backup != BackupMode::Numbered
+            {
+                ln.dest_set = Some(HashMap::new());
+            }
+            let mut ok = true;
             for src in &files {
-                let dest = concat_path(&dir, &operand_base(src));
-                if !ln_one(src, &dest, &o, ctx) {
-                    status = 1;
-                }
+                let last = last_component(src.as_bytes());
+                let (dest, _) = file_name_concat(dir.as_bytes(), &last[..base_len(last)]);
+                ok &= ln.do_link(Path::new(src), &dest, None);
             }
+            ok
         }
-        None => {
-            if !ln_one(&files[0], Path::new(&files[1]), &o, ctx) {
-                status = 1;
-            }
-        }
-    }
-    Ok(status)
+        None => ln.do_link(Path::new(&files[0]), Path::new(&files[1]), link_res),
+    };
+    Ok(if ok { 0 } else { 1 })
 }
 
-fn ln_one(src: &str, dest: &Path, o: &LnOpts, ctx: &DogfishContext) -> bool {
-    let src_path = Path::new(src);
-    let src_meta = if o.symbolic {
-        None
-    } else {
-        let m = if o.logical {
-            fs::metadata(src_path)
-        } else {
-            fs::symlink_metadata(src_path)
-        };
-        match m {
-            Err(e) => {
-                eprintln!("ln: failed to access {}: {}", qa(src), gnu_io_error(&e));
-                return false;
-            }
-            Ok(m) if m.is_dir() => {
-                eprintln!("ln: {}: hard link not allowed for directory", qf(src));
-                return false;
-            }
-            Ok(m) => Some(m),
-        }
-    };
-    // With -L, resolve the source before DEST (which may be that symlink) is removed.
-    let real_src = if o.logical && !o.symbolic {
-        match fs::canonicalize(src_path) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("ln: failed to access {}: {}", qa(src), gnu_io_error(&e));
-                return false;
-            }
-        }
-    } else {
-        None
-    };
-    let target: OsString = if o.relative {
-        relative_link_target(src_path, dest)
-    } else {
-        OsString::from(src)
-    };
+/// Opens `d` as a directory (GNU's `O_PATHSEARCH | O_DIRECTORY`), not
+/// following a final symlink with `-n`.
+fn open_dir(d: &Path, no_deref: bool) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let base = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let base = libc::O_RDONLY;
+    let flags =
+        base | libc::O_DIRECTORY | libc::O_CLOEXEC | if no_deref { libc::O_NOFOLLOW } else { 0 };
+    let c = c_path(d)?;
+    let fd = unsafe { libc::open(c.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::close(fd) };
+    Ok(())
+}
 
-    let mut backup = None;
-    if (o.force || o.interactive || o.backup != BackupMode::None)
-        && let Ok(dm) = fs::symlink_metadata(dest)
+/// GNU `atomic_link`: the link, when it can be made in one step (the
+/// destination does not exist and no `-r` conversion is needed). `None`
+/// when it cannot be tried that way.
+fn atomic_link(o: &LnOpts, src: &Path, dest: &Path) -> Option<io::Result<()>> {
+    if o.symbolic {
+        (!o.relative).then(|| symlink(src, dest))
+    } else {
+        Some(link_at(src, dest, o.logical))
+    }
+}
+
+fn link_at(src: &Path, dest: &Path, follow: bool) -> io::Result<()> {
+    let (s, d) = (c_path(src)?, c_path(dest)?);
+    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            s.as_ptr(),
+            libc::AT_FDCWD,
+            d.as_ptr(),
+            flags,
+        )
+    } == 0
     {
-        if dm.is_dir() {
-            eprintln!("ln: {}: cannot overwrite directory", qf(dest));
-            return false;
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// GNU `convert_abs_rel`: `from` relative to the directory that will hold
+/// `target`. Only that directory is resolved: `target` itself may be an
+/// existing symlink that is about to be replaced.
+fn convert_abs_rel(from: &Path, target: &Path) -> PathBuf {
+    let dir = dir_name(target);
+    match (
+        canonicalize_mode(&dir, CanMode::Missing, false),
+        canonicalize_mode(from, CanMode::Missing, false),
+    ) {
+        (Ok(realdest), Ok(realfrom)) => relpath(&realfrom, &realdest),
+        _ => from.to_path_buf(),
+    }
+}
+
+impl Linker<'_> {
+    fn seen(&self, dest: &Path, sb: &fs::Metadata) -> bool {
+        self.dest_set.as_ref().is_some_and(|set| {
+            set.get(&(sb.dev(), sb.ino()))
+                .is_some_and(|names| names.iter().any(|n| same_name(n, dest)))
+        })
+    }
+
+    fn record(&mut self, dest: &Path, sb: &fs::Metadata) {
+        if let Some(set) = &mut self.dest_set {
+            set.entry((sb.dev(), sb.ino()))
+                .or_default()
+                .push(dest.to_path_buf());
         }
-        // Replacing DEST must not delete the file SOURCE names.
-        let same = (o.force || o.interactive || (o.backup != BackupMode::None && !o.symbolic))
-            && if o.symbolic {
-                fs::metadata(src_path).ok()
+    }
+
+    /// GNU `do_link`: links `source` at `dest`. `tried` is the result of an
+    /// earlier attempt at the plain link.
+    fn do_link(&mut self, source: &Path, dest: &Path, tried: Option<io::Result<()>>) -> bool {
+        let o = &self.o;
+        let symbolic = o.symbolic;
+        let mut link_res = tried.or_else(|| atomic_link(o, source, dest));
+        let stat_source = |follow: bool| {
+            if follow {
+                fs::metadata(source)
             } else {
-                src_meta.clone()
+                fs::symlink_metadata(source)
             }
-            .is_some_and(|sm| {
-                same_inode(&sm, &dm) && (sm.nlink() == 1 || same_name(src_path, dest))
-            });
-        // Nor may `ln -sf` turn a file into a link to itself.
-        let self_link = o.symbolic && o.force && !dm.is_symlink() && {
-            let dir = dest.parent().unwrap_or(Path::new(""));
-            same_file(&dir.join(&target), dest)
         };
-        let fatal_same = same && (o.force || (o.backup != BackupMode::None && !o.symbolic));
-        if same && !fatal_same {
-            // `ln -i` replacing a file with itself is a no-op (GNU renames a fresh
-            // link over it); never remove it.
-            return ask("ln", &format!("replace {}? ", qa(dest)));
-        }
-        if fatal_same || self_link {
-            eprintln!("ln: {} and {} are the same file", qa(src), qa(dest));
-            return false;
-        }
-        if o.interactive && !ask("ln", &format!("replace {}? ", qa(dest))) {
-            return false;
-        }
-        let remove = o.force || o.interactive;
-        if o.backup != BackupMode::None {
-            let name = backup_name(dest, o.backup, &o.suffix);
-            match fs::rename(dest, &name) {
-                Ok(()) => backup = Some(name),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        let mut source_stats = None;
+        if (!matches!(link_res, Some(Ok(()))) || self.dest_set.is_some()) && !symbolic {
+            match stat_source(o.logical) {
+                Ok(m) => source_stats = Some(m),
                 Err(e) => {
-                    eprintln!("ln: cannot backup {}: {}", qa(dest), gnu_io_error(&e));
+                    eprintln!("ln: failed to access {}: {}", qa(source), gnu_io_error(&e));
                     return false;
                 }
             }
-        } else if remove
-            && let Err(e) = fs::remove_file(dest)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            eprintln!("ln: cannot remove {}: {}", qa(dest), gnu_io_error(&e));
-            return false;
         }
-    }
 
-    let res = if o.symbolic {
-        symlink(&target, dest)
-    } else if let Some(real) = &real_src {
-        fs::hard_link(real, dest)
-    } else {
-        fs::hard_link(src_path, dest)
-    };
-    let arrow = if o.symbolic { "->" } else { "=>" };
-    match res {
-        Ok(()) => {
-            ctx.telemetry.add_items(1);
-            if o.verbose {
-                match &backup {
-                    Some(b) => outln!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&target)),
-                    None => outln!("{} {arrow} {}", qa(dest), qa(&target)),
+        let mut source: PathBuf = source.to_path_buf();
+        let mut backup: Option<PathBuf> = None;
+        if !matches!(link_res, Some(Ok(()))) {
+            if !symbolic
+                && !o.hard_dir_link
+                && source_stats.as_ref().is_some_and(fs::Metadata::is_dir)
+            {
+                eprintln!("ln: {}: hard link not allowed for directory", qf(&source));
+                return false;
+            }
+            if o.relative {
+                source = convert_abs_rel(&source, dest);
+            }
+            let mut force = o.force || o.interactive || o.backup != BackupMode::None;
+            if force {
+                match fs::symlink_metadata(dest) {
+                    Err(e) => {
+                        if e.kind() != io::ErrorKind::NotFound {
+                            eprintln!("ln: failed to access {}: {}", qa(dest), gnu_io_error(&e));
+                            return false;
+                        }
+                        force = false;
+                    }
+                    Ok(ds) if ds.is_dir() => {
+                        eprintln!("ln: {}: cannot overwrite directory", qf(dest));
+                        return false;
+                    }
+                    Ok(ds) if self.seen(dest, &ds) => {
+                        eprintln!(
+                            "ln: will not overwrite just-created {} with {}",
+                            qa(dest),
+                            qa(&source)
+                        );
+                        return false;
+                    }
+                    Ok(ds) => {
+                        // Removing DEST must not remove SOURCE: with backups
+                        // that matters for hard links, otherwise for -f.
+                        let check = if o.backup != BackupMode::None {
+                            !symbolic
+                        } else {
+                            o.force
+                        };
+                        if check {
+                            let ss = match &source_stats {
+                                Some(s) => Some(s.clone()),
+                                None => fs::metadata(&source).ok(),
+                            };
+                            if ss.is_some_and(|s| {
+                                same_inode(&s, &ds) && (s.nlink() == 1 || same_name(&source, dest))
+                            }) {
+                                eprintln!("ln: {} and {} are the same file", qa(&source), qa(dest));
+                                return false;
+                            }
+                        }
+                        // Dogfish also refuses to replace a file with a
+                        // symlink to itself, which would lose its contents.
+                        let self_loop = symbolic
+                            && o.backup == BackupMode::None
+                            && !ds.file_type().is_symlink()
+                            && fs::metadata(dir_name(dest).join(&source))
+                                .is_ok_and(|t| same_inode(&t, &ds));
+                        if self_loop && o.force {
+                            eprintln!("ln: {} and {} are the same file", qa(&source), qa(dest));
+                            return false;
+                        }
+                        let unset_or_exists = match &link_res {
+                            None => true,
+                            Some(Err(e)) => e.raw_os_error() == Some(libc::EEXIST),
+                            Some(Ok(())) => false,
+                        };
+                        if unset_or_exists {
+                            if o.interactive {
+                                let yes = ask("ln", &format!("replace {}? ", qa(dest)));
+                                if !yes || self_loop {
+                                    return yes;
+                                }
+                            }
+                            if o.backup != BackupMode::None {
+                                let name = backup_name(dest, o.backup, &o.suffix);
+                                match fs::rename(dest, &name) {
+                                    Ok(()) => backup = Some(name),
+                                    Err(e) if e.kind() == io::ErrorKind::NotFound => force = false,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "ln: cannot backup {}: {}",
+                                            qa(dest),
+                                            gnu_io_error(&e)
+                                        );
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            true
-        }
-        Err(e) => {
-            let errno = e.raw_os_error().unwrap_or(0);
-            let msg = if o.symbolic {
-                if errno != libc::ENAMETOOLONG && !target.is_empty() {
-                    format!("failed to create symbolic link {}", qa(dest))
-                } else {
-                    format!(
-                        "failed to create symbolic link {} -> {}",
-                        qa(dest),
-                        qa(&target)
-                    )
-                }
-            } else if errno == libc::EMLINK {
-                format!("failed to create hard link to {}", qa(src))
-            } else if [libc::EDQUOT, libc::EEXIST, libc::ENOSPC, libc::EROFS].contains(&errno) {
-                format!("failed to create hard link {}", qa(dest))
+            // Try to link before removing DEST, so a failing link never costs
+            // DEST. DEST is replaced even after a backup: when it and the
+            // backup were links to one file, the rename left it in place.
+            let res = if symbolic {
+                force_symlinkat(&source, dest, force, link_res.take())
             } else {
-                format!("failed to create hard link {} => {}", qa(dest), qa(src))
+                force_linkat(&source, dest, o.logical, force, link_res.take())
             };
-            eprintln!("ln: {msg}: {}", gnu_io_error(&e));
-            if let Some(b) = backup {
-                let _ = fs::rename(b, dest);
+            link_res = Some(res.map(|_| ()));
+        }
+
+        match link_res {
+            Some(Ok(())) | None => {
+                if !symbolic && let Some(s) = &source_stats {
+                    let s = s.clone();
+                    self.record(dest, &s);
+                }
+                self.ctx.telemetry.add_items(1);
+                if self.o.verbose {
+                    let arrow = if symbolic { "->" } else { "=>" };
+                    match &backup {
+                        Some(b) => outln!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&source)),
+                        None => outln!("{} {arrow} {}", qa(dest), qa(&source)),
+                    }
+                }
+                true
             }
-            false
+            Some(Err(e)) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                let msg = if symbolic {
+                    if errno != libc::ENAMETOOLONG && !source.as_os_str().is_empty() {
+                        format!("failed to create symbolic link {}", qa(dest))
+                    } else {
+                        format!(
+                            "failed to create symbolic link {} -> {}",
+                            qa(dest),
+                            qa(&source)
+                        )
+                    }
+                } else if errno == libc::EMLINK {
+                    format!("failed to create hard link to {}", qa(&source))
+                } else if [libc::EDQUOT, libc::EEXIST, libc::ENOSPC, libc::EROFS].contains(&errno) {
+                    format!("failed to create hard link {}", qa(dest))
+                } else {
+                    format!("failed to create hard link {} => {}", qa(dest), qa(&source))
+                };
+                eprintln!("ln: {msg}: {}", gnu_io_error(&e));
+                if let Some(b) = backup
+                    && let Err(e) = fs::rename(&b, dest)
+                {
+                    eprintln!("ln: cannot un-backup {}: {}", qa(dest), gnu_io_error(&e));
+                }
+                false
+            }
         }
     }
-}
-
-/// `ln -sr`: SOURCE relative to the directory that will contain DEST.
-fn relative_link_target(src: &Path, dest: &Path) -> OsString {
-    let real_src =
-        canonicalize_mode(src, CanMode::Missing, false).unwrap_or_else(|_| src.to_path_buf());
-    let real_dest =
-        canonicalize_mode(dest, CanMode::Missing, false).unwrap_or_else(|_| dest.to_path_buf());
-    let dir = real_dest.parent().unwrap_or(Path::new("/"));
-    relpath(&real_src, dir).into_os_string()
 }
