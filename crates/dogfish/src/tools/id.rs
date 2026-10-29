@@ -4,12 +4,13 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 use serde::Serialize;
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version,
+    Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version,
 };
+use crate::common::quote::quote_locale;
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
 const ID_HELP: &str = "\
@@ -45,7 +46,7 @@ struct IdArgs {
     zero: bool,
     json: bool,
     ignored: bool,
-    users: Vec<String>,
+    users: Vec<std::ffi::OsString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,7 +99,7 @@ fn parse_id_args(args: Vec<std::ffi::OsString>) -> std::result::Result<IdArgs, i
             IdArgsOpt::Version => return Err(print_version("id")),
         }
     }
-    parsed.users = lossy_all(opts.operands());
+    parsed.users = opts.operands();
     Ok(parsed)
 }
 
@@ -112,14 +113,15 @@ struct IdRecord {
 }
 
 /// Looks `spec` up as a user name, falling back to a numeric user ID.
-fn lookup_user(spec: &str) -> Option<(u32, u32, CString)> {
-    let cname = CString::new(spec).ok()?;
+fn lookup_user(spec: &std::ffi::OsStr) -> Option<(u32, u32, CString)> {
+    use std::os::unix::ffi::OsStrExt;
+    let cname = CString::new(spec.as_bytes()).ok()?;
     // SAFETY: getpwnam/getpwuid return null or a pointer to static storage that
     // stays valid until the next lookup; the fields are copied out immediately.
     unsafe {
         let mut pw = libc::getpwnam(cname.as_ptr());
         if pw.is_null()
-            && let Ok(uid) = spec.parse::<u32>()
+            && let Some(uid) = spec.to_str().and_then(|s| s.parse::<u32>().ok())
         {
             pw = libc::getpwuid(uid);
         }
@@ -296,33 +298,39 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         return Ok(1);
     }
 
-    let mut targets: Vec<Option<Identity>> = Vec::new();
+    // Each user, or the operand that names no user (reported in turn, as GNU does).
+    let mut targets: Vec<std::result::Result<Identity, &std::ffi::OsStr>> = Vec::new();
     let mut status = 0;
     if parsed.users.is_empty() {
-        targets.push(Some(Identity::current()));
+        targets.push(Ok(Identity::current()));
     } else {
         for spec in &parsed.users {
-            match lookup_user(spec) {
-                Some((uid, gid, name)) => targets.push(Some(Identity {
+            targets.push(match lookup_user(spec) {
+                Some((uid, gid, name)) => Ok(Identity {
                     ruid: uid,
                     euid: uid,
                     rgid: gid,
                     egid: gid,
                     name: Some(name),
-                })),
-                None => {
-                    eprintln!("id: {}: no such user", gnu_quote(spec));
-                    status = 1;
-                    targets.push(None);
-                }
-            }
+                }),
+                None => Err(spec),
+            });
         }
     }
 
     let mut out = stdout::stdout();
     let st = ctx.style();
     let term = if parsed.zero { b'\0' } else { b'\n' };
-    for who in targets.into_iter().flatten() {
+    for target in targets {
+        let who = match target {
+            Ok(who) => who,
+            Err(spec) => {
+                ignore_broken_pipe(out.flush())?;
+                eprintln!("id: {}: no such user", quote_locale(spec));
+                status = 1;
+                continue;
+            }
+        };
         if parsed.json {
             let group_entry =
                 |g: u32| (g, get_groupname_by_gid(g).unwrap_or_else(|| g.to_string()));

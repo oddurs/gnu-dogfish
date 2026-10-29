@@ -1,7 +1,8 @@
 //! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -9,10 +10,10 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
 use crate::common::path::dir_names;
-use crate::common::preserve_root::{is_root_dir, refuse_root};
+use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
@@ -116,6 +117,8 @@ struct ChownRun {
     report_changes: bool,
     verbose: bool,
     quiet: bool,
+    /// `/`'s identity under `-R --preserve-root` (GNU `chopt.root_dev_ino`).
+    root_dev_ino: Option<DevIno>,
 }
 
 pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -131,8 +134,9 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         report_changes: false,
         verbose: false,
         quiet: false,
+        root_dev_ino: None,
     };
-    let (mut deref, mut preserve_root, mut from, mut reference) = (None, false, None, None);
+    let (mut deref, mut preserve_root, mut reference) = (None, false, None);
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -146,7 +150,17 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Verbose => run.verbose = true,
             Deref => deref = Some(true),
             NoDeref => deref = Some(false),
-            From => from = v.as_deref().map(lossy),
+            // GNU parses --from as it meets it, before any operand check.
+            From => match parse_owner_spec(&v.unwrap_or_default()) {
+                Ok(s) => {
+                    run.from_uid = s.uid;
+                    run.from_gid = s.gid;
+                }
+                Err(msg) => {
+                    eprintln!("chown: {msg}");
+                    return Ok(1);
+                }
+            },
             NoPreserveRoot => preserve_root = false,
             PreserveRoot => preserve_root = true,
             Reference => reference = v,
@@ -169,6 +183,15 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     run.affect_referent = deref != Some(false);
 
     let mut files = opts.operands();
+    if files.len() < if reference.is_some() { 1 } else { 2 } {
+        return Ok(match files.last() {
+            None => usage_error("chown", "missing operand"),
+            Some(last) => usage_error(
+                "chown",
+                format!("missing operand after {}", quote_locale(last)),
+            ),
+        });
+    }
     if let Some(r) = &reference {
         match fs::metadata(r) {
             Ok(m) => {
@@ -189,32 +212,22 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     } else {
-        if files.is_empty() {
-            return Ok(usage_error("chown", "missing operand"));
-        }
-        let spec = lossy(&files.remove(0));
-        match parse_owner_spec(&spec) {
+        match parse_owner_spec(&files.remove(0)) {
             Ok(s) => run.spec = s,
             Err(msg) => {
                 eprintln!("chown: {msg}");
                 return Ok(1);
             }
         }
-        if files.is_empty() {
-            return Ok(usage_error(
-                "chown",
-                format!("missing operand after {}", quote_locale(&spec)),
-            ));
-        }
     }
-    if let Some(f) = &from {
-        match parse_owner_spec(f) {
-            Ok(s) => {
-                run.from_uid = s.uid;
-                run.from_gid = s.gid;
-            }
-            Err(msg) => {
-                eprintln!("chown: {msg}");
+    if run.recursive && preserve_root {
+        match root_dev_ino() {
+            Ok(r) => run.root_dev_ino = Some(r),
+            Err(e) => {
+                eprintln!(
+                    "chown: failed to get attributes of '/': {}",
+                    gnu_io_error(&e)
+                );
                 return Ok(1);
             }
         }
@@ -222,11 +235,6 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut ok = true;
     for f in &files {
-        if run.recursive && preserve_root && is_root_dir(Path::new(f)) {
-            refuse_root("chown", f);
-            ok = false;
-            continue;
-        }
         ok &= chown_path(Path::new(f), true, &run, ctx);
     }
     Ok(if ok { 0 } else { 1 })
@@ -241,7 +249,7 @@ fn gid_label(gid: u32) -> String {
 }
 
 /// `getpwnam`: (uid, login gid) of a user name.
-fn lookup_user(name: &str) -> Option<(u32, u32)> {
+fn lookup_user(name: &[u8]) -> Option<(u32, u32)> {
     let c = CString::new(name).ok()?;
     // SAFETY: `c` is a NUL-terminated name that outlives the call.
     let pw = unsafe { libc::getpwnam(c.as_ptr()) };
@@ -250,7 +258,7 @@ fn lookup_user(name: &str) -> Option<(u32, u32)> {
     (!pw.is_null()).then(|| unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
 }
 
-fn lookup_group(name: &str) -> Option<u32> {
+fn lookup_group(name: &[u8]) -> Option<u32> {
     let c = CString::new(name).ok()?;
     // SAFETY: `c` is a NUL-terminated name that outlives the call.
     let gr = unsafe { libc::getgrnam(c.as_ptr()) };
@@ -260,20 +268,26 @@ fn lookup_group(name: &str) -> Option<u32> {
 }
 
 /// A numeric id as GNU accepts it (`-1` is reserved).
-fn parse_id(s: &str) -> Option<u32> {
-    s.parse::<u32>().ok().filter(|&id| id != u32::MAX)
+fn parse_id(s: &[u8]) -> Option<u32> {
+    std::str::from_utf8(s)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|&id| id != u32::MAX)
 }
 
 /// Parses `[OWNER][:[GROUP]]` (GNU `parse_user_spec`); `.` is accepted as the
-/// separator, with a warning, when the whole spec is not a user name.
-fn parse_owner_spec(spec: &str) -> std::result::Result<OwnerSpec, String> {
-    if let Some(i) = spec.find(':') {
-        return parse_owner_parts(spec, &spec[..i], Some(&spec[i + 1..]));
+/// separator, with a warning, when the whole spec is not a user name. The
+/// spec is raw bytes: names are looked up exactly as given.
+fn parse_owner_spec(spec: &OsStr) -> std::result::Result<OwnerSpec, String> {
+    let b = spec.as_bytes();
+    if let Some(i) = b.iter().position(|&c| c == b':') {
+        return parse_owner_parts(spec, &b[..i], Some(&b[i + 1..]));
     }
-    let whole = parse_owner_parts(spec, spec, None);
+    let whole = parse_owner_parts(spec, b, None);
     if whole.is_err()
-        && let Some(i) = spec.find('.')
-        && let Ok(s) = parse_owner_parts(spec, &spec[..i], Some(&spec[i + 1..]))
+        && let Some(i) = b.iter().position(|&c| c == b'.')
+        && let Ok(s) = parse_owner_parts(spec, &b[..i], Some(&b[i + 1..]))
     {
         eprintln!("chown: warning: '.' should be ':': {}", quote_locale(spec));
         return Ok(s);
@@ -282,9 +296,9 @@ fn parse_owner_spec(spec: &str) -> std::result::Result<OwnerSpec, String> {
 }
 
 fn parse_owner_parts(
-    spec: &str,
-    user: &str,
-    group: Option<&str>,
+    spec: &OsStr,
+    user: &[u8],
+    group: Option<&[u8]>,
 ) -> std::result::Result<OwnerSpec, String> {
     let mut s = OwnerSpec::default();
     let invalid = |what: &str| format!("invalid {what}: {}", quote_locale(spec));
@@ -292,19 +306,19 @@ fn parse_owner_parts(
         match lookup_user(user) {
             Some((uid, login_gid)) => {
                 s.uid = Some(uid);
-                if group == Some("") {
+                if group == Some(b"") {
                     s.gid = Some(login_gid);
                     s.group = Some(gid_label(login_gid));
                 }
             }
             None => {
                 s.uid = Some(parse_id(user).ok_or_else(|| invalid("user"))?);
-                if group == Some("") {
+                if group == Some(b"") {
                     return Err(invalid("user"));
                 }
             }
         }
-        s.user = Some(user.to_string());
+        s.user = Some(String::from_utf8_lossy(user).into_owned());
     }
     if let Some(g) = group.filter(|g| !g.is_empty()) {
         let by_name = lookup_group(g);
@@ -313,7 +327,7 @@ fn parse_owner_parts(
                 .or_else(|| parse_id(g))
                 .ok_or_else(|| invalid("group"))?,
         );
-        s.group = Some(g.to_string());
+        s.group = Some(String::from_utf8_lossy(g).into_owned());
         if by_name.is_some() && s.user.is_none() {
             // GNU reports `:GROUP` (by name) as an ownership change.
             s.user = Some(String::new());
@@ -347,7 +361,20 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
             }
         }
     };
-    let lmeta = match fs::symlink_metadata(path) {
+    // The stat fts makes for the walk (`fts_statp`): `-L` follows every symlink,
+    // `-H` those on the command line; a dangling one falls back to the link.
+    // Whether a directory is entered depends on this alone, never on `-h`.
+    let walk_follows =
+        run.traverse == Traverse::All || (top_level && run.traverse == Traverse::CommandLine);
+    let walked = if walk_follows {
+        fs::metadata(path).or_else(|e| match fs::symlink_metadata(path) {
+            Ok(m) if e.kind() == std::io::ErrorKind::NotFound => Ok(m),
+            _ => Err(e),
+        })
+    } else {
+        fs::symlink_metadata(path)
+    };
+    let walked = match walked {
         Ok(m) => m,
         Err(e) => {
             if !run.quiet {
@@ -357,7 +384,14 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
             return false;
         }
     };
-    let follow = lmeta.is_symlink() && run.affect_referent;
+    let traverse_dir = run.recursive && walked.is_dir();
+    // GNU `change_file_owner`, FTS_D: every directory the walk would enter is
+    // checked, the command-line operands and those reached through `-L` alike.
+    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of(&walked)) {
+        refuse_root("chown", path);
+        return false;
+    }
+    let follow = walked.is_symlink() && run.affect_referent;
     let meta = if follow {
         match fs::metadata(path) {
             Ok(m) => m,
@@ -374,14 +408,9 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
             }
         }
     } else {
-        lmeta.clone()
+        walked
     };
 
-    let traverse_dir = run.recursive
-        && meta.is_dir()
-        && (!lmeta.is_symlink()
-            || run.traverse == Traverse::All
-            || (top_level && run.traverse == Traverse::CommandLine));
     let mut ok = true;
     // Like GNU (fts post-order), a directory's contents are changed before it.
     if traverse_dir {
@@ -414,7 +443,7 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     let mut status_changed = false;
     let mut failed = false;
     if matches && (spec.uid.is_some() || spec.gid.is_some()) {
-        let res = if follow || !lmeta.is_symlink() {
+        let res = if run.affect_referent {
             std::os::unix::fs::chown(path, spec.uid, spec.gid)
         } else {
             std::os::unix::fs::lchown(path, spec.uid, spec.gid)
@@ -468,4 +497,78 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
         }
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    // The --preserve-root walk is tested against a temporary directory standing
+    // in for `/`, never against the real root (AGENTS.md). The group is "changed"
+    // to the files' own group, which every owner may do.
+    fn run(traverse: Traverse, affect_referent: bool, root: Option<DevIno>, gid: u32) -> ChownRun {
+        ChownRun {
+            spec: OwnerSpec {
+                uid: None,
+                gid: Some(gid),
+                user: None,
+                group: Some(gid.to_string()),
+            },
+            from_uid: None,
+            from_gid: None,
+            recursive: true,
+            traverse,
+            affect_referent,
+            report_changes: false,
+            verbose: false,
+            quiet: true,
+            root_dev_ino: root,
+        }
+    }
+
+    #[test]
+    fn preserve_root_checks_every_directory_the_walk_enters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_root = tmp.path().join("root");
+        fs::create_dir(&fake_root).unwrap();
+        let d = tmp.path().join("d");
+        fs::create_dir(&d).unwrap();
+        symlink(&fake_root, d.join("slink-to-root")).unwrap();
+        let top_link = tmp.path().join("top-link");
+        symlink(&fake_root, &top_link).unwrap();
+        let ctx = DogfishContext::new("chown");
+        let root = Some(DevIno::of(&fs::metadata(&fake_root).unwrap()));
+        let gid = fs::metadata(&d).unwrap().gid();
+        let (all, cmdline, none) = (Traverse::All, Traverse::CommandLine, Traverse::None);
+
+        // -RLh and -RL: the walk follows d/slink-to-root, so it is refused.
+        assert!(!chown_path(&d, true, &run(all, false, root, gid), &ctx));
+        assert!(!chown_path(&d, true, &run(all, true, root, gid), &ctx));
+        // -RHh and -RP: the link below the operand is not followed.
+        assert!(chown_path(&d, true, &run(cmdline, false, root, gid), &ctx));
+        assert!(chown_path(&d, true, &run(none, false, root, gid), &ctx));
+        // -RH on a command-line link to root, with or without -h: refused.
+        assert!(!chown_path(
+            &top_link,
+            true,
+            &run(cmdline, true, root, gid),
+            &ctx
+        ));
+        assert!(!chown_path(
+            &top_link,
+            true,
+            &run(cmdline, false, root, gid),
+            &ctx
+        ));
+        // -RP: a command-line link is just a link.
+        assert!(chown_path(
+            &top_link,
+            true,
+            &run(none, false, root, gid),
+            &ctx
+        ));
+        // Without --preserve-root, -RLh walks through.
+        assert!(chown_path(&d, true, &run(all, false, None, gid), &ctx));
+    }
 }
