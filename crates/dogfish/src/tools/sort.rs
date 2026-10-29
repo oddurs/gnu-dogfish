@@ -453,13 +453,28 @@ impl Sorter {
                     ord
                 }
             }
+            // A plain byte key: its first 8 bytes decide most comparisons.
+            _ if first.opts.is_default() => {
+                let ord = a
+                    .key_prefix
+                    .cmp(&b.key_prefix)
+                    .then_with(|| a.key.cmp(b.key));
+                if first.opts.reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
             _ => self.key_order(first, a.key, b.key),
         };
         let ord = ord.then_with(|| self.keycompare_from(1, a.line, b.line));
         if ord != Ordering::Equal || self.no_last_resort {
             return ord;
         }
-        let ord = a.line.cmp(b.line);
+        let ord = a
+            .line_prefix
+            .cmp(&b.line_prefix)
+            .then_with(|| a.line.cmp(b.line));
         if self.reverse { ord.reverse() } else { ord }
     }
 
@@ -505,6 +520,19 @@ struct Keyed<'a> {
     key: &'a [u8],
     /// The key parsed as a number, for a plain `-n` first key.
     num: Option<SortNum<'a>>,
+    /// The first 8 bytes of the key and of the line, big-endian and
+    /// zero-padded: equal-length prefixes order like the bytes, and are
+    /// compared without touching the line.
+    key_prefix: u64,
+    line_prefix: u64,
+}
+
+/// See [`Keyed::key_prefix`].
+fn prefix8(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
 }
 
 struct SortNum<'a> {
@@ -1147,6 +1175,8 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     line,
                     key,
                     num: numeric.then(|| parse_sort_num(key)),
+                    key_prefix: prefix8(key),
+                    line_prefix: prefix8(line),
                 }
             })
             .collect();
