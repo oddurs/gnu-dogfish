@@ -9,6 +9,7 @@
 //! - **Undo Journal**: Transaction log and trash staging for reversible `rm`, `mv`, and `cp`.
 
 pub mod context;
+pub mod crash;
 pub mod format;
 pub mod io;
 pub mod journal;
@@ -16,6 +17,7 @@ pub mod stdout;
 pub mod table;
 
 pub use context::{ColorMode, DogfishContext, Switches, Telemetry};
+pub use crash::crash_point;
 pub use format::{
     Style, format_duration_human, format_mode_rwx, format_relative_time, format_size, gnu_io_error,
     gnu_quote, gnu_quote_file, parse_duration_str, parse_size_str, sparkline_bar,
@@ -25,5 +27,5 @@ pub use io::{
     CopyMethod, DEFAULT_BUF_SIZE, FastReader, InputSource, copy_file_fast, copy_tree, move_path,
     same_file,
 };
-pub use journal::{JournalAction, JournalEntry, UndoJournal};
+pub use journal::{JournalAction, JournalEntry, Take, UndoJournal};
 pub use table::{ColumnAlign, Table, emit_objects_or_table, eval_json_where, read_ndjson_stdin};

@@ -309,3 +309,15 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     };
     Ok(if emit(&mut out, stamp)? { 0 } else { 1 })
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// Formats `stamp` with `fmt` as `date +FMT` does (`TZ` as set).
+    pub fn render(stamp: Stamp, fmt: &[u8]) {
+        let _ = render_date(stamp, fmt);
+    }
+}

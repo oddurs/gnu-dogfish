@@ -487,3 +487,20 @@ fn posixtime(s: &[u8], bits: u32) -> Option<i64> {
         leapsec = true;
     }
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `touch -t STAMP` and the obsolete `touch MMDDhhmm[YY] FILE`.
+    pub fn stamp(s: &[u8]) {
+        for bits in [
+            PDS_LEADING_YEAR | PDS_CENTURY | PDS_SECONDS,
+            PDS_TRAILING_YEAR | PDS_PRE_2000,
+        ] {
+            let _ = posixtime(s, bits);
+        }
+    }
+}

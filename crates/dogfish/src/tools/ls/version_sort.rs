@@ -99,3 +99,18 @@ fn version_revcmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     }
     std::cmp::Ordering::Equal
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `filevercmp` is a total order: antisymmetric, and equal only to itself
+    /// when the names are equal.
+    pub fn cmp(a: &[u8], b: &[u8]) {
+        let ab = filevercmp(a, b);
+        assert_eq!(ab, filevercmp(b, a).reverse(), "{a:?} {b:?}");
+        assert_eq!(filevercmp(a, a), std::cmp::Ordering::Equal);
+    }
+}

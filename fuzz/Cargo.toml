@@ -1,0 +1,119 @@
+# Fuzz targets for Dogfish's parsers (cargo-fuzz layout; needs nightly).
+#
+#     cargo xtask fuzz [TARGET] [SECONDS]
+#     cargo +nightly fuzz run TARGET corpus/TARGET seeds/TARGET -- -max_total_time=60
+#
+# Its own workspace, outside the main one, so `cargo xtask ci`, the MSRV check
+# and cargo-deny never see it. (libfuzzer-sys is MIT OR Apache-2.0, with LLVM's
+# libFuzzer under NCSA; none of it goes into a Dogfish release.)
+[package]
+name = "dogfish-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-or-later OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dogfish = { path = "../crates/dogfish", features = ["fuzzing"] }
+dogfish-core = { path = "../crates/dogfish-core" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "basenc"
+path = "fuzz_targets/basenc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cut_list"
+path = "fuzz_targets/cut_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "date"
+path = "fuzz_targets/date.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "getopt"
+path = "fuzz_targets/getopt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ls_colors"
+path = "fuzz_targets/ls_colors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mode"
+path = "fuzz_targets/mode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "numbers"
+path = "fuzz_targets/numbers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "printf"
+path = "fuzz_targets/printf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quote"
+path = "fuzz_targets/quote.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sort_key"
+path = "fuzz_targets/sort_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strftime"
+path = "fuzz_targets/strftime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table"
+path = "fuzz_targets/table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tr"
+path = "fuzz_targets/tr.rs"
+test = false
+doc = false
+bench = false

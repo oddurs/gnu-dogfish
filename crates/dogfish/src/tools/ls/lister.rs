@@ -1299,11 +1299,15 @@ impl<W: Write> Lister<'_, W> {
             _ => right(&mut line, &self.size_cell(f), w.size),
         }
         line.push(b' ');
-        match f.time(o.time).and_then(|t| self.format_time(t)) {
+        let time = f.time(o.time);
+        match time.and_then(|t| self.format_time(t)) {
             Some(s) => line.extend_from_slice(s.as_bytes()),
             None => {
+                // Like GNU: a time the format can't render (too long, or out of
+                // range) is shown as seconds since the epoch.
                 let width = self.long_time_width();
-                right(&mut line, "?", width);
+                let secs = time.map_or_else(|| "?".to_string(), |t| t.sec.to_string());
+                right(&mut line, &secs, width);
             }
         }
         line.push(b' ');

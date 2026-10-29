@@ -136,7 +136,10 @@ fn gnu_strftime(fmt: &str, tm: &libc::tm, t: Timespec) -> String {
         }
         let mut width: Option<usize> = None;
         while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
-            width = Some(width.unwrap_or(0) * 10 + d.to_digit(10).unwrap_or(0) as usize);
+            // Anything wider is over the limit anyway (and never overflows).
+            let w = width.unwrap_or(0).saturating_mul(10);
+            let w = w + d.to_digit(10).unwrap_or(0) as usize;
+            width = Some(w.min(TIME_STAMP_LEN_MAXIMUM + 1));
             spec.push(d);
             chars.next();
         }
@@ -270,7 +273,14 @@ fn gnu_strftime(fmt: &str, tm: &libc::tm, t: Timespec) -> String {
     out
 }
 
-/// Formats `t` in local time with a GNU `strftime` format.
+/// The longest time stamp `ls` formats (GNU's `TIME_STAMP_LEN_MAXIMUM`).
+pub(crate) const TIME_STAMP_LEN_MAXIMUM: usize = 1000;
+
+/// Formats `t` in local time with a GNU `strftime` format; `None` when the
+/// time can't be converted or the text would be longer than
+/// [`TIME_STAMP_LEN_MAXIMUM`] (GNU `ls` then shows the seconds).
 pub(crate) fn format_local_time(fmt: &str, t: Timespec) -> Option<String> {
-    local_tm(t.sec).map(|tm| gnu_strftime(fmt, &tm, t))
+    local_tm(t.sec)
+        .map(|tm| gnu_strftime(fmt, &tm, t))
+        .filter(|s| s.len() <= TIME_STAMP_LEN_MAXIMUM)
 }

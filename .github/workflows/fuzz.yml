@@ -1,0 +1,87 @@
+name: Fuzz
+
+# Runs every fuzz target in fuzz/ (`cargo xtask fuzz TARGET SECONDS`) for a
+# few minutes, weekly and on demand. Each target's corpus is cached between
+# runs, so coverage accumulates; a crash fails the job and uploads its input.
+
+on:
+  schedule:
+    - cron: "17 3 * * 3"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - basenc
+          - cut_list
+          - date
+          - getopt
+          - ls_colors
+          - mode
+          - numbers
+          - printf
+          - quote
+          - sort_key
+          - strftime
+          - table
+          - tr
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Stable runs xtask; the pinned nightly (ASAN_TOOLCHAIN in crates/xtask)
+      # builds the targets. Bump both together.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Install the fuzzing toolchain
+        run: rustup toolchain install nightly-2026-10-20 --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-fuzz
+
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
+          TARGET: ${{ matrix.target }}
+        run: cargo xtask fuzz "$TARGET" "$SECONDS_PER_TARGET"
+
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

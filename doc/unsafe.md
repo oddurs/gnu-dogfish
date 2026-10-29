@@ -103,7 +103,15 @@ with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `drop` | `flock(LOCK_UN)` on the journal lock | Descriptor only (owned by the lock guard). |
+| `process_alive` | `kill(pid, 0)` on the process of a pending entry | Signal 0 only checks that the process exists; no pointers. |
 | `lock` | `flock(LOCK_EX)` on the journal lock | Descriptor only. |
+| `trash_dir_for` | `geteuid` | No preconditions. |
+
+### `crates/dogfish-core/src/crash.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `crash_point` | `kill(getpid(), SIGKILL)` (debug builds, `DOGFISH_CRASH_AT` only) | No pointers; kills this process, which is the point. |
 
 ### `crates/dogfish/src/main.rs`
 
@@ -115,6 +123,12 @@ with `read(2)` instead.
 | `main` | `CStr::from_ptr(argv[i])` | Checked non-null; argv strings are NUL-terminated and live for the whole process. |
 | `main` | `fcntl(F_GETFD)` on descriptors 0 to 2 | Descriptor only; queries, never changes. |
 | `main` | `open("/dev/null")` to fill a closed 0, 1 or 2 | C path; the lowest free descriptor is the closed one, as GNU's stdopen does. |
+
+### `crates/dogfish/src/fuzz_api.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `init` | `remove_var` / `set_var` of the locale and `TZ` (`fuzzing` feature only) | Runs once, from the fuzzer's only thread, before anything reads the environment. |
 
 ### `crates/dogfish/src/common/backup.rs`
 
@@ -420,6 +434,18 @@ with `read(2)` instead.
 | --- | --- | --- |
 | `sigbus_from_truncated_mmap_is_a_clean_error` | `kill(SIGBUS)` (test) | Signals our own child, which has not been waited for yet. |
 | `sigbus_from_truncated_mmap_is_a_clean_error` | `kill(SIGBUS)` (test) | The same, for a second child. |
+
+### `crates/dogfish/tests/fs_safety.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `undo_restores_a_fifo_that_remove_destination_replaced` | `mkfifo` (test) | C path. |
+
+### `crates/dogfish/tests/undo_model.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `mkfifo` | `mkfifo` (test) | C path. |
 
 ### `crates/dogfish/tests/gnu_compat_listing.rs`
 

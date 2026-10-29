@@ -5,8 +5,9 @@ members = [
     "crates/dogfish",
     "crates/xtask",
 ]
-# Patched in only by `cargo xtask macos`.
-exclude = ["crates/xtask/ring-stub"]
+# Patched in only by `cargo xtask macos`; the fuzz targets are their own
+# workspace (nightly only).
+exclude = ["crates/xtask/ring-stub", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -73,10 +73,14 @@ const STEPS: &[(&str, &str)] = &[
         "repro",
         "build the release twice in two trees, require identical output [--target T]",
     ),
+    (
+        "fuzz",
+        "run the fuzz targets in fuzz/ [TARGET] [SECONDS, default 60] (cargo-fuzz)",
+    ),
 ];
 
 /// Steps that take arguments; every other step takes none.
-const TAKES_ARGS: &[&str] = &["dist", "repro"];
+const TAKES_ARGS: &[&str] = &["dist", "repro", "fuzz"];
 
 type Step = Result<(), String>;
 
@@ -155,6 +159,7 @@ fn run_step(root: &Path, step: &str, args: &[String]) -> Step {
             dist::dist(root, &t, epoch).map(drop)
         }),
         "repro" => dist::target_arg(args).and_then(|t| dist::repro(root, &t)),
+        "fuzz" => fuzz(root, args),
         _ => unreachable!("unknown step {step}"),
     };
     r.map_err(|e| format!("{step}: {e}"))
@@ -203,6 +208,82 @@ fn asan(root: &Path) -> Step {
             "{e} (missing toolchain? `rustup toolchain install {ASAN_TOOLCHAIN} --component rust-src`)"
         )
     })
+}
+
+/// `cargo fuzz run` for each target in fuzz/ (or the one named), for the
+/// given number of seconds each, on the pinned nightly. Each target grows its
+/// corpus in fuzz/corpus/TARGET from the seeds in fuzz/seeds/TARGET; a crash
+/// leaves its input in fuzz/artifacts/TARGET and fails the step.
+fn fuzz(root: &Path, args: &[String]) -> Step {
+    let dir = root.join("fuzz");
+    let all = fuzz_targets(&dir)?;
+    let (mut targets, mut secs) = (all.clone(), 60u64);
+    let mut rest = args.iter();
+    if let Some(a) = rest.next() {
+        match a.parse::<u64>() {
+            Ok(n) => secs = n,
+            Err(_) if all.contains(a) => targets = vec![a.clone()],
+            Err(_) => {
+                return Err(format!(
+                    "no fuzz target {a:?} (targets: {})",
+                    all.join(", ")
+                ));
+            }
+        }
+    }
+    if let Some(s) = rest.next() {
+        secs = s
+            .parse()
+            .map_err(|_| format!("SECONDS must be a number, not {s:?}"))?;
+    }
+    if let Some(extra) = rest.next() {
+        return Err(format!("unexpected argument {extra:?}"));
+    }
+    let installed = Command::new("cargo")
+        .args([&format!("+{ASAN_TOOLCHAIN}"), "fuzz", "--version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !installed {
+        return Err(format!(
+            "needs cargo-fuzz and {ASAN_TOOLCHAIN}: `cargo install --locked cargo-fuzz` and \
+             `rustup toolchain install {ASAN_TOOLCHAIN}`"
+        ));
+    }
+    for t in &targets {
+        eprintln!("xtask: fuzz: {t} for {secs}s");
+        fs::create_dir_all(dir.join("corpus").join(t)).map_err(|e| e.to_string())?;
+        run(Command::new("cargo")
+            .arg(format!("+{ASAN_TOOLCHAIN}"))
+            .args(["fuzz", "run", "-O", t])
+            .arg(format!("corpus/{t}"))
+            .arg(format!("seeds/{t}"))
+            .arg("--")
+            .arg(format!("-max_total_time={secs}"))
+            .args(["-rss_limit_mb=2048", "-max_len=4096", "-timeout=10"])
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .current_dir(&dir))
+        .map_err(|e| format!("{t}: {e} (the input is in fuzz/artifacts/{t})"))?;
+    }
+    Ok(())
+}
+
+/// The `[[bin]]` names in fuzz/Cargo.toml.
+fn fuzz_targets(dir: &Path) -> Result<Vec<String>, String> {
+    let manifest = fs::read_to_string(dir.join("Cargo.toml")).map_err(|e| e.to_string())?;
+    let mut in_bin = false;
+    let mut names = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_bin = line == "[[bin]]";
+        } else if in_bin && let Some(v) = line.strip_prefix("name") {
+            names.push(
+                v.trim_start_matches([' ', '='])
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+    }
+    Ok(names)
 }
 
 fn cargo_bin() -> String {

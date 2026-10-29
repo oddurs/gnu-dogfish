@@ -1222,3 +1222,14 @@ fn run(t: &mut Tail, files: &mut [FileSpec], n_units: u64) -> R<bool> {
     }
     Ok(ok)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_tail_args(args);
+    }
+}

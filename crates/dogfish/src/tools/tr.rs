@@ -865,3 +865,45 @@ pub fn run_tr(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
 /// Read size: large enough that syscalls are not the cost.
 const IO_SIZE: usize = 128 * 1024;
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `tr [-cdst] SET1 [SET2]` up to the translation table, as `run_tr`
+    /// builds it; `flags` picks the options.
+    pub fn sets(set1: &[u8], set2: Option<&[u8]>, flags: u8) {
+        let opts = TrArgs {
+            complement: flags & 1 != 0,
+            delete: flags & 2 != 0,
+            squeeze: flags & 4 != 0,
+            truncate: flags & 8 != 0,
+            sets: Vec::new(),
+        };
+        let translating = !opts.delete && set2.is_some();
+        let Ok(mut s1) = SpecList::parse(set1) else {
+            return;
+        };
+        let mut s2 = match set2.map(SpecList::parse) {
+            None => None,
+            Some(Ok(s)) => Some(s),
+            Some(Err(_)) => return,
+        };
+        if validate(&mut s1, s2.as_mut(), &opts, translating).is_err() {
+            return;
+        }
+        let _ = s1.membership(opts.complement);
+        if let Some(s2) = s2.as_mut() {
+            if translating {
+                let _ = build_xlate(&mut s1, s2, opts.complement);
+            }
+            let _ = s2.membership(false);
+        }
+    }
+
+    pub fn args(args: Vec<std::ffi::OsString>) {
+        let _ = parse_tr_args(args);
+    }
+}
