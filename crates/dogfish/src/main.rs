@@ -8,7 +8,6 @@ mod common;
 mod hash;
 mod meta;
 mod sys;
-mod text;
 mod tools;
 
 use std::path::Path;
@@ -473,19 +472,19 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
         "mktemp" => tools::mktemp::run_mktemp(args, ctx),
 
         // Tier 2: Text & Streaming
-        "cat" => text::run_cat(args, ctx),
-        "tac" => text::run_tac(args, ctx),
-        "head" => text::run_head(args, ctx),
-        "tail" => text::run_tail(args, ctx),
-        "wc" => text::run_wc(args, ctx),
-        "sort" => text::run_sort(args, ctx),
-        "uniq" => text::run_uniq(args, ctx),
-        "cut" => text::run_cut(args, ctx),
-        "tr" => text::run_tr(args, ctx),
-        "paste" => text::run_paste(args, ctx),
-        "nl" => text::run_nl(args, ctx),
-        "shuf" => text::run_shuf(args, ctx),
-        "query" | "filter" => text::run_query(args, ctx),
+        "cat" => tools::cat::run_cat(args, ctx),
+        "tac" => tools::tac::run_tac(args, ctx),
+        "head" => tools::head::run_head(args, ctx),
+        "tail" => tools::tail::run_tail(args, ctx),
+        "wc" => tools::wc::run_wc(args, ctx),
+        "sort" => tools::sort::run_sort(args, ctx),
+        "uniq" => tools::uniq::run_uniq(args, ctx),
+        "cut" => tools::cut::run_cut(args, ctx),
+        "tr" => tools::tr::run_tr(args, ctx),
+        "paste" => tools::paste::run_paste(args, ctx),
+        "nl" => tools::nl::run_nl(args, ctx),
+        "shuf" => tools::shuf::run_shuf(args, ctx),
+        "query" | "filter" => tools::query::run_query(args, ctx),
 
         // Tier 3: Hashing & Encoding
         "b2sum" => hash::run_b2sum(args, ctx),
