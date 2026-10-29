@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
-use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
+use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names, WalkPath, fts_root_name};
 use crate::common::file_info::{describe_mode, file_type_description};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, print_help, print_version, try_help, usage_error,
@@ -104,6 +104,10 @@ enum RmStatus {
     /// Declined to descend: the directory stays, so its ancestors are left alone.
     Kept,
     Failed,
+    /// A deep walk could not get a directory back through `..` (it was
+    /// moved meanwhile): the rest of the operand is left alone, as GNU's
+    /// `fts_read` failure ends it.
+    Lost,
 }
 
 /// GNU's `directory_status`: whether a directory has entries, or why it
@@ -298,7 +302,10 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     });
 
     let mut exit_code = 0;
-    for f in &files {
+    for arg in &files {
+        // GNU's fts names the operand with at most one trailing slash, in
+        // messages and when acting on it.
+        let f = OsStr::from_bytes(fts_root_name(arg.as_bytes()));
         let p = Path::new(f);
         let meta = match p.symlink_metadata() {
             Ok(m) => m,
@@ -394,14 +401,25 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let mut path = WalkPath::new(f.as_bytes());
         let status = if meta.is_dir() {
             if run.recursive {
-                rm_tree(at, &mut path, Some(&info), 0, meta.dev(), &run, ctx)
+                let top_dev = meta.dev();
+                let mut cwd = Parent::Cwd;
+                rm_tree(
+                    &mut cwd,
+                    &c_operand,
+                    &mut path,
+                    Some(&info),
+                    0,
+                    top_dev,
+                    &run,
+                    ctx,
+                )
             } else {
                 rm_empty_dir(at, path.as_path(), Some(&info), None, &run, ctx)
             }
         } else {
             rm_file(at, path.as_path(), Some(&info), &run, ctx)
         };
-        if status == RmStatus::Failed {
+        if matches!(status, RmStatus::Failed | RmStatus::Lost) {
             exit_code = 1;
         }
     }
@@ -563,15 +581,66 @@ fn rm_empty_dir(
     }
 }
 
+/// The directory entries are removed from: the working directory (operands
+/// are paths from it) or an open directory, which a deep walk may let go of
+/// while it removes a subdirectory's contents.
+enum Parent {
+    Cwd,
+    Dir {
+        /// `None` while let go of.
+        fd: Option<DirFd>,
+        /// (device, inode), to check the directory got back through `..`;
+        /// known when a subdirectory may let go of it.
+        id: Option<(u64, u64)>,
+    },
+}
+
+impl Parent {
+    /// How to act on `name` in this directory.
+    fn at<'a>(&self, name: &'a CStr) -> At<'a> {
+        match self {
+            Parent::Cwd => At::cwd(name),
+            Parent::Dir { fd: Some(fd), .. } => At { dir: fd.fd(), name },
+            // Not reached: a directory is got back before it is used again.
+            // EBADF says so if it were.
+            Parent::Dir { fd: None, .. } => At { dir: -1, name },
+        }
+    }
+
+    /// Closes the directory for now; true if it was open.
+    fn release(&mut self) -> bool {
+        match self {
+            Parent::Dir { fd, id: Some(_) } => fd.take().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Opens the directory again, as the `..` of `child`.
+    fn reacquire(&mut self, child: &DirFd) -> io::Result<()> {
+        if let Parent::Dir { fd, id: Some(id) } = self {
+            *fd = Some(child.open_parent(*id)?);
+        }
+        Ok(())
+    }
+}
+
 /// Removes a directory tree depth-first in `readdir` order, like GNU's `fts`
 /// traversal. Symbolic links are removed, never followed. After an error inside
 /// a directory, its ancestors are left alone (GNU reports only the first error).
 ///
 /// Entries are removed relative to their open directory, and `lstat`ed only
 /// when a prompt or `--one-file-system` needs more than `readdir`'s type.
-/// `path` is the printed name of `at` and is restored before returning.
+/// Deeper than [`MAX_OPEN_DIRS`], a directory's parent is closed while the
+/// directory's contents are removed, and opened again through its `..`
+/// (checked to be the same directory) to remove the directory itself: no
+/// depth needs a longer path than one name, or more open descriptors.
+///
+/// `name` is the directory in `parent`; `path` is its printed name and is
+/// restored before returning.
+#[allow(clippy::too_many_arguments)]
 fn rm_tree(
-    at: At<'_>,
+    parent: &mut Parent,
+    name: &CStr,
     path: &mut WalkPath,
     info: Option<&Info>,
     depth: usize,
@@ -579,6 +648,7 @@ fn rm_tree(
     run: &RmRun,
     ctx: &DogfishContext,
 ) -> RmStatus {
+    let at = parent.at(name);
     let mut names = Names::default();
     let dir = at
         .open_dir(true)
@@ -614,67 +684,114 @@ fn rm_tree(
         {
             return RmStatus::Kept;
         }
-        // Deep down, entries are reached by full path, with no directory held open.
-        let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
-        let need_info = run.may_prompt() || run.one_file_system;
-        let (mut failed, mut kept) = (false, false);
-        for i in 0..names.len() {
-            let (name, kind, _) = names.get(i);
-            let mark = path.push(name.to_bytes());
-            let full;
-            let child = match &dir {
-                Some(d) => At { dir: d.fd(), name },
-                None => {
-                    full = path.c_path().map(CStr::to_owned);
-                    match &full {
-                        Some(c) => At::cwd(c),
-                        // A path with a NUL cannot be reached; EBADF says so.
-                        None => At { dir: -1, name },
-                    }
-                }
-            };
-            let cinfo = if need_info || kind == EntryType::Unknown {
-                match child.stat(false) {
-                    Ok(st) => Some(Info::from_stat(&st)),
-                    Err(e) => {
-                        eprintln!(
-                            "rm: cannot remove {}: {}",
-                            qa(path.as_path()),
-                            gnu_io_error(&e)
-                        );
-                        failed = true;
-                        path.truncate(mark);
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-            let is_dir = cinfo.map_or(kind, |i| i.kind()) == EntryType::Dir;
-            let status = if is_dir {
-                if run.one_file_system && cinfo.is_some_and(|i| i.dev != top_dev) {
+        // Subdirectories one level further down let go of this directory.
+        let id = if depth + 1 >= MAX_OPEN_DIRS {
+            match dir.id() {
+                Ok(id) => Some(id),
+                Err(e) => {
                     eprintln!(
-                        "rm: skipping {}, since it's on a different device",
-                        qa(path.as_path())
+                        "rm: cannot remove {}: {}",
+                        qa(path.as_path()),
+                        gnu_io_error(&e)
                     );
-                    RmStatus::Failed
-                } else {
-                    rm_tree(child, path, cinfo.as_ref(), depth + 1, top_dev, run, ctx)
+                    return RmStatus::Failed;
                 }
-            } else {
-                rm_file(child, path.as_path(), cinfo.as_ref(), run, ctx)
+            }
+        } else {
+            None
+        };
+        let mut this = Parent::Dir { fd: Some(dir), id };
+        let released = depth >= MAX_OPEN_DIRS && parent.release();
+        let status = rm_entries(&mut this, &names, path, depth, top_dev, run, ctx);
+        if status == RmStatus::Lost {
+            return RmStatus::Lost;
+        }
+        if released {
+            let Parent::Dir { fd: Some(own), .. } = &this else {
+                return RmStatus::Lost;
             };
-            path.truncate(mark);
-            failed |= status == RmStatus::Failed;
-            kept |= status == RmStatus::Kept;
+            if let Err(e) = parent.reacquire(own) {
+                // GNU's fts gives up on the whole operand.
+                eprintln!("rm: fts_read failed: {}", gnu_io_error(&e));
+                return RmStatus::Lost;
+            }
         }
-        if failed {
-            return RmStatus::Failed;
-        }
-        if kept {
-            return RmStatus::Kept;
+        if status != RmStatus::Removed {
+            return status;
         }
     }
     let status = names.is_empty().then_some(DirStatus::Empty);
-    rm_empty_dir(at, path.as_path(), info, status, run, ctx)
+    rm_empty_dir(parent.at(name), path.as_path(), info, status, run, ctx)
+}
+
+/// Removes the entries `names` of the open directory `this` (printed as
+/// `path`): `Removed` if all went, else what kept the directory.
+fn rm_entries(
+    this: &mut Parent,
+    names: &Names,
+    path: &mut WalkPath,
+    depth: usize,
+    top_dev: u64,
+    run: &RmRun,
+    ctx: &DogfishContext,
+) -> RmStatus {
+    let need_info = run.may_prompt() || run.one_file_system;
+    let (mut failed, mut kept) = (false, false);
+    for i in 0..names.len() {
+        let (name, kind, _) = names.get(i);
+        let mark = path.push(name.to_bytes());
+        let cinfo = if need_info || kind == EntryType::Unknown {
+            match this.at(name).stat(false) {
+                Ok(st) => Some(Info::from_stat(&st)),
+                Err(e) => {
+                    eprintln!(
+                        "rm: cannot remove {}: {}",
+                        qa(path.as_path()),
+                        gnu_io_error(&e)
+                    );
+                    failed = true;
+                    path.truncate(mark);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let is_dir = cinfo.map_or(kind, |i| i.kind()) == EntryType::Dir;
+        let status = if is_dir {
+            if run.one_file_system && cinfo.is_some_and(|i| i.dev != top_dev) {
+                eprintln!(
+                    "rm: skipping {}, since it's on a different device",
+                    qa(path.as_path())
+                );
+                RmStatus::Failed
+            } else {
+                rm_tree(
+                    this,
+                    name,
+                    path,
+                    cinfo.as_ref(),
+                    depth + 1,
+                    top_dev,
+                    run,
+                    ctx,
+                )
+            }
+        } else {
+            rm_file(this.at(name), path.as_path(), cinfo.as_ref(), run, ctx)
+        };
+        path.truncate(mark);
+        if status == RmStatus::Lost {
+            return RmStatus::Lost;
+        }
+        failed |= status == RmStatus::Failed;
+        kept |= status == RmStatus::Kept;
+    }
+    if failed {
+        RmStatus::Failed
+    } else if kept {
+        RmStatus::Kept
+    } else {
+        RmStatus::Removed
+    }
 }
