@@ -243,13 +243,19 @@ fn gid_label(gid: u32) -> String {
 /// `getpwnam`: (uid, login gid) of a user name.
 fn lookup_user(name: &str) -> Option<(u32, u32)> {
     let c = CString::new(name).ok()?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call.
     let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    // SAFETY: a non-null getpwnam result points at a valid passwd record
+    // until the next getpw* call; the IDs are copied out at once.
     (!pw.is_null()).then(|| unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
 }
 
 fn lookup_group(name: &str) -> Option<u32> {
     let c = CString::new(name).ok()?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call.
     let gr = unsafe { libc::getgrnam(c.as_ptr()) };
+    // SAFETY: a non-null getgrnam result points at a valid group record
+    // until the next getgr* call; the ID is copied out at once.
     (!gr.is_null()).then(|| unsafe { (*gr).gr_gid })
 }
 

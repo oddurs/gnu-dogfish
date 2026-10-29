@@ -43,6 +43,8 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: signalling our own child, which has not been waited for yet,
+    // so its pid cannot have been reused.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGBUS);
     }

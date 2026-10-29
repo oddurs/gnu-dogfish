@@ -270,6 +270,8 @@ fn mode_t(mode: u32) -> libc::mode_t {
 
 fn open_path(p: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
     let c = c_path(p)?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call; open(2) reads
+    // nothing else through pointers.
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
@@ -280,6 +282,7 @@ fn open_path(p: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
+        // SAFETY: `fd` is a descriptor open(2) just returned, owned by nothing else.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
@@ -287,12 +290,14 @@ fn open_path(p: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
 fn unlink_path(p: &Path, dir: bool) -> io::Result<()> {
     let c = c_path(p)?;
     let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     cvt(unsafe { libc::unlinkat(libc::AT_FDCWD, c.as_ptr(), flags) })
 }
 
 fn link_path(src: &Path, dst: &Path, follow: bool) -> io::Result<()> {
     let (s, d) = (c_path(src)?, c_path(dst)?);
     let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+    // SAFETY: `s` and `d` are NUL-terminated paths that outlive the call.
     cvt(unsafe {
         libc::linkat(
             libc::AT_FDCWD,
@@ -306,10 +311,12 @@ fn link_path(src: &Path, dst: &Path, follow: bool) -> io::Result<()> {
 
 fn chmod_path(p: &Path, mode: u32) -> io::Result<()> {
     let c = c_path(p)?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     cvt(unsafe { libc::chmod(c.as_ptr(), mode_t(mode & CHMOD_MODE_BITS)) })
 }
 
 fn fchmod_file(f: &File, mode: u32) -> io::Result<()> {
+    // SAFETY: fchmod takes an open descriptor (owned by `f`) and no pointers.
     cvt(unsafe { libc::fchmod(f.as_raw_fd(), mode_t(mode & CHMOD_MODE_BITS)) })
 }
 
@@ -342,6 +349,8 @@ fn utimens_path(p: &Path, times: &[libc::timespec; 2], nofollow: bool) -> io::Re
     } else {
         0
     };
+    // SAFETY: `c` is a NUL-terminated path and `times` an array of two
+    // timespecs, as utimensat(2) requires; both outlive the call.
     cvt(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) })
 }
 
@@ -349,9 +358,11 @@ fn lchown_ids(fd: Option<&File>, p: &Path, uid: Option<u32>, gid: Option<u32>) -
     let u = uid.unwrap_or(u32::MAX) as libc::uid_t;
     let g = gid.unwrap_or(u32::MAX) as libc::gid_t;
     match fd {
+        // SAFETY: fchown takes an open descriptor (owned by `f`) and no pointers.
         Some(f) => cvt(unsafe { libc::fchown(f.as_raw_fd(), u, g) }),
         None => {
             let c = c_path(p)?;
+            // SAFETY: `c` is a NUL-terminated path that outlives the call.
             cvt(unsafe { libc::lchown(c.as_ptr(), u, g) })
         }
     }
@@ -364,17 +375,20 @@ fn mknod_path(p: &Path, mode: u32, dev: u64) -> io::Result<()> {
     let m = (ty | (mode & CHMOD_MODE_BITS)) as libc::mode_t;
     #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
     let d = dev as libc::dev_t;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     cvt(unsafe { libc::mknod(c.as_ptr(), m, d) })
 }
 
 fn mkfifo_path(p: &Path, mode: u32) -> io::Result<()> {
     let c = c_path(p)?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     cvt(unsafe { libc::mkfifo(c.as_ptr(), mode_t(mode)) })
 }
 
 /// The process's effective IDs may write `p` (faccessat with `AT_EACCESS`).
 fn eaccess_ok(p: &Path, how: libc::c_int) -> bool {
     let Ok(c) = c_path(p) else { return false };
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), how, libc::AT_EACCESS) == 0 }
 }
 
@@ -527,6 +541,7 @@ fn seek_data(f: &File, off: i64, hole: bool) -> io::Result<i64> {
     } else {
         libc::SEEK_DATA
     };
+    // SAFETY: lseek takes an open descriptor (owned by `f`) and no pointers.
     let r = unsafe { libc::lseek(f.as_raw_fd(), off as libc::off_t, whence) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -536,6 +551,7 @@ fn seek_data(f: &File, off: i64, hole: bool) -> io::Result<i64> {
 }
 
 fn lseek(f: &File, off: i64, whence: libc::c_int) -> io::Result<i64> {
+    // SAFETY: lseek takes an open descriptor (owned by `f`) and no pointers.
     let r = unsafe { libc::lseek(f.as_raw_fd(), off as libc::off_t, whence) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -567,6 +583,7 @@ fn infer_scantype(f: &File, sb: &fs::Metadata) -> ScanType {
 fn punch_hole(f: &File, offset: i64, length: i64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: fallocate takes an open descriptor (owned by `f`) and no pointers.
         let r = unsafe {
             libc::fallocate(
                 f.as_raw_fd(),
@@ -617,6 +634,8 @@ fn clone_file(dst: &File, src: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         const FICLONE: libc::c_ulong = 0x4004_9409;
+        // SAFETY: FICLONE takes two open descriptors (owned by `dst` and `src`)
+        // and no pointers.
         cvt(unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) })
     }
     #[cfg(not(target_os = "linux"))]
@@ -646,6 +665,7 @@ impl<'a> Copier<'a> {
             ctx,
             journal,
             umask,
+            // SAFETY: geteuid has no preconditions and cannot fail.
             privileged: unsafe { libc::geteuid() } == 0,
             src_to_dest: HashMap::new(),
             dest_info: None,
@@ -1630,6 +1650,7 @@ impl<'a> Copier<'a> {
             if new_dst || !dst_sb.as_ref().is_some_and(fs::Metadata::is_dir) {
                 let mode = dst_mode_bits & !omitted;
                 let res =
+                    // SAFETY: `c` is a NUL-terminated path that outlives the call.
                     c_path(dst).and_then(|c| cvt(unsafe { libc::mkdir(c.as_ptr(), mode_t(mode)) }));
                 if let Err(e) = res {
                     self.diag_err(&format!("cannot create directory {}", qa(dst)), &e);
@@ -2196,6 +2217,8 @@ impl<'a> Copier<'a> {
 
         if self.x.preserve_timestamps {
             let times = src_times(src_sb);
+            // SAFETY: `dest` is open and `times` is an array of two timespecs, as
+            // futimens(2) requires.
             let r = cvt(unsafe { libc::futimens(dest.as_raw_fd(), times.as_ptr()) });
             if let Err(e) = r {
                 self.diag_err(&format!("preserving times for {}", qa(dst)), &e);
@@ -2236,6 +2259,7 @@ impl<'a> Copier<'a> {
             }
         }
 
+        // SAFETY: into_raw_fd hands over the descriptor, so it is closed exactly once.
         if unsafe { libc::close(dest.into_raw_fd()) } < 0 {
             let e = io::Error::last_os_error();
             self.diag_err(&format!("failed to close {}", qa(dst)), &e);
@@ -2410,6 +2434,8 @@ impl<'a> Copier<'a> {
         if hole_size == 0 && allow_reflink {
             while max_n_read > 0 {
                 let copy_max: u64 = (isize::MAX as u64) >> 30 << 30;
+                // SAFETY: both descriptors are open (owned by `source` and `dest`); null
+                // offsets mean "use and update the file offsets".
                 let n = unsafe {
                     libc::copy_file_range(
                         source.as_raw_fd(),
@@ -2713,6 +2739,7 @@ impl<'a> Copier<'a> {
             } else {
                 CLONE_NOOWNERCOPY
             };
+        // SAFETY: `s` and `d` are NUL-terminated paths that outlive the call.
         if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), flags) } != 0 {
             let e = io::Error::last_os_error();
             let report = is_terminal_error(errno(&e));

@@ -137,6 +137,7 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // GNU checks standard output before reading anything.
     // SAFETY: fstat writes into the zeroed buffer it is given.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on descriptor 1 with a properly sized, writable buffer.
     if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) } < 0 {
         eprintln!(
             "cat: standard output: {}",

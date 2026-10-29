@@ -157,6 +157,7 @@ fn check_extension(s: &mut Vec<u8>, filelen: usize, dir: &Path) -> bool {
     let mut baselen_max = 255;
     if NAME_MAX_MINIMUM < baselen {
         let name_max = c_path(dir)
+            // SAFETY: `c` is a NUL-terminated path that outlives the call.
             .map(|c| unsafe { libc::pathconf(c.as_ptr(), libc::_PC_NAME_MAX) })
             .unwrap_or(-1);
         baselen_max = usize::try_from(name_max)

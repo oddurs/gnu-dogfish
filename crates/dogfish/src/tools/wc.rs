@@ -276,8 +276,9 @@ fn count_source(src: &InputSource, need_scan: bool, ctx: &DogfishContext) -> io:
 
 /// (is_regular_file, size) of standard input.
 fn stdin_stat() -> Option<(bool, u64)> {
+    // SAFETY: libc::stat is plain data, for which all-zero bytes are valid.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // Safety: fstat on fd 0 with a properly sized, zeroed stat buffer.
+    // SAFETY: fstat on fd 0 with a properly sized, writable stat buffer.
     if unsafe { libc::fstat(0, &mut st) } != 0 {
         return None;
     }
