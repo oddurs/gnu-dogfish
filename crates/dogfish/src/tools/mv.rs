@@ -328,3 +328,11 @@ fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
     }
     true
 }
+
+/// mv's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("mv", MV_HELP, SPECS)
+        .choices("backup", crate::common::backup::backup_words())
+        .choices("update", ["all", "none", "older"])
+}

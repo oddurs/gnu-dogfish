@@ -239,6 +239,15 @@ const B2SUM_SPECS: &[OptSpec<SumOpt>] = &[
     OptSpec::both(b'J', "json", HasArg::No, SumOpt::Json).exact(),
 ];
 
+/// `tool`'s table: b2sum's, or the others' without `--length`.
+fn specs_for(tool: &str) -> &'static [OptSpec<SumOpt>] {
+    if tool == "b2sum" {
+        B2SUM_SPECS
+    } else {
+        &B2SUM_SPECS[1..]
+    }
+}
+
 /// The options of a `*sum` tool, resolved the way GNU's option loop does
 /// (`--tag` implies binary mode; --status/--quiet/--warn override each other).
 struct HashMode {
@@ -276,12 +285,7 @@ impl HashMode {
             bits: 512,
             files: Vec::new(),
         };
-        let specs = if tool == "b2sum" {
-            B2SUM_SPECS
-        } else {
-            &B2SUM_SPECS[1..]
-        };
-        let mut opts = Getopt::new(args.into_iter().skip(1).collect(), specs);
+        let mut opts = Getopt::new(args.into_iter().skip(1).collect(), specs_for(tool));
         while let Some(opt) = opts.next() {
             let (o, v) = opt.map_err(|e| getopt_error(tool, &e))?;
             match o {
@@ -916,4 +920,15 @@ fn report_tally(tool: &str, list_name: &str, tally: &CheckTally, mode: &HashMode
     if mode.ignore_missing && tally.properly_formatted && !tally.matched {
         eprintln!("{tool}: {list_name}: no file was verified");
     }
+}
+
+/// The option table and help text of `tool` (b2sum, sha256sum or md5sum),
+/// for its manual page and shell completions (`crate::manual`).
+pub(crate) fn manual(tool: &'static str) -> crate::manual::Manual {
+    let help = match tool {
+        "b2sum" => B2SUM_HELP,
+        "sha256sum" => SHA256SUM_HELP,
+        _ => MD5SUM_HELP,
+    };
+    crate::manual::Manual::new(tool, help, specs_for(tool))
 }

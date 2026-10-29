@@ -589,6 +589,14 @@ fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Res
     Ok(0)
 }
 
+/// uniq's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("uniq", UNIQ_HELP, SPECS)
+        .choices("all-repeated", ["none", "prepend", "separate"])
+        .choices("group", ["prepend", "append", "separate", "both"])
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]

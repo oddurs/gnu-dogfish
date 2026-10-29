@@ -8,7 +8,11 @@
 #![allow(dead_code, unused_imports)]
 
 mod common;
+mod manual;
+mod tool_list;
 mod tools;
+
+use tool_list::ALL_TOOLS;
 
 #[doc(hidden)]
 pub mod fuzz_api;

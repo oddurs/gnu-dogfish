@@ -404,6 +404,12 @@ fn chmod_dir(
     Ok(ok)
 }
 
+/// chmod's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("chmod", CHMOD_HELP, SPECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

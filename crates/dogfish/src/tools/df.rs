@@ -1090,3 +1090,10 @@ fn df_render_rich<W: Write>(
     }
     table.render(out, st)
 }
+
+/// df's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("df", DF_HELP, DF_OPTIONS)
+        .choices("output", DfField::ALL.iter().map(|f| f.name()))
+}

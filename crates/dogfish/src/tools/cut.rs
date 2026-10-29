@@ -635,6 +635,12 @@ fn cut_objects(mut objs: Vec<Value>, parsed: &CutArgs, ctx: &DogfishContext) -> 
     Ok(0)
 }
 
+/// cut's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("cut", CUT_HELP, SPECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::set_fields;

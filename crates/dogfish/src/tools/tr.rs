@@ -866,6 +866,12 @@ pub fn run_tr(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 /// Read size: large enough that syscalls are not the cost.
 const IO_SIZE: usize = 128 * 1024;
 
+/// tr's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("tr", TR_HELP, SPECS)
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]

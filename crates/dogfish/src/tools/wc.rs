@@ -874,3 +874,10 @@ fn wc_rich(
     tbl.render(&mut out, st)?;
     Ok(exit_code)
 }
+
+/// wc's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("wc", WC_HELP, SPECS)
+        .choices("total", ["auto", "always", "only", "never"])
+}

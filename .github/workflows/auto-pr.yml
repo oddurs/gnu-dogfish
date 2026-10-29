@@ -59,5 +59,14 @@ jobs:
             cat .github/pull_request_template.md
             printf '\n## Commits\n%s\n' "$commits"
           } > "$RUNNER_TEMP/body.md"
-          gh pr create --draft --base main --head "$BRANCH" \
-            --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          # Someone may open the PR between the check above and here.
+          if ! out=$(gh pr create --draft --base main --head "$BRANCH" \
+            --title "$title" --body-file "$RUNNER_TEMP/body.md" 2>&1); then
+            if grep -q 'already exists' <<<"$out"; then
+              echo "A PR was opened for $BRANCH meanwhile"
+              exit 0
+            fi
+            echo "$out" >&2
+            exit 1
+          fi
+          echo "$out"

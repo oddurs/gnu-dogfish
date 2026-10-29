@@ -127,3 +127,9 @@ pub fn run_printenv(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     ignore_broken_pipe(out.flush())?;
     Ok(exit_code)
 }
+
+/// printenv's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("printenv", PRINTENV_HELP, SPECS)
+}
