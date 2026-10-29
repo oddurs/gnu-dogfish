@@ -216,6 +216,8 @@ struct TreeCase<'a> {
     args: &'a [&'a str],
     stdin: Option<&'a [u8]>,
     tz: &'a str,
+    /// `_POSIX2_VERSION` for both runs (enables obsolete syntax).
+    posix2_version: Option<&'a str>,
     cmp: Compare,
 }
 
@@ -236,6 +238,7 @@ impl TreeCase<'_> {
             "no_undo" => self.cmp.no_undo = true,
             "unordered" => self.cmp.unordered = true,
             "tz_new_york" => self.tz = TZ_NEW_YORK,
+            "posix_1992" => self.posix2_version = Some("199209"),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -270,6 +273,10 @@ impl TreeCase<'_> {
         }
         let mut theirs = Command::new(&gnu);
         theirs.arg0(self.tool).args(self.args).env("TZ", self.tz);
+        if let Some(v) = self.posix2_version {
+            ours.env("_POSIX2_VERSION", v);
+            theirs.env("_POSIX2_VERSION", v);
+        }
         let a = exec(ours, &ours_dir, self.stdin, "C");
         let b = exec(theirs, &gnu_dir, self.stdin, "C");
 
@@ -327,7 +334,7 @@ impl TreeCase<'_> {
 /// `name: tool [args...] (stdin b"...")? (=> flag, ...)?;` — runs the command in
 /// two fresh scratch trees and compares everything (see the module docs).
 /// Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`, `nostderr`, `unordered`,
-/// `tz_new_york`.
+/// `tz_new_york`, `posix_1992` (`_POSIX2_VERSION=199209`).
 macro_rules! tree_cases {
     ($(
         $(#[$meta:meta])*
@@ -347,6 +354,7 @@ macro_rules! tree_cases {
                     args: &[$($arg),*],
                     stdin: None,
                     tz: "UTC0",
+                    posix2_version: None,
                     cmp: Compare::default(),
                 };
                 $( case.stdin = Some($input); )?
@@ -612,6 +620,28 @@ tree_cases! {
     touch_follows_symlink: "touch" ["-d", "@9", "la"] => mtime;
     touch_directory: "touch" ["-d", "@0", "e"] => atime, dir_mtime;
     touch_no_operand: "touch" [];
+    touch_stdout: "touch" ["-"];
+    touch_stdout_no_create: "touch" ["-c", "-", "n"];
+    touch_stdout_no_dereference: "touch" ["-h", "-"];
+    touch_now_is_no_date: "touch" ["-d", "now", "n"];
+    touch_relative_now: "touch" ["-d", "+0 sec", "n"];
+    touch_obsolete_stamp: "touch" ["01010000", "n"] => atime, posix_1992;
+    touch_obsolete_stamp_year: "touch" ["0101000099", "n"] => atime, posix_1992;
+    touch_obsolete_stamp_dash_dash: "touch" ["--", "1231235969", "n"] => atime, posix_1992;
+    touch_obsolete_pre_2000_is_a_file: "touch" ["0101000000", "n"] => posix_1992;
+    touch_obsolete_century_is_a_file: "touch" ["200001010000", "n"] => posix_1992;
+    touch_obsolete_invalid_is_a_file: "touch" ["13010000", "n"] => posix_1992;
+    touch_obsolete_one_operand_is_a_file: "touch" ["01010000"] => posix_1992;
+    touch_obsolete_needs_old_posix: "touch" ["01010000", "n"];
+    touch_obsolete_not_after_date: "touch" ["-d", "@0", "01010000", "n"] => atime, posix_1992;
+    touch_tz_in_date_string: "touch" ["-d", "TZ=\"Asia/Tokyo\" 2020-01-01 09:00", "n"] => atime;
+    touch_military_zone: "touch" ["-d", "2020-01-01 09:00 Q", "n"] => atime;
+    touch_ordinal_weekday: "touch" ["-d", "2020-01-01 third fri", "n"] => atime;
+    touch_two_digit_year_rel: "touch" ["-d", "Sun, 90-12-11 + 3 days - 90 minutes", "n"] => atime;
+    touch_stamp_trailing_dot: "touch" ["-t", "202001011200.", "n"];
+    touch_stamp_odd_length: "touch" ["-t", "2020010112001", "n"];
+    touch_stamp_century_short: "touch" ["-t", "6901011200", "n"] => atime;
+    touch_stamp_feb_30: "touch" ["-t", "202002301200", "n"];
 
     // ----------------------------------------------------------------- ln
     ln_hard_verbose: "ln" ["-v", "a", "hl"];
