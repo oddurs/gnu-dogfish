@@ -186,8 +186,10 @@ fn follow_name_without_retry_gives_up() {
         t.expect("x\n");
         fs::remove_file(dir.join("f")).unwrap();
         // As in GNU, the inotify loop fails while polling ends the loop and
-        // exits with the status of the initial reads.
-        let status = if mode.is_empty() { 1 } else { 0 };
+        // exits with the status of the initial reads. Without inotify (macOS)
+        // both modes poll.
+        let inotify = cfg!(target_os = "linux") && mode.is_empty();
+        let status = if inotify { 1 } else { 0 };
         assert_eq!(t.wait_exit(), Some(status));
         assert!(
             t.output().ends_with("tail: no files remaining\n"),
