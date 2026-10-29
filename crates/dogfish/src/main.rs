@@ -4,11 +4,8 @@
 // `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
 #![allow(rustdoc::broken_intra_doc_links)]
 
-mod fs_ops;
-mod hash;
-mod meta;
-mod sys;
-mod text;
+mod common;
+mod tools;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -454,71 +451,71 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
     let tool_names: Vec<&str> = ALL_TOOLS.iter().map(|(n, _, _)| *n).collect();
     match tool {
         // Tier 1: File & Directory
-        "ls" => fs_ops::run_ls(args, ctx),
-        "cp" => fs_ops::run_cp(args, ctx),
-        "mv" => fs_ops::run_mv(args, ctx),
-        "rm" => fs_ops::run_rm(args, ctx),
-        "mkdir" => fs_ops::run_mkdir(args, ctx),
-        "ln" => fs_ops::run_ln(args, ctx),
-        "chmod" => fs_ops::run_chmod(args, ctx),
-        "chown" => fs_ops::run_chown(args, ctx),
-        "stat" => fs_ops::run_stat(args, ctx),
-        "touch" => fs_ops::run_touch(args, ctx),
-        "df" => fs_ops::run_df(args, ctx),
-        "du" => fs_ops::run_du(args, ctx),
-        "realpath" => fs_ops::run_realpath(args, ctx),
-        "basename" => fs_ops::run_basename(args, ctx),
-        "dirname" => fs_ops::run_dirname(args, ctx),
-        "mktemp" => fs_ops::run_mktemp(args, ctx),
+        "ls" => tools::ls::run_ls(args, ctx),
+        "cp" => tools::cp::run_cp(args, ctx),
+        "mv" => tools::mv::run_mv(args, ctx),
+        "rm" => tools::rm::run_rm(args, ctx),
+        "mkdir" => tools::mkdir::run_mkdir(args, ctx),
+        "ln" => tools::ln::run_ln(args, ctx),
+        "chmod" => tools::chmod::run_chmod(args, ctx),
+        "chown" => tools::chown::run_chown(args, ctx),
+        "stat" => tools::stat::run_stat(args, ctx),
+        "touch" => tools::touch::run_touch(args, ctx),
+        "df" => tools::df::run_df(args, ctx),
+        "du" => tools::du::run_du(args, ctx),
+        "realpath" => tools::realpath::run_realpath(args, ctx),
+        "basename" => tools::basename::run_basename(args, ctx),
+        "dirname" => tools::dirname::run_dirname(args, ctx),
+        "mktemp" => tools::mktemp::run_mktemp(args, ctx),
 
         // Tier 2: Text & Streaming
-        "cat" => text::run_cat(args, ctx),
-        "tac" => text::run_tac(args, ctx),
-        "head" => text::run_head(args, ctx),
-        "tail" => text::run_tail(args, ctx),
-        "wc" => text::run_wc(args, ctx),
-        "sort" => text::run_sort(args, ctx),
-        "uniq" => text::run_uniq(args, ctx),
-        "cut" => text::run_cut(args, ctx),
-        "tr" => text::run_tr(args, ctx),
-        "paste" => text::run_paste(args, ctx),
-        "nl" => text::run_nl(args, ctx),
-        "shuf" => text::run_shuf(args, ctx),
-        "query" | "filter" => text::run_query(args, ctx),
+        "cat" => tools::cat::run_cat(args, ctx),
+        "tac" => tools::tac::run_tac(args, ctx),
+        "head" => tools::head::run_head(args, ctx),
+        "tail" => tools::tail::run_tail(args, ctx),
+        "wc" => tools::wc::run_wc(args, ctx),
+        "sort" => tools::sort::run_sort(args, ctx),
+        "uniq" => tools::uniq::run_uniq(args, ctx),
+        "cut" => tools::cut::run_cut(args, ctx),
+        "tr" => tools::tr::run_tr(args, ctx),
+        "paste" => tools::paste::run_paste(args, ctx),
+        "nl" => tools::nl::run_nl(args, ctx),
+        "shuf" => tools::shuf::run_shuf(args, ctx),
+        "query" | "filter" => tools::query::run_query(args, ctx),
 
         // Tier 3: Hashing & Encoding
-        "b2sum" => hash::run_b2sum(args, ctx),
-        "sha256sum" => hash::run_sha256sum(args, ctx),
-        "md5sum" => hash::run_md5sum(args, ctx),
-        "base64" => hash::run_base64(args, ctx),
-        "basenc" => hash::run_basenc(args, ctx),
+        "b2sum" => tools::checksum::run_b2sum(args, ctx),
+        "sha256sum" => tools::checksum::run_sha256sum(args, ctx),
+        "md5sum" => tools::checksum::run_md5sum(args, ctx),
+        "base64" => tools::basenc::run_base64(args, ctx),
+        "basenc" => tools::basenc::run_basenc(args, ctx),
 
         // Tier 4: Shell & System
-        "echo" => sys::run_echo(args, ctx),
-        "printf" => sys::run_printf(args, ctx),
-        "env" => sys::run_env(args, ctx),
-        "printenv" => sys::run_printenv(args, ctx),
-        "id" => sys::run_id(args, ctx),
-        "uname" => sys::run_uname(args, ctx),
-        "hostname" => sys::run_hostname(args, ctx),
-        "nproc" => sys::run_nproc(args, ctx),
-        "whoami" => sys::run_whoami(args, ctx),
-        "yes" => sys::run_yes(args, ctx),
-        "true" => sys::run_true(args, ctx),
-        "false" => sys::run_false(args, ctx),
-        "sleep" => sys::run_sleep(args, ctx),
-        "timeout" => sys::run_timeout(args, ctx),
-        "watch" => sys::run_watch(args, ctx),
-        "seq" => sys::run_seq(args, ctx),
-        "date" => sys::run_date(args, ctx),
-        "tee" => sys::run_tee(args, ctx),
+        "echo" => tools::echo::run_echo(args, ctx),
+        "printf" => tools::printf::run_printf(args, ctx),
+        "env" => tools::env::run_env(args, ctx),
+        "printenv" => tools::printenv::run_printenv(args, ctx),
+        "id" => tools::id::run_id(args, ctx),
+        "uname" => tools::uname::run_uname(args, ctx),
+        "hostname" => tools::hostname::run_hostname(args, ctx),
+        "nproc" => tools::nproc::run_nproc(args, ctx),
+        "whoami" => tools::whoami::run_whoami(args, ctx),
+        "yes" => tools::yes::run_yes(args, ctx),
+        "true" => tools::true_false::run_true(args, ctx),
+        "false" => tools::true_false::run_false(args, ctx),
+        "sleep" => tools::sleep::run_sleep(args, ctx),
+        "timeout" => tools::timeout::run_timeout(args, ctx),
+        "watch" => tools::watch::run_watch(args, ctx),
+        "seq" => tools::seq::run_seq(args, ctx),
+        "date" => tools::date::run_date(args, ctx),
+        "tee" => tools::tee::run_tee(args, ctx),
 
         // Meta-Tools
-        "bench" => meta::run_bench(args, ctx),
-        "undo" => meta::run_undo(args, ctx),
-        "history" => meta::run_history(args, ctx),
-        "init" => meta::run_init(args, &tool_names, ctx),
-        "install-links" => meta::run_install_links(args, &tool_names, ctx),
+        "bench" => tools::bench::run_bench(args, ctx),
+        "undo" => tools::undo::run_undo(args, ctx),
+        "history" => tools::history::run_history(args, ctx),
+        "init" => tools::init::run_init(args, &tool_names, ctx),
+        "install-links" => tools::install_links::run_install_links(args, &tool_names, ctx),
 
         other => Err(anyhow::anyhow!(
             "unknown utility '{}'. Run `dogfish --help` to see all 44 utilities.",

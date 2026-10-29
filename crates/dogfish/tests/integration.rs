@@ -372,7 +372,8 @@ fn test_cut_tr_paste_shuf() {
 
 #[test]
 fn test_ndjson_pipeline_and_query_engine() {
-    let ls_out = run(&["ls", "-J", "src"]);
+    // A directory of the crate's own sources holding several files over 1K.
+    let ls_out = run(&["ls", "-J", "src/tools"]);
     assert!(ls_out.status.success());
 
     let q_out = run_stdin(
