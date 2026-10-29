@@ -1,11 +1,14 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, Read, Write};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use clap::{ArgAction, Parser};
+use digest::Digest;
 use dogfish_core::{
     ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
     emit_objects_or_table, eval_json_where, gnu_io_error,
@@ -13,6 +16,7 @@ use dogfish_core::{
     read_ndjson_stdin, sparkline_bar,
     table::{compare_json_field, read_all_stdin_lines},
 };
+use md5::Md5;
 use memchr::{memchr_iter, memmem, memrchr_iter};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1362,9 +1366,30 @@ struct SortArgs {
     #[arg(short = 'i', long = "ignore-nonprinting")]
     ignore_nonprinting: bool,
 
+    /// Compare (unknown) < 'JAN' < ... < 'DEC'
+    #[arg(short = 'M', long = "month-sort")]
+    month: bool,
+
     /// Compare according to string numerical value
     #[arg(short = 'n', long = "numeric-sort")]
     numeric: bool,
+
+    /// Shuffle, but group identical keys
+    #[arg(short = 'R', long = "random-sort")]
+    random: bool,
+
+    /// Get random bytes from FILE
+    #[arg(long = "random-source", value_name = "FILE")]
+    random_source: Option<String>,
+
+    /// Sort according to WORD: general-numeric -g, human-numeric -h, month -M,
+    /// numeric -n, random -R, version -V
+    #[arg(long = "sort", value_name = "WORD", action = ArgAction::Append)]
+    sort_words: Vec<String>,
+
+    /// Natural sort of (version) numbers within text
+    #[arg(short = 'V', long = "version-sort")]
+    version: bool,
 
     /// Reverse the result of comparisons
     #[arg(short = 'r', long = "reverse", visible_alias = "desc")]
@@ -1418,8 +1443,11 @@ struct SortOpts {
     general: bool,
     human: bool,
     nonprinting: bool,
+    month: bool,
     numeric: bool,
+    random: bool,
     reverse: bool,
+    version: bool,
 }
 
 impl SortOpts {
@@ -1432,7 +1460,52 @@ impl SortOpts {
             || self.general
             || self.human
             || self.nonprinting
-            || self.numeric)
+            || self.month
+            || self.numeric
+            || self.random
+            || self.version)
+    }
+
+    /// True when `-d`, `-i` or `-f` rewrite the key before it is compared.
+    fn filters(&self) -> bool {
+        self.dictionary || self.nonprinting || self.fold
+    }
+
+    /// GNU `key_to_opts`: the key's option letters, in GNU's canonical order.
+    fn letters(&self) -> String {
+        [
+            (self.skip_sblanks || self.skip_eblanks, 'b'),
+            (self.dictionary, 'd'),
+            (self.fold, 'f'),
+            (self.general, 'g'),
+            (self.human, 'h'),
+            (self.nonprinting, 'i'),
+            (self.month, 'M'),
+            (self.numeric, 'n'),
+            (self.random, 'R'),
+            (self.reverse, 'r'),
+            (self.version, 'V'),
+        ]
+        .iter()
+        .filter_map(|&(on, c)| on.then_some(c))
+        .collect()
+    }
+
+    /// GNU `check_ordering_compatibility`: at most one of `-n`, `-g`, `-h`, `-M`
+    /// and the string orderings (`-V`, `-R`, `-d`, `-i`, which combine freely).
+    fn is_compatible(&self) -> bool {
+        let string_like = self.version || self.random || self.dictionary || self.nonprinting;
+        [
+            self.numeric,
+            self.general,
+            self.human,
+            self.month,
+            string_like,
+        ]
+        .iter()
+        .filter(|&&on| on)
+        .count()
+            <= 1
     }
 }
 
@@ -1469,8 +1542,11 @@ fn parse_sort_key(spec: &str) -> std::result::Result<SortKey, String> {
                 b'g' => opts.general = true,
                 b'h' => opts.human = true,
                 b'i' => opts.nonprinting = true,
+                b'M' => opts.month = true,
                 b'n' => opts.numeric = true,
+                b'R' => opts.random = true,
                 b'r' => opts.reverse = true,
+                b'V' => opts.version = true,
                 _ => return Err(invalid("stray character in field spec")),
             }
             *i += 1;
@@ -1521,6 +1597,8 @@ struct Sorter {
     /// Disable the last-resort whole-line comparison (`-s` / `-u`).
     no_last_resort: bool,
     reverse: bool,
+    /// MD5 state primed with the `-R` seed; each key is hashed with a clone.
+    random_seed: Md5,
 }
 
 impl Sorter {
@@ -1610,16 +1688,33 @@ impl Sorter {
             let ka = self.key_slice(a, key);
             let kb = self.key_slice(b, key);
             let o = &key.opts;
-            let ord = if o.numeric {
-                numeric_compare(ka, kb)
-            } else if o.human {
-                human_unit_order(ka)
-                    .cmp(&human_unit_order(kb))
-                    .then_with(|| numeric_compare(ka, kb))
-            } else if o.general {
-                general_numeric_compare(ka, kb)
-            } else if o.dictionary || o.nonprinting || o.fold {
-                filtered_compare(ka, kb, o)
+            let ord = if o.numeric || o.general || o.human || o.month || o.random || o.version {
+                // As in GNU, these orderings see the key after `-d`/`-i`/`-f` rewriting.
+                let (ka, kb): (Cow<[u8]>, Cow<[u8]>) = if o.filters() {
+                    (
+                        key_filter(ka, o).collect::<Vec<u8>>().into(),
+                        key_filter(kb, o).collect::<Vec<u8>>().into(),
+                    )
+                } else {
+                    (ka.into(), kb.into())
+                };
+                if o.numeric {
+                    numeric_compare(&ka, &kb)
+                } else if o.general {
+                    general_numeric_compare(&ka, &kb)
+                } else if o.human {
+                    human_unit_order(&ka)
+                        .cmp(&human_unit_order(&kb))
+                        .then_with(|| numeric_compare(&ka, &kb))
+                } else if o.month {
+                    month_of(&ka).cmp(&month_of(&kb))
+                } else if o.random {
+                    self.random_compare(&ka, &kb)
+                } else {
+                    filevercmp(&ka, &kb)
+                }
+            } else if o.filters() {
+                key_filter(ka, o).cmp(key_filter(kb, o))
             } else {
                 ka.cmp(kb)
             };
@@ -1628,6 +1723,13 @@ impl Sorter {
             }
         }
         Ordering::Equal
+    }
+
+    /// GNU `compare_random`: order by the seeded MD5 of each key, falling back
+    /// to the bytes themselves so that only identical keys compare equal.
+    fn random_compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        let digest = |key: &[u8]| self.random_seed.clone().chain_update(key).finalize();
+        digest(a).cmp(&digest(b)).then_with(|| a.cmp(b))
     }
 
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -1856,28 +1958,208 @@ fn general_numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-fn filtered_compare(a: &[u8], b: &[u8], o: &SortOpts) -> Ordering {
-    let keep = |c: &u8| {
-        if o.dictionary {
-            c.is_ascii_alphanumeric() || is_blank(*c)
-        } else if o.nonprinting {
-            (0x20..0x7f).contains(c)
-        } else {
-            true
-        }
+/// The bytes of a key after `-d`/`-i` deletion and `-f` folding.
+fn key_filter<'a>(key: &'a [u8], o: &SortOpts) -> impl Iterator<Item = u8> + 'a {
+    let SortOpts {
+        dictionary,
+        nonprinting,
+        fold,
+        ..
+    } = *o;
+    key.iter()
+        .copied()
+        .filter(move |&c| {
+            if dictionary {
+                c.is_ascii_alphanumeric() || is_blank(c)
+            } else if nonprinting {
+                (0x20..0x7f).contains(&c)
+            } else {
+                true
+            }
+        })
+        .map(move |c| if fold { c.to_ascii_uppercase() } else { c })
+}
+
+/// GNU `getmonth`: 0 for unknown, else 1..=12 for a key that starts (after
+/// blanks) with a case-insensitive `JAN`..`DEC`.
+fn month_of(key: &[u8]) -> u8 {
+    const MONTHS: [&[u8]; 12] = [
+        b"JAN", b"FEB", b"MAR", b"APR", b"MAY", b"JUN", b"JUL", b"AUG", b"SEP", b"OCT", b"NOV",
+        b"DEC",
+    ];
+    let start = key.iter().position(|&c| !is_blank(c)).unwrap_or(key.len());
+    let Some(abbr) = key[start..].get(..3) else {
+        return 0;
     };
-    let tr = |c: &u8| if o.fold { c.to_ascii_uppercase() } else { *c };
-    a.iter()
-        .filter(|c| keep(c))
-        .map(tr)
-        .cmp(b.iter().filter(|c| keep(c)).map(tr))
+    MONTHS
+        .iter()
+        .position(|m| abbr.eq_ignore_ascii_case(m))
+        .map_or(0, |i| i as u8 + 1)
+}
+
+/// gnulib `file_prefixlen`: the length of `s` without its file suffix, the
+/// longest tail matching `(\.[A-Za-z~][A-Za-z0-9~]*)*$` that leaves at least
+/// one leading byte.
+fn file_prefix_len(s: &[u8]) -> usize {
+    let n = s.len();
+    let mut prefix = 0;
+    let mut i = 0;
+    while i < n {
+        i += 1;
+        prefix = i;
+        while i + 1 < n && s[i] == b'.' && (s[i + 1].is_ascii_alphabetic() || s[i + 1] == b'~') {
+            i += 2;
+            while i < n && (s[i].is_ascii_alphanumeric() || s[i] == b'~') {
+                i += 1;
+            }
+        }
+    }
+    prefix
+}
+
+/// gnulib `order`: the version-sort weight of the byte at `pos`. `~` sorts
+/// first, then the end of the string, then letters, then all other bytes.
+fn version_weight(s: &[u8], pos: usize) -> i32 {
+    match s.get(pos) {
+        None => -1,
+        Some(b'~') => -2,
+        Some(c) if c.is_ascii_digit() => 0,
+        Some(c) if c.is_ascii_alphabetic() => i32::from(*c),
+        Some(&c) => i32::from(c) + 256,
+    }
+}
+
+/// gnulib `verrevcmp`: Debian-style comparison of alternating non-digit and
+/// digit runs, the latter compared numerically.
+fn verrevcmp(a: &[u8], b: &[u8]) -> Ordering {
+    let digit_at = |s: &[u8], i: usize| s.get(i).is_some_and(u8::is_ascii_digit);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        while (i < a.len() && !digit_at(a, i)) || (j < b.len() && !digit_at(b, j)) {
+            let ord = version_weight(a, i).cmp(&version_weight(b, j));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            i += 1;
+            j += 1;
+        }
+        while a.get(i) == Some(&b'0') {
+            i += 1;
+        }
+        while b.get(j) == Some(&b'0') {
+            j += 1;
+        }
+        let mut first_diff = Ordering::Equal;
+        while digit_at(a, i) && digit_at(b, j) {
+            first_diff = first_diff.then(a[i].cmp(&b[j]));
+            i += 1;
+            j += 1;
+        }
+        if digit_at(a, i) {
+            return Ordering::Greater;
+        }
+        if digit_at(b, j) {
+            return Ordering::Less;
+        }
+        if first_diff != Ordering::Equal {
+            return first_diff;
+        }
+    }
+    Ordering::Equal
+}
+
+/// gnulib `filenvercmp`, the `-V` ordering: empty first, then `.`, `..` and
+/// other dot-files, then a version comparison that ignores file suffixes
+/// (`.tar.gz`) unless they are needed to break a tie.
+fn filevercmp(a: &[u8], b: &[u8]) -> Ordering {
+    match (a, b) {
+        ([], []) => return Ordering::Equal,
+        ([], _) => return Ordering::Less,
+        (_, []) => return Ordering::Greater,
+        ([b'.', ..], [b'.', ..]) => {
+            for special in [&b"."[..], b".."] {
+                match (a == special, b == special) {
+                    (true, true) => return Ordering::Equal,
+                    (true, false) => return Ordering::Less,
+                    (false, true) => return Ordering::Greater,
+                    (false, false) => {}
+                }
+            }
+        }
+        ([b'.', ..], _) => return Ordering::Less,
+        (_, [b'.', ..]) => return Ordering::Greater,
+        _ => {}
+    }
+    let (pa, pb) = (file_prefix_len(a), file_prefix_len(b));
+    let ord = verrevcmp(&a[..pa], &b[..pb]);
+    if ord != Ordering::Equal || (pa == a.len() && pb == b.len()) {
+        ord
+    } else {
+        verrevcmp(a, b)
+    }
+}
+
+/// Turns on the ordering a `--sort=WORD` names.
+type SetOrdering = fn(&mut SortOpts);
+
+/// Resolves a `--sort=WORD` argument the way GNU `argmatch` does: an exact
+/// name or an unambiguous prefix.
+fn parse_sort_word(word: &str) -> std::result::Result<SetOrdering, String> {
+    const WORDS: [(&str, SetOrdering); 6] = [
+        ("general-numeric", |o| o.general = true),
+        ("human-numeric", |o| o.human = true),
+        ("month", |o| o.month = true),
+        ("numeric", |o| o.numeric = true),
+        ("random", |o| o.random = true),
+        ("version", |o| o.version = true),
+    ];
+    if let Some(&(_, set)) = WORDS.iter().find(|(name, _)| *name == word) {
+        return Ok(set);
+    }
+    let mut matches = WORDS.iter().filter(|(name, _)| name.starts_with(word));
+    let problem = match (matches.next(), matches.next()) {
+        (Some(&(_, set)), None) => return Ok(set),
+        (None, _) => "invalid",
+        (Some(_), Some(_)) => "ambiguous",
+    };
+    let valid: String = WORDS
+        .iter()
+        .map(|(name, _)| format!("\n  - '{name}'"))
+        .collect();
+    Err(format!(
+        "{problem} argument '{word}' for '--sort'\nValid arguments are:{valid}\nTry 'sort --help' for more information."
+    ))
+}
+
+/// The 16 bytes GNU sort mixes into every `-R` hash: the start of
+/// `--random-source=FILE`, or fresh randomness.
+fn sort_random_seed(source: Option<&str>) -> std::result::Result<[u8; 16], String> {
+    let mut seed = [0u8; 16];
+    match source {
+        Some(path) => {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| format!("open failed: {}: {}", path, gnu_io_error(&e)))?;
+            file.read_exact(&mut seed).map_err(|e| match e.kind() {
+                io::ErrorKind::UnexpectedEof => format!("'{path}': end of file"),
+                _ => format!("'{}': read error: {}", path, gnu_io_error(&e)),
+            })?;
+        }
+        None => {
+            // std's `RandomState` keys are drawn from the OS entropy source.
+            let state = RandomState::new();
+            for (i, chunk) in seed.chunks_exact_mut(8).enumerate() {
+                chunk.copy_from_slice(&state.hash_one(i).to_ne_bytes());
+            }
+        }
+    }
+    Ok(seed)
 }
 
 pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = SortArgs::try_parse_from(args)?;
     let _ = parsed.help;
 
-    let global = SortOpts {
+    let mut global = SortOpts {
         skip_sblanks: parsed.ignore_blanks,
         skip_eblanks: parsed.ignore_blanks,
         dictionary: parsed.dictionary,
@@ -1885,9 +2167,21 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         general: parsed.general_numeric,
         human: parsed.human_numeric,
         nonprinting: parsed.ignore_nonprinting,
+        month: parsed.month,
         numeric: parsed.numeric,
+        random: parsed.random,
         reverse: parsed.reverse,
+        version: parsed.version,
     };
+    for word in &parsed.sort_words {
+        match parse_sort_word(word) {
+            Ok(set) => set(&mut global),
+            Err(msg) => {
+                eprintln!("sort: {msg}");
+                return Ok(1);
+            }
+        }
+    }
     let tab = match parsed.separator.as_deref() {
         None => None,
         Some("\\0") => Some(0),
@@ -1926,11 +2220,26 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             opts: global,
         });
     }
+    if let Some(key) = keys.iter().find(|k| !k.opts.is_compatible()) {
+        eprintln!("sort: options '-{}' are incompatible", key.opts.letters());
+        return Ok(2);
+    }
+    let mut random_seed = Md5::new();
+    if keys.iter().any(|k| k.opts.random) {
+        match sort_random_seed(parsed.random_source.as_deref()) {
+            Ok(seed) => random_seed.update(seed),
+            Err(msg) => {
+                eprintln!("sort: {msg}");
+                return Ok(2);
+            }
+        }
+    }
     let sorter = Sorter {
         keys,
         tab,
         no_last_resort: parsed.unique || parsed.stable,
         reverse: parsed.reverse,
+        random_seed,
     };
 
     let sources = InputSource::from_args(&parsed.files);
@@ -2236,9 +2545,13 @@ struct CutArgs {
     #[arg(short = 'b', long = "bytes", allow_hyphen_values = true)]
     bytes: Option<String>,
 
-    /// Select only these characters
+    /// Select only these characters (bytes, as in GNU coreutils)
     #[arg(short = 'c', long = "characters", allow_hyphen_values = true)]
     chars: Option<String>,
+
+    /// (ignored)
+    #[arg(short = 'n')]
+    no_split: bool,
 
     /// Select only these fields (1-indexed numbers or NDJSON field names like `name,size`)
     #[arg(
@@ -2275,31 +2588,35 @@ struct CutArgs {
     files: Vec<String>,
 }
 
+/// `-b` and `-c` are the same byte selection (as in GNU coreutils, which has
+/// no multibyte `cut`); `-f` selects delimited fields.
 #[derive(Clone, Copy, PartialEq)]
 enum CutMode {
     Bytes,
-    Chars,
     Fields,
 }
 
 struct CutSpec {
     mode: CutMode,
+    /// Sorted, disjoint 1-based selected ranges (already complemented).
     ranges: Vec<(usize, usize)>,
-    complement: bool,
     delim: Vec<u8>,
     out_delim: Vec<u8>,
+    /// `--output-delimiter` was given: separate byte ranges with it.
+    delimit_bytes: bool,
     only_delimited: bool,
 }
 
 impl CutSpec {
     fn selected(&self, pos: usize) -> bool {
         let idx = self.ranges.partition_point(|&(_, end)| end < pos);
-        let hit = self.ranges.get(idx).is_some_and(|&(start, _)| start <= pos);
-        hit != self.complement
+        self.ranges.get(idx).is_some_and(|&(start, _)| start <= pos)
     }
 }
 
-/// Parses a GNU list (`1,3`, `2-5`, `-3`, `4-`) into sorted, merged 1-based ranges.
+/// Parses a GNU list (`1,3`, `2-5`, `-3`, `4-`) into sorted 1-based ranges,
+/// merging only overlapping ones like GNU, so that `1-2,3-4` stays two ranges
+/// for `--output-delimiter`.
 fn parse_cut_list(spec: &str, mode: CutMode) -> std::result::Result<Vec<(usize, usize)>, String> {
     let what = if mode == CutMode::Fields {
         "fields are"
@@ -2348,46 +2665,44 @@ fn parse_cut_list(spec: &str, mode: CutMode) -> std::result::Result<Vec<(usize, 
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (s, e) in ranges {
         match merged.last_mut() {
-            Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
             _ => merged.push((s, e)),
         }
     }
     Ok(merged)
 }
 
+/// GNU `complement_rp`: the positions not covered by sorted, disjoint `ranges`.
+fn complement_cut_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let mut next = 1;
+    for &(start, end) in ranges {
+        if start > next {
+            out.push((next, start - 1));
+        }
+        next = end.saturating_add(1);
+    }
+    if ranges.last().is_some_and(|&(_, end)| end < usize::MAX) {
+        out.push((next, usize::MAX));
+    }
+    out
+}
+
 fn cut_line<W: Write>(line: &[u8], spec: &CutSpec, out: &mut W) -> io::Result<()> {
     match spec.mode {
         CutMode::Bytes => {
-            let mut buf = Vec::with_capacity(line.len());
-            for (i, &b) in line.iter().enumerate() {
-                if spec.selected(i + 1) {
-                    buf.push(b);
+            let mut printed = false;
+            for &(start, end) in &spec.ranges {
+                if start > line.len() {
+                    break;
                 }
+                if printed && spec.delimit_bytes {
+                    out.write_all(&spec.out_delim)?;
+                }
+                out.write_all(&line[start - 1..end.min(line.len())])?;
+                printed = true;
             }
-            out.write_all(&buf)?;
         }
-        CutMode::Chars => match std::str::from_utf8(line) {
-            Ok(s) => {
-                let mut buf = String::with_capacity(s.len());
-                for (i, ch) in s.chars().enumerate() {
-                    if spec.selected(i + 1) {
-                        buf.push(ch);
-                    }
-                }
-                out.write_all(buf.as_bytes())?;
-            }
-            Err(_) => {
-                let byte_spec = CutSpec {
-                    mode: CutMode::Bytes,
-                    ranges: spec.ranges.clone(),
-                    complement: spec.complement,
-                    delim: Vec::new(),
-                    out_delim: Vec::new(),
-                    only_delimited: false,
-                };
-                return cut_line(line, &byte_spec, out);
-            }
-        },
         CutMode::Fields => {
             if memmem::find(line, &spec.delim).is_none() {
                 if !spec.only_delimited {
@@ -2471,46 +2786,47 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         all_stdin = Some(all);
     }
 
-    let (mode, list) = match (&parsed.bytes, &parsed.chars, &parsed.fields) {
-        (Some(l), None, None) => (CutMode::Bytes, l),
-        (None, Some(l), None) => (CutMode::Chars, l),
-        (None, None, Some(l)) => (CutMode::Fields, l),
-        (None, None, None) => {
-            eprintln!(
-                "cut: you must specify a list of bytes, characters, or fields\nTry 'cut --help' for more information."
-            );
-            return Ok(1);
-        }
-        _ => {
-            eprintln!(
-                "cut: only one type of list may be specified\nTry 'cut --help' for more information."
-            );
-            return Ok(1);
-        }
-    };
-    let ranges = match parse_cut_list(list, mode) {
-        Ok(r) => r,
-        Err(msg) => {
-            eprintln!("cut: {}\nTry 'cut --help' for more information.", msg);
-            return Ok(1);
-        }
+    let usage_error = |msg: &str| {
+        eprintln!("cut: {msg}\nTry 'cut --help' for more information.");
+        Ok(1)
     };
     let delim = parsed.delimiter.clone().unwrap_or_else(|| "\t".to_string());
     if delim.chars().count() != 1 {
-        eprintln!(
-            "cut: the delimiter must be a single character\nTry 'cut --help' for more information."
+        return usage_error("the delimiter must be a single character");
+    }
+    let (mode, list) = match (&parsed.bytes, &parsed.chars, &parsed.fields) {
+        (Some(l), None, None) | (None, Some(l), None) => (CutMode::Bytes, l),
+        (None, None, Some(l)) => (CutMode::Fields, l),
+        (None, None, None) => {
+            return usage_error("you must specify a list of bytes, characters, or fields");
+        }
+        _ => return usage_error("only one type of list may be specified"),
+    };
+    if mode == CutMode::Bytes && parsed.delimiter.is_some() {
+        return usage_error("an input delimiter may be specified only when operating on fields");
+    }
+    if mode == CutMode::Bytes && parsed.only_delimited {
+        return usage_error(
+            "suppressing non-delimited lines makes sense\n\tonly when operating on fields",
         );
-        return Ok(1);
+    }
+    let mut ranges = match parse_cut_list(list, mode) {
+        Ok(r) => r,
+        Err(msg) => return usage_error(&msg),
+    };
+    if parsed.complement {
+        ranges = complement_cut_ranges(&ranges);
     }
     let spec = CutSpec {
         mode,
         ranges,
-        complement: parsed.complement,
-        out_delim: parsed
-            .output_delimiter
-            .clone()
-            .unwrap_or_else(|| delim.clone())
-            .into_bytes(),
+        delimit_bytes: parsed.output_delimiter.is_some(),
+        out_delim: match parsed.output_delimiter.as_deref() {
+            // GNU treats an empty `--output-delimiter` as a NUL byte.
+            Some("") => vec![0],
+            Some(d) => d.as_bytes().to_vec(),
+            None => delim.as_bytes().to_vec(),
+        },
         delim: delim.into_bytes(),
         only_delimited: parsed.only_delimited,
     };
