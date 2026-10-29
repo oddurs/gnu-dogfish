@@ -891,18 +891,14 @@ fn yes_long_line() {
 /// pause, so that writes hit EAGAIN; returns the exit status and the bytes read.
 fn run_nonblocking_stdout(mut cmd: Command, input: &[u8]) -> (Option<i32>, usize) {
     use std::io::Write;
-    use std::os::fd::{FromRawFd, OwnedFd};
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is a valid out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors were just created and are owned here.
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // SAFETY: setting a status flag on a descriptor we own; O_NONBLOCK is
-    // shared with the child through the open file description.
+    use std::os::fd::AsRawFd;
+    let (mut read_end, write_end) = std::io::pipe().expect("pipe");
+    // SAFETY: fcntl on a descriptor owned by `write_end` takes no pointers;
+    // O_NONBLOCK is shared with the child through the open file description.
     unsafe {
-        let flags = libc::fcntl(fds[1], libc::F_GETFL);
-        libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let fd = write_end.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -920,7 +916,7 @@ fn run_nonblocking_stdout(mut cmd: Command, input: &[u8]) -> (Option<i32>, usize
     });
     std::thread::sleep(Duration::from_millis(200));
     let mut out = Vec::new();
-    std::fs::File::from(read_end).read_to_end(&mut out).unwrap();
+    read_end.read_to_end(&mut out).unwrap();
     feeder.join().unwrap();
     (child.wait().unwrap().code(), out.len())
 }

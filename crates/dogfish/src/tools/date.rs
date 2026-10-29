@@ -12,22 +12,14 @@ use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
     unsupported, usage_error,
 };
-use crate::common::parse_datetime::{TimeZone, parse_datetime2, tzset};
+use crate::common::parse_datetime::{TimeZone, gmtime, parse_datetime2, tzset};
 use crate::common::quote::quote_locale;
 
 fn utc_time(t: i64) -> Option<LocalTime> {
-    let tt = t as libc::time_t;
-    // SAFETY: `tm` is a valid out-pointer.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::gmtime_r(&tt, &mut tm).is_null() {
-            return None;
-        }
-        Some(LocalTime {
-            tm,
-            zone: b"UTC".to_vec(),
-        })
-    }
+    Some(LocalTime {
+        tm: gmtime(t)?,
+        zone: b"UTC".to_vec(),
+    })
 }
 
 const DATE_HELP: &str = "\

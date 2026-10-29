@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::Result;
@@ -279,6 +279,7 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         exits
     };
 
+    let mut stdin = io::stdin().lock();
     let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
     while let Some(first) = outputs.iter().position(|o| o.fd.is_some()) {
         if let (true, Some(fd)) = (outputs[first].pollable, outputs[first].fd) {
@@ -297,21 +298,19 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 }
             }
         }
-        // SAFETY: `buf` is valid for `buf.len()` bytes.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+        // Reads into a buffer this large bypass std's stdin buffer, so each
+        // read is one read(2), as in GNU.
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("tee: read error: {}", gnu_io_error(&e));
+                status = 1;
+                break;
             }
-            eprintln!("tee: read error: {}", gnu_io_error(&e));
-            status = 1;
-            break;
-        }
-        if n == 0 {
-            break;
-        }
-        let chunk = &buf[..n as usize];
+        };
+        let chunk = &buf[..n];
         ctx.telemetry.add_read(chunk.len() as u64);
         for out in &mut outputs {
             let Some(fd) = out.fd else {

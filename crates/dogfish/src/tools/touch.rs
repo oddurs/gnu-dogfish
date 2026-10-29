@@ -11,11 +11,11 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error};
 
-use crate::common::date_format::Stamp;
+use crate::common::date_format::{Stamp, local_time};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
 };
-use crate::common::parse_datetime::parse_datetime;
+use crate::common::parse_datetime::{TimeZone, parse_datetime, zero_tm};
 use crate::common::path::c_path;
 use crate::common::quote::{qa, quote_locale};
 
@@ -218,7 +218,7 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         newtime = [Stamp { sec, ns: 0 }; 2];
         date_set = true;
         if std::env::var_os("POSIXLY_CORRECT").is_none()
-            && let Some(tm) = local_tm(sec)
+            && let Some(tm) = local_time(sec).map(|lt| lt.tm)
         {
             eprintln!(
                 "touch: warning: 'touch {}' is obsolete; use 'touch -t {:04}{:02}{:02}{:02}{:02}.{:02}'",
@@ -389,15 +389,6 @@ const PDS_CENTURY: u32 = 4;
 const PDS_SECONDS: u32 = 8;
 const PDS_PRE_2000: u32 = 16;
 
-fn local_tm(t: i64) -> Option<libc::tm> {
-    let tt = libc::time_t::try_from(t).ok()?;
-    // SAFETY: `tm` is a valid out-pointer.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        (!libc::localtime_r(&tt, &mut tm).is_null()).then_some(tm)
-    }
-}
-
 /// gnulib's `year`: sets `tm_year` from 0, 1 or 2 digit pairs.
 fn posix_year(tm: &mut libc::tm, pairs: &[i32], bits: u32) -> Option<()> {
     match *pairs {
@@ -419,9 +410,7 @@ fn posix_year(tm: &mut libc::tm, pairs: &[i32], bits: u32) -> Option<()> {
         }
         _ => {
             // The current year.
-            // SAFETY: time(NULL) has no preconditions.
-            let now = unsafe { libc::time(std::ptr::null_mut()) };
-            tm.tm_year = local_tm(now as i64)?.tm_year;
+            tm.tm_year = local_time(Stamp::now().sec)?.tm.tm_year;
         }
     }
     Some(())
@@ -451,8 +440,7 @@ fn posixtime(s: &[u8], bits: u32) -> Option<i64> {
         .chunks(2)
         .map(|p| i32::from(p[0] - b'0') * 10 + i32::from(p[1] - b'0'))
         .collect();
-    // SAFETY: struct tm is plain data; all-zero is a valid value.
-    let mut tm0: libc::tm = unsafe { std::mem::zeroed() };
+    let mut tm0 = zero_tm();
     let mut p = pairs.as_slice();
     if bits & PDS_TRAILING_YEAR == 0 {
         posix_year(&mut tm0, &p[..p.len() - 4], bits)?;
@@ -472,13 +460,13 @@ fn posixtime(s: &[u8], bits: u32) -> Option<i64> {
         }
         Some(_) => return None,
     };
+    let local_zone = TimeZone::from_env();
     let mut leapsec = false;
     loop {
         let mut tm1 = tm0;
         tm1.tm_wday = -1;
         tm1.tm_isdst = -1;
-        // SAFETY: `tm1` is a valid, initialized struct tm.
-        let t = unsafe { libc::mktime(&mut tm1) } as i64;
+        let t = local_zone.mktime(&mut tm1);
         if tm1.tm_wday < 0 {
             return None;
         }

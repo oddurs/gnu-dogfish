@@ -12,11 +12,11 @@
 //! environment variable around each `localtime`/`mktime` call. The callers
 //! are single-threaded.
 
-use std::ffi::{CStr, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-use crate::common::date_format::{LocalTime, Stamp, format_time};
+use crate::common::date_format::{LocalTime, Stamp, format_time, local_time};
 
 unsafe extern "C" {
     /// POSIX `tzset(3)`; the `libc` crate does not bind it on every Unix.
@@ -68,39 +68,24 @@ impl TimeZone {
 
     /// `localtime_rz`: the broken-down time and zone abbreviation.
     pub(crate) fn localtime(&self, t: i64) -> Option<LocalTime> {
-        self.with(|| {
-            let tt = libc::time_t::try_from(t).ok()?;
-            // SAFETY: `tm` is a valid out-pointer; tm_zone, when set, points
-            // at zone-name storage that is copied before TZ changes again.
-            unsafe {
-                let mut tm: libc::tm = std::mem::zeroed();
-                if libc::localtime_r(&tt, &mut tm).is_null() {
-                    return None;
-                }
-                let zone = if tm.tm_zone.is_null() {
-                    Vec::new()
-                } else {
-                    CStr::from_ptr(tm.tm_zone).to_bytes().to_vec()
-                };
-                Some(LocalTime { tm, zone })
-            }
-        })
+        // local_time copies the zone name before TZ changes again.
+        self.with(|| local_time(t))
     }
 
     /// `mktime_z`. Failure is seen as `tm_wday` left negative, as in gnulib.
-    fn mktime(&self, tm: &mut libc::tm) -> i64 {
+    pub(crate) fn mktime(&self, tm: &mut libc::tm) -> i64 {
         // SAFETY: `tm` is a valid, initialized struct tm.
         self.with(|| unsafe { libc::mktime(tm) } as i64)
     }
 }
 
-fn gmtime(t: i64) -> Option<libc::tm> {
+/// `gmtime_r`: the broken-down UTC time.
+pub(crate) fn gmtime(t: i64) -> Option<libc::tm> {
     let tt = libc::time_t::try_from(t).ok()?;
-    // SAFETY: `tm` is a valid out-pointer.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        (!libc::gmtime_r(&tt, &mut tm).is_null()).then_some(tm)
-    }
+    let mut tm = zero_tm();
+    // SAFETY: `tt` and `tm` are valid pointers to a time_t and a struct tm.
+    let ok = !unsafe { libc::gmtime_r(&tt, &mut tm) }.is_null();
+    ok.then_some(tm)
 }
 
 const BILLION: i64 = 1_000_000_000;
@@ -366,7 +351,8 @@ fn tm_year_str(tm_year: i32) -> String {
     )
 }
 
-fn zero_tm() -> libc::tm {
+/// An all-zero `struct tm`, to fill in.
+pub(crate) fn zero_tm() -> libc::tm {
     // SAFETY: struct tm is plain data; all-zero is a valid value.
     unsafe { std::mem::zeroed() }
 }
