@@ -1,49 +1,79 @@
 //! yes — Page-aligned 64 KiB vector I/O
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, stdout};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, stdout};
 
-#[derive(Parser)]
-#[command(
-    name = "yes",
-    about = "Repeatedly output a line with all specified STRING(s), or 'y'",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
-struct YesArgs {
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
+use crate::common::getopt::{Getopt, HasArg, OptSpec, getopt_error, print_help, print_version};
 
-    /// String(s) to repeat
-    strings: Vec<String>,
+const YES_HELP: &str = "\
+Repeatedly output a line with all specified STRING(s), or 'y'
+
+Usage: yes [STRINGS]...
+
+Arguments:
+  [STRINGS]...  String(s) to repeat
+
+Options:
+      --help  Display this help and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YesOpt {
+    Help,
+    Version,
 }
 
-pub fn run_yes(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = YesArgs::try_parse_from(args)?;
-    let line = if parsed.strings.is_empty() {
-        "y\n".to_string()
-    } else {
-        format!("{}\n", parsed.strings.join(" "))
-    };
+/// gnulib's `parse_gnu_standard_options_only`: `--help` and `--version`
+/// anywhere (abbreviable), any other option an error.
+const SPECS: &[OptSpec<YesOpt>] = &[
+    OptSpec::long("help", HasArg::No, YesOpt::Help),
+    OptSpec::long("version", HasArg::No, YesOpt::Version),
+];
+
+pub fn run_yes(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    // Every option ends the parse: help, version or an error.
+    if let Some(opt) = opts.next() {
+        return Ok(match opt {
+            Ok((YesOpt::Help, _)) => print_help(YES_HELP),
+            Ok((YesOpt::Version, _)) => print_version("yes"),
+            Err(e) => getopt_error("yes", &e),
+        });
+    }
+    let operands = opts.operands();
+    let mut line = Vec::new();
+    for (i, s) in operands.iter().enumerate() {
+        if i > 0 {
+            line.push(b' ');
+        }
+        line.extend_from_slice(s.as_bytes());
+    }
+    if operands.is_empty() {
+        line.push(b'y');
+    }
+    line.push(b'\n');
 
     ctx.telemetry.set_strategy("64KiB page-aligned buffer");
-    let line_bytes = line.as_bytes();
-    let mut buf = Vec::with_capacity(DEFAULT_BUF_SIZE + line_bytes.len());
+    let mut buf = Vec::with_capacity(DEFAULT_BUF_SIZE + line.len());
     while buf.len() < DEFAULT_BUF_SIZE {
-        buf.extend_from_slice(line_bytes);
+        buf.extend_from_slice(&line);
     }
 
-    let mut handle = stdout::stdout();
+    // Repeat until a write fails, then fail with GNU's single diagnostic.
+    let mut out = stdout::stdout();
     loop {
-        match handle.write_all(&buf) {
+        match out.write_all(&buf) {
             Ok(()) => ctx.telemetry.add_written(buf.len() as u64),
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-            Err(e) => return Err(e.into()),
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
+            Err(e) => {
+                stdout::mark_reported();
+                eprintln!("yes: standard output: {}", gnu_io_error(&e));
+                return Ok(1);
+            }
         }
     }
-    Ok(0)
 }

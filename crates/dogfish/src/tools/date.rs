@@ -1,16 +1,20 @@
 //! date — GNU date strings (`-d`), strftime with GNU flags, -I/-R/--rfc-3339
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
 use dogfish_core::{
-    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, outln, stdout,
+    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
 };
 
 use crate::common::date_format::{LocalTime, MONTHS, Stamp, WEEKDAYS, format_time, local_time};
-use crate::common::legacy_getopt::{
-    GetOpt, HasArg, OptSpec, argmatch, opt, print_help, usage_error,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
+    unsupported, usage_error,
 };
+use crate::common::quote::quote_locale;
 
 unsafe extern "C" {
     /// POSIX `tzset(3)`; the `libc` crate does not bind it on every Unix.
@@ -898,22 +902,28 @@ FORMAT controls the output, with the usual strftime conversions (%a %b %c
 '+' (pad with zeros, sign years), '^' (upper case) and '#' (opposite case).
 ";
 
-static DATE_OPTS: [OptSpec; 15] = [
-    opt(Some('d'), Some("date"), HasArg::Required, "date"),
-    opt(Some('f'), Some("file"), HasArg::Required, "file"),
-    opt(Some('I'), Some("iso-8601"), HasArg::Optional, "iso-8601"),
-    opt(Some('r'), Some("reference"), HasArg::Required, "reference"),
-    opt(Some('R'), Some("rfc-email"), HasArg::No, "rfc-email"),
-    opt(None, Some("rfc-822"), HasArg::No, "rfc-email"),
-    opt(None, Some("rfc-2822"), HasArg::No, "rfc-email"),
-    opt(None, Some("rfc-3339"), HasArg::Required, "rfc-3339"),
-    opt(Some('s'), Some("set"), HasArg::Required, "set"),
-    opt(Some('u'), Some("utc"), HasArg::No, "utc"),
-    opt(None, Some("universal"), HasArg::No, "utc"),
-    opt(None, Some("debug"), HasArg::No, "debug"),
-    opt(Some('J'), Some("json"), HasArg::No, "json"),
-    opt(None, Some("help"), HasArg::No, "help"),
-    opt(None, Some("version"), HasArg::No, "version"),
+/// GNU's `long_options` and `short_options` (`"d:f:I::r:Rs:u"`), plus the
+/// Dogfish `-J, --json`.
+const DATE_OPTS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'd', "date", HasArg::Required, "date"),
+    OptSpec::long("debug", HasArg::No, "debug"),
+    OptSpec::both(b'f', "file", HasArg::Required, "file"),
+    OptSpec::long("iso-8601", HasArg::Optional, "iso-8601"),
+    OptSpec::both(b'r', "reference", HasArg::Required, "reference"),
+    OptSpec::long("resolution", HasArg::No, "unsupported"),
+    OptSpec::long("rfc-email", HasArg::No, "rfc-email"),
+    OptSpec::long("rfc-822", HasArg::No, "rfc-email"),
+    OptSpec::long("rfc-2822", HasArg::No, "rfc-email"),
+    OptSpec::long("rfc-3339", HasArg::Required, "rfc-3339"),
+    OptSpec::both(b's', "set", HasArg::Required, "set"),
+    OptSpec::long("uct", HasArg::No, "utc"),
+    OptSpec::both(b'u', "utc", HasArg::No, "utc"),
+    OptSpec::long("universal", HasArg::No, "utc"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    OptSpec::short(b'I', HasArg::Optional, "iso-8601"),
+    OptSpec::short(b'R', HasArg::No, "rfc-email"),
 ];
 
 const ISO_8601_FORMATS: [(&str, &str); 5] = [
@@ -931,61 +941,65 @@ const RFC_3339_FORMATS: [(&str, &str); 3] = [
 ];
 
 /// Formats one time with `fmt`, or reports it as out of range.
-fn render_date(stamp: Stamp, fmt: &str) -> Option<Vec<u8>> {
+fn render_date(stamp: Stamp, fmt: &[u8]) -> Option<Vec<u8>> {
     let lt = local_time(stamp.sec)?;
-    let mut line = format_time(fmt.as_bytes(), &lt, stamp.ns, stamp.sec, false);
+    let mut line = format_time(fmt, &lt, stamp.ns, stamp.sec, false);
     line.push(b'\n');
     Some(line)
 }
 
-pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
-    let usage = |msg: String| Ok(usage_error("date", msg, 1));
-    let mut opts = GetOpt::new(args.into_iter().skip(1).collect(), &DATE_OPTS, true);
-    let mut date_str: Option<String> = None;
+pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
+    let usage = |msg: String| Ok(usage_error("date", msg));
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        DATE_OPTS,
+        Order::Permute,
+    );
+    // `-d` as given, for diagnostics, which echo its bytes.
+    let mut date_raw: Option<OsString> = None;
     let mut date_file: Option<String> = None;
     let mut reference: Option<String> = None;
     let mut set_str: Option<String> = None;
-    let mut formats: Vec<String> = Vec::new();
+    // Formats are bytes: `date +$'\xb0'` prints that byte.
+    let mut formats: Vec<Vec<u8>> = Vec::new();
     let mut utc = false;
     let mut json = false;
-    while let Some(item) = opts.next_opt() {
-        let (key, value) = match item {
+    while let Some(item) = opts.next() {
+        let (key, raw) = match item {
             Ok(kv) => kv,
-            Err(msg) => return usage(msg),
+            Err(e) => return Ok(getopt_error("date", &e)),
         };
+        let value = raw.as_deref().map(lossy);
         match key {
-            "date" => date_str = value,
+            "date" => date_raw = raw,
             "file" => date_file = value,
             "reference" => reference = value,
             "set" => set_str = value,
             "utc" => utc = true,
             "json" => json = true,
             "debug" => {}
-            "rfc-email" => formats.push("%a, %d %b %Y %H:%M:%S %z".to_string()),
+            "rfc-email" => formats.push(b"%a, %d %b %Y %H:%M:%S %z".to_vec()),
             "iso-8601" => {
-                let names = ISO_8601_FORMATS.map(|(n, _)| n);
                 let spec = value.as_deref().unwrap_or("date");
-                match argmatch("date", "--iso-8601", spec, &names, 1) {
-                    Ok(i) => formats.push(ISO_8601_FORMATS[i].1.to_string()),
+                match argmatch("date", "--iso-8601", spec, &ISO_8601_FORMATS) {
+                    Ok(f) => formats.push(f.as_bytes().to_vec()),
                     Err(status) => return Ok(status),
                 }
             }
             "rfc-3339" => {
-                let names = RFC_3339_FORMATS.map(|(n, _)| n);
                 let spec = value.as_deref().unwrap_or_default();
-                match argmatch("date", "--rfc-3339", spec, &names, 1) {
-                    Ok(i) => formats.push(RFC_3339_FORMATS[i].1.to_string()),
+                match argmatch("date", "--rfc-3339", spec, &RFC_3339_FORMATS) {
+                    Ok(f) => formats.push(f.as_bytes().to_vec()),
                     Err(status) => return Ok(status),
                 }
             }
-            "help" => return print_help(DATE_HELP),
-            _ => {
-                outln!("date (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
-                return Ok(0);
-            }
+            "unsupported" => return Ok(unsupported("date", &opts.last_spelling())),
+            "help" => return Ok(print_help(DATE_HELP)),
+            _ => return Ok(print_version("date")),
         }
     }
-    let operands = opts.into_operands();
+    let operands = opts.operands();
+    let date_str = date_raw.as_deref().map(lossy);
     let sources = [&date_str, &date_file, &reference]
         .iter()
         .filter(|s| s.is_some())
@@ -997,20 +1011,20 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         return usage("the options to print and set the time may not be used together".into());
     }
     if operands.len() > 1 {
-        return usage(format!("extra operand {}", gnu_quote(&operands[1])));
+        return usage(format!("extra operand {}", quote_locale(&operands[1])));
     }
     if let Some(op) = operands.first() {
-        match op.strip_prefix('+') {
-            Some(f) => formats.push(f.to_string()),
+        match op.as_bytes().strip_prefix(b"+") {
+            Some(f) => formats.push(f.to_vec()),
             None if sources > 0 || set_str.is_some() => {
                 return usage(format!(
                     "the argument {} lacks a leading '+';\n\
                      when using an option to specify date(s), any non-option\n\
                      argument must be a format string beginning with '+'",
-                    gnu_quote(op)
+                    quote_locale(op)
                 ));
             }
-            None => set_str = Some(op.clone()),
+            None => set_str = Some(lossy(op)),
         }
     }
     if formats.len() > 1 {
@@ -1032,14 +1046,14 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
     unsafe { tzset() };
     let fmt = formats
         .pop()
-        .unwrap_or_else(|| "%a %b %e %H:%M:%S %Z %Y".to_string());
+        .unwrap_or_else(|| b"%a %b %e %H:%M:%S %Z %Y".to_vec());
 
     let now = Stamp::now();
     let mut out = stdout::stdout();
     let emit = |out: &mut stdout::Stdout, stamp: Stamp| -> Result<bool> {
         if json {
             let iso = |s: Stamp| {
-                render_date(s, "%Y-%m-%dT%H:%M:%S%:z")
+                render_date(s, b"%Y-%m-%dT%H:%M:%S%:z")
                     .map(|v| String::from_utf8_lossy(v.trim_ascii_end()).into_owned())
             };
             let obj = serde_json::json!({
@@ -1113,7 +1127,8 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         match parse_date(d, now) {
             Some(s) => s,
             None => {
-                eprintln!("date: invalid date {}", gnu_quote(d));
+                let shown = date_raw.as_deref().unwrap_or(OsStr::new(d));
+                eprintln!("date: invalid date {}", quote_locale(shown));
                 return Ok(1);
             }
         }

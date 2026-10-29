@@ -3,13 +3,15 @@
 // Doc comments on clap structs are the `--help` text, where usage syntax such as
 // `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
 #![allow(rustdoc::broken_intra_doc_links)]
+// The C `main` below is the entry point: Rust's own start-up code would
+// reopen a closed standard output on /dev/null, hiding `>&-` from the tools.
+#![cfg_attr(not(test), no_main)]
 
 mod common;
 mod tools;
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::ExitCode;
 
 use anyhow::Result;
 use dogfish_core::{
@@ -273,9 +275,45 @@ pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn main() -> ExitCode {
+/// The process entry point, as C sees it. Before anything else, standard
+/// input, output and error are made safe: a descriptor the shell closed
+/// (`>&-`) is taken by `/dev/null`, so that no file the tool opens becomes
+/// its standard output, and a closed standard output makes every write
+/// fail, as in GNU.
+///
+/// # Safety
+///
+/// Called by the C runtime only, with `argc` valid strings in `argv`.
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
+    use std::os::unix::ffi::OsStringExt;
+    for fd in 0..3 {
+        // SAFETY: fcntl(F_GETFD) only queries the descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            // SAFETY: a NUL-terminated path; the lowest free descriptor is `fd`.
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if fd == libc::STDOUT_FILENO {
+                stdout::started_closed();
+            }
+        }
+    }
+    let args = (0..usize::try_from(argc).unwrap_or(0))
+        .filter_map(|i| {
+            // SAFETY: the C runtime passes `argc` valid NUL-terminated strings.
+            let arg = unsafe { *argv.add(i) };
+            (!arg.is_null()).then(|| {
+                OsString::from_vec(unsafe { std::ffi::CStr::from_ptr(arg) }.to_bytes().to_vec())
+            })
+        })
+        .collect();
+    libc::c_int::from(run(args))
+}
+
+/// Runs the multicall binary on `raw_args` (`argv`); returns the exit status.
+#[cfg_attr(test, allow(dead_code))]
+fn run(raw_args: Vec<OsString>) -> u8 {
     install_sigpipe_handler();
-    let raw_args: Vec<OsString> = std::env::args_os().collect();
 
     // Determine if invoked via symlink (e.g. `ls`, `df-ls`) or as `dogfish <subcommand>`
     let argv0_name = raw_args
@@ -391,7 +429,7 @@ fn main() -> ExitCode {
 /// Flushes standard output and exits with `code`, or, when output was lost to
 /// a write error nobody has reported, reports it and fails (gnulib's
 /// `close_stdout`).
-fn finish(tool: &str, code: i32) -> ExitCode {
+fn finish(tool: &str, code: i32) -> u8 {
     let code = match stdout::close() {
         Some(err) => {
             report_write_error(tool, &err);
@@ -399,7 +437,7 @@ fn finish(tool: &str, code: i32) -> ExitCode {
         }
         None => code,
     };
-    ExitCode::from(code as u8)
+    code as u8
 }
 
 /// GNU's diagnostic for output lost to a write error: `tool: write error:
@@ -524,24 +562,24 @@ fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32
         "basenc" => tools::basenc::run_basenc(lossy_all(args), ctx),
 
         // Tier 4: Shell & System
-        "echo" => tools::echo::run_echo(lossy_all(args), ctx),
-        "printf" => tools::printf::run_printf(lossy_all(args), ctx),
-        "env" => tools::env::run_env(lossy_all(args), ctx),
-        "printenv" => tools::printenv::run_printenv(lossy_all(args), ctx),
-        "id" => tools::id::run_id(lossy_all(args), ctx),
-        "uname" => tools::uname::run_uname(lossy_all(args), ctx),
-        "hostname" => tools::hostname::run_hostname(lossy_all(args), ctx),
-        "nproc" => tools::nproc::run_nproc(lossy_all(args), ctx),
-        "whoami" => tools::whoami::run_whoami(lossy_all(args), ctx),
-        "yes" => tools::yes::run_yes(lossy_all(args), ctx),
-        "true" => tools::true_false::run_true(lossy_all(args), ctx),
-        "false" => tools::true_false::run_false(lossy_all(args), ctx),
-        "sleep" => tools::sleep::run_sleep(lossy_all(args), ctx),
-        "timeout" => tools::timeout::run_timeout(lossy_all(args), ctx),
-        "watch" => tools::watch::run_watch(lossy_all(args), ctx),
-        "seq" => tools::seq::run_seq(lossy_all(args), ctx),
-        "date" => tools::date::run_date(lossy_all(args), ctx),
-        "tee" => tools::tee::run_tee(lossy_all(args), ctx),
+        "echo" => tools::echo::run_echo(args, ctx),
+        "printf" => tools::printf::run_printf(args, ctx),
+        "env" => tools::env::run_env(args, ctx),
+        "printenv" => tools::printenv::run_printenv(args, ctx),
+        "id" => tools::id::run_id(args, ctx),
+        "uname" => tools::uname::run_uname(args, ctx),
+        "hostname" => tools::hostname::run_hostname(args, ctx),
+        "nproc" => tools::nproc::run_nproc(args, ctx),
+        "whoami" => tools::whoami::run_whoami(args, ctx),
+        "yes" => tools::yes::run_yes(args, ctx),
+        "true" => tools::true_false::run_true(args, ctx),
+        "false" => tools::true_false::run_false(args, ctx),
+        "sleep" => tools::sleep::run_sleep(args, ctx),
+        "timeout" => tools::timeout::run_timeout(args, ctx),
+        "watch" => tools::watch::run_watch(args, ctx),
+        "seq" => tools::seq::run_seq(args, ctx),
+        "date" => tools::date::run_date(args, ctx),
+        "tee" => tools::tee::run_tee(args, ctx),
 
         // Meta-Tools
         "bench" => tools::bench::run_bench(lossy_all(args), ctx),

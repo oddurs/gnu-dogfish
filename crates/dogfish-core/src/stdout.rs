@@ -18,6 +18,8 @@ use std::sync::{Mutex, MutexGuard};
 const BUF_CAP: usize = 8 * 1024;
 
 struct State {
+    /// Descriptor 1 was closed when the process started (see [`started_closed`]).
+    closed: bool,
     buf: Vec<u8>,
     /// `errno` of the first failed write, if any.
     error: Option<i32>,
@@ -26,6 +28,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
+    closed: false,
     buf: Vec::new(),
     error: None,
     reported: false,
@@ -81,6 +84,12 @@ impl State {
         if let Some(err) = self.sticky() {
             return Err(err);
         }
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.closed {
+            return Err(self.fail(libc::EBADF));
+        }
         // Everything through the last newline goes out now; the rest waits.
         let (now, later) = match memchr::memrchr(b'\n', data) {
             Some(i) => data.split_at(i + 1),
@@ -132,6 +141,14 @@ impl Write for Stdout {
         }
         st.flush_buf()
     }
+}
+
+/// Records that descriptor 1 was closed when the process started. The
+/// caller keeps the descriptor number taken (on `/dev/null`) so that no file
+/// the tool opens lands on it, and every write fails with `EBADF`, as it
+/// would for GNU's `printf foo >&-`.
+pub fn started_closed() {
+    state().closed = true;
 }
 
 /// Writes out any buffered bytes (before running a child process that shares
@@ -207,6 +224,7 @@ mod tests {
     #[test]
     fn sticky_error_state() {
         let mut st = State {
+            closed: false,
             buf: Vec::new(),
             error: None,
             reported: false,
@@ -218,5 +236,17 @@ mod tests {
         let again = st.put(b"more\n").unwrap_err();
         assert_eq!(again.raw_os_error(), Some(libc::ENOSPC));
         assert!(st.buf.is_empty());
+    }
+
+    #[test]
+    fn closed_descriptor_fails_only_when_written() {
+        let mut st = State {
+            closed: true,
+            buf: Vec::new(),
+            error: None,
+            reported: false,
+        };
+        assert!(st.put(b"").is_ok());
+        assert_eq!(st.put(b"x").unwrap_err().raw_os_error(), Some(libc::EBADF));
     }
 }

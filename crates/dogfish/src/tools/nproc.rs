@@ -1,32 +1,73 @@
 //! nproc — Print number of available processing units
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
 use dogfish_core::{DogfishContext, gnu_quote, outln};
 
-#[derive(Parser)]
-#[command(
-    name = "nproc",
-    about = "Print the number of processing units available to the current process, \
-             which may be less than the number of online processors",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version, usage_error,
+};
+use crate::common::quote::quote_locale;
+
+const NPROC_HELP: &str = "\
+Print the number of processing units available to the current process, which may be less than the
+number of online processors
+
+Usage: nproc [OPTIONS]
+
+Options:
+      --all         Print the number of installed processors
+      --ignore <N>  If possible, exclude N processing units
+  -J, --json        
+      --help        Display this help and exit
+";
+
+#[derive(Default)]
 struct NprocArgs {
-    /// Print the number of installed processors
-    #[arg(long = "all")]
     all: bool,
-
-    /// If possible, exclude N processing units
-    #[arg(long = "ignore", value_name = "N")]
     ignore: Option<String>,
-
-    #[arg(short = 'J', long = "json")]
     json: bool,
+}
 
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NprocArgsOpt {
+    All,
+    Ignore,
+    Json,
+    Help,
+    Version,
+}
+
+const SPECS: &[OptSpec<NprocArgsOpt>] = &[
+    OptSpec::long("all", HasArg::No, NprocArgsOpt::All),
+    OptSpec::long("ignore", HasArg::Required, NprocArgsOpt::Ignore),
+    OptSpec::both(b'J', "json", HasArg::No, NprocArgsOpt::Json),
+    OptSpec::long("help", HasArg::No, NprocArgsOpt::Help),
+    OptSpec::long("version", HasArg::No, NprocArgsOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_nproc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<NprocArgs, i32> {
+    let mut parsed = NprocArgs::default();
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("nproc", &e))?;
+        match o {
+            NprocArgsOpt::All => parsed.all = true,
+            NprocArgsOpt::Ignore => parsed.ignore = v.as_deref().map(lossy),
+            NprocArgsOpt::Json => parsed.json = true,
+            NprocArgsOpt::Help => return Err(print_help(NPROC_HELP)),
+            NprocArgsOpt::Version => return Err(print_version("nproc")),
+        }
+    }
+    let operands = opts.operands();
+    if let Some(extra) = operands.first() {
+        return Err(usage_error(
+            "nproc",
+            format!("extra operand {}", quote_locale(extra)),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Parses an OpenMP thread count like gnulib: a decimal number, optionally
@@ -72,8 +113,11 @@ fn online_processors(all: bool) -> u64 {
     if n > 0 { n as u64 } else { 1 }
 }
 
-pub fn run_nproc(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
-    let parsed = NprocArgs::try_parse_from(args)?;
+pub fn run_nproc(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_nproc_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let ignore = match parsed.ignore.as_deref() {
         None => 0,
         Some(s) => match s.trim_start().parse::<u64>() {
