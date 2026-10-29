@@ -32,6 +32,54 @@ const B2_HELLO: &str = "f60ce482e5cc1229f39d71313171a8d9f4ca3a87d066bf4b205effb5
                         f14f3271e2c1a90e1de53f275b4d4793eef2f5e31ea90d2ce29d2e481c36435f";
 const B2_256_HELLO: &str = "93becc6e9882211c3ec3708c95bcd69baab7bb59c7f4bc84ce637b88a534b783";
 
+const STD_B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const URL_B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Deterministic pseudo-random bytes (xorshift), larger than the codecs'
+/// blocks so that streaming crosses block boundaries.
+fn big_data() -> &'static [u8] {
+    static DATA: OnceLock<Vec<u8>> = OnceLock::new();
+    DATA.get_or_init(|| {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..300_001)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    })
+}
+
+/// Base64 of `data` with `alphabet`, wrapped at 76 columns as GNU writes it.
+fn base64_wrapped(data: &[u8], alphabet: &[u8; 64]) -> Vec<u8> {
+    let mut flat = Vec::new();
+    for g in data.chunks(3) {
+        let byte = |i: usize| u32::from(g.get(i).copied().unwrap_or(0));
+        let n = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for k in 0..4 {
+            flat.push(if k <= g.len() {
+                alphabet[((n >> (18 - 6 * k)) & 63) as usize]
+            } else {
+                b'='
+            });
+        }
+    }
+    let mut out = Vec::new();
+    for line in flat.chunks(76) {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `big_data` in base64, as standard input.
+fn big_b64() -> &'static [u8] {
+    static DATA: OnceLock<Vec<u8>> = OnceLock::new();
+    DATA.get_or_init(|| base64_wrapped(big_data(), STD_B64))
+}
+
 /// Fixture directory shared by every case; both implementations run with it
 /// as their working directory so file names in output are identical.
 fn fixtures() -> &'static Path {
@@ -39,6 +87,11 @@ fn fixtures() -> &'static Path {
     DIR.get_or_init(|| {
         let dir = common::fresh_fixture_dir();
         let bin: Vec<u8> = (0..=255u8).collect();
+        let mut big_bad = big_b64().to_vec();
+        let at = big_bad.len() - 1000;
+        big_bad[at] = b'*';
+        let mut big_url = base64_wrapped(big_data(), URL_B64);
+        big_url[9000] = b'+';
         let lists: Vec<(&str, String)> = vec![
             (
                 "good.md5",
@@ -129,6 +182,10 @@ fn fixtures() -> &'static Path {
             ("d/inner.txt", b"inner\n"),
             ("hello.b64", b"aGVsbG8gd29ybGQK\n"),
             ("wrapped.b64", b"aGVs\nbG8g\nd29y\nbGQK\n"),
+            ("big.dat", big_data()),
+            ("big.b64", big_b64()),
+            ("bigbad.b64", &big_bad),
+            ("bigurl.b64", &big_url),
         ];
         files.extend(lists.iter().map(|(n, c)| (*n, c.as_bytes())));
         common::write_files(&dir, &files);
@@ -289,6 +346,26 @@ gnu_cases! {
     basenc_z85_decode: "basenc" ["--z85", "-d"] stdin b"xK#0@zY<mx";
     basenc_z85_decode_partial: "basenc" ["--z85", "-d"] stdin b"xK#0";
     basenc_z85_decode_invalid_char: "basenc" ["--z85", "-d"] stdin b"xK#0@~~~~~";
+    // Streams larger than the codecs' blocks.
+    base64_big_encode: "base64" ["big.dat"];
+    base64_big_encode_wrap_7: "base64" ["-w", "7", "big.dat"];
+    base64_big_encode_nowrap: "base64" ["-w0", "big.dat"];
+    base64_big_encode_stdin: "base64" [] stdin big_data();
+    base64_big_decode: "base64" ["-d", "big.b64"];
+    base64_big_decode_stdin: "base64" ["-d"] stdin big_b64();
+    base64_big_decode_bad_tail: "base64" ["-d", "bigbad.b64"];
+    base64_big_decode_ignore_garbage: "base64" ["-di", "bigbad.b64"];
+    basenc_big_base32_wrap_9: "basenc" ["--base32", "-w", "9", "big.dat"];
+    basenc_big_base2lsbf: "basenc" ["--base2lsbf", "big.dat"];
+    // GNU writes the 30720-byte blocks before the ragged one, then fails.
+    basenc_z85_big_ragged: "basenc" ["--z85", "big.dat"];
+    // GNU rejects the whole 5600-byte step holding the '+'.
+    basenc_base64url_big_std_char: "basenc" ["--base64url", "-d", "bigurl.b64"];
+    // GNU translates base32hex to standard base32, passing the rest through.
+    basenc_base32hex_std_letters: "basenc" ["--base32hex", "-d"] stdin b"ZZZZZZZZ";
+    // --ignore-garbage keeps '=' for every encoding.
+    basenc_base16_ignore_garbage_padding: "basenc" ["--base16", "-di"] stdin b"6 8=6";
+    basenc_base2_ignore_garbage_padding: "basenc" ["--base2msbf", "-di"] stdin b"01101000=0";
 
     // ---------------------------------------------------------- echo/printf
     echo_help_is_text_with_args: "echo" ["--help", "x"];
