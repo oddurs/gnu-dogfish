@@ -44,8 +44,6 @@ pub(crate) struct LsFile {
     gnu_stat: bool,
     /// With `--hyperlink`: the canonical absolute name the link points to.
     absolute: Option<Vec<u8>>,
-    /// The inode number `readdir` gave (GNU shows it for `-i` without a stat).
-    d_ino: Option<u64>,
 }
 
 impl LsFile {
@@ -70,14 +68,15 @@ impl LsFile {
         self.meta.as_ref().map_or(0, |m| m.size())
     }
 
-    /// The inode number for `-i`: the stat's, else readdir's.
+    /// The inode number for `-i`, when the file was stat'ed (GNU prints `?`
+    /// otherwise: readdir's `d_ino` is wrong for mount points).
     fn ino(&self) -> Option<u64> {
-        self.meta.as_ref().map(|m| m.ino()).or(self.d_ino)
+        self.meta.as_ref().map(|m| m.ino())
     }
 }
 
 /// Raw `readdir` (keeps `.`/`..` and directory order): `(name, file-type letter)`.
-fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8, u64)>> {
+fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8)>> {
     let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
     // SAFETY: opendir/readdir/closedir on a valid C path; each dirent is
     // copied out before the next readdir call.
@@ -105,8 +104,7 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8, u64)>> {
                 libc::DT_BLK => b'b',
                 _ => b'?',
             };
-            #[allow(clippy::unnecessary_cast)] // `ino_t` varies by platform
-            entries.push((name, letter, (*ent).d_ino as u64));
+            entries.push((name, letter));
         }
         libc::closedir(dir);
         Ok(entries)
@@ -281,13 +279,12 @@ impl<W: Write> Lister<'_, W> {
             list_as_dir,
             gnu_stat: true,
             absolute,
-            d_ino: None,
         };
         self.inspect_link(&mut f);
         Some(f)
     }
 
-    fn gobble_entry(&mut self, dir: &Path, name: Vec<u8>, letter: u8, ino: u64) -> LsFile {
+    fn gobble_entry(&mut self, dir: &Path, name: Vec<u8>, letter: u8) -> LsFile {
         let o = self.opts;
         let d = path_bytes(dir);
         // `dir == "."` component-wise (which also takes `./`), without
@@ -316,6 +313,8 @@ impl<W: Write> Lister<'_, W> {
         let needs_type = !needs_stat
             && (o.recursive || colors.is_some() || o.indicator != Indicator::None || o.dirs_first);
         let gnu_stat = needs_stat
+            // GNU does not trust d_ino (READDIR_LIES_ABOUT_MOUNTPOINT_D_INO).
+            || o.inode
             || o.hyperlink
             || (letter == b'd' && colored(&[C_OTHER_WRITABLE, C_STICKY, C_STICKY_OTHER_WRITABLE]))
             || ((o.inode || needs_type)
@@ -328,8 +327,8 @@ impl<W: Write> Lister<'_, W> {
                     || (letter == b'-'
                         && (o.indicator == Indicator::Classify
                             || colored(&[C_EXEC, C_SETUID, C_SETGID, C_CAP])))));
-        // Without a stat, GNU goes by readdir's type and inode number (for
-        // colours, indicators, -i, recursion and grouping): skip it then too.
+        // Without a stat, GNU goes by readdir's type (for colours,
+        // indicators, recursion and grouping): skip it then too.
         // Only the Dogfish JSON and terminal views read more.
         let unused = !gnu_stat && !o.json && self.rich.is_none();
         let follow = o.deref == LsDeref::Always && gnu_stat;
@@ -375,7 +374,6 @@ impl<W: Write> Lister<'_, W> {
             list_as_dir,
             gnu_stat,
             absolute,
-            d_ino: Some(ino),
         };
         self.inspect_link(&mut f);
         f
@@ -463,9 +461,9 @@ impl<W: Write> Lister<'_, W> {
         self.first_header = false;
 
         let mut files: Vec<LsFile> = Vec::with_capacity(entries.len());
-        for (entry, letter, ino) in entries {
+        for (entry, letter) in entries {
             if !self.ignored(&entry) {
-                let f = self.gobble_entry(path, entry, letter, ino);
+                let f = self.gobble_entry(path, entry, letter);
                 files.push(f);
             }
         }
