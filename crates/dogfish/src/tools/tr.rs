@@ -2,11 +2,13 @@
 //! parsing of `[:class:]`, `[=c=]`, `[c*n]` and ranges, and its validation
 //! of SET1 and SET2.
 
-use std::io::{self, Read, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_io_error, io::ignore_broken_pipe};
+
+use crate::common::input::{RawStdout, safe_read, stdin_file};
 
 use crate::common::quote::quote_locale;
 
@@ -744,39 +746,59 @@ pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     ctx.telemetry.set_strategy("256-byte O(1) LUT stream");
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
-    let mut obuf = Vec::with_capacity(DEFAULT_BUF_SIZE);
+    let squeezing = squeeze.iter().any(|&b| b);
+    let deleting = delete.iter().any(|&b| b);
+    let mut stdin = stdin_file();
+    let mut out = RawStdout;
+    let mut buf = vec![0u8; IO_SIZE];
     let mut last: Option<u8> = None;
     loop {
-        let n = match reader.read(&mut buf) {
+        let n = match safe_read(&mut *stdin, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 eprintln!("tr: read error: {}", gnu_io_error(&e));
                 return Ok(1);
             }
         };
         ctx.telemetry.add_read(n as u64);
-        obuf.clear();
-        for &b in &buf[..n] {
-            if delete[b as usize] {
-                continue;
+        let data = &mut buf[..n];
+        // Each case filters the buffer in place, then writes it once.
+        let kept = if !squeezing && !deleting {
+            for b in data.iter_mut() {
+                *b = xlate[*b as usize];
             }
-            let c = xlate[b as usize];
-            if squeeze[c as usize] && last == Some(c) {
-                continue;
+            n
+        } else if !squeezing {
+            let mut k = 0;
+            for i in 0..n {
+                let b = data[i];
+                data[k] = b;
+                k += usize::from(!delete[b as usize]);
             }
-            obuf.push(c);
-            last = Some(c);
-        }
-        ignore_broken_pipe(out.write_all(&obuf))?;
-        ctx.telemetry.add_written(obuf.len() as u64);
+            k
+        } else {
+            let mut k = 0;
+            for i in 0..n {
+                let b = data[i];
+                if delete[b as usize] {
+                    continue;
+                }
+                let c = xlate[b as usize];
+                if squeeze[c as usize] && last == Some(c) {
+                    continue;
+                }
+                data[k] = c;
+                k += 1;
+                last = Some(c);
+            }
+            k
+        };
+        ignore_broken_pipe(out.write_all(&data[..kept]))?;
+        ctx.telemetry.add_written(kept as u64);
     }
-    ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
+
+/// Read size: large enough that syscalls are not the cost.
+const IO_SIZE: usize = 128 * 1024;
