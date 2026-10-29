@@ -2,8 +2,6 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::mem::ManuallyDrop;
-use std::os::fd::FromRawFd;
 
 use anyhow::{Result, anyhow};
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
@@ -13,6 +11,7 @@ use dogfish_core::{
 };
 
 use crate::common::arg_order::last_index;
+use crate::common::output::raw_stdout;
 
 /// The encodings `basenc` offers (`base64` always uses [`Encoding::Base64`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -337,14 +336,6 @@ fn read_some(input: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
             r => return r,
         }
     }
-}
-
-/// Standard output without Rust's line buffering: every block goes out in one
-/// `write`.
-fn raw_stdout() -> ManuallyDrop<File> {
-    // Safety: fd 1 stays open for the life of the process, and ManuallyDrop
-    // keeps this handle from closing it.
-    ManuallyDrop::new(unsafe { File::from_raw_fd(1) })
 }
 
 /// Two output characters for every 12-bit input value: one lookup per half

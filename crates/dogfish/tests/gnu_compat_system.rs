@@ -549,6 +549,14 @@ gnu_cases! {
 
     // ---------------------------------------------------------------- seq
     seq_empty_range_no_newline: "seq" ["1", "0"];
+    // The fast integer path: runs of last digits, carries, block boundaries.
+    seq_fast_carries: "seq" ["7", "3", "131"];
+    seq_fast_end_mid_run: "seq" ["95", "1004"];
+    seq_fast_end_same_digit: "seq" ["5", "5"];
+    seq_fast_big_step: "seq" ["3", "200", "100000"];
+    seq_fast_many: "seq" ["200000"];
+    seq_fast_long_sep: "seq" ["-s", "<a separator longer than a line>", "95", "105"];
+    seq_fast_huge_numbers: "seq" ["99999999999999999999999999999999990", "7", "100000000000000000000000000000000077"];
     seq_invalid_last: "seq" ["x"];
     seq_invalid_first: "seq" ["1", "x"];
     seq_invalid_quoting: "seq" ["a'b\\c"];

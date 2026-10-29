@@ -25,6 +25,7 @@ pub(crate) mod human;
 pub(crate) mod interval;
 pub(crate) mod lines;
 pub(crate) mod mode;
+pub(crate) mod output;
 pub(crate) mod path;
 pub(crate) mod preserve_root;
 pub(crate) mod printf_format;
