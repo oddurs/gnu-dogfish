@@ -461,8 +461,7 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
     });
 
     // If multiple file sources and none is stdin, hash in parallel using Rayon!
-    let can_parallel =
-        sources.len() > 1 && sources.iter().all(|s| matches!(s, Source::File(_)));
+    let can_parallel = sources.len() > 1 && sources.iter().all(|s| matches!(s, Source::File(_)));
     let hash_one = |src: &Source| compute_source_hash(algo, src, ctx);
     let results: Vec<io::Result<HashRecord>> = if can_parallel {
         sources.par_iter().map(hash_one).collect()
@@ -547,7 +546,11 @@ fn write_digest_line<W: Write>(
     } else {
         line.extend_from_slice(rec.digest.as_bytes());
         line.push(b' ');
-        line.push(if mode.binary == Some(true) { b'*' } else { b' ' });
+        line.push(if mode.binary == Some(true) {
+            b'*'
+        } else {
+            b' '
+        });
         line.extend_from_slice(name);
     }
     line.push(if mode.zero { b'\0' } else { b'\n' });
