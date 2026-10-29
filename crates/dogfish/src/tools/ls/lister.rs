@@ -231,7 +231,21 @@ impl<W: Write> Lister<'_, W> {
                         && (o.indicator == Indicator::Classify
                             || colored(&[C_EXEC, C_SETUID, C_SETGID, C_CAP])))));
         let follow = o.deref == LsDeref::Always && gnu_stat;
-        let meta = if follow {
+        // Nothing in plain names-only output (`ls`, `ls -1`, `-m`, `-x`)
+        // looks at the metadata: skip the stat, as GNU does.
+        let unused = !gnu_stat
+            && !needs_type
+            && !o.inode
+            && !o.recursive
+            && !o.json
+            && !o.dirs_first
+            && !o.check_symlink_mode
+            && o.indicator == Indicator::None
+            && colors.is_none()
+            && self.rich.is_none();
+        let meta = if unused {
+            None
+        } else if follow {
             match fs::metadata(&path) {
                 Ok(m) => Some(m),
                 Err(e) => {
