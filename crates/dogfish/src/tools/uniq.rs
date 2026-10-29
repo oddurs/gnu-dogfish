@@ -505,7 +505,7 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     // Rich output: NDJSON objects are deduplicated by field on a terminal
     // (or with -J). Piped output is GNU's, byte for byte.
-    if (ctx.stdout_is_tty || cfg.json) && cfg.delimiter == b'\n' && cfg.output == "-" {
+    if (ctx.stdout_is_tty() || cfg.json) && cfg.delimiter == b'\n' && cfg.output == "-" {
         let peek = input.fill_buf()?;
         if looks_like_json(peek) {
             let mut all = Vec::new();
@@ -584,4 +584,15 @@ fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Res
         .collect();
     emit_objects_or_table(&filtered, ctx, cfg.json, !cfg.json)?;
     Ok(0)
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_args(args);
+    }
 }

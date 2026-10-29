@@ -560,7 +560,7 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let json_fields = parsed.fields.is_some() && spec.is_err();
     if sources.len() == 1
         && matches!(sources[0], InputSource::Stdin)
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
         && !parsed.zero_terminated
         && (json_fields || parsed.where_expr.is_some() || parsed.json)
     {
@@ -660,5 +660,34 @@ mod tests {
             ))
         );
         assert!(set_fields("18446744073709551614-", true, false).is_ok());
+    }
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `cut -b`/`-f LIST` (with and without `--complement`): ranges come out
+    /// sorted, 1-based and non-empty.
+    pub fn list(spec: &str) {
+        for byte_mode in [false, true] {
+            for complement in [false, true] {
+                if let Ok(ranges) = set_fields(spec, byte_mode, complement) {
+                    for w in ranges.windows(2) {
+                        assert!(w[0].1 < w[1].0, "{spec:?}: {ranges:?}");
+                    }
+                    for &(lo, hi) in &ranges {
+                        assert!(1 <= lo && lo <= hi, "{spec:?}: {ranges:?}");
+                    }
+                    let _ = complement_ranges(&ranges);
+                }
+            }
+        }
+    }
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_cut_args(args);
     }
 }

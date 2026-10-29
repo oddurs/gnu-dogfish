@@ -237,8 +237,8 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !elide_from_end
         && !parsed.verbose
         && !parsed.zero_terminated
-        && !ctx.stdin_is_tty
-        && (ctx.stdout_is_tty || parsed.json)
+        && !ctx.stdin_is_tty()
+        && (ctx.stdout_is_tty() || parsed.json)
     {
         return head_stdin_adaptive(count, parsed.json, ctx);
     }
@@ -762,5 +762,18 @@ mod tests {
         assert_eq!(expand(&["head", "-3lvz"]), ["head", "-n", "3", "-v", "-z"]);
         assert_eq!(expand(&["head", "-n", "3"]), ["head", "-n", "3"]);
         assert!(expand_obsolete(vec!["head".into(), "-1x".into()]).is_err());
+    }
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        if let Ok(args) = expand_obsolete(args) {
+            let _ = parse_head_args(args);
+        }
     }
 }

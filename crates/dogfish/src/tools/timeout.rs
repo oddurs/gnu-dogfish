@@ -248,13 +248,25 @@ pub fn run_timeout(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
 
+    // The command inherits an ignored SIGPIPE, as from GNU's timeout (the
+    // standard library resets it to the default in the child).
+    // SAFETY: sigaction(2) with a null new action only reads the current
+    // one into the zeroed local `old`.
+    let pipe_ignored = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    };
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     // SAFETY: the closure runs in the forked child and only calls signal(2).
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::signal(libc::SIGTTIN, libc::SIG_DFL);
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            if pipe_ignored {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            }
             Ok(())
         });
     }

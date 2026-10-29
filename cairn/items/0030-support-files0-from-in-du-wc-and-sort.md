@@ -3,7 +3,7 @@ id: 30
 uid: ee4d9658-4eca-4b38-9751-5d5805e33a9e
 title: "Support --files0-from in du, wc and sort"
 type: bug
-status: doing
+status: done
 assignee: claude
 claimed: 2026-10-29
 milestone: "v1.0"
@@ -11,6 +11,7 @@ depends_on:
 - 8
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p2
 effort: m
 area: compat
@@ -41,8 +42,8 @@ names from stdin, no file name of '-' allowed`, ...).
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
 
 ## 2026-10-29
 

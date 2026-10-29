@@ -1391,6 +1391,8 @@ fn write_errors_match_gnu() {
         ("printf", &["%d\\n", "x"]),
         ("printf", &["abc%z"]),
         ("printf", &["%s", "hello"]),
+        ("printf", &["%2147483647d", "0"]),
+        ("printf", &["a%2147483647db\\n", "0"]),
         ("echo", &["hi"]),
         ("seq", &["100000"]),
         ("cat", &["a.txt"]),

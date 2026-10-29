@@ -347,7 +347,7 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     // Rich output: NDJSON objects are shuffled as objects on a terminal (or
     // with -J). Piped output is GNU's, byte for byte.
-    if (ctx.stdout_is_tty || cfg.json)
+    if (ctx.stdout_is_tty() || cfg.json)
         && !cfg.echo
         && cfg.range.is_none()
         && !cfg.repeat
@@ -462,5 +462,16 @@ mod tests {
         p.sort_unstable();
         assert_eq!(p, (0..100).collect::<Vec<_>>());
         assert_eq!(partial_permutation(&mut rng, 2, u64::MAX).len(), 2);
+    }
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_args(args);
     }
 }

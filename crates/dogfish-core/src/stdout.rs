@@ -489,6 +489,12 @@ pub fn gnu_input_on_fd1(blksize: u64, kept_open: bool) {
     st.fd1_input_kept |= kept_open;
 }
 
+/// Records that a GNU stdio call failed without writing anything, which
+/// sets the stream's error flag (`printf` failing with `EOVERFLOW`).
+pub fn gnu_ferror() {
+    state().model().failed = true;
+}
+
 /// GNU's `close_stdout_set_ignore_EPIPE`: a broken pipe found at exit is
 /// not reported.
 pub fn ignore_epipe() {
@@ -609,12 +615,14 @@ macro_rules! out {
 
 /// Like `eprintln!`, the way glibc's `error` prints a diagnostic: GNU's
 /// standard output is flushed first ([`gnu_fflush`]), for the tools whose
-/// stdio calls are modelled.
+/// stdio calls are modelled. A failure to write the diagnostic is ignored,
+/// as in GNU (`eprintln!` would panic).
 #[macro_export]
 macro_rules! gnu_error {
     ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
         $crate::stdout::gnu_fflush();
-        ::std::eprintln!($($arg)*);
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
     }};
 }
 

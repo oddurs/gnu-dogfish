@@ -1346,7 +1346,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // -J, or when --by/--where ask for it. Piped output is GNU's.
     if !parsed.check
         && !parsed.zero_terminated
-        && (ctx.stdout_is_tty
+        && (ctx.stdout_is_tty()
             || parsed.json
             || parsed.by_field.is_some()
             || parsed.where_expr.is_some())
@@ -1508,4 +1508,24 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         return Err(e.into());
     }
     Ok(0)
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// `sort -k KEYDEF`, numeric key parsing and the command line.
+    pub fn key(spec: &str, line: &[u8]) {
+        let _ = parse_sort_key(spec);
+        let n = parse_sort_num(line);
+        assert!(n.int.len() + n.frac.len() <= line.len());
+        let _ = parse_general_num(line);
+        assert!(month_of(line) <= 12);
+    }
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_sort_args(args);
+    }
 }

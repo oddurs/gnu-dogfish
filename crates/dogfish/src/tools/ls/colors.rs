@@ -382,3 +382,17 @@ pub(crate) fn colorize_mode(mode: &str, st: Style) -> String {
     }
     out
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// An `LS_COLORS` value.
+    pub fn parse(spec: &[u8]) {
+        if let Some(c) = LsColors::parse(spec) {
+            let _ = c.suffix_color(b"name.txt");
+        }
+    }
+}

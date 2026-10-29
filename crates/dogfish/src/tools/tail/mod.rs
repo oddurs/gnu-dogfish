@@ -1151,9 +1151,9 @@ pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !a.forever
         && a.header_mode != HeaderMode::Always
         && a.line_end == b'\n'
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
         && !stdin_is_closed()
-        && (ctx.stdout_is_tty || a.json)
+        && (ctx.stdout_is_tty() || a.json)
     {
         return tail_ndjson(&a, ctx);
     }
@@ -1224,4 +1224,15 @@ fn run(t: &mut Tail, files: &mut [FileSpec], n_units: u64) -> R<bool> {
         return Err(t.fatal_io(&e, "-"));
     }
     Ok(ok)
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_tail_args(args);
+    }
 }

@@ -18,7 +18,13 @@ struct PrintfRun<'a> {
     args: &'a [String],
     next: usize,
     failed: bool,
+    /// A conversion was too wide for C's printf (`EOVERFLOW`): GNU prints
+    /// nothing for it and reports a write error when it exits.
+    overflow: bool,
 }
+
+/// Field widths and precisions from this up make glibc's printf fail.
+const PRINTF_FIELD_MAX: usize = 2_147_483_646;
 
 impl<'a> PrintfRun<'a> {
     fn take(&mut self) -> Option<&'a str> {
@@ -326,7 +332,9 @@ fn printf_once(
             width = w.unsigned_abs() as usize;
         } else {
             while let Some(d @ b'0'..=b'9') = fmt.get(i).copied() {
-                width = width * 10 + (d - b'0') as usize;
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add(usize::from(d - b'0'));
                 i += 1;
             }
         }
@@ -351,12 +359,13 @@ fn printf_once(
             } else {
                 let mut p = 0usize;
                 while let Some(d @ b'0'..=b'9') = fmt.get(i).copied() {
-                    p = p * 10 + (d - b'0') as usize;
+                    p = p.saturating_mul(10).saturating_add(usize::from(d - b'0'));
                     i += 1;
                 }
                 prec = Some(p);
             }
         }
+        let overflow = width >= PRINTF_FIELD_MAX || prec.is_some_and(|p| p >= PRINTF_FIELD_MAX);
         // Length modifiers are accepted and ignored.
         while matches!(fmt.get(i), Some(b'h' | b'l' | b'L' | b'j' | b'z' | b't')) {
             i += 1;
@@ -375,6 +384,15 @@ fn printf_once(
                 String::from_utf8_lossy(&fmt[spec_start..i])
             );
             return Err(());
+        }
+        if overflow {
+            // Found by fuzzing: this was allocated (a 2^41-byte width aborted).
+            // GNU's printf(3) fails with EOVERFLOW, printing nothing and
+            // setting the stream's error flag.
+            run.take();
+            run.overflow = true;
+            stdout::gnu_ferror();
+            continue;
         }
         // The field's text, and whether zero padding applies to it.
         let (body, zero_ok): (Vec<u8>, bool) = match conv {
@@ -486,6 +504,7 @@ pub fn run_printf(raw: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         args: &args[first + 1..],
         next: 0,
         failed: false,
+        overflow: false,
     };
     let mut output = Vec::new();
     let mut ok = true;
@@ -516,5 +535,48 @@ pub fn run_printf(raw: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut out = stdout::stdout();
     out.write_all(&output)?;
     ctx.telemetry.add_written(output.len() as u64);
+    if run.overflow {
+        // GNU's `close_stdout` sees the error flag: a bare `write error`,
+        // or one with the reason when the final flush fails too, as does
+        // closing a closed descriptor.
+        out.flush()?;
+        if stdout::was_closed() {
+            let e = io::Error::from_raw_os_error(libc::EBADF);
+            eprintln!("printf: write error: {}", gnu_io_error(&e));
+        } else {
+            eprintln!("printf: write error");
+        }
+        return Ok(1);
+    }
     Ok(if ok && !run.failed { 0 } else { 1 })
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// Renders `fmt` with `args` as `printf FORMAT ARGS...` would, without
+    /// writing it anywhere.
+    pub fn render(fmt: &[u8], args: &[String]) -> Vec<u8> {
+        let mut run = PrintfRun {
+            args,
+            next: 0,
+            failed: false,
+            overflow: false,
+        };
+        let mut out = Vec::new();
+        loop {
+            let before = run.next;
+            match printf_once(fmt, &mut run, &mut out) {
+                Ok(true) => {}
+                Ok(false) | Err(()) => break,
+            }
+            if run.next >= run.args.len() || run.next == before {
+                break;
+            }
+        }
+        out
+    }
 }

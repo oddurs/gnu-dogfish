@@ -18,14 +18,15 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::outln;
 use dogfish_core::{
-    CopyMethod, DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path,
+    CopyMethod, DogfishContext, JournalAction, JournalEntry, Take, UndoJournal, crash_point,
+    gnu_io_error, move_path,
 };
 
 use crate::common::backup::{BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
     Deref, absolute, c_path, dir_name, dir_names, last_component, rename_noreplace, same_inode,
-    same_name,
+    same_name, stable_path,
 };
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf, quote_locale};
@@ -183,16 +184,28 @@ pub(crate) struct Outcome {
     /// mv: the source was renamed (or deliberately left alone), so it must
     /// not be removed.
     pub(crate) rename_succeeded: bool,
+    /// mv: the source was renamed to the destination.
+    pub(crate) renamed: bool,
 }
 
 /// What `dogfish undo` needs to reverse one command-line operand.
 struct UndoPlan {
+    /// The command-line source.
+    src: PathBuf,
+    /// Its device and inode before the operation.
+    src_inode: Option<(u64, u64)>,
     /// The path the operation created or rewrote.
     created: PathBuf,
     /// Where the journal saved what `created` held before.
     backup: Option<PathBuf>,
     /// Whether `created` existed before the operation.
     existed: bool,
+    /// The backup is a copy of `created`, which the operation writes into.
+    in_place: bool,
+    /// mv across file systems: the source is completely copied.
+    copied: bool,
+    /// The pending journal entry (write-ahead), when it could be recorded.
+    entry: Option<JournalEntry>,
 }
 
 /// GNU's file sets (`dest_info`, `src_info`): files by device and inode,
@@ -233,6 +246,12 @@ pub(crate) struct Copier<'a> {
     top_level_src: PathBuf,
     top_level_dst: PathBuf,
     plan: Option<UndoPlan>,
+    /// Journal entries of the `--backup` renames made so far, by backup name.
+    backup_entries: HashMap<PathBuf, JournalEntry>,
+    /// mv: the top-level source has been renamed.
+    renamed: bool,
+    /// A pending journal entry the next [`Self::copy`] continues.
+    adopted: Option<JournalEntry>,
     /// How the data of the last regular file was copied (shown on a terminal).
     method: CopyMethod,
 }
@@ -269,6 +288,7 @@ fn mode_t(mode: u32) -> libc::mode_t {
 }
 
 fn open_path(p: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
+    crash_point();
     let c = c_path(p)?;
     // SAFETY: `c` is a NUL-terminated path that outlives the call; open(2) reads
     // nothing else through pointers.
@@ -288,6 +308,7 @@ fn open_path(p: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
 }
 
 fn unlink_path(p: &Path, dir: bool) -> io::Result<()> {
+    crash_point();
     let c = c_path(p)?;
     let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: `c` is a NUL-terminated path that outlives the call.
@@ -459,6 +480,7 @@ pub(crate) fn force_linkat(
     force: bool,
     tried: Option<io::Result<()>>,
 ) -> io::Result<Linked> {
+    crash_point();
     let first = tried.unwrap_or_else(|| link_path(src, dst, follow));
     match first {
         Ok(()) => return Ok(Linked::New),
@@ -673,6 +695,9 @@ impl<'a> Copier<'a> {
             top_level_src: PathBuf::new(),
             top_level_dst: PathBuf::new(),
             plan: None,
+            backup_entries: HashMap::new(),
+            renamed: false,
+            adopted: None,
             method: CopyMethod::StandardCopy,
         }
     }
@@ -711,18 +736,88 @@ impl<'a> Copier<'a> {
     /// Whether the journal may save what is at `dst`: a top-level operand
     /// whose previous state is not saved yet, in a directory the operation
     /// could change at all (otherwise it is about to fail anyway, with GNU's
-    /// message). Special files hold no data and are never saved (reading a
-    /// FIFO to copy it into the trash would block).
+    /// message). Device nodes are not saved (recreating one across file
+    /// systems needs privileges); FIFOs and sockets are moved, never opened.
     fn journal_wants(&self, dst: &Path, top: bool) -> Option<fs::Metadata> {
         if !top || self.journal.is_none() || self.plan.as_ref().is_none_or(|p| p.backup.is_some()) {
             return None;
         }
         let m = fs::symlink_metadata(dst).ok()?;
         let ft = m.file_type();
-        if !(ft.is_file() || ft.is_dir() || ft.is_symlink()) {
+        if std::os::unix::fs::FileTypeExt::is_block_device(&ft)
+            || std::os::unix::fs::FileTypeExt::is_char_device(&ft)
+        {
             return None;
         }
         eaccess_ok(&dir_name(dst), libc::W_OK | libc::X_OK).then_some(m)
+    }
+
+    /// The pending entry's action, as the plan now stands.
+    fn plan_action(&self, p: &UndoPlan) -> JournalAction {
+        if self.x.move_mode {
+            JournalAction::Move {
+                src: absolute(&p.src),
+                dst: absolute(&p.created),
+                backup_path: p.backup.clone(),
+                copied: p.copied,
+                existed: p.existed,
+                src_inode: p.src_inode,
+            }
+        } else {
+            JournalAction::CopyCreate {
+                src: absolute(&p.src),
+                created_path: absolute(&p.created),
+                backup_path: p.backup.clone(),
+                in_place: p.in_place,
+                existed: p.existed,
+            }
+        }
+    }
+
+    /// Writes the plan into the pending journal entry, so an interrupted
+    /// operation can be recovered from what it had done.
+    fn sync_entry(&mut self) {
+        let Some(p) = &self.plan else { return };
+        let action = self.plan_action(p);
+        if let Some(j) = &self.journal
+            && let Some(p) = &mut self.plan
+            && let Some(e) = &mut p.entry
+        {
+            e.action = action;
+            let _ = j.update(e);
+        }
+    }
+
+    /// Saves the top-level `dst` in the trash, as `how` says (see [`Take`]).
+    /// The trash slot is in the journal before anything moves.
+    fn journal_save(&mut self, dst: &Path, how: Take) -> io::Result<bool> {
+        let by_copy = how == Take::Copy;
+        let Some(p) = &mut self.plan else {
+            return Ok(false);
+        };
+        p.created = stable_path(dst);
+        p.in_place = by_copy;
+        let Some(p) = &self.plan else {
+            return Ok(false);
+        };
+        let action = self.plan_action(p);
+        let (Some(j), Some(p)) = (&self.journal, &mut self.plan) else {
+            return Ok(false);
+        };
+        let Some(entry) = &mut p.entry else {
+            return Err(io::Error::other("cannot record the operation for undo"));
+        };
+        entry.action = action;
+        match j.take(entry, dst, how)? {
+            Some(b) => {
+                p.backup = Some(b);
+                Ok(true)
+            }
+            None => {
+                p.in_place = false;
+                Ok(false)
+            }
+        }
     }
 
     /// Moves the top-level `dst` into the trash instead of removing it.
@@ -731,45 +826,35 @@ impl<'a> Copier<'a> {
         if self.journal_wants(dst, top).is_none() {
             return Ok(false);
         }
-        let Some(j) = &self.journal else {
+        self.journal_save(dst, Take::Move)
+    }
+
+    /// As [`Self::journal_take`], but `dst` stays in place for a `rename` to
+    /// replace atomically.
+    fn journal_take_linked(&mut self, dst: &Path, top: bool) -> io::Result<bool> {
+        if self.journal_wants(dst, top).is_none() {
             return Ok(false);
-        };
-        match j.backup_existing(dst, false)? {
-            Some(b) => {
-                if let Some(p) = &mut self.plan {
-                    p.created = dst.to_path_buf();
-                    p.backup = Some(b);
-                }
-                Ok(true)
-            }
-            None => Ok(false),
         }
+        self.journal_save(dst, Take::Link)
     }
 
     /// Puts a destination saved by [`Self::journal_take`] back after the
     /// operation that was to replace it failed.
     fn journal_untake(&mut self, dst: &Path) {
         if let Some(p) = &mut self.plan
-            && let Some(b) = p.backup.take()
+            && let Some(b) = p.backup.clone()
             && fs::symlink_metadata(dst).is_err()
+            && move_path(Path::new(&b), dst).is_ok()
         {
-            let _ = move_path(Path::new(&b), dst);
+            p.backup = None;
+            self.sync_entry();
         }
     }
 
     /// Saves a copy of `real` (a regular file or a directory) before the
     /// operation writes into it.
     fn journal_copy(&mut self, real: &Path) -> io::Result<()> {
-        let Some(j) = &self.journal else {
-            return Ok(());
-        };
-        if let Some(b) = j.backup_existing(real, true)?
-            && let Some(p) = &mut self.plan
-        {
-            p.created = real.to_path_buf();
-            p.backup = Some(b);
-        }
-        Ok(())
+        self.journal_save(real, Take::Copy).map(|_| ())
     }
 
     fn journal_failed(&self, dst: &Path, e: &io::Error) {
@@ -781,6 +866,7 @@ impl<'a> Copier<'a> {
         match self.journal_take(dst, top) {
             Ok(true) => Ok(()),
             Ok(false) => {
+                crash_point();
                 unlink_path(dst, dir)?;
                 self.note_removed(top);
                 Ok(())
@@ -792,31 +878,71 @@ impl<'a> Copier<'a> {
     /// The top-level destination was removed without saving it (it held no
     /// data, or a `--backup` file keeps it): what is there afterwards is new.
     fn note_removed(&mut self, top: bool) {
-        if top && let Some(p) = &mut self.plan {
+        if top
+            && let Some(p) = &mut self.plan
+            && p.existed
+        {
             p.existed = false;
+            self.sync_entry();
         }
     }
 
-    /// Records the top-level operation in the journal. `moved_from` is the
-    /// source of a completed move.
-    pub(crate) fn commit_top(&mut self, src: &Path, moved_from: Option<&Path>) {
+    /// The next top-level operation continues `entry`, which the caller
+    /// recorded before starting it.
+    pub(crate) fn adopt_entry(&mut self, entry: Option<JournalEntry>) {
+        self.adopted = entry;
+    }
+
+    /// mv across file systems: `src` is completely copied, and about to be
+    /// removed. From here on, undo moves the copy back even if part of `src`
+    /// is left.
+    pub(crate) fn mark_copied(&mut self) {
+        if let Some(p) = &mut self.plan {
+            p.copied = true;
+            self.sync_entry();
+        }
+    }
+
+    /// Records the top-level operation in the journal; `moved` when it was a
+    /// move that renamed or completely copied its source.
+    pub(crate) fn commit_top(&mut self, moved: bool) {
         let Some(plan) = self.plan.take() else { return };
         let Some(j) = &self.journal else { return };
         let exists = fs::symlink_metadata(&plan.created).is_ok();
-        let action = match moved_from {
-            Some(from) if exists && fs::symlink_metadata(from).is_err() => JournalAction::Move {
-                src: absolute(from),
+        let action = match moved {
+            // What is left at the source (a removal that failed part-way) is
+            // a remnant of what is now at the destination.
+            true if exists => JournalAction::Move {
+                src: absolute(&plan.src),
                 dst: absolute(&plan.created),
                 backup_path: plan.backup,
+                copied: fs::symlink_metadata(&plan.src).is_ok(),
+                existed: false,
+                src_inode: None,
             },
             _ if plan.backup.is_some() || (!plan.existed && exists) => JournalAction::CopyCreate {
-                src: absolute(src),
+                src: absolute(&plan.src),
                 created_path: absolute(&plan.created),
                 backup_path: plan.backup,
+                in_place: plan.in_place,
+                existed: false,
             },
-            _ => return,
+            _ => {
+                if let Some(mut e) = plan.entry {
+                    let _ = j.cancel(&mut e);
+                }
+                return;
+            }
         };
-        let _ = j.record(self.tool, action);
+        match plan.entry {
+            Some(mut e) => {
+                e.action = action;
+                let _ = j.commit(&mut e);
+            }
+            None => {
+                let _ = j.record(self.tool, action);
+            }
+        }
     }
 
     // ---------------------------------------------------------------- copy
@@ -827,11 +953,28 @@ impl<'a> Copier<'a> {
     pub(crate) fn copy(&mut self, src: &Path, dst: &Path, nonexistent_dst: i32) -> Outcome {
         self.top_level_src = src.to_path_buf();
         self.top_level_dst = dst.to_path_buf();
-        self.plan = Some(UndoPlan {
-            created: dst.to_path_buf(),
+        let mut plan = UndoPlan {
+            src_inode: dogfish_core::journal::inode(src),
+            src: stable_path(src),
+            created: stable_path(dst),
             backup: None,
             existed: fs::symlink_metadata(dst).is_ok(),
-        });
+            in_place: false,
+            copied: false,
+            entry: None,
+        };
+        if let Some(e) = self.adopted.take() {
+            // Begun by the caller before it renamed `src` to `dst`.
+            if let JournalAction::Move { src_inode, .. } = &e.action {
+                plan.src_inode = *src_inode;
+            }
+            plan.existed = false;
+            plan.entry = Some(e);
+        } else if let Some(j) = &self.journal {
+            // Write-ahead: the operation is in the journal before it starts.
+            plan.entry = j.begin(self.tool, self.plan_action(&plan)).ok();
+        }
+        self.plan = Some(plan);
         let mut first_dir_created = false;
         let mut out = Outcome::default();
         let level = Level {
@@ -849,6 +992,7 @@ impl<'a> Copier<'a> {
             &mut out.copy_into_self,
             &mut out.rename_succeeded,
         );
+        out.renamed = std::mem::take(&mut self.renamed);
         out
     }
 
@@ -1112,8 +1256,13 @@ impl<'a> Copier<'a> {
         *copy_into_self = false;
 
         let mut rename_errno: i32 = self.x.rename_errno.unwrap_or(-1);
+        // Where `dst` is once renamed: GNU reaches it through the target
+        // directory's descriptor, which still works when the rename moved what
+        // the path went through (`mv b a b`, with `b` a symlink to a directory).
+        let mut renamed_dst = dst.to_path_buf();
         if x_move {
             if rename_errno < 0 {
+                renamed_dst = stable_path(dst);
                 rename_errno = match rename_noreplace(src, dst) {
                     Ok(()) => 0,
                     Err(e) => errno(&e),
@@ -1121,6 +1270,7 @@ impl<'a> Copier<'a> {
             }
             new_dst = rename_errno == 0;
             *rename_succeeded = new_dst;
+            self.renamed |= top && new_dst;
             nonexistent_dst = i32::from(new_dst);
         }
         let skip_no = matches!(
@@ -1135,11 +1285,15 @@ impl<'a> Copier<'a> {
             rename_errno != libc::EEXIST || !skip_no
         };
         if stat_src {
-            let name = if rename_errno == 0 { dst } else { src };
-            let res = if deref_level == Deref::Never {
-                fs::symlink_metadata(name)
+            let (name, at) = if rename_errno == 0 {
+                (dst, renamed_dst.as_path())
             } else {
-                fs::metadata(name)
+                (src, src)
+            };
+            let res = if deref_level == Deref::Never {
+                fs::symlink_metadata(at)
+            } else {
+                fs::metadata(at)
             };
             match res {
                 Ok(m) => src_sb = Some(m),
@@ -1356,7 +1510,10 @@ impl<'a> Copier<'a> {
                             self.journal.as_ref(),
                             self.tool,
                         ) {
-                            Ok(b) => {
+                            Ok((b, entry)) => {
+                                if let Some(e) = entry {
+                                    self.backup_entries.insert(b.clone(), e);
+                                }
                                 dst_backup = Some(b);
                                 self.note_removed(top);
                             }
@@ -1416,7 +1573,7 @@ impl<'a> Copier<'a> {
 
         // On a terminal, a regular copy is announced once it is done, with
         // how the data was copied (a Dogfish extra).
-        let rich_verbose = self.ctx.stdout_is_tty
+        let rich_verbose = self.ctx.stdout_is_tty()
             && !self.x.hard_link
             && !self.x.symbolic_link
             && (is_type(src_mode, S_IFREG)
@@ -1537,7 +1694,7 @@ impl<'a> Copier<'a> {
                     !d.is_dir() || fs::read_dir(dst).is_ok_and(|mut r| r.next().is_none())
                 });
                 if replaceable {
-                    match self.journal_take(dst, top) {
+                    match self.journal_take_linked(dst, top) {
                         Ok(s) => saved = s,
                         Err(e) => {
                             self.journal_failed(dst, &e);
@@ -1546,6 +1703,7 @@ impl<'a> Copier<'a> {
                         }
                     }
                 }
+                crash_point();
                 rename_errno = match fs::rename(src, dst) {
                     Ok(()) => 0,
                     Err(e) => errno(&e),
@@ -1560,6 +1718,7 @@ impl<'a> Copier<'a> {
                     self.emit_verbose("renamed ", src, dst, dst_backup.as_deref());
                 }
                 *rename_succeeded = true;
+                self.renamed |= top;
                 if command_line_arg
                     && !self.x.last_file
                     && let Some(ssb) = &src_sb
@@ -1930,6 +2089,29 @@ impl<'a> Copier<'a> {
         delayed_ok
     }
 
+    /// The backup `b` of `dst` was renamed back: withdraw its journal entry,
+    /// once the older backup file it displaced (if any) is back too.
+    fn forget_backup(&mut self, b: &Path, dst: &Path) {
+        if let Some(mut e) = self.backup_entries.remove(b)
+            && let Some(j) = &self.journal
+        {
+            let older = match &e.action {
+                JournalAction::Move { backup_path, .. } => backup_path.clone(),
+                _ => None,
+            };
+            if older.is_none_or(|o| move_path(&o, b).is_ok()) {
+                let _ = j.cancel(&mut e);
+            }
+        }
+        if let Some(p) = &mut self.plan
+            && p.created == stable_path(dst)
+            && !p.existed
+        {
+            p.existed = true;
+            self.sync_entry();
+        }
+    }
+
     /// GNU's `un_backup` label: forget the source and put a backup back after
     /// failing to create the destination.
     fn un_backup(
@@ -1943,12 +2125,14 @@ impl<'a> Copier<'a> {
             self.forget_created(src_sb);
         }
         if let Some(b) = dst_backup {
+            crash_point();
             match fs::rename(b, dst) {
                 Err(e) => self.diag_err(&format!("cannot un-backup {}", qa(dst)), &e),
                 Ok(()) => {
                     if self.x.verbose {
                         outln!("{} -> {} (unbackup)", qa(b), qa(dst));
                     }
+                    self.forget_backup(b, dst);
                 }
             }
         }
@@ -2144,6 +2328,7 @@ impl<'a> Copier<'a> {
                                 p.created =
                                     fs::canonicalize(dst).unwrap_or_else(|_| dst.to_path_buf());
                                 p.existed = false;
+                                self.sync_entry();
                             }
                             dest = Some(f);
                         }
@@ -2275,10 +2460,26 @@ impl<'a> Copier<'a> {
     /// After a failed copy into a file the journal saved: put it back.
     fn restore_saved(&mut self) {
         if let Some(p) = &mut self.plan
-            && let Some(b) = p.backup.take()
+            && let Some(b) = p.backup.clone()
         {
-            let _ = fs::remove_file(&p.created);
-            let _ = move_path(Path::new(&b), &p.created);
+            if p.in_place {
+                // Written into: put the old contents back into the same inode.
+                if let Ok(data) = fs::read(&b)
+                    && fs::write(&p.created, data).is_ok()
+                {
+                    let _ = fs::remove_file(&b);
+                    p.backup = None;
+                }
+            } else {
+                let _ = fs::remove_file(&p.created);
+                if move_path(Path::new(&b), &p.created).is_ok() {
+                    p.backup = None;
+                }
+            }
+            if p.backup.is_none() {
+                p.in_place = false;
+                self.sync_entry();
+            }
         }
     }
 
@@ -2518,6 +2719,7 @@ impl<'a> Copier<'a> {
                     }
                     if !prev_hole {
                         let end = ppos + psize as usize;
+                        crash_point();
                         if let Err(e) = (&*dest).write_all(&buf[ppos..end]) {
                             self.diag_err(&format!("error writing {}", qa(dst)), &e);
                             return false;

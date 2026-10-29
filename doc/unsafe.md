@@ -65,12 +65,14 @@ process can write to or truncate the file while Dogfish reads it.
   splitting lines); it never relies on two reads of the same byte agreeing to
   stay memory-safe, so the outcome is wrong-but-safe output, the same as GNU's.
 - A concurrent **truncate** makes the vanished pages raise `SIGBUS`.
-  `install_sigbus_handler` turns that into `tool: input file was truncated
-  while being read` and exit status 1 (tested in `tests/edge_cases.rs`).
+  The handler `FastReader` installs before its first mapping turns that into
+  `tool: input file was truncated while being read` and exit status 1
+  (tested in `tests/edge_cases.rs`).
 
 Every Rust program that maps files it does not control carries this risk;
-the speed is the reason it is accepted. Files larger than 16 GiB, empty files
-and non-regular files are read with `read(2)` instead.
+the speed is the reason it is accepted. Files larger than 16 GiB, files of
+16 KiB or less (cheaper to read than to map) and non-regular files are read
+with `read(2)` instead.
 
 ## Inventory
 
@@ -78,14 +80,14 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `from_file` | `Mmap::map` of an input file | Read-only private mapping of a regular file the caller opened; see "Accepted risk" above. |
+| `from_file` | `MmapOptions::map` of an input file | Read-only private mapping of a regular file the caller opened; see "Accepted risk" above. |
 | `from_file` | `madvise(MADV_SEQUENTIAL)` | Pointer and length describe the mapping just created; `madvise` is a hint and never changes the contents. |
 | `copy_file_fast` | `clonefile` (macOS) | C paths. |
 | `copy_file_fast` | `ioctl(FICLONE)` (Linux) | Descriptor only (both files open for the call). |
 | `make_node_like` | `mknod` | C path. |
 | `on_sigbus` | `write(2)` of the preformatted message | Async-signal-safe; the message is a `Vec` in a `OnceLock` that is never changed or freed once set, so pointer and length stay valid. |
 | `on_sigbus` | `_exit(1)` | Async-signal-safe; never returns. |
-| `install_sigbus_handler` | `sigaction(SIGBUS)` | Zeroed `sigaction` (no flags, empty mask); the handler is an `extern "C" fn(c_int)` and the message is set before it is installed. |
+| `arm_sigbus_handler` | `sigaction(SIGBUS)` | Zeroed `sigaction` (no flags, empty mask); the handler is an `extern "C" fn(c_int)` and the message is set before it is installed. |
 | `copy_tree_recreates_a_fifo_instead_of_reading_it` | `mkfifo` (test) | C path. |
 | `copy_tree_recreates_fifos_inside_directories` | `mkfifo` (test) | C path. |
 | `umask` | `umask` read and restore (test) | No preconditions. |
@@ -103,7 +105,15 @@ and non-regular files are read with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `drop` | `flock(LOCK_UN)` on the journal lock | Descriptor only (owned by the lock guard). |
+| `process_alive` | `kill(pid, 0)` on the process of a pending entry | Signal 0 only checks that the process exists; no pointers. |
 | `lock` | `flock(LOCK_EX)` on the journal lock | Descriptor only. |
+| `trash_dir_for` | `geteuid` | No preconditions. |
+
+### `crates/dogfish-core/src/crash.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `crash_point` | `kill(getpid(), SIGKILL)` (debug builds, `DOGFISH_CRASH_AT` only) | No pointers; kills this process, which is the point. |
 
 ### `crates/dogfish/src/main.rs`
 
@@ -111,10 +121,16 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `attribute` | `#[unsafe(no_mangle)]` on `main` | Exports the C entry point under its C name; no other symbol in the binary is called `main` (the Rust one is replaced by `#![no_main]`). |
 | `main` | `unsafe extern "C" fn main(argc, argv)` | Called only by the C runtime, which guarantees `argc` entries of `argv` (its documented `# Safety` contract). |
-| `main` | `fcntl(F_GETFD)` on descriptors 0 to 2 | Descriptor only; queries, never changes. |
-| `main` | `open("/dev/null")` to fill a closed 0, 1 or 2 | C path; the lowest free descriptor is the closed one, as GNU's stdopen does. |
 | `main` | read `argv[i]` | `i < argc`, and the C runtime passes `argc` valid pointers. |
 | `main` | `CStr::from_ptr(argv[i])` | Checked non-null; argv strings are NUL-terminated and live for the whole process. |
+| `main` | `fcntl(F_GETFD)` on descriptors 0 to 2 | Descriptor only; queries, never changes. |
+| `main` | `open("/dev/null")` to fill a closed 0, 1 or 2 | C path; the lowest free descriptor is the closed one, as GNU's stdopen does. |
+
+### `crates/dogfish/src/fuzz_api.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `init` | `remove_var` / `set_var` of the locale and `TZ` (`fuzzing` feature only) | Runs once, from the fuzzer's only thread, before anything reads the environment. |
 
 ### `crates/dogfish/src/common/backup.rs`
 
@@ -392,6 +408,7 @@ and non-regular files are read with `read(2)` instead.
 | `arm_timer` | `setitimer(ITIMER_REAL)` | Reads a fully initialised `itimerval`; async-signal-safe (also called from the handler). |
 | `timeout_on_signal` | the signal handler's `kill`, `write`, `signal`, `_exit` | Signals: atomics and async-signal-safe calls only; the verbose message is a `OnceLock` set before the handler is installed. |
 | `run_timeout` | `setpgid`, `sigaction`, `signal` setup | Signals: set up before the child exists; zeroed `sigaction` with an `extern "C"` handler. |
+| `run_timeout` | `sigaction` to read SIGPIPE's disposition | A null new action; the old one is written to a zeroed local `sigaction`. |
 | `run_timeout` | `CommandExt::pre_exec` | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
 | `run_timeout` | `getpid`, `getpgrp` | No preconditions. |
 | `run_timeout` | `setrlimit`, `signal`, `sigprocmask`, `raise` to die by the child's signal | Plain calls on this process with initialised arguments. |
@@ -425,6 +442,19 @@ and non-regular files are read with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `sigbus_from_truncated_mmap_is_a_clean_error` | `kill(SIGBUS)` (test) | Signals our own child, which has not been waited for yet. |
+| `sigbus_from_truncated_mmap_is_a_clean_error` | `kill(SIGBUS)` (test) | The same, for a second child. |
+
+### `crates/dogfish/tests/fs_safety.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `undo_restores_a_fifo_that_remove_destination_replaced` | `mkfifo` (test) | C path. |
+
+### `crates/dogfish/tests/undo_model.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `mkfifo` | `mkfifo` (test) | C path. |
 
 ### `crates/dogfish/tests/gnu_compat_listing.rs`
 

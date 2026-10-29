@@ -230,6 +230,18 @@ gnu_cases! {
     tr_class: "tr" ["[:lower:]", "[:upper:]"] stdin b"abc xyz\n";
     tr_delete: "tr" ["-d", "aeiou"] stdin b"education\n";
     tr_squeeze: "tr" ["-s", " "] stdin b"a   b    c\n";
+    // Found by fuzzing (fuzz/fuzz_targets/tr.rs): repeat counts as large as
+    // GNU's uintmax_t used to be expanded in memory, or silently read as 0.
+    tr_repeat_count_huge: "tr" ["a", "[x*18446744073709551614]"] stdin b"abc\n";
+    tr_repeat_count_long_in_set1: "tr" ["[a*99999]b", "xy"] stdin b"abc\n";
+    tr_repeat_count_too_large: "tr" ["a", "[x*18446744073709551615]"] stdin b"abc\n";
+    tr_repeat_count_overflow: "tr" ["a", "[x*99999999999999999999]"] stdin b"abc\n";
+    tr_repeat_count_bad_octal: "tr" ["a", "[x*09]"] stdin b"abc\n";
+    tr_repeat_octal: "tr" ["abc", "[x*010]"] stdin b"abcd\n";
+    tr_fill_in_set1: "tr" ["a[b*]", "xy"] stdin b"abc\n";
+    tr_two_fills_in_set2: "tr" ["abc", "x[y*][z*]"] stdin b"abc\n";
+    tr_fill_and_repeats: "tr" ["abcd", "x[y*2]z"] stdin b"abcd\n";
+    tr_fill_between: "tr" ["ab[c*3]d", "[q*]z"] stdin b"abcd\n";
     tr_squeeze_translate: "tr" ["-s", "a-z", "A-Z"] stdin b"aabbccdd\n";
     tr_complement_delete: "tr" ["-cd", "0-9\n"] stdin b"a1b2c3\nx9\n";
     tr_complement_translate: "tr" ["-c", "a-z\n", "_"] stdin b"ab-cd e!\n";
@@ -291,6 +303,13 @@ gnu_cases! {
     printf_escape: "printf" ["a\\tb\\\\c\\n"];
     printf_percent: "printf" ["100%%\\n"];
     printf_char: "printf" ["%c%c\\n", "hello", "world"];
+    // Found by fuzzing (fuzz/fuzz_targets/printf.rs): widths that overflow
+    // C's printf made Dogfish allocate them (or overflow the parse).
+    printf_width_overflows_int: "printf" ["a%2147483646db%sc\n", "1", "2"];
+    printf_precision_overflows_int: "printf" ["%.2147483646d|\n", "1"];
+    printf_width_digits_overflow: "printf" ["%99999999999999999999999d\n", "1"];
+    printf_star_width_out_of_range: "printf" ["%*d\n", "99999999999", "1"];
+    printf_star_precision_out_of_range: "printf" ["%.*d\n", "2147483648", "1"];
 
     // --------------------------------------------------------- base64/hash
     base64_encode: "base64" ["lines.txt"];

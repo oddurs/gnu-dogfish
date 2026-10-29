@@ -132,7 +132,7 @@ Retention is bounded so the trash cannot grow forever:
 | `DOGFISH_BACKUP_LIMIT` | `1G` | Total size of the automatic backups `cp`/`mv` keep of files they overwrite. Oldest backups are discarded first; the newest is always kept. `rm --safe` files never count against it. |
 | `DOGFISH_UNDO` | on | Set to `off` to stop `cp`/`mv` recording undo entries and keeping backups of what they overwrite (overwrites then cost what GNU's do, and can't be undone). `rm --safe` still uses the trash. |
 
-`undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it.
+`undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it. Operations are journaled before they start, so even a `cp`, `mv` or `rm --safe` killed half-way can be undone; files on other file systems go to a trash on that file system (`.dogfish-trash-<uid>-…` at its top), so trashing is a rename that keeps hard links. The guarantees are listed in [SECURITY.md](SECURITY.md#undo-and-the-trash).
 
 ### 4. Rich Visual Cards & Unicode Sparklines (`df`, `du`, `stat`, `wc --table`)
 ```text
@@ -154,7 +154,7 @@ When output goes to a pipe or a file, Dogfish behaves like GNU coreutils 9.4 byt
 
 This is checked on every Linux CI run by a differential suite of more than 1,800 cases, which runs each command through both Dogfish and GNU in identical fixture trees and compares the results (`crates/dogfish/tests/gnu_compat*.rs`).
 
-GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's tests against Dogfish (only the tests whose programs under test Dogfish implements all of); CI runs it nightly and fails if a test in [`util/gnu-baseline.json`](./util/gnu-baseline.json) stops passing. **Today 343 of 375 such tests pass (91.5%; 42 more skip).** Every failing test is filed as a cairn item (0025–0056). Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`), `ls --dired`, and a handful of rarely used flags.
+GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's tests against Dogfish (only the tests whose programs under test Dogfish implements all of); CI runs it nightly and fails if a test in [`util/gnu-baseline.json`](./util/gnu-baseline.json) stops passing. **Today 366 of 375 such tests pass (97.6%; 42 more skip).** Every failing test is filed as a cairn item (0025–0056). Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`) and a handful of rarely used flags.
 
 ---
 

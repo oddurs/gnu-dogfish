@@ -115,7 +115,7 @@ pub fn run_watch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let output = sh.output()?;
         let elapsed = start.elapsed();
 
-        if ctx.stdout_is_tty {
+        if ctx.stdout_is_tty() {
             out!("\x1b[2J\x1b[H"); // Clear screen & home cursor
         }
         let now = Stamp::now();

@@ -155,7 +155,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     if operands.is_empty() {
         return Ok(usage_error("stat", "missing operand"));
     }
-    if json || (ctx.stdout_is_tty && format.is_none() && !terse && !file_system) {
+    if json || (ctx.stdout_is_tty() && format.is_none() && !terse && !file_system) {
         return stat_card(&operands, dereference, json, ctx);
     }
 

@@ -293,6 +293,24 @@ pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
     use std::os::unix::ffi::OsStringExt;
+    let argc = usize::try_from(argc).unwrap_or(0);
+    let arg = |i: usize| -> Option<&[u8]> {
+        if i >= argc {
+            return None;
+        }
+        // SAFETY: the C runtime passes `argc` valid pointers; `i < argc`.
+        let p = unsafe { *argv.add(i) };
+        // SAFETY: a non-null argv entry is a NUL-terminated string that
+        // lives for the whole process.
+        (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes())
+    };
+    // `true` and `false` are called in loops; settle them before anything
+    // allocates (the first allocation alone costs three system calls).
+    if let Some(code) = trivial_exit_status(argc, arg(0), arg(1), || {
+        std::env::var_os("DOGFISH_STATS").is_some()
+    }) {
+        return code;
+    }
     for fd in 0..3 {
         // SAFETY: fcntl(F_GETFD) only queries the descriptor.
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
@@ -313,18 +331,41 @@ pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_cha
             }
         }
     }
-    let args = (0..usize::try_from(argc).unwrap_or(0))
-        .filter_map(|i| {
-            // SAFETY: the C runtime passes `argc` valid NUL-terminated strings.
-            let arg = unsafe { *argv.add(i) };
-            (!arg.is_null()).then(|| {
-                // SAFETY: a non-null argv entry is a NUL-terminated string
-                // that lives for the whole process.
-                OsString::from_vec(unsafe { std::ffi::CStr::from_ptr(arg) }.to_bytes().to_vec())
-            })
-        })
+    let args = (0..argc)
+        .filter_map(|i| arg(i).map(|a| OsString::from_vec(a.to_vec())))
         .collect();
     libc::c_int::from(run(args))
+}
+
+/// The exit status of a `true` or `false` that has nothing to do but exit:
+/// GNU's ignore every argument unless there is exactly one (`--help` or
+/// `--version`). `None` when the full start-up is needed: another tool, a
+/// lone argument, or `DOGFISH_STATS` asking for the `--stats` footer.
+/// `argv0` and `argv1` are the first two arguments (`argc` of them in all).
+#[cfg_attr(test, allow(dead_code))]
+fn trivial_exit_status(
+    argc: usize,
+    argv0: Option<&[u8]>,
+    argv1: Option<&[u8]>,
+    stats_requested: impl FnOnce() -> bool,
+) -> Option<libc::c_int> {
+    let argv0 = argv0?;
+    let name = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
+    let name = name.strip_prefix(b"df-").unwrap_or(name);
+    // As `dogfish true ...`, the tool's own arguments start one later.
+    let (tool, tool_argc) = match name {
+        b"dogfish" | b"gnu-dogfish" => {
+            let sub = argv1?;
+            (sub.strip_prefix(b"df-").unwrap_or(sub), argc - 1)
+        }
+        _ => (name, argc),
+    };
+    let code = match tool {
+        b"true" => 0,
+        b"false" => 1,
+        _ => return None,
+    };
+    (tool_argc != 2 && !stats_requested()).then_some(code)
 }
 
 /// Runs the multicall binary on `raw_args` (`argv`); returns the exit status.
@@ -592,4 +633,39 @@ fn print_banner_and_help() {
 
     let _ = tbl.render(&mut stdout::stdout(), st);
     outln!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trivial_exit_status;
+
+    fn status(args: &[&str], stats: bool) -> Option<libc::c_int> {
+        let arg = |i: usize| args.get(i).map(|a| a.as_bytes());
+        trivial_exit_status(args.len(), arg(0), arg(1), || stats)
+    }
+
+    #[test]
+    fn true_and_false_exit_without_start_up() {
+        assert_eq!(status(&["true"], false), Some(0));
+        assert_eq!(status(&["/bin/df-false"], false), Some(1));
+        assert_eq!(status(&["true", "a", "b"], false), Some(0));
+        assert_eq!(status(&["dogfish", "false"], false), Some(1));
+        assert_eq!(
+            status(&["/x/gnu-dogfish", "df-true", "x", "y"], false),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_lone_argument_or_stats_takes_the_full_path() {
+        // `true --help` and `true --version` print; one argument may be either.
+        assert_eq!(status(&["true", "--help"], false), None);
+        assert_eq!(status(&["dogfish", "true", "--version"], false), None);
+        // DOGFISH_STATS asks for the --stats footer.
+        assert_eq!(status(&["true"], true), None);
+        assert_eq!(status(&["echo"], false), None);
+        assert_eq!(status(&["dogfish"], false), None);
+        assert_eq!(status(&["true/"], false), None);
+        assert_eq!(status(&[], false), None);
+    }
 }
