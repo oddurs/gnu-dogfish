@@ -764,6 +764,7 @@ fn re_protect(copier: &Copier<'_>, dst: &Path, attrs: &[DirAttr]) -> bool {
         if x.preserve_ownership
             && let Err(e) = std::os::unix::fs::lchown(&dir, Some(p.st.uid()), Some(p.st.gid()))
         {
+            // SAFETY: geteuid has no preconditions and cannot fail.
             let privileged = unsafe { libc::geteuid() } == 0;
             if !(matches!(e.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) && !privileged) {
                 eprintln!(

@@ -366,7 +366,8 @@ fn count_bytes_only(file: &mut File) -> (u64, Option<io::Error>) {
     if let Ok(meta) = file.metadata()
         && meta.is_file()
     {
-        // Safety: sysconf has no preconditions.
+        // SAFETY: no preconditions: sysconf takes no pointers and cannot
+        // fail in a way that matters (a -1 falls back to 4096).
         let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
             .unwrap_or(4096)
             .max(1);

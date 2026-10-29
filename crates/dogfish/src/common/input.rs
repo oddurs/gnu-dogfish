@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Standard input as a `File` that is never closed when dropped, so callers
 /// can `fstat` it, read its offset and seek it as GNU does with fd 0.
 pub(crate) fn stdin_file() -> ManuallyDrop<File> {
-    // Safety: fd 0 stays open for the life of the process (or is closed, in
-    // which case every operation on it fails with EBADF); ManuallyDrop keeps
-    // the File from closing it.
+    // SAFETY: descriptor only: fd 0 is open for the life of the process
+    // (`main` holds a closed one with /dev/null, and after close_stdin every
+    // operation fails with EBADF); ManuallyDrop keeps the File from closing
+    // it, so no descriptor is closed twice.
     ManuallyDrop::new(unsafe { File::from_raw_fd(0) })
 }
 
@@ -40,7 +41,8 @@ impl io::Write for RawStdout {
 /// when the descriptor does not support the query.
 pub(crate) fn bytes_available(fd: RawFd) -> Option<usize> {
     let mut n: libc::c_int = 0;
-    // Safety: FIONREAD writes one int through the pointer.
+    // SAFETY: out-pointer: FIONREAD writes one int through a pointer to
+    // the live local `n`; a bad descriptor only makes the call fail.
     let rc = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut n) };
     (rc == 0).then(|| usize::try_from(n).unwrap_or(0))
 }
@@ -64,7 +66,8 @@ pub(crate) fn close_stdin() -> io::Result<()> {
     if STDIN_CLOSED.load(Ordering::Relaxed) {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
-    // Safety: closing fd 0 has no memory-safety effect; nothing reads it after.
+    // SAFETY: descriptor only: fd 0 is closed once, after its last read;
+    // stdin_file Files never close it themselves.
     if unsafe { libc::close(0) } == 0 {
         Ok(())
     } else {

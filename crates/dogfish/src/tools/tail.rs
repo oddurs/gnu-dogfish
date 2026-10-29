@@ -287,10 +287,11 @@ fn open_tail_input(src: &InputSource) -> io::Result<FastReader> {
         if stdin.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
             && stdin.stream_position().is_ok_and(|p| p == 0)
         {
-            // Safety: read-only mapping of a regular file, as FastReader does.
-            if let Ok(map) = unsafe { memmap2::Mmap::map(&*stdin) } {
+            if let Ok(map @ FastReader::Mapped(_)) =
+                stdin.try_clone().and_then(FastReader::from_file)
+            {
                 let _ = stdin.seek(io::SeekFrom::End(0));
-                return Ok(FastReader::Mapped(map));
+                return Ok(map);
             }
         }
     }

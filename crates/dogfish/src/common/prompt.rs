@@ -23,6 +23,7 @@ pub(crate) fn write_protected(p: &Path) -> bool {
     let Ok(c) = c_path(p) else {
         return false;
     };
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     let denied = unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0;
     denied && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
 }

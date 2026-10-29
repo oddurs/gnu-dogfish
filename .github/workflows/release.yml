@@ -1,5 +1,10 @@
 name: Release Binaries (macOS & Linux)
 
+# Builds the release archives reproducibly (`cargo xtask dist`), writes a
+# CycloneDX SBOM per archive, and publishes both with SHA256SUMS and GitHub
+# artifact attestations (Sigstore-signed SLSA build provenance, plus an SBOM
+# attestation per archive). doc/verify.md says how to check them.
+
 on:
   # A tag pushed by a person (or a token that triggers workflows).
   push:
@@ -21,57 +26,168 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+# Only the publish job writes; the build jobs can only read.
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release toolchain is pinned so anyone can rebuild a release bit for bit
+  # (doc/verify.md). Keep it equal to the repro job in supply-chain.yml.
+  RELEASE_TOOLCHAIN: 1.99.1
 
 jobs:
   build-release:
     name: Build Release Archive (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive_name: gnu-dogfish-linux-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive_name: gnu-dogfish-macos-arm64.tar.gz
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Test
         run: cargo test --workspace --release --locked --target ${{ matrix.target }}
 
       # Built for the baseline CPU of the target (no `target-cpu=native`) so the
-      # binaries run on any machine of that architecture.
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      # binaries run on any machine of that architecture. Writes the archive and
+      # its .sha256 to target/dist/out; SOURCE_DATE_EPOCH is the commit time.
+      - name: Build release archive
+        run: cargo xtask dist --target ${{ matrix.target }}
 
-      - name: Package release archive & SHA256SUMS
+      - name: Keep the archive for the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: target/dist/out/*
+          if-no-files-found: error
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
+
+      # A prebuilt binary, checked against the SHA-256 in install-action's manifest.
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-cyclonedx@0.5.9
+          fallback: none
+
+      # One SBOM per archive: the dependency graph differs per target. Each
+      # lists every crate compiled into (or used to build) the binary, with
+      # versions, licenses and package URLs.
+      - name: Generate SBOMs
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/dogfish dist/
-          cp README.md LICENSE LICENSE-GPL LICENSE-MIT CHANGELOG.md dist/
-          tar -czf ${{ matrix.archive_name }} -C dist .
-          ./target/${{ matrix.target }}/release/dogfish sha256sum ${{ matrix.archive_name }} > ${{ matrix.archive_name }}.sha256
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          mkdir -p sbom
+          for pair in \
+            x86_64-unknown-linux-gnu:gnu-dogfish-linux-x86_64 \
+            aarch64-apple-darwin:gnu-dogfish-macos-arm64; do
+            target=${pair%%:*} name=${pair#*:}
+            cargo cyclonedx --manifest-path crates/dogfish/Cargo.toml \
+              --format json --spec-version 1.5 --target "$target" \
+              --override-filename "$name.cdx"
+            mv "crates/dogfish/$name.cdx.json" sbom/
+            # cargo-cyclonedx writes one for every workspace member; only the
+            # binary's is shipped.
+            rm -f "crates/dogfish-core/$name.cdx.json" "crates/xtask/$name.cdx.json"
+          done
+          ls -l sbom
+
+      - name: Keep the SBOMs for the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
+  publish:
+    name: Attest & Publish
+    needs: [build-release, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload release assets
+      id-token: write # Sigstore signing certificate for the attestations
+      attestations: write # store the attestations
+    steps:
+      - name: Download archives and SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the per-archive sums and write SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -c -- *.tar.gz.sha256
+          sha256sum -- *.tar.gz *.cdx.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+            dist/SHA256SUMS
+
+      - name: Attest SBOM (Linux archive)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/gnu-dogfish-linux-x86_64.tar.gz
+          sbom-path: dist/gnu-dogfish-linux-x86_64.cdx.json
+
+      - name: Attest SBOM (macOS archive)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/gnu-dogfish-macos-arm64.tar.gz
+          sbom-path: dist/gnu-dogfish-macos-arm64.cdx.json
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            ${{ matrix.archive_name }}
-            ${{ matrix.archive_name }}.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.cdx.json
+            dist/SHA256SUMS
           # release-please writes the notes itself; only generate them for a hand-pushed tag.
           generate_release_notes: ${{ inputs.tag == '' }}

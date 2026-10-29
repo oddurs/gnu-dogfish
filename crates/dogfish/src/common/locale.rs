@@ -9,8 +9,11 @@ use std::sync::OnceLock;
 pub(crate) fn utf8_locale() -> bool {
     static UTF8: OnceLock<bool> = OnceLock::new();
     *UTF8.get_or_init(|| {
-        // Safety: only LC_CTYPE is touched, and it is put back to "C" so
-        // nothing else sees a changed locale; the codeset is read before.
+        // SAFETY: the locale names are NUL-terminated literals; nl_langinfo
+        // returns null or a NUL-terminated string in libc storage that is
+        // copied (compared) before the next setlocale call. Only LC_CTYPE is
+        // touched, once, through a OnceLock, and it is put back to "C" so
+        // nothing else sees a changed locale.
         unsafe {
             if libc::setlocale(libc::LC_CTYPE, c"".as_ptr()).is_null() {
                 return false;

@@ -142,6 +142,7 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // GNU checks standard output before reading anything.
     // SAFETY: fstat writes into the zeroed buffer it is given.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on descriptor 1 with a properly sized, writable buffer.
     if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) } < 0 {
         eprintln!(
             "cat: standard output: {}",
@@ -167,7 +168,10 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     };
     let mut exit_code = 0;
     // GNU refuses to copy a non-empty regular file onto itself.
-    let out_id = stdout_identity();
+    // GNU's `input file is output file` check needs standard output's
+    // identity when it is a regular file.
+    let out_id = (st.st_mode & libc::S_IFMT == libc::S_IFREG)
+        .then_some((st.st_dev as u64, st.st_ino as u64));
     let mut buf = vec![0u8; IO_SIZE];
 
     for src in &sources {
@@ -213,15 +217,6 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 /// Read and write size: large enough that syscalls are not the cost.
 const IO_SIZE: usize = 128 * 1024;
 
-/// Device and inode of standard output when it is a regular file.
-fn stdout_identity() -> Option<(u64, u64)> {
-    // Safety: fstat only writes the stat buffer.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::fstat(1, &mut st) } == 0;
-    (ok && st.st_mode & libc::S_IFMT == libc::S_IFREG)
-        .then_some((st.st_dev as u64, st.st_ino as u64))
-}
-
 /// Opens one input: `Some(None)` is standard input, `None` the regular file
 /// standard output writes to while unread data remains (GNU's `input file
 /// is output file`).
@@ -255,8 +250,9 @@ fn cat_plain(
     if out_is_regular && input.metadata().is_ok_and(|m| m.is_file()) {
         let fd = input.as_raw_fd();
         loop {
-            // Safety: both descriptors are open; null offsets use (and
-            // advance) the file offsets.
+            // SAFETY: descriptor only: `fd` is owned by the live `input`
+            // and 1 is standard output; null offsets use (and advance) the
+            // file offsets, so no pointer is read or written.
             let n = unsafe {
                 libc::copy_file_range(
                     fd,

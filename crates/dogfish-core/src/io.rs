@@ -79,8 +79,17 @@ impl FastReader {
     pub fn from_file(file: File) -> io::Result<Self> {
         let meta = file.metadata()?;
         if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
-            // Safety: read-only memory map for fast sequential scan
+            // SAFETY: a read-only private mapping of a regular file the
+            // caller opened. Rust's aliasing rules assume the bytes do not
+            // change while mapped; another process can still modify or
+            // truncate the file. Modification can only change the data read
+            // (as with read(2) racing a writer); truncation raises SIGBUS,
+            // which install_sigbus_handler turns into a clean exit. See
+            // doc/unsafe.md.
             if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                // SAFETY: the pointer and length describe the live mapping
+                // just created; madvise is only a hint and never changes its
+                // contents.
                 #[cfg(unix)]
                 unsafe {
                     libc::madvise(
@@ -177,6 +186,7 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
             if dst.exists() {
                 let _ = fs::remove_file(dst);
             }
+            // SAFETY: both pointers come from CStrings that outlive the call.
             let ret = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
             if ret == 0 {
                 let len = fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
@@ -194,6 +204,8 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
         let src_file = File::open(src)?;
         let meta = src_file.metadata()?;
         let dst_file = File::create(dst)?;
+        // SAFETY: FICLONE takes two open file descriptors and no pointers;
+        // both files stay open for the duration of the call.
         let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
         let (bytes, method) = if ret == 0 {
             (meta.len(), CopyMethod::FicloneCoW)
@@ -272,6 +284,7 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.
 pub fn install_sigpipe_handler() {
+    // SAFETY: restores the default disposition; no handler code runs.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -284,10 +297,13 @@ static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 extern "C" fn on_sigbus(_: libc::c_int) {
     // Async-signal-safe only: write(2) a preformatted message, then _exit(2).
     if let Some(msg) = SIGBUS_MSG.get() {
+        // SAFETY: write(2) is async-signal-safe; `msg` is a Vec that is never
+        // freed or changed once set, so the pointer and length stay valid.
         unsafe {
             libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
         }
     }
+    // SAFETY: _exit(2) is async-signal-safe and never returns.
     unsafe { libc::_exit(1) }
 }
 
@@ -299,6 +315,9 @@ extern "C" fn on_sigbus(_: libc::c_int) {
 pub fn install_sigbus_handler(tool: &str) {
     let _ =
         SIGBUS_MSG.set(format!("{tool}: input file was truncated while being read\n").into_bytes());
+    // SAFETY: a zeroed sigaction is a valid "no flags, empty mask" value; the
+    // handler is an `extern "C" fn(c_int)` that only calls async-signal-safe
+    // functions, and SIGBUS_MSG is set before the handler is installed.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigbus as *const () as libc::sighandler_t;
