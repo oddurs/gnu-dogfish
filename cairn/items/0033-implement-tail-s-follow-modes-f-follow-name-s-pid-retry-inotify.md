@@ -3,12 +3,13 @@ id: 33
 uid: f40e8107-12cc-416b-9773-755f8f5229bc
 title: "Implement tail's follow modes (-F, --follow=name, -s, --pid, --retry, inotify)"
 type: bug
-status: planned
+status: done
 milestone: "v0.3"
 depends_on:
 - 8
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p1
 effort: xl
 area: compat
@@ -60,5 +61,9 @@ tail.pl is tracked by 0028 (obsolete syntax) and 0029 (`-z`).
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Notes
+
+- 2026-10-29: Ported GNU's tail.c follow loop as `tools/tail/{mod,follow,inotify}.rs`. All 22 listed tests pass in four runs with RUN_EXPENSIVE_TESTS=yes; inotify-race and inotify-race2 skip (they set gdb breakpoints in GNU's binary), append-only and end-of-device need root. Keeping an inherited ignored SIGPIPE (needed by pipe-f) exposed EPIPE message differences in a few tools; tracked as follow-up work on branch epipe-gnu.
