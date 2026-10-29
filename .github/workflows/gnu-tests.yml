@@ -38,7 +38,7 @@ jobs:
 
       # The built GNU tree depends only on the pinned release.
       - name: Cache GNU coreutils build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target/gnu/coreutils-9.4
           key: gnu-coreutils-9.4-${{ runner.os }}-v1
