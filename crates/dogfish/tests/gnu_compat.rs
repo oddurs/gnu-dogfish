@@ -10,7 +10,7 @@
 // Case names mirror the flags they test (`cat_A_stdin` vs `cat_e_...`), where case matters.
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,24 @@ fn fixtures() -> &'static Path {
                 "mixcase.txt",
                 b"banana\nApple\napple\nCherry\nbanana\nBANANA\n",
             ),
+            (
+                "months.txt",
+                b"  feb\nJan\nmar 1\nDEC\njunk\n\nMAY\n\tapr\njanuary\nja\nMarch\nfeb\nnot\n   \nOct\nfEb\n",
+            ),
+            (
+                "versions.txt",
+                b"a~\na\na.1\na.10\na.2\n.hidden\n1.0rc1\n1.0\n1.0~rc1\nfoo-1.2.tar.gz\n\
+                  foo-1.10.tar.gz\nfoo-1.2.zip\n\n007\n7\n07\n..\n.\n~\na1b\na01b\n1.2.3\n\
+                  1.2.3a\n1.2.3~\nx.tar.gz\nx\n1.0.\nREADME\nfile10.txt\nfile9.txt\nfile.txt\n\
+                  .a.b\n.~\n-1\n_x\n",
+            ),
+            (
+                "keyver.txt",
+                b"pkg 1.10 Mar\nlib 1.2 jan\npkg 1.9 FEB\nlib 1.2~rc1 Dec\napp 2.0 jan\napp 2 x\n",
+            ),
+            // `--random-source` needs at least 16 bytes; `short.bin` has too few.
+            ("seed.bin", b"0123456789abcdefghijklmnopqrstuv"),
+            ("short.bin", b"abc"),
         ];
         for (name, data) in files {
             std::fs::write(dir.join(name), data).unwrap();
@@ -533,4 +551,242 @@ gnu_cases! {
     paste_serial: "paste" ["-s", "lines.txt", "notrail.txt"];
     paste_stdin: "paste" ["-", "lines.txt"] stdin b"x\ny\n";
     paste_missing: "paste" ["nonexist"];
+
+    // ------------------------------------------------- sort -M / -V / --sort
+    sort_month: "sort" ["-M", "months.txt"];
+    sort_month_reverse: "sort" ["-Mr", "months.txt"];
+    sort_month_unique: "sort" ["-Mu", "months.txt"];
+    sort_month_stable: "sort" ["-Ms", "months.txt"];
+    sort_month_long: "sort" ["--month-sort", "months.txt"];
+    sort_month_word: "sort" ["--sort=month", "months.txt"];
+    sort_month_fold_blanks: "sort" ["-bfM", "months.txt"];
+    sort_month_key: "sort" ["-k3M", "keyver.txt"];
+    sort_month_key_reverse: "sort" ["-k3,3Mr", "-k1,1", "keyver.txt"];
+    sort_month_key_char: "sort" ["-k1.2M"] stdin b"xjan\nyDEC\nzfeb\nwjunk\n";
+    sort_month_ties: "sort" ["-M"] stdin b"jan b\nJAN a\nfeb\njan a\n";
+    sort_month_check_ok: "sort" ["-cM"] stdin b"junk\njan\nFeb\ndec\n";
+    sort_month_check_bad: "sort" ["-cM"] stdin b"feb\njan\n";
+    sort_month_check_unique: "sort" ["-cuM"] stdin b"jan\nJAN\n";
+    sort_version: "sort" ["-V", "versions.txt"];
+    sort_version_reverse: "sort" ["-Vr", "versions.txt"];
+    sort_version_unique: "sort" ["-Vu", "versions.txt"];
+    sort_version_stable: "sort" ["-Vs", "versions.txt"];
+    sort_version_long: "sort" ["--version-sort", "versions.txt"];
+    sort_version_word: "sort" ["--sort=version", "versions.txt"];
+    sort_version_word_prefix: "sort" ["--sort=v", "versions.txt"];
+    sort_version_fold: "sort" ["-Vf", "versions.txt"];
+    sort_version_dictionary: "sort" ["-Vd", "versions.txt"];
+    sort_version_blanks: "sort" ["-bV"] stdin b"  1.10\n1.9\n \t1.2\n";
+    sort_version_key: "sort" ["-k1,1", "-k2,2V", "keyver.txt"];
+    sort_version_key_reverse: "sort" ["-k2,2Vr", "keyver.txt"];
+    sort_version_key_sep: "sort" ["-t", "-", "-k2V"] stdin b"foo-1.10\nbar-1.9\nbaz-1.9~rc\nqux-\n";
+    sort_version_suffixes: "sort" ["-V"] stdin b"a.tar.gz\na.tar\na\na1.tar.gz\na.1.tar.gz\na~.tar\n";
+    sort_version_leading_zeros: "sort" ["-V"] stdin b"1.010\n1.01\n1.1\n1.001\n01.1\n";
+    sort_version_tilde: "sort" ["-V"] stdin b"1~\n1\n1~~\n1~a\n1a\n~\n~~\n\n";
+    sort_version_check_bad: "sort" ["-cV"] stdin b"1.10\n1.9\n";
+    sort_word_numeric: "sort" ["--sort=numeric", "nums.txt"];
+    sort_word_general: "sort" ["--sort=general-numeric", "nums.txt"];
+    sort_word_human: "sort" ["--sort=h", "human.txt"];
+    sort_word_invalid: "sort" ["--sort=foo"] stdin b"x\n";
+    sort_word_ambiguous: "sort" ["--sort="] stdin b"x\n";
+    sort_incompatible: "sort" ["-nM"] stdin b"x\n";
+    sort_incompatible_inherited: "sort" ["-k1,1", "-Vh"] stdin b"x\n";
+    sort_incompatible_dictionary: "sort" ["-k2,2dM"] stdin b"x\n";
+    sort_incompatible_words: "sort" ["--sort=month", "--sort=numeric"] stdin b"x\n";
+    sort_compatible_string_orders: "sort" ["-k1,1Vdi", "-k2,2Mb"] stdin b"b 2\na 1\n";
+    sort_random_source_missing: "sort" ["-R", "--random-source=nonexist"] stdin b"x\n";
+    sort_random_source_short: "sort" ["-R", "--random-source=short.bin"] stdin b"x\n";
+    sort_random_source_unused: "sort" ["--random-source=nonexist"] stdin b"b\na\n";
+    sort_random_incompatible: "sort" ["-Rn", "--random-source=seed.bin"] stdin b"x\n";
+
+    // -------------------------------------------- cut -c is bytes, like GNU
+    cut_chars_utf8: "cut" ["-c", "1-3", "utf8.txt"];
+    cut_chars_utf8_locale: "cut" ["-c", "1-3", "utf8.txt"] @ "C.UTF-8";
+    cut_chars_utf8_split: "cut" ["-c", "2,5-7"] @ "C.UTF-8" stdin "\u{e9}t\u{e9} \u{65e5}\u{672c}\n".as_bytes();
+    cut_chars_utf8_complement: "cut" ["-c", "-2", "--complement", "utf8.txt"] @ "C.UTF-8";
+    cut_chars_n_ignored: "cut" ["-n", "-c", "2-4", "utf8.txt"] @ "C.UTF-8";
+    cut_bytes_n_ignored: "cut" ["-n", "-b", "1,4", "utf8.txt"];
+    cut_chars_output_delim: "cut" ["-c", "1-2,3-4,6-", "--output-delimiter=|", "utf8.txt"];
+    cut_bytes_output_delim_complement: "cut" ["-b", "2,4", "--complement", "--output-delimiter=:"] stdin b"abcdefgh\n";
+    cut_chars_empty_output_delim: "cut" ["-c", "1-2,4-", "--output-delimiter="] stdin b"abcdef\n";
+    cut_fields_empty_output_delim: "cut" ["-d,", "-f1,3", "--output-delimiter="] stdin b"a,b,c\n";
+    cut_chars_with_delim: "cut" ["-c1", "-d,"] stdin b"a,b\n";
+    cut_bytes_only_delimited: "cut" ["-b1", "-s"] stdin b"a,b\n";
+}
+
+// ---------------------------------------------------------------- sort -R
+//
+// The order of `sort -R` depends on the random seed, so raw output is never
+// compared with GNU. With a fixed `--random-source`, both implementations
+// must be deterministic, keep exactly the input lines, and keep equal keys
+// adjacent.
+
+fn dogfish_sort() -> Command {
+    let mut cmd = Command::new(dogfish_bin());
+    cmd.arg("sort");
+    cmd
+}
+
+fn gnu_sort() -> Option<Command> {
+    let mut cmd = Command::new(gnu_tool("sort")?);
+    cmd.arg0("sort");
+    Some(cmd)
+}
+
+/// Runs `cmd ARGS` over `input` under `LC_ALL=C` and returns its stdout.
+fn run_sort(mut cmd: Command, args: &[&str], input: &[u8]) -> Vec<u8> {
+    cmd.args(args);
+    let out = exec(cmd, Some(input), "C");
+    assert!(
+        out.status.success(),
+        "sort {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn lines_of(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    body.split(|&b| b == b'\n')
+        .filter(move |_| !bytes.is_empty())
+}
+
+fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = lines_of(bytes).collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Asserts that the lines of `output` with equal `key` form one contiguous run.
+fn assert_grouped(output: &[u8], key: fn(&[u8]) -> Vec<u8>, who: &str) {
+    let mut finished = HashSet::new();
+    let mut current: Option<Vec<u8>> = None;
+    for line in lines_of(output) {
+        let k = key(line);
+        if current.as_ref() == Some(&k) {
+            continue;
+        }
+        assert!(
+            !finished.contains(&k),
+            "{who}: lines with key {:?} are not adjacent:\n{}",
+            String::from_utf8_lossy(&k),
+            String::from_utf8_lossy(output)
+        );
+        if let Some(prev) = current.replace(k) {
+            finished.insert(prev);
+        }
+    }
+}
+
+/// Checks the seeded `-R` properties for dogfish and (when installed) GNU
+/// sort, and that both output the same multiset of lines.
+fn check_random_sort(args: &[&str], input: &[u8], key: fn(&[u8]) -> Vec<u8>) {
+    let ours = run_sort(dogfish_sort(), args, input);
+    assert_eq!(
+        ours,
+        run_sort(dogfish_sort(), args, input),
+        "dogfish sort {args:?} is not deterministic"
+    );
+    assert_grouped(&ours, key, "dogfish");
+
+    let (Some(first), Some(second)) = (gnu_sort(), gnu_sort()) else {
+        eprintln!("note: skipping GNU half — system `sort` is missing or not GNU coreutils");
+        return;
+    };
+    let theirs = run_sort(first, args, input);
+    assert_eq!(
+        theirs,
+        run_sort(second, args, input),
+        "GNU sort {args:?} is not deterministic"
+    );
+    assert_grouped(&theirs, key, "GNU");
+    assert_eq!(
+        sorted_lines(&ours),
+        sorted_lines(&theirs),
+        "sort {args:?}: dogfish and GNU output different lines"
+    );
+}
+
+const RANDOM_INPUT: &[u8] = b"pear 3\napple 1\nfig 2\napple 1\nPear 9\nkiwi 2\npear 3\n\
+    fig 2\napple 7\n\nkiwi 2\npear 3\n\nfig 5\nAPPLE 1\n";
+
+fn whole_line(line: &[u8]) -> Vec<u8> {
+    line.to_vec()
+}
+
+fn first_field(line: &[u8]) -> Vec<u8> {
+    line.split(|&b| b == b' ')
+        .next()
+        .unwrap_or_default()
+        .to_vec()
+}
+
+fn first_field_folded(line: &[u8]) -> Vec<u8> {
+    first_field(line).to_ascii_uppercase()
+}
+
+#[test]
+fn sort_random_groups_identical_lines() {
+    check_random_sort(
+        &["-R", "--random-source=seed.bin"],
+        RANDOM_INPUT,
+        whole_line,
+    );
+}
+
+#[test]
+fn sort_random_long_options() {
+    let args = ["--random-sort", "--random-source", "seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, whole_line);
+    let args = ["--sort=random", "--random-source=seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, whole_line);
+}
+
+#[test]
+fn sort_random_reverse() {
+    check_random_sort(
+        &["-Rr", "--random-source=seed.bin"],
+        RANDOM_INPUT,
+        whole_line,
+    );
+}
+
+#[test]
+fn sort_random_key_groups_equal_keys() {
+    let args = ["-k1,1R", "--random-source=seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, first_field);
+    let args = ["-s", "-k1,1R", "--random-source=seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, first_field);
+}
+
+#[test]
+fn sort_random_fold_groups_case_insensitively() {
+    let args = ["-fR", "-k1,1", "--random-source=seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, first_field_folded);
+}
+
+#[test]
+fn sort_random_unique_keeps_one_of_each() {
+    let args = ["-Ru", "--random-source=seed.bin"];
+    check_random_sort(&args, RANDOM_INPUT, whole_line);
+    let ours = run_sort(dogfish_sort(), &args, RANDOM_INPUT);
+    let mut expected = sorted_lines(RANDOM_INPUT);
+    expected.dedup();
+    assert_eq!(sorted_lines(&ours), expected);
+}
+
+#[test]
+fn sort_random_then_sort_is_plain_sort() {
+    // `sort -R --random-source=f | sort` must equal `sort`; the second stage
+    // is GNU sort when available.
+    let plain_sort = || gnu_sort().unwrap_or_else(dogfish_sort);
+    let shuffled = run_sort(
+        dogfish_sort(),
+        &["-R", "--random-source=seed.bin"],
+        RANDOM_INPUT,
+    );
+    assert_eq!(
+        run_sort(plain_sort(), &[], &shuffled),
+        run_sort(plain_sort(), &[], RANDOM_INPUT)
+    );
 }
