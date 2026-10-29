@@ -135,6 +135,61 @@ gnu_cases! {
     uniq_bad_skip: "uniq" ["-f", "x"] stdin b"a\n";
     uniq_extra_operand: "uniq" ["dup.txt", "out", "extra"];
     uniq_no_trailing_newline: "uniq" [] stdin b"a\na";
+
+    // ---------------------------------------------------------------- cut
+    cut_nul_delimiter: "cut" ["-d", "", "--output-delimiter=_", "-f2,3"] stdin b"a\0b\0c\n";
+    cut_newline_delimiter: "cut" ["-d", "\n", "-f1"] stdin b"a:1\nb:";
+    cut_newline_delimiter_s: "cut" ["-s", "-d", "\n", "-f2"] stdin b"\nb";
+    cut_newline_delimiter_join: "cut" ["-d", "\n", "-f1-", "--output-delimiter=:"] stdin b"a\nb\n";
+    cut_zero: "cut" ["-z", "-d:", "-f1"] stdin b"a:1\0b:2";
+    cut_zero_bytes: "cut" ["-z", "-c1"] stdin b"ab\0cd";
+    cut_nul_output_delimiter: "cut" ["-d:", "--output-delimiter=", "-f2,3"] stdin b"a:b:c\n";
+    cut_abbreviated_option: "cut" ["-d:", "--out=_", "-f2,3"] stdin b"a:b:c\n";
+    cut_only_delimited: "cut" ["-s", "-d:", "-f2", "fields.txt"];
+    cut_complement: "cut" ["--complement", "-d:", "-f2", "fields.txt"];
+    cut_byte_ranges_delimited: "cut" ["-b1-2,4-", "--output-delimiter=|", "fields.txt"];
+    cut_huge_offset: "cut" ["-b18446744073709551615", "fields.txt"];
+    cut_huge_offset_open_range: "cut" ["-b18446744073709551614-", "fields.txt"];
+    cut_field_too_large: "cut" ["-f99999999999999999999", "fields.txt"];
+    cut_decreasing_range: "cut" ["-f", "2-0", "fields.txt"];
+    cut_double_dash_range: "cut" ["-b", "1-2-3", "fields.txt"];
+    cut_field_range_double_dash: "cut" ["-f", "1--2", "fields.txt"];
+    cut_no_endpoint: "cut" ["-f", "1,-", "fields.txt"];
+    cut_invalid_value: "cut" ["-f", "1x", "fields.txt"];
+    cut_missing_list: "cut" ["-f", "--", "fields.txt"];
+    cut_empty_list: "cut" ["-b", "", "fields.txt"];
+    cut_two_lists: "cut" ["-f1", "-b2", "fields.txt"];
+    cut_delimiter_with_bytes: "cut" ["-d", "", "-b1", "fields.txt"];
+    cut_multichar_delimiter: "cut" ["-d", "ab", "-f1", "fields.txt"];
+    cut_no_list: "cut" ["fields.txt"];
+    cut_missing_file: "cut" ["-f1", "nonexist", "fields.txt"];
+
+    // ----------------------------------------------------------------- tr
+    tr_upper_class_lines_up: "tr" ["[:lower:][:lower:]", "[:upper:]0-9"] stdin b"abcxyz\n";
+    tr_misaligned_case_class: "tr" ["A-Z[:lower:]", "a-y[:upper:]"] stdin b"";
+    tr_set2_ends_in_class: "tr" ["[:upper:] ", "[:lower:]"] stdin b"";
+    tr_repeat_of_colon: "tr" ["[:*3][:digit:]", "a-m"] stdin b":1239";
+    tr_bad_octal_repeat: "tr" ["[b*08]", "[x*]"] stdin b"";
+    tr_backslash_at_end: "tr" ["\\", "x"] stdin b"\\";
+    tr_complement_class_not_homogeneous: "tr" ["-cs", "[:upper:]", "X[Y*]"] stdin b"";
+    tr_complement_class_homogeneous: "tr" ["-cs", "[:upper:]", "[X*]"] stdin b"AMZamz123.-+AMZ";
+    tr_empty_equiv: "tr" ["[==]", "x"] stdin b"";
+    tr_empty_class: "tr" ["[::]", "x"] stdin b"";
+    tr_bad_class: "tr" ["[:foo:]", "x"] stdin b"";
+    tr_equiv_too_long: "tr" ["[=ab=]", "x"] stdin b"";
+    tr_equiv_in_set2: "tr" ["a", "[=b=]"] stdin b"a";
+    tr_class_in_set2: "tr" ["a", "[:digit:]"] stdin b"a";
+    tr_repeat_in_set1: "tr" ["[a*]", "x"] stdin b"a";
+    tr_two_repeats_in_set2: "tr" ["ab", "[x*][y*]"] stdin b"a";
+    tr_repeat_not_translating: "tr" ["-ds", "a", "[x*]"] stdin b"a";
+    tr_reverse_range: "tr" ["z-a", "x"] stdin b"a";
+    tr_ambiguous_octal: "tr" ["\\400", "x"] stdin b" 0";
+    tr_repeat_escaped_count: "tr" ["abc", "[b*\\9]"] stdin b"abcd";
+    tr_repeat_zeros: "tr" ["abc", "[b*00000000000000000000]"] stdin b"abcd";
+    tr_complement_repeat: "tr" ["-c", "[a*65536]\\n", "[b*]"] stdin b"abcd";
+    tr_missing_operand_after: "tr" ["-ds", "a"] stdin b"";
+    tr_extra_operand: "tr" ["-d", "a", "b"] stdin b"";
+    tr_empty_set2: "tr" ["a", ""] stdin b"";
 }
 
 // ------------------------------------------------------- shell pipelines
