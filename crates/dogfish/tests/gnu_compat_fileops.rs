@@ -92,6 +92,7 @@ fn build_tree(root: &Path) {
         ("ld", "d"),
         ("lla", "la"),
         ("lsub", "d/sub/g"),
+        ("lh1", "h1"),
         ("d/up", "../a"),
     ] {
         symlink(target, root.join(link)).unwrap();
@@ -138,6 +139,9 @@ struct Compare {
     no_tree: bool,
     /// Skip comparing stderr.
     no_stderr: bool,
+    /// Run Dogfish with `DOGFISH_UNDO=off`: the undo trash keeps an extra hard
+    /// link to a replaced file, which shows in its link count (ROADMAP.md).
+    no_undo: bool,
     /// Compare stdout as a set of lines: GNU `cp -r` copies a directory's
     /// entries in inode order, which differs between the two scratch trees.
     unordered: bool,
@@ -229,6 +233,7 @@ impl TreeCase<'_> {
             }
             "no_tree" => self.cmp.no_tree = true,
             "nostderr" => self.cmp.no_stderr = true,
+            "no_undo" => self.cmp.no_undo = true,
             "unordered" => self.cmp.unordered = true,
             "tz_new_york" => self.tz = TZ_NEW_YORK,
             other => panic!("unknown flag {other}"),
@@ -260,6 +265,9 @@ impl TreeCase<'_> {
             .args(self.args)
             .env("DOGFISH_HOME", base.join("dogfish-home"))
             .env("TZ", self.tz);
+        if self.cmp.no_undo {
+            ours.env("DOGFISH_UNDO", "off");
+        }
         let mut theirs = Command::new(&gnu);
         theirs.arg0(self.tool).args(self.args).env("TZ", self.tz);
         let a = exec(ours, &ours_dir, self.stdin, "C");
@@ -820,6 +828,18 @@ tree_cases! {
     cp_directory_onto_file: "cp" ["-rv", "e", "a"];
     cp_preserves_hard_links: "cp" ["-a", "h1", "h2", "e"];
     cp_attributes_only: "cp" ["--attributes-only", "a", "x"];
+    // A symlink copied onto what it resolves to (GNU's same_file_ok).
+    cp_no_dereference_symlink_onto_referent: "cp" ["-d", "la", "a"];
+    cp_archive_symlink_onto_referent: "cp" ["-a", "la", "a"];
+    cp_remove_destination_symlink_onto_referent: "cp" ["--remove-destination", "-d", "la", "a"];
+    cp_symlink_onto_referent: "cp" ["la", "a"];
+    cp_backup_onto_symlink_to_source: "cp" ["-bv", "a", "la"];
+    cp_backup_no_dereference_onto_symlink_to_source: "cp" ["-bdv", "a", "la"];
+    cp_hard_link_onto_symlink_to_source: "cp" ["-l", "a", "la"];
+    cp_symbolic_link_onto_symlink_to_source: "cp" ["-s", "a", "la"];
+    cp_force_symbolic_link_onto_symlink_to_source: "cp" ["-sf", "a", "la"];
+    cp_backup_hard_links: "cp" ["-bv", "h1", "h2"] => no_undo;
+    cp_attributes_only_keeps_linked_contents: "cp" ["-a", "--attributes-only", "a", "h1"] => mtime;
     cp_strip_trailing_slashes: "cp" ["-rv", "--strip-trailing-slashes", "d/", "x"] => unordered;
     cp_quoting: "cp" ["-v", "spa ce", "it's"];
     cp_bad_option: "cp" ["--bogus", "a", "b"];
@@ -833,6 +853,14 @@ tree_cases! {
     mv_missing_destination: "mv" ["a"];
     mv_same_file: "mv" ["a", "a"];
     mv_same_file_dot: "mv" ["a", "./a"];
+    // A symlink moved onto what it resolves to would destroy the file.
+    mv_symlink_onto_referent: "mv" ["la", "a"];
+    mv_symlink_chain_onto_referent: "mv" ["lla", "a"];
+    mv_symlink_onto_referent_by_link: "mv" ["lh1", "h1"];
+    mv_symlink_onto_other_hard_link: "mv" ["-v", "lh1", "h2"] => no_undo;
+    mv_backup_symlink_onto_referent: "mv" ["-bv", "la", "a"];
+    mv_hard_links: "mv" ["h1", "h2"];
+    mv_backup_hard_links: "mv" ["-bv", "h1", "h2"];
     mv_into_itself: "mv" ["d", "d/sub"];
     mv_into_directory: "mv" ["-v", "a", "b", "e"];
     mv_into_directory_partial: "mv" ["-v", "a", "nope", "b", "e"];

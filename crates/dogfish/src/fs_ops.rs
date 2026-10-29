@@ -5190,20 +5190,38 @@ impl Copier<'_> {
             if !src_is_dir && exists && matches!(self.o.clobber, Clobber::No | Clobber::Skip) {
                 return true;
             }
-            // Same-file check: never truncate or unlink the source itself.
-            let same = if src_is_link {
-                same_inode(src_meta, dl)
-            } else {
-                dst_meta.as_ref().is_some_and(|dm| same_inode(src_meta, dm))
+            // Same-file check (GNU's same_file_ok): never truncate or unlink
+            // the source itself. A regular file is written through a
+            // destination symlink, so it compares with what that resolves to,
+            // unless the destination is replaced rather than written.
+            let backup = self.o.backup != BackupMode::None;
+            let use_lstat = !src_meta.is_file()
+                || self.o.symbolic_link
+                || self.o.hard_link
+                || backup
+                || self.o.remove_destination;
+            let x = SameFileOpts {
+                move_mode: false,
+                deref_never: self.o.deref == Deref::Never,
+                hard_link: self.o.hard_link,
+                symbolic_link: self.o.symbolic_link,
+                backup,
+                unlink_dest_before_opening: self.o.remove_destination,
             };
-            // Removing a destination symlink first is fine (`--remove-destination`).
-            if self.o.hard_link && !src_is_dir && same_inode(src_meta, dl) {
-                // Already a link to the source: nothing to do.
-                return true;
-            }
-            if same && !(dl.is_symlink() && self.o.remove_destination) {
-                eprintln!("cp: {} and {} are the same file", qa(src), qa(dst));
-                return false;
+            let dst_sb = if use_lstat {
+                Some(dl)
+            } else {
+                dst_meta.as_ref()
+            };
+            if let Some(dst_sb) = dst_sb {
+                match same_file_ok(src, src_meta, dst, dst_sb, &x) {
+                    (false, _) => {
+                        eprintln!("cp: {} and {} are the same file", qa(src), qa(dst));
+                        return false;
+                    }
+                    (true, true) => return true,
+                    (true, false) => {}
+                }
             }
             // A symlink to a directory only counts as one with --keep-directory-symlink.
             let dst_is_dir = dl.is_dir()
@@ -5268,8 +5286,11 @@ impl Copier<'_> {
                         }
                     }
                 } else if self.o.remove_destination
-                    || (self.o.preserve_links && dl.nlink() > 1)
-                    || (self.o.deref == Deref::Never && !src_meta.is_file())
+                    // Only a data copy may replace the file: --attributes-only
+                    // must leave the destination's contents (and links) alone.
+                    || (!self.o.attributes_only
+                        && ((self.o.preserve_links && dl.nlink() > 1)
+                            || (self.o.deref == Deref::Never && !src_meta.is_file())))
                 {
                     if let Err(e) = self.remove_existing(dst, &mut plan, top) {
                         eprintln!("cp: cannot remove {}: {}", qa(dst), gnu_io_error(&e));
@@ -5972,6 +5993,130 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
+/// The options GNU's `same_file_ok` looks at.
+#[derive(Default)]
+struct SameFileOpts {
+    move_mode: bool,
+    /// `--no-dereference` (or `-d`, `-P`, `-a`, `-R` without `-L`/`-H`).
+    deref_never: bool,
+    hard_link: bool,
+    symbolic_link: bool,
+    backup: bool,
+    /// `--remove-destination`.
+    unlink_dest_before_opening: bool,
+}
+
+/// A port of GNU's `same_file_ok` (copy.c): may `src` be copied or moved onto
+/// the existing `dst` without losing data? `src_sb` and `dst_sb` are stat'ed
+/// as GNU's `copy_internal` stats them. The second value is GNU's
+/// `return_now`: the operation is already complete (or must stop) and
+/// should report success or failure without doing anything.
+fn same_file_ok(
+    src: &Path,
+    src_sb: &fs::Metadata,
+    dst: &Path,
+    dst_sb: &fs::Metadata,
+    x: &SameFileOpts,
+) -> (bool, bool) {
+    let same = same_inode(src_sb, dst_sb);
+    if same && x.hard_link {
+        return (true, true);
+    }
+    let (src_link, dst_link, same_link);
+    if x.deref_never {
+        same_link = same;
+        if src_sb.is_symlink() && dst_sb.is_symlink() {
+            let sn = same_name(src, dst);
+            if !sn {
+                if x.backup {
+                    return (true, false);
+                }
+                // Two hard links to one symlink: rename(2) would do nothing.
+                if same_link {
+                    return (!x.move_mode, true);
+                }
+            }
+            return (!sn, false);
+        }
+        src_link = src_sb.clone();
+        dst_link = dst_sb.clone();
+    } else {
+        if !same {
+            return (true, false);
+        }
+        let (Ok(d), Ok(s)) = (dst.symlink_metadata(), src.symlink_metadata()) else {
+            return (true, false);
+        };
+        same_link = same_inode(&s, &d);
+        if s.is_symlink() && d.is_symlink() && x.unlink_dest_before_opening {
+            return (true, false);
+        }
+        src_link = s;
+        dst_link = d;
+    }
+    // A backup keeps the data, unless both names are one directory entry.
+    if x.backup {
+        if !same_link {
+            // Backing up the referent of a dereferenced source symlink would
+            // leave the source dangling.
+            let dangles =
+                !x.move_mode && !x.deref_never && src_link.is_symlink() && !dst_link.is_symlink();
+            return (!dangles, false);
+        }
+        return (!same_name(src, dst), false);
+    }
+    if x.move_mode || x.unlink_dest_before_opening {
+        // A destination symlink is replaced, never written through.
+        if dst_link.is_symlink() {
+            return (true, false);
+        }
+        // Distinct hard links to one file: racy, may lose data.
+        if same_link && dst_link.nlink() > 1 && !same_name(src, dst) {
+            return (!x.move_mode, false);
+        }
+    }
+    if !src_link.is_symlink() && !dst_link.is_symlink() {
+        if !same_inode(&src_link, &dst_link) {
+            return (true, false);
+        }
+        if x.hard_link {
+            return (true, true);
+        }
+    }
+    // Moving a symlink onto its referent loses the file, except when the
+    // referent has other hard links and the symlink names one of those.
+    if x.move_mode
+        && src_sb.is_symlink()
+        && dst_link.nlink() > 1
+        && let Ok(abs_src) = fs::canonicalize(src)
+    {
+        return (!same_name(&abs_src, dst), false);
+    }
+    // Recreating a destination symlink is fine.
+    if x.symbolic_link && dst_link.is_symlink() {
+        return (true, false);
+    }
+    if x.deref_never {
+        let target = |link: &fs::Metadata, p: &Path| {
+            if link.is_symlink() {
+                fs::metadata(p).ok()
+            } else {
+                Some(link.clone())
+            }
+        };
+        let (Some(ts), Some(td)) = (target(&src_link, src), target(&dst_link, dst)) else {
+            return (true, false);
+        };
+        if !same_inode(&ts, &td) {
+            return (true, false);
+        }
+        if x.hard_link {
+            return (true, !dst_link.is_symlink());
+        }
+    }
+    (false, false)
+}
+
 fn mv_one(
     src: &Path,
     dst: &Path,
@@ -6006,7 +6151,13 @@ fn mv_one(
             Clobber::Skip => return true,
             _ => {}
         }
-        if same_inode(&src_meta, dm) {
+        let x = SameFileOpts {
+            move_mode: true,
+            deref_never: true,
+            backup: o.backup != BackupMode::None,
+            ..SameFileOpts::default()
+        };
+        if !same_file_ok(src, &src_meta, dst, dm, &x).0 {
             eprintln!("mv: {} and {} are the same file", qa(src), qa(dst));
             return false;
         }

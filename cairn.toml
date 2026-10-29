@@ -1,0 +1,220 @@
+# cairn.toml — the schema for GNU/Dogfish's roadmap and issues.
+#
+# Items live in cairn/items as Markdown with YAML frontmatter (cairn format 5).
+#   cairn next --view next    ready, approved work
+#   cairn check               validate every item against this schema
+#   cairn render              regenerate cairn/ROADMAP.md
+#
+# ROADMAP.md at the repository root is the hand-written list of known
+# differences from GNU coreutils; the generated roadmap is cairn/ROADMAP.md.
+
+format = 5
+
+[project]
+name = "gnu-dogfish"
+description = "Libre, object-aware coreutils in Rust: GNU-exact when piped, rich on a terminal, safe on real data."
+dir = "cairn/items"
+default_type = "feature"
+default_status = "backlog"
+url = "https://github.com/oddurs/gnu-dogfish/blob/main"
+claim_stale_after = 7
+
+# ─── Item types ──────────────────────────────────────────────────────────────
+
+[[type]]
+name = "feature"
+icon = "+"
+color = "cyan"
+template = """
+## Problem
+
+## Proposal
+
+## Acceptance criteria
+
+- [ ]
+"""
+
+[[type]]
+name = "bug"
+icon = "!"
+color = "red"
+template = """
+## What happens
+
+## What should happen
+
+## Reproduction
+
+1.
+
+## Acceptance criteria
+
+- [ ] A regression check reproduces the failure and passes with the fix.
+"""
+
+[[type]]
+name = "chore"
+icon = "~"
+color = "gray"
+template = """
+## Purpose
+
+## Approach
+
+## Acceptance criteria
+
+- [ ]
+"""
+
+[[type]]
+name = "docs"
+icon = "*"
+color = "blue"
+template = """
+## Reader and question
+
+## Change
+
+## Acceptance criteria
+
+- [ ]
+"""
+
+[[type]]
+name = "decision"
+icon = "?"
+color = "magenta"
+description = "A choice worth remembering after the work is finished"
+template = """
+## Context
+
+## Options and tradeoffs
+
+## Decision
+
+## Revisit when
+
+## Acceptance criteria
+
+- [ ] The choice, its evidence, and its consequences are recorded.
+"""
+
+[[type]]
+name = "milestone"
+description = "An outcome to ship, gated by evidence rather than dates"
+groups = "one"
+inverse = "scheduled"
+template = """
+Describe the outcome in one paragraph; this appears in the roadmap.
+
+## Release gate
+
+State what must be true to ship. Keep executable work in linked items.
+"""
+
+# ─── Statuses ────────────────────────────────────────────────────────────────
+
+[[status]]
+name = "backlog"
+category = "open"
+color = "gray"
+label = "not committed"
+
+[[status]]
+name = "planned"
+category = "open"
+color = "blue"
+label = "up next"
+
+[[status]]
+name = "doing"
+label = "in progress"
+category = "active"
+color = "yellow"
+
+[[status]]
+name = "blocked"
+category = "open"
+color = "red"
+label = "waiting"
+
+[[status]]
+name = "done"
+category = "done"
+color = "green"
+
+[[status]]
+name = "dropped"
+category = "dropped"
+color = "gray"
+board = false
+
+# ─── Custom fields ───────────────────────────────────────────────────────────
+
+[[field]]
+name = "priority"
+kind = "enum"
+values = ["p0", "p1", "p2", "p3"]
+default = "p2"
+column = true
+description = "p0: broken build or data loss; p1: next outcome; p2: useful; p3: optional"
+
+[[field]]
+name = "effort"
+kind = "enum"
+values = ["s", "m", "l", "xl"]
+description = "Rough size, not an estimate"
+
+[[field]]
+name = "area"
+kind = "text"
+description = "compat, safety, testing, architecture, performance, security, docs, release, or direction"
+
+# ─── Saved views ─────────────────────────────────────────────────────────────
+
+[[view]]
+name = "now"
+description = "Work someone is doing now"
+filter = "category=active,type!=milestone"
+sort = "priority,id"
+columns = ["id", "status", "assignee", "priority", "title"]
+
+[[view]]
+name = "next"
+description = "Approved work with no unfinished dependencies"
+filter = "status=planned|doing,blocked=false,type!=milestone"
+sort = "priority,milestone"
+columns = ["id", "priority", "area", "title"]
+
+[[view]]
+name = "waiting"
+description = "Needs an external action or a decision; read the item's notes"
+filter = "status=blocked,type!=milestone"
+sort = "priority,id"
+columns = ["id", "owner", "priority", "title"]
+
+[[view]]
+name = "later"
+description = "Not yet committed to a milestone's queue"
+filter = "status=backlog,type!=milestone"
+sort = "milestone,priority,id"
+columns = ["id", "milestone", "priority", "title"]
+
+[[view]]
+name = "decisions"
+description = "Recorded choices"
+filter = "type=decision,category=open|active|done|dropped"
+sort = "-updated,id"
+
+# ─── Rendering ───────────────────────────────────────────────────────────────
+
+[render]
+target = "cairn/ROADMAP.md"
+title = "Roadmap"
+group_by = "milestone"
+include = "category=open|active"
+checkbox = true
+show_ids = true
+group_by_status = true
+link_items = true
