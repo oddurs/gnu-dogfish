@@ -295,6 +295,10 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
             UniqOpt::Version => return Err(print_version("uniq")),
         }
     }
+    // What follows `--` is files, even `+N`.
+    for rest in opts.operands() {
+        add_file(&mut files, lossy(&rest))?;
+    }
     if cfg.grouping != Grouping::None && output_option_used {
         eprintln!("uniq: --group is mutually exclusive with -c/-d/-D/-u");
         return Err(try_help("uniq"));

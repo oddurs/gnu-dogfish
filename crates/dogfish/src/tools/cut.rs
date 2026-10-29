@@ -2,7 +2,7 @@
 //! `-z`) AND NDJSON `--field name,size` projection!
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStringExt;
 
 use anyhow::Result;
@@ -460,6 +460,49 @@ fn cut_buffer<W: Write>(bytes: &[u8], spec: &CutSpec, out: &mut W) -> io::Result
     }
 }
 
+/// [`cut_buffer`] over a stream, a run of whole records at a time, so that
+/// an endless input (`cut -z -c1- /dev/zero`) is cut as it is read and a
+/// write error stops it.
+fn cut_stream<W: Write>(r: &mut impl BufRead, spec: &CutSpec, out: &mut W) -> io::Result<()> {
+    let mut partial: Vec<u8> = Vec::new();
+    // A field delimiter equal to the line delimiter makes the whole input
+    // one record.
+    if !spec.byte_mode && spec.delim == spec.line_delim {
+        r.read_to_end(&mut partial)?;
+        return cut_buffer(&partial, spec, out);
+    }
+    loop {
+        let buf = match r.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let n = buf.len();
+        match memchr::memrchr(spec.line_delim, buf) {
+            Some(last) if partial.is_empty() => {
+                cut_buffer(&buf[..=last], spec, out)?;
+                partial.extend_from_slice(&buf[last + 1..]);
+            }
+            Some(last) => {
+                partial.extend_from_slice(&buf[..=last]);
+                cut_buffer(&partial, spec, out)?;
+                partial.clear();
+                partial.extend_from_slice(&buf[last + 1..]);
+            }
+            None => partial.extend_from_slice(buf),
+        }
+        r.consume(n);
+    }
+    if partial.is_empty() {
+        Ok(())
+    } else {
+        cut_buffer(&partial, spec, out)
+    }
+}
+
 /// Option checks in GNU's order; `Err` is the message for a usage error.
 fn cut_spec(parsed: &CutArgs) -> Result<CutSpec, ListError> {
     // A second list and a long delimiter were refused while parsing.
@@ -545,9 +588,9 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         ignore_broken_pipe(cut_buffer(&all, &spec, &mut out))?;
     } else {
         for src in &sources {
-            let res = FastReader::open(src).and_then(|mut r| {
-                r.with_bytes(|bytes| cut_buffer(bytes, &spec, &mut out))
-                    .and_then(|r| r)
+            let res = FastReader::open(src).and_then(|r| match r {
+                FastReader::Mapped(map) => cut_buffer(&map, &spec, &mut out),
+                FastReader::Buffered(mut r) => cut_stream(&mut r, &spec, &mut out),
             });
             match res {
                 Ok(()) => {}

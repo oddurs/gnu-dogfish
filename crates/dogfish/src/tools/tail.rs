@@ -1,6 +1,6 @@
 //! tail — SIMD reverse newline scan (`memrchr`), `+N`, `-f` follow + NDJSON support
 
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::thread;
 use std::time::Duration;
 
@@ -296,6 +296,49 @@ fn open_tail_input(src: &InputSource) -> io::Result<FastReader> {
     FastReader::open(src)
 }
 
+/// `tail -n +N` / `-c +N` of a stream: skips N-1 records (or bytes), then
+/// copies the rest. Returns the bytes copied.
+fn copy_from_start<R: BufRead + ?Sized, W: Write>(
+    r: &mut R,
+    by_bytes: bool,
+    count: u64,
+    eol: u8,
+    out: &mut W,
+) -> io::Result<u64> {
+    let mut skip = count.saturating_sub(1);
+    let mut copied = 0;
+    loop {
+        let buf = match r.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            return Ok(copied);
+        }
+        let n = buf.len();
+        let mut from = 0;
+        if skip > 0 {
+            if by_bytes {
+                from = to_usize(skip).min(n);
+                skip -= from as u64;
+            } else {
+                from = n;
+                for i in memchr_iter(eol, buf) {
+                    skip -= 1;
+                    if skip == 0 {
+                        from = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        out.write_all(&buf[from..])?;
+        copied += (n - from) as u64;
+        r.consume(n);
+    }
+}
+
 /// Offset at which tail output starts.
 fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64, eol: u8) -> usize {
     let len = bytes.len();
@@ -389,15 +432,24 @@ pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             first_header = false;
             ignore_broken_pipe(writeln!(out, "==> {} <==", header_name(src)))?;
         }
-        let res = reader
-            .with_bytes(|bytes| {
-                let start = tail_start(bytes, by_bytes, from_start, count, eol);
-                let slice = &bytes[start..];
-                ctx.telemetry.add_read(slice.len() as u64);
-                ctx.telemetry.add_written(slice.len() as u64);
-                out.write_all(slice)
+        let res = if let (FastReader::Buffered(r), true) = (&mut reader, from_start) {
+            // From the start, a stream is copied as it is read, so an
+            // endless input works (and a write error stops it).
+            copy_from_start(r, by_bytes, count, eol, &mut out).map(|n| {
+                ctx.telemetry.add_read(n);
+                ctx.telemetry.add_written(n);
             })
-            .and_then(|r| r);
+        } else {
+            reader
+                .with_bytes(|bytes| {
+                    let start = tail_start(bytes, by_bytes, from_start, count, eol);
+                    let slice = &bytes[start..];
+                    ctx.telemetry.add_read(slice.len() as u64);
+                    ctx.telemetry.add_written(slice.len() as u64);
+                    out.write_all(slice)
+                })
+                .and_then(|r| r)
+        };
         match res {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
