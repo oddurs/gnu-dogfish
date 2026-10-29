@@ -12,8 +12,8 @@ use serde::Serialize;
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version, try_help,
-    usage_error,
+    Getopt, HasArg, OptSpec, Order, error_bytes, getopt_error, lossy, print_help, print_version,
+    try_help, usage_error,
 };
 use crate::common::quote::quote_locale;
 use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
@@ -379,6 +379,14 @@ struct EnvRecord {
     value: String,
 }
 
+/// GNU's hint after an error that suggests a shebang line without -S.
+const SHEBANG_HINT: &str = "use -[v]S to pass options in shebang lines";
+
+/// C's `isspace` in the C locale (which, unlike Rust's, includes `\v`).
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
 pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let usage = |msg: String| Ok(usage_error("env", msg));
     let mut opts = Getopt::with_order(
@@ -398,7 +406,18 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     while let Some(item) = opts.next() {
         let (key, value) = match item {
             Ok((key, value)) => (key, value.as_deref().map(lossy)),
-            Err(e) => return Ok(getopt_error("env", &e)),
+            Err(e) => {
+                // A space in the first argument means a shebang line like
+                // `#!/usr/bin/env -i command`, which needs -S (GNU's hint).
+                if let Some(&[c, b'\'']) = e.as_bytes().strip_prefix(b"invalid option -- '")
+                    && is_c_space(c)
+                {
+                    error_bytes("env", e.as_bytes());
+                    eprintln!("env: {SHEBANG_HINT}");
+                    return Ok(try_help("env"));
+                }
+                return Ok(getopt_error("env", &e));
+            }
         };
         match key {
             "ignore-environment" => ignore_env = true,
@@ -539,6 +558,9 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         EXIT_CANNOT_INVOKE
     };
     eprintln!("env: {}: {}", quote_locale(&command[0]), gnu_io_error(&err));
+    if status == EXIT_ENOENT && command[0].as_bytes().iter().copied().any(is_c_space) {
+        eprintln!("env: {SHEBANG_HINT}");
+    }
     Ok(status)
 }
 
