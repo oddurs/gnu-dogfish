@@ -1,0 +1,11 @@
+# Type-check-only stand-in for `ring`, patched in by `cargo xtask macos` so the
+# macOS target can be type-checked from Linux without an Apple SDK. Never built
+# into a binary.
+[package]
+name = "ring"
+version = "0.17.14"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main]
 
+# Every step is a `cargo xtask` step, so `cargo xtask ci` runs the same checks locally.
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -34,20 +35,18 @@ jobs:
 
       - name: Check formatting
         if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
+        run: cargo xtask fmt
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo xtask clippy
 
       - name: Docs
         if: runner.os == 'Linux'
-        run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
+        run: cargo xtask doc
 
       - name: Package (crates.io dry run)
         if: runner.os == 'Linux'
-        run: cargo package --workspace --locked
+        run: cargo xtask package
 
   test:
     name: Test (${{ matrix.os }})
@@ -69,10 +68,10 @@ jobs:
       # Debug builds keep clap's argument-definition asserts and overflow checks on,
       # which catch bugs that release builds silently ignore.
       - name: Test (debug)
-        run: cargo test --workspace --locked
+        run: cargo xtask test
 
       - name: Test (release)
-        run: cargo test --workspace --release --locked
+        run: cargo xtask test-release
 
       # Smoke test only: shared CI runners are too noisy for meaningful timings.
       - name: Benchmark smoke test
@@ -89,4 +88,4 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo xtask test
