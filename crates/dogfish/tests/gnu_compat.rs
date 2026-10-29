@@ -334,6 +334,9 @@ gnu_cases! {
     wc_missing_and_file: "wc" ["lines.txt", "nonexist"];
 
     // --------------------------------------------------------------- sort
+    // GNU: -d takes precedence over -i whatever their order (globally and per key).
+    sort_dict_over_nonprinting: "sort" ["-i", "-d"] stdin b"ab\na-c\n\x01z\n";
+    sort_key_dict_over_nonprinting: "sort" ["-k1id"] stdin b"ab\na-c\n\x01z\n";
     sort_plain: "sort" ["dup.txt"];
     sort_numeric: "sort" ["-n", "nums.txt"];
     sort_numeric_reverse: "sort" ["-rn", "nums.txt"];
