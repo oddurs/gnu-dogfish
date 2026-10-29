@@ -48,3 +48,7 @@ Each tool accepts the obsolete forms exactly where GNU does (including the
 ## 2026-10-29
 
 touch's obsolete `MMDDhhmm[YY]` operand under `_POSIX2_VERSION=199209` is done (tests/touch/obsolescent.sh passes).
+
+## 2026-10-29
+
+head (`-1c`, `-2b`, `-1k`...), tail (`+2c`, `-1l`, `-b`, `+N`, `_POSIX2_VERSION`) and uniq (`-1`, `+1`) obsolete forms are done; head.pl, tail.pl and uniq.pl pass. Remaining: `sort +POS -POS`.

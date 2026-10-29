@@ -3,7 +3,10 @@ id: 54
 uid: e383a4b1-9dea-4a73-baa4-e2d7327e12de
 title: "printf: reject field widths and precisions above INT_MAX"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -34,5 +37,9 @@ Both tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+Widths and precisions above INT_MAX are rejected with GNU's messages; printf-cov.pl and printf.sh pass. Known gap: in the C locale `\U` above U+FFFF is printed as UTF-8 where GNU prints it literally.

@@ -3,7 +3,10 @@ id: 51
 uid: 5cfbea6d-6af5-48b7-a09c-c91c5e36de00
 title: "tr: GNU's validation of SET1/SET2"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -36,5 +39,9 @@ Both tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+GNU's SET1/SET2 validation and messages; sets are byte vectors. tr.pl and tr-case-class pass.
