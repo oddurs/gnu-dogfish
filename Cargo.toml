@@ -27,9 +27,9 @@ bytecount = "0.6"
 memmap2 = "0.9"
 rayon = "1.10"
 jwalk = "0.9"
-blake2 = "0.10"
+blake2 = "0.11"
 md-5 = { version = "0.10", features = ["asm"] }
-digest = "0.10"
+digest = "0.11"
 base64 = "0.23"
 data-encoding = "2.6"
 chrono = { version = "0.4", features = ["serde"] }
