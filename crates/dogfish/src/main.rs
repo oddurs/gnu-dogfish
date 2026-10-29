@@ -4,11 +4,12 @@
 // `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
 #![allow(rustdoc::broken_intra_doc_links)]
 
-mod fs_ops;
+mod common;
 mod hash;
 mod meta;
 mod sys;
 mod text;
+mod tools;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -454,22 +455,22 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
     let tool_names: Vec<&str> = ALL_TOOLS.iter().map(|(n, _, _)| *n).collect();
     match tool {
         // Tier 1: File & Directory
-        "ls" => fs_ops::run_ls(args, ctx),
-        "cp" => fs_ops::run_cp(args, ctx),
-        "mv" => fs_ops::run_mv(args, ctx),
-        "rm" => fs_ops::run_rm(args, ctx),
-        "mkdir" => fs_ops::run_mkdir(args, ctx),
-        "ln" => fs_ops::run_ln(args, ctx),
-        "chmod" => fs_ops::run_chmod(args, ctx),
-        "chown" => fs_ops::run_chown(args, ctx),
-        "stat" => fs_ops::run_stat(args, ctx),
-        "touch" => fs_ops::run_touch(args, ctx),
-        "df" => fs_ops::run_df(args, ctx),
-        "du" => fs_ops::run_du(args, ctx),
-        "realpath" => fs_ops::run_realpath(args, ctx),
-        "basename" => fs_ops::run_basename(args, ctx),
-        "dirname" => fs_ops::run_dirname(args, ctx),
-        "mktemp" => fs_ops::run_mktemp(args, ctx),
+        "ls" => tools::ls::run_ls(args, ctx),
+        "cp" => tools::cp::run_cp(args, ctx),
+        "mv" => tools::mv::run_mv(args, ctx),
+        "rm" => tools::rm::run_rm(args, ctx),
+        "mkdir" => tools::mkdir::run_mkdir(args, ctx),
+        "ln" => tools::ln::run_ln(args, ctx),
+        "chmod" => tools::chmod::run_chmod(args, ctx),
+        "chown" => tools::chown::run_chown(args, ctx),
+        "stat" => tools::stat::run_stat(args, ctx),
+        "touch" => tools::touch::run_touch(args, ctx),
+        "df" => tools::df::run_df(args, ctx),
+        "du" => tools::du::run_du(args, ctx),
+        "realpath" => tools::realpath::run_realpath(args, ctx),
+        "basename" => tools::basename::run_basename(args, ctx),
+        "dirname" => tools::dirname::run_dirname(args, ctx),
+        "mktemp" => tools::mktemp::run_mktemp(args, ctx),
 
         // Tier 2: Text & Streaming
         "cat" => text::run_cat(args, ctx),

@@ -1,0 +1,827 @@
+//! `ls` options and their parsing.
+
+use dogfish_core::DogfishContext;
+
+use crate::common::gnu_getopt::{
+    OptArg, OptSpec, gnu_argmatch, gnu_getopt, gnu_usage_error, print_help_text,
+    print_tool_version, try_help,
+};
+use crate::common::human::{
+    HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, parse_block_size,
+};
+use crate::common::quote::{Quoting, quote_bytes};
+use crate::common::strftime::Timespec;
+use crate::tools::ls::colors::LsColors;
+
+/// GNU `ls` options. `-L` means `--dereference`, except with `--tree`, where it
+/// keeps its Dogfish meaning of `--level` (see [`ls_option_table`]).
+const LS_OPTIONS: &[OptSpec] = &[
+    // Long options in GNU's table order (it decides ambiguity diagnostics).
+    OptSpec::new("all", Some('a'), Some("all"), OptArg::No),
+    OptSpec::new("escape", Some('b'), Some("escape"), OptArg::No),
+    OptSpec::new("directory", Some('d'), Some("directory"), OptArg::No),
+    OptSpec::new("full-time", None, Some("full-time"), OptArg::No),
+    OptSpec::new(
+        "group-directories-first",
+        None,
+        Some("group-directories-first"),
+        OptArg::No,
+    ),
+    OptSpec::new(
+        "human-readable",
+        Some('h'),
+        Some("human-readable"),
+        OptArg::No,
+    ),
+    OptSpec::new("inode", Some('i'), Some("inode"), OptArg::No),
+    OptSpec::new("kibibytes", Some('k'), Some("kibibytes"), OptArg::No),
+    OptSpec::new(
+        "numeric-uid-gid",
+        Some('n'),
+        Some("numeric-uid-gid"),
+        OptArg::No,
+    ),
+    OptSpec::new("no-group", Some('G'), Some("no-group"), OptArg::No),
+    OptSpec::new(
+        "hide-control-chars",
+        Some('q'),
+        Some("hide-control-chars"),
+        OptArg::No,
+    ),
+    OptSpec::new("reverse", Some('r'), Some("reverse"), OptArg::No),
+    OptSpec::new("size", Some('s'), Some("size"), OptArg::No),
+    OptSpec::new("width", Some('w'), Some("width"), OptArg::Required),
+    OptSpec::new("almost-all", Some('A'), Some("almost-all"), OptArg::No),
+    OptSpec::new(
+        "ignore-backups",
+        Some('B'),
+        Some("ignore-backups"),
+        OptArg::No,
+    ),
+    OptSpec::new("classify", Some('F'), Some("classify"), OptArg::Optional),
+    OptSpec::new("file-type", None, Some("file-type"), OptArg::No),
+    OptSpec::new("si", None, Some("si"), OptArg::No),
+    OptSpec::new(
+        "dereference-command-line",
+        Some('H'),
+        Some("dereference-command-line"),
+        OptArg::No,
+    ),
+    OptSpec::new(
+        "dereference-command-line-symlink-to-dir",
+        None,
+        Some("dereference-command-line-symlink-to-dir"),
+        OptArg::No,
+    ),
+    OptSpec::new("hide", None, Some("hide"), OptArg::Required),
+    OptSpec::new("ignore", Some('I'), Some("ignore"), OptArg::Required),
+    OptSpec::new(
+        "indicator-style",
+        None,
+        Some("indicator-style"),
+        OptArg::Required,
+    ),
+    OptSpec::new("dereference", Some('L'), Some("dereference"), OptArg::No),
+    OptSpec::new("literal", Some('N'), Some("literal"), OptArg::No),
+    OptSpec::new("quote-name", Some('Q'), Some("quote-name"), OptArg::No),
+    OptSpec::new(
+        "quoting-style",
+        None,
+        Some("quoting-style"),
+        OptArg::Required,
+    ),
+    OptSpec::new("recursive", Some('R'), Some("recursive"), OptArg::No),
+    OptSpec::new("format", None, Some("format"), OptArg::Required),
+    OptSpec::new(
+        "show-control-chars",
+        None,
+        Some("show-control-chars"),
+        OptArg::No,
+    ),
+    OptSpec::new("sort", None, Some("sort"), OptArg::Required),
+    OptSpec::new("tabsize", Some('T'), Some("tabsize"), OptArg::Required),
+    OptSpec::new("time", None, Some("time"), OptArg::Required),
+    OptSpec::new("time-style", None, Some("time-style"), OptArg::Required),
+    OptSpec::new("zero", None, Some("zero"), OptArg::No),
+    OptSpec::new("color", None, Some("color"), OptArg::Optional),
+    OptSpec::new("hyperlink", None, Some("hyperlink"), OptArg::Optional),
+    OptSpec::new("block-size", None, Some("block-size"), OptArg::Required),
+    OptSpec::new("context", Some('Z'), Some("context"), OptArg::No),
+    OptSpec::new("author", None, Some("author"), OptArg::No),
+    OptSpec::new("help", None, Some("help"), OptArg::No),
+    OptSpec::new("version", None, Some("version"), OptArg::No),
+    // Dogfish extensions.
+    OptSpec::new("tree", None, Some("tree"), OptArg::No),
+    OptSpec::new("level", None, Some("level"), OptArg::Required),
+    OptSpec::new("json", Some('J'), Some("json"), OptArg::No),
+    // Short-only options.
+    OptSpec::new("ctime", Some('c'), None, OptArg::No),
+    OptSpec::new("vertical", Some('C'), None, OptArg::No),
+    OptSpec::new("unsorted-all", Some('f'), None, OptArg::No),
+    OptSpec::new("no-owner", Some('g'), None, OptArg::No),
+    OptSpec::new("long", Some('l'), None, OptArg::No),
+    OptSpec::new("commas", Some('m'), None, OptArg::No),
+    OptSpec::new("long-no-group", Some('o'), None, OptArg::No),
+    OptSpec::new("slash", Some('p'), None, OptArg::No),
+    OptSpec::new("sort-size", Some('S'), None, OptArg::No),
+    OptSpec::new("sort-time", Some('t'), None, OptArg::No),
+    OptSpec::new("atime", Some('u'), None, OptArg::No),
+    OptSpec::new("unsorted", Some('U'), None, OptArg::No),
+    OptSpec::new("sort-version", Some('v'), None, OptArg::No),
+    OptSpec::new("across", Some('x'), None, OptArg::No),
+    OptSpec::new("sort-extension", Some('X'), None, OptArg::No),
+    OptSpec::new("one-per-line", Some('1'), None, OptArg::No),
+];
+
+/// With `--tree`, `-L N` is the tree depth (`dogfish ls --tree -L 2`).
+fn ls_option_table(args: &[String]) -> Vec<OptSpec> {
+    let tree = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--tree" || (a.len() > 3 && "--tree".starts_with(a.as_str())));
+    LS_OPTIONS
+        .iter()
+        .map(|s| {
+            if tree && s.key == "dereference" {
+                OptSpec::new("level", Some('L'), None, OptArg::Required)
+            } else {
+                OptSpec::new(s.key, s.short, s.long, s.arg)
+            }
+        })
+        .collect()
+}
+
+const LS_HELP: &str = "\
+Usage: ls [OPTION]... [FILE]...
+List information about the FILEs (the current directory by default).
+Sort entries alphabetically if none of -cftuvSUX nor --sort is specified.
+
+  -a, --all                  do not ignore entries starting with .
+  -A, --almost-all           do not list implied . and ..
+      --author               with -l, print the author of each file
+  -b, --escape               print C-style escapes for nongraphic characters
+      --block-size=SIZE      with -l, scale sizes by SIZE when printing them
+  -B, --ignore-backups       do not list implied entries ending with ~
+  -c                         with -lt: sort by, and show, ctime; with -l: show
+                               ctime and sort by name; otherwise: sort by ctime
+  -C                         list entries by columns
+  -d, --directory            list directories themselves, not their contents
+  -f                         same as -a -U
+  -F, --classify[=WHEN]      append indicator (one of */=>@|) to entries
+      --file-type            likewise, except do not append '*'
+      --format=WORD          across -x, commas -m, horizontal -x, long -l,
+                               single-column -1, verbose -l, vertical -C
+      --full-time            like -l --time-style=full-iso
+  -g                         like -l, but do not list owner
+      --group-directories-first  group directories before files
+  -G, --no-group             in a long listing, don't print group names
+  -h, --human-readable       with -l and -s, print sizes like 1K 234M 2G etc.
+      --si                   likewise, but use powers of 1000 not 1024
+  -H, --dereference-command-line  follow symbolic links listed on the command line
+      --hide=PATTERN         do not list implied entries matching shell PATTERN
+      --indicator-style=WORD  none, slash (-p), file-type, classify (-F)
+  -i, --inode                print the index number of each file
+  -I, --ignore=PATTERN       do not list implied entries matching shell PATTERN
+  -k, --kibibytes            default to 1024-byte blocks for file system usage
+  -l                         use a long listing format
+  -L, --dereference          show information for the file a symbolic link
+                               references (with --tree: the tree depth)
+  -m                         fill width with a comma separated list of entries
+  -n, --numeric-uid-gid      like -l, but list numeric user and group IDs
+  -N, --literal              print entry names without quoting
+  -o                         like -l, but do not list group information
+  -p                         append / indicator to directories
+  -q, --hide-control-chars   print ? instead of nongraphic characters
+  -Q, --quote-name           enclose entry names in double quotes
+      --quoting-style=WORD   literal, locale, shell, shell-always, shell-escape,
+                               shell-escape-always, c, escape
+  -r, --reverse              reverse order while sorting
+  -R, --recursive            list subdirectories recursively
+  -s, --size                 print the allocated size of each file, in blocks
+  -S                         sort by file size, largest first
+      --sort=WORD            none (-U), size (-S), time (-t), version (-v),
+                               extension (-X), width
+      --time=WORD            atime, ctime, mtime or birth time for -l and -t
+      --time-style=STYLE     full-iso, long-iso, iso, locale, or +FORMAT
+  -t                         sort by time, newest first
+  -T, --tabsize=COLS         assume tab stops at each COLS instead of 8
+  -u                         with -lt / -l / alone: like -c, but for atime
+  -U                         do not sort; list entries in directory order
+  -v                         natural sort of (version) numbers within text
+  -w, --width=COLS           set output width to COLS.  0 means no limit
+  -x                         list entries by lines instead of by columns
+  -X                         sort alphabetically by entry extension
+  -Z, --context              print any security context of each file
+      --zero                 end each output line with NUL, not newline
+  -1                         list one file per line
+      --tree                 Dogfish: render the hierarchy as a tree (-L depth)
+      --level=N              Dogfish: maximum --tree depth (default 3)
+  -J, --json                 Dogfish: emit NDJSON records
+      --help                 display this help and exit
+      --version              output version information and exit
+
+On a terminal Dogfish shows colors and a table/grid; when output is not a
+terminal it is identical to GNU ls (one entry per line by default).
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LsFormat {
+    Long,
+    OnePerLine,
+    Columns,
+    Across,
+    Commas,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LsSort {
+    Name,
+    None,
+    Time,
+    Size,
+    Extension,
+    Version,
+    Width,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LsTime {
+    Mtime,
+    Atime,
+    Ctime,
+    Birth,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Indicator {
+    None,
+    Slash,
+    FileType,
+    Classify,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LsDeref {
+    Never,
+    CommandLineSymlinkToDir,
+    CommandLine,
+    Always,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LsIgnore {
+    /// Hide names starting with `.`.
+    Default,
+    /// `-A`: hide only `.` and `..`.
+    DotAndDotDot,
+    /// `-a`: hide nothing.
+    Minimal,
+}
+
+pub(crate) struct LsOpts {
+    pub(crate) ignore: LsIgnore,
+    pub(crate) ignore_patterns: Vec<Vec<u8>>,
+    pub(crate) hide_patterns: Vec<Vec<u8>>,
+    pub(crate) immediate_dirs: bool,
+    pub(crate) recursive: bool,
+    pub(crate) format: LsFormat,
+    pub(crate) sort: LsSort,
+    pub(crate) reverse: bool,
+    pub(crate) dirs_first: bool,
+    pub(crate) time: LsTime,
+    pub(crate) indicator: Indicator,
+    pub(crate) deref: LsDeref,
+    pub(crate) inode: bool,
+    pub(crate) blocks: bool,
+    pub(crate) owner: bool,
+    pub(crate) group: bool,
+    pub(crate) author: bool,
+    pub(crate) numeric: bool,
+    pub(crate) context: bool,
+    pub(crate) quoting: Quoting,
+    pub(crate) hide_control: bool,
+    pub(crate) human_opts: u32,
+    pub(crate) block_size: u64,
+    pub(crate) file_human_opts: u32,
+    pub(crate) file_block_size: u64,
+    /// `[non-recent, recent]` strftime formats for `-l`.
+    pub(crate) time_formats: [String; 2],
+    pub(crate) line_length: usize,
+    pub(crate) tab_size: usize,
+    pub(crate) eol: u8,
+    /// GNU `print_with_color`, as `--color`, `-f` and `--zero` leave it.
+    pub(crate) color: bool,
+    /// The colour table in effect for GNU-style output (`None`: no colour).
+    pub(crate) colors: Option<LsColors>,
+    /// GNU `check_symlink_mode`: follow symlinks to colour or group them.
+    pub(crate) check_symlink_mode: bool,
+    pub(crate) tree: bool,
+    pub(crate) level: usize,
+    pub(crate) json: bool,
+    pub(crate) now: std::cell::Cell<Timespec>,
+}
+
+/// Parses the GNU `--time-style` argument into `[non-recent, recent]` formats.
+fn ls_time_formats(style: &str) -> std::result::Result<[String; 2], i32> {
+    let mut style = style;
+    // `posix-STYLE` means STYLE only outside the POSIX locale.
+    if let Some(rest) = style.strip_prefix("posix-") {
+        let locale = ["LC_ALL", "LC_TIME", "LANG"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .find(|v| !v.is_empty())
+            .unwrap_or_default();
+        style = if locale.is_empty() || locale == "C" || locale == "POSIX" {
+            "locale"
+        } else {
+            rest
+        };
+    }
+    if let Some(fmt) = style.strip_prefix('+') {
+        return match fmt.split_once('\n') {
+            Some((_, recent)) if recent.contains('\n') => {
+                eprintln!(
+                    "ls: invalid time style format {}",
+                    quote_bytes(fmt.as_bytes(), Quoting::Locale)
+                );
+                Err(2)
+            }
+            Some((old, recent)) => Ok([old.to_string(), recent.to_string()]),
+            None => Ok([fmt.to_string(), fmt.to_string()]),
+        };
+    }
+    let pair = |a: &str, b: &str| Ok([a.to_string(), b.to_string()]);
+    match style {
+        "full-iso" => pair("%Y-%m-%d %H:%M:%S.%N %z", "%Y-%m-%d %H:%M:%S.%N %z"),
+        "long-iso" => pair("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M"),
+        "iso" => pair("%Y-%m-%d ", "%m-%d %H:%M"),
+        "locale" => pair("%b %e  %Y", "%b %e %H:%M"),
+        _ => {
+            eprintln!(
+                "ls: invalid argument {} for 'time style'\nValid arguments are:\n  \
+                 - [posix-]full-iso\n  - [posix-]long-iso\n  - [posix-]iso\n  \
+                 - [posix-]locale\n  - +FORMAT (e.g., +%H:%M) for a 'date'-style format",
+                quote_bytes(style.as_bytes(), Quoting::Locale)
+            );
+            Err(try_help("ls", 2))
+        }
+    }
+}
+
+/// Parses `ls` arguments; `Err` carries the exit status after a diagnostic.
+/// Like GNU, the default format is columns on a terminal, one per line otherwise.
+pub(crate) fn parse_ls_args(
+    args: &[String],
+    stdout_is_tty: bool,
+) -> std::result::Result<(LsOpts, Vec<String>), i32> {
+    let specs = ls_option_table(args);
+    let parsed = gnu_getopt(&specs, args).map_err(|msg| gnu_usage_error("ls", &msg, 2))?;
+
+    let (env_opts, env_size) = env_block_size("LS_BLOCK_SIZE");
+    let env_sizes_files =
+        std::env::var_os("LS_BLOCK_SIZE").is_some() || std::env::var_os("BLOCK_SIZE").is_some();
+    let mut o = LsOpts {
+        ignore: LsIgnore::Default,
+        ignore_patterns: Vec::new(),
+        hide_patterns: Vec::new(),
+        immediate_dirs: false,
+        recursive: false,
+        format: if stdout_is_tty {
+            LsFormat::Columns
+        } else {
+            LsFormat::OnePerLine
+        },
+        sort: LsSort::Name,
+        reverse: false,
+        dirs_first: false,
+        time: LsTime::Mtime,
+        indicator: Indicator::None,
+        deref: LsDeref::CommandLineSymlinkToDir,
+        inode: false,
+        blocks: false,
+        owner: true,
+        group: true,
+        author: false,
+        numeric: false,
+        context: false,
+        quoting: Quoting::Literal,
+        hide_control: false,
+        human_opts: env_opts,
+        block_size: env_size,
+        file_human_opts: if env_sizes_files { env_opts } else { 0 },
+        file_block_size: if env_sizes_files { env_size } else { 1 },
+        time_formats: ["%b %e  %Y".into(), "%b %e %H:%M".into()],
+        line_length: 80,
+        tab_size: 8,
+        eol: b'\n',
+        color: false,
+        colors: None,
+        check_symlink_mode: false,
+        tree: false,
+        level: 3,
+        json: false,
+        now: std::cell::Cell::new(Timespec::now()),
+    };
+    let mut width_opt: Option<usize> = None;
+    if let Some(tab) = std::env::var("TABSIZE")
+        .ok()
+        .and_then(|t| t.parse::<usize>().ok())
+    {
+        o.tab_size = tab;
+    }
+    let mut deref: Option<LsDeref> = None;
+    let mut sort_specified = false;
+    let mut time_style: Option<String> = std::env::var("TIME_STYLE").ok();
+    let mut kibibytes = false;
+    let mut explicit_sizes = false;
+    let mut time_explicit = false;
+    let mut quoting: Option<Quoting> = None;
+    let mut hide_control: Option<bool> = None;
+    let width_arg = |value: &str, what: &str| -> std::result::Result<usize, i32> {
+        value.parse::<usize>().map_err(|_| {
+            eprintln!(
+                "ls: invalid {what}: {}",
+                quote_bytes(value.as_bytes(), Quoting::Locale)
+            );
+            2
+        })
+    };
+    for opt in parsed.opts {
+        let value = opt.value.clone().unwrap_or_default();
+        match opt.key {
+            "all" => o.ignore = LsIgnore::Minimal,
+            "almost-all" => o.ignore = LsIgnore::DotAndDotDot,
+            "author" => o.author = true,
+            "escape" => quoting = Some(Quoting::Escape),
+            "block-size" => match parse_block_size(&value) {
+                Ok((opts, size)) => {
+                    (o.human_opts, o.block_size) = (opts, size);
+                    (o.file_human_opts, o.file_block_size) = (opts, size);
+                    explicit_sizes = true;
+                }
+                Err(e) => {
+                    eprintln!("ls: {}", e.message(&opt.spelled, &value));
+                    return Err(2);
+                }
+            },
+            "ignore-backups" => o.ignore_patterns.extend([b"*~".to_vec(), b".*~".to_vec()]),
+            "ctime" => {
+                o.time = LsTime::Ctime;
+                time_explicit = true;
+            }
+            "atime" => {
+                o.time = LsTime::Atime;
+                time_explicit = true;
+            }
+            "vertical" => o.format = LsFormat::Columns,
+            "across" => o.format = LsFormat::Across,
+            "commas" => o.format = LsFormat::Commas,
+            // GNU: -1 has no effect after -l.
+            "one-per-line" if o.format != LsFormat::Long => o.format = LsFormat::OnePerLine,
+            "one-per-line" => {}
+            "long" => o.format = LsFormat::Long,
+            "color" | "hyperlink" => {
+                let when = [
+                    ("always", "always"),
+                    ("yes", "always"),
+                    ("force", "always"),
+                    ("never", "never"),
+                    ("no", "never"),
+                    ("none", "never"),
+                    ("auto", "auto"),
+                    ("tty", "auto"),
+                    ("if-tty", "auto"),
+                ];
+                let when = match &opt.value {
+                    None => "always",
+                    Some(v) => gnu_argmatch("ls", &format!("--{}", opt.key), v, &when)
+                        .ok_or_else(|| try_help("ls", 1))?,
+                };
+                // Hyperlinks are accepted but not emitted.
+                if opt.key == "color" {
+                    o.color = when == "always" || (when == "auto" && stdout_is_tty);
+                }
+            }
+            "directory" => o.immediate_dirs = true,
+            "unsorted-all" => {
+                o.ignore = LsIgnore::Minimal;
+                o.sort = LsSort::None;
+                sort_specified = true;
+                o.color = false;
+            }
+            "classify" => {
+                let when = [
+                    ("always", "always"),
+                    ("yes", "always"),
+                    ("force", "always"),
+                    ("never", "never"),
+                    ("no", "never"),
+                    ("none", "never"),
+                    ("auto", "auto"),
+                    ("tty", "auto"),
+                    ("if-tty", "auto"),
+                ];
+                let when = match &opt.value {
+                    None => "always",
+                    Some(v) => gnu_argmatch("ls", "--classify", v, &when)
+                        .ok_or_else(|| try_help("ls", 1))?,
+                };
+                // Output is not a terminal here, so `auto` means no indicators.
+                if when == "always" {
+                    o.indicator = Indicator::Classify;
+                } else if when == "auto" {
+                    o.indicator = Indicator::None;
+                }
+            }
+            "file-type" => o.indicator = Indicator::FileType,
+            "slash" => o.indicator = Indicator::Slash,
+            "indicator-style" => {
+                let choices = [
+                    ("none", "none"),
+                    ("slash", "slash"),
+                    ("file-type", "file-type"),
+                    ("classify", "classify"),
+                ];
+                o.indicator = match gnu_argmatch("ls", "--indicator-style", &value, &choices) {
+                    Some("none") => Indicator::None,
+                    Some("slash") => Indicator::Slash,
+                    Some("file-type") => Indicator::FileType,
+                    Some(_) => Indicator::Classify,
+                    None => return Err(try_help("ls", 1)),
+                };
+            }
+            "format" => {
+                let choices = [
+                    ("verbose", "long"),
+                    ("long", "long"),
+                    ("commas", "commas"),
+                    ("horizontal", "across"),
+                    ("across", "across"),
+                    ("vertical", "vertical"),
+                    ("single-column", "single-column"),
+                ];
+                o.format = match gnu_argmatch("ls", "--format", &value, &choices) {
+                    Some("long") => LsFormat::Long,
+                    Some("commas") => LsFormat::Commas,
+                    Some("across") => LsFormat::Across,
+                    Some("vertical") => LsFormat::Columns,
+                    Some(_) => LsFormat::OnePerLine,
+                    None => return Err(try_help("ls", 1)),
+                };
+            }
+            "full-time" => {
+                o.format = LsFormat::Long;
+                time_style = Some("full-iso".into());
+            }
+            "no-owner" => {
+                o.format = LsFormat::Long;
+                o.owner = false;
+            }
+            "long-no-group" => {
+                o.format = LsFormat::Long;
+                o.group = false;
+            }
+            "no-group" => o.group = false,
+            "numeric-uid-gid" => {
+                o.format = LsFormat::Long;
+                o.numeric = true;
+            }
+            "group-directories-first" => o.dirs_first = true,
+            "human-readable" | "si" => {
+                let opts = if opt.key == "si" {
+                    HUMAN_AUTOSCALE | HUMAN_SI
+                } else {
+                    HUMAN_AUTOSCALE | HUMAN_SI | HUMAN_BASE_1024
+                };
+                (o.human_opts, o.block_size) = (opts, 1);
+                (o.file_human_opts, o.file_block_size) = (opts, 1);
+                explicit_sizes = true;
+            }
+            "dereference-command-line" => deref = Some(LsDeref::CommandLine),
+            "dereference-command-line-symlink-to-dir" => {
+                deref = Some(LsDeref::CommandLineSymlinkToDir)
+            }
+            "dereference" => deref = Some(LsDeref::Always),
+            "hide" => o.hide_patterns.push(value.into_bytes()),
+            "ignore" => o.ignore_patterns.push(value.into_bytes()),
+            "inode" => o.inode = true,
+            "kibibytes" => kibibytes = true,
+            "literal" => quoting = Some(Quoting::Literal),
+            "hide-control-chars" => hide_control = Some(true),
+            "show-control-chars" => hide_control = Some(false),
+            "quote-name" => quoting = Some(Quoting::C),
+            "quoting-style" => {
+                let choices: Vec<(&str, &str)> = Quoting::NAMES.iter().map(|n| (*n, *n)).collect();
+                let name = gnu_argmatch("ls", "--quoting-style", &value, &choices)
+                    .ok_or_else(|| try_help("ls", 1))?;
+                quoting = Quoting::from_name(name);
+            }
+            "reverse" => o.reverse = true,
+            "recursive" => o.recursive = true,
+            "size" => o.blocks = true,
+            "sort-size" => {
+                o.sort = LsSort::Size;
+                sort_specified = true;
+            }
+            "sort-time" => {
+                o.sort = LsSort::Time;
+                sort_specified = true;
+            }
+            "unsorted" => {
+                o.sort = LsSort::None;
+                sort_specified = true;
+            }
+            "sort-version" => {
+                o.sort = LsSort::Version;
+                sort_specified = true;
+            }
+            "sort-extension" => {
+                o.sort = LsSort::Extension;
+                sort_specified = true;
+            }
+            "sort" => {
+                let choices = [
+                    ("none", "none"),
+                    ("time", "time"),
+                    ("size", "size"),
+                    ("extension", "extension"),
+                    ("version", "version"),
+                    ("width", "width"),
+                ];
+                o.sort = match gnu_argmatch("ls", "--sort", &value, &choices) {
+                    Some("none") => LsSort::None,
+                    Some("time") => LsSort::Time,
+                    Some("size") => LsSort::Size,
+                    Some("extension") => LsSort::Extension,
+                    Some("version") => LsSort::Version,
+                    Some(_) => LsSort::Width,
+                    None => return Err(try_help("ls", 1)),
+                };
+                sort_specified = true;
+            }
+            "time" => {
+                let choices = [
+                    ("atime", "atime"),
+                    ("access", "atime"),
+                    ("use", "atime"),
+                    ("ctime", "ctime"),
+                    ("status", "ctime"),
+                    ("mtime", "mtime"),
+                    ("modification", "mtime"),
+                    ("birth", "birth"),
+                    ("creation", "birth"),
+                ];
+                o.time = match gnu_argmatch("ls", "--time", &value, &choices) {
+                    Some("atime") => LsTime::Atime,
+                    Some("ctime") => LsTime::Ctime,
+                    Some("mtime") => LsTime::Mtime,
+                    Some(_) => LsTime::Birth,
+                    None => return Err(try_help("ls", 1)),
+                };
+                time_explicit = o.time != LsTime::Mtime;
+            }
+            "time-style" => time_style = Some(value),
+            "tabsize" => o.tab_size = width_arg(&value, "tab size")?,
+            "width" => match decode_line_length(&value) {
+                Some(n) => width_opt = Some(n),
+                None => {
+                    eprintln!(
+                        "ls: invalid line width: {}",
+                        quote_bytes(value.as_bytes(), Quoting::Locale)
+                    );
+                    return Err(2);
+                }
+            },
+            "context" => o.context = true,
+            "zero" => {
+                o.eol = b'\0';
+                o.color = false;
+            }
+            "tree" => o.tree = true,
+            "level" => {
+                o.level = value.parse().map_err(|_| {
+                    eprintln!(
+                        "ls: invalid tree level: {}",
+                        quote_bytes(value.as_bytes(), Quoting::Locale)
+                    );
+                    2
+                })?
+            }
+            "json" => o.json = true,
+            "help" => {
+                let _ = print_help_text(LS_HELP);
+                return Err(0);
+            }
+            "version" => {
+                print_tool_version("ls");
+                return Err(0);
+            }
+            _ => unreachable!("unhandled ls option"),
+        }
+    }
+    if o.eol == b'\0' && o.format != LsFormat::Long {
+        o.format = LsFormat::OnePerLine;
+    }
+    // GNU consults COLUMNS only when the format or colouring needs a width.
+    o.line_length = match width_opt {
+        Some(n) => n,
+        None if o.color
+            || matches!(
+                o.format,
+                LsFormat::Columns | LsFormat::Across | LsFormat::Commas
+            ) =>
+        {
+            match std::env::var_os("COLUMNS").filter(|c| !c.is_empty()) {
+                Some(c) => decode_line_length(&c.to_string_lossy()).unwrap_or_else(|| {
+                    eprintln!(
+                        "ls: ignoring invalid width in environment variable COLUMNS: {}",
+                        quote_bytes(c.as_encoded_bytes(), Quoting::Locale)
+                    );
+                    80
+                }),
+                None => 80,
+            }
+        }
+        None => 80,
+    };
+    if kibibytes && !explicit_sizes && std::env::var_os("LS_BLOCK_SIZE").is_none() {
+        (o.human_opts, o.block_size) = (0, 1024);
+    }
+    if let Some(style) = time_style {
+        o.time_formats = ls_time_formats(&style)?;
+    }
+    if time_explicit && !sort_specified && o.format != LsFormat::Long {
+        o.sort = LsSort::Time;
+    }
+    o.deref = deref.unwrap_or(
+        if o.immediate_dirs || o.indicator == Indicator::Classify || o.format == LsFormat::Long {
+            LsDeref::Never
+        } else {
+            LsDeref::CommandLineSymlinkToDir
+        },
+    );
+    o.quoting = quoting.unwrap_or_else(|| {
+        std::env::var("QUOTING_STYLE")
+            .ok()
+            .and_then(|s| Quoting::from_name(&s))
+            .unwrap_or(Quoting::Literal)
+    });
+    o.hide_control = hide_control.unwrap_or(false);
+    Ok((o, parsed.operands))
+}
+
+/// `ls` parses `--color[=WHEN]` itself, like GNU (in argument order, so `-f`
+/// and `--zero` can turn it off again, and with GNU's diagnostics), so it takes
+/// its arguments from before the global-flag filtering, dropping only
+/// `--stats`; the Dogfish `--no-color` means `--color=never`.
+pub(crate) fn ls_args(ctx: &DogfishContext, filtered: Vec<String>) -> Vec<String> {
+    if ctx.raw_args.is_empty() {
+        return filtered;
+    }
+    let mut args = Vec::with_capacity(ctx.raw_args.len());
+    let mut operands_only = false;
+    for (i, arg) in ctx.raw_args.iter().enumerate() {
+        if i == 0 || operands_only {
+            args.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => {
+                operands_only = true;
+                args.push(arg.clone());
+            }
+            "--stats" => {}
+            "--no-color" => args.push("--color=never".into()),
+            _ => args.push(arg.clone()),
+        }
+    }
+    args
+}
+
+/// GNU `decode_line_length` (for `-w` and COLUMNS): a number in C syntax
+/// (decimal, `0x` hex or `0` octal), where too large means unlimited (0).
+fn decode_line_length(spec: &str) -> Option<usize> {
+    let s = spec.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = if let Some(hex) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (hex, 16)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (&s[1..], 8)
+    } else {
+        (s, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    Some(
+        u64::from_str_radix(digits, radix)
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n <= isize::MAX as usize)
+            .unwrap_or(0),
+    )
+}
