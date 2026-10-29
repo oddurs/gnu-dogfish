@@ -361,7 +361,7 @@ fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) 
         // Lines (and bytes): stream in large reads, as GNU's wc_lines does,
         // rather than mapping or buffering the whole input.
         let (mut lines, mut bytes) = (0u64, 0u64);
-        let mut buf = vec![0u8; 256 * 1024];
+        let mut buf = vec![0u8; 64 * 1024];
         let error = loop {
             match safe_read(handle, &mut buf) {
                 Ok(0) => break None,
