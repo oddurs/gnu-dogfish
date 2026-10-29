@@ -3,10 +3,11 @@ id: 4
 uid: 9bdc65a3-12ab-4f90-9306-3fbb51e7b0ce
 title: "Restore main: digest and blake2 0.11 bumps broke the build"
 type: bug
-status: doing
+status: done
 milestone: "v0.2"
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p0
 effort: s
 area: release
@@ -35,7 +36,21 @@ without a human, and only after CI on that exact commit passes.
 
 ## Acceptance criteria
 
-- [ ] A regression check reproduces the failure and passes with the fix.
-- [ ] #11 merged: digest/blake2 reverted, base64 0.23 and jwalk 0.9 kept after the full suite passed.
-- [ ] The auto-merge rule refuses 0.x minor bumps and waits for CI on the head commit.
-- [ ] Dependabot PR titles pass the Conventional Commit check.
+- [x] A regression check reproduces the failure and passes with the fix.
+- [x] #11 merged: digest/blake2 reverted, base64 0.23 and jwalk 0.9 kept after the full suite passed.
+- [x] The auto-merge rule refuses 0.x minor bumps and waits for CI on the head commit.
+- [x] Dependabot PR titles pass the Conventional Commit check.
+
+## Result
+
+Fixed in #11 (squash `2b41f62`). digest 0.11 and blake2 0.11 were reverted;
+base64 0.23 and jwalk 0.9 passed fmt, Clippy and all 1,915 tests and stayed.
+The regression check is the build itself: `cargo build --locked` fails on
+`f14660d` and passes on `2b41f62`, and CI now gates every merge on it.
+
+The auto-merge workflow now decides compatibility by Cargo's rules (patch,
+or minor at >=1.0), checked against the four bumps that slipped through
+(all refused) and other cases, and it merges only after the CI run for the
+PR's exact head commit passes, so it no longer depends on branch protection.
+Dependabot titles are `chore(deps): ...` / `ci: ...`, which the PR Title
+check accepts. Upgrading the RustCrypto crates is 0015.

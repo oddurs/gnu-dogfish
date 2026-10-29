@@ -1,0 +1,74 @@
+name: GNU Test Suite
+
+# Runs GNU coreutils' own test suite against Dogfish (util/gnu-tests.sh) and
+# fails on any test that passed in util/gnu-baseline.json and no longer does.
+# The pass rate and per-program breakdown appear in the job summary.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "util/gnu-tests.sh"
+      - "util/gnu_tests.py"
+      - "util/gnu-baseline.json"
+      - "Cargo.lock"
+      - ".github/workflows/gnu-tests.yml"
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  gnu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The built GNU tree depends only on the pinned release.
+      - name: Cache GNU coreutils build
+        uses: actions/cache@v4
+        with:
+          path: target/gnu/coreutils-9.4
+          key: gnu-coreutils-9.4-${{ runner.os }}-v1
+
+      - name: Build Dogfish
+        run: cargo build --release --locked
+
+      - name: Run GNU's test suite against Dogfish
+        run: util/gnu-tests.sh
+
+      - name: Print passing tests (for updating the baseline)
+        if: always()
+        run: |
+          python3 -I - <<'EOF'
+          import json
+          r = json.load(open("target/gnu/gnu-results.json"))
+          passing = sorted(t for t, v in r["tests"].items() if v["result"] in ("PASS", "XFAIL"))
+          print("::group::gnu-baseline.json")
+          print(json.dumps({"gnu_version": "coreutils-9.4", "pass": passing}, indent=1))
+          print("::endgroup::")
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnu-test-results
+          path: |
+            target/gnu/gnu-results.json
+            target/gnu/gnu-summary.md
+            target/gnu/selection.json
+            target/gnu/check.log
+            target/gnu/coreutils-9.4/tests/**/*.log
+          if-no-files-found: warn

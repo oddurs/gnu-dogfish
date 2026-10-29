@@ -3,8 +3,10 @@ id: 8
 uid: 44cd79f9-13d0-4ccc-91b9-b85e6eefcfd8
 title: "Run GNU coreutils' own test suite and publish the pass rate"
 type: feature
-status: planned
+status: doing
 milestone: "v0.3"
+assignee: claude
+claimed: 2026-10-29
 depends_on:
 - 4
 created: 2026-10-29
