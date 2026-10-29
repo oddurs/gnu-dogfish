@@ -59,6 +59,25 @@ The workspace consists of two crates:
 
 ---
 
+## 🔀 Pull Requests & Releases
+
+- **Branches open PRs automatically.** Pushing a branch with new commits opens a *draft* PR against `main` (`.github/workflows/auto-pr.yml`); mark it ready when it is.
+- **PR titles are Conventional Commits** (`feat: ...`, `fix(cp): ...`, `perf: ...`, `docs: ...`, `chore: ...`; add `!` for breaking changes). PRs are squash-merged, so the title becomes the commit on `main`, and the **PR Title** check enforces the format.
+- **Releases are automated** by [release-please](https://github.com/googleapis/release-please): every merge to `main` updates a `chore: release X.Y.Z` PR that bumps the version in `Cargo.toml`, refreshes `Cargo.lock`, and adds a `CHANGELOG.md` entry from the commit titles (`feat` → minor, `fix`/`perf` → patch while we are pre-1.0). Merging it tags `vX.Y.Z`, publishes the GitHub Release, and attaches Linux and macOS archives with SHA-256 sums.
+- **Dependabot** opens weekly dependency and Actions updates; patch and minor ones auto-merge once CI is green, majors wait for a human.
+
+### Repository settings these workflows rely on (maintainers)
+
+| Setting | Where | Why |
+| :--- | :--- | :--- |
+| Allow squash merging (and preferably only squash) | Settings → General → Pull Requests | One Conventional Commit per PR on `main`. |
+| Allow auto-merge | Settings → General → Pull Requests | Dependabot (and maintainers) can queue merges. |
+| Branch protection on `main` requiring the CI checks (Lint, Test, MSRV, PR Title) | Settings → Branches | Auto-merge waits for green CI instead of merging immediately. |
+| Allow GitHub Actions to create and approve pull requests | Settings → Actions → General | The default token can open the release and draft PRs. |
+| Optional secrets `RELEASE_PLEASE_TOKEN`, `AUTO_PR_TOKEN` (fine-grained PAT or GitHub App token: contents + pull-requests write) | Settings → Secrets and variables → Actions | PRs opened with the default `GITHUB_TOKEN` don't trigger CI; with these secrets, release and auto-opened PRs get checks immediately. |
+
+---
+
 ## 📜 License Agreement
 
 By contributing to GNU/Dogfish, you agree that your contributions will be licensed under the repository's dual **GPL-3.0-or-later OR MIT** license so that all users retain the Four Essential Freedoms.
