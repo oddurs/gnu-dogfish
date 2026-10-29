@@ -18,10 +18,10 @@ use crate::common::interval::{duration_from_secs, parse_interval};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct SleepArgs {
+struct SleepArgs {
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     #[arg(required = true, value_name = "NUMBER")]
     durations: Vec<String>,

@@ -36,7 +36,7 @@ fn path_prefix(prefix: &Path, path: &Path) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RealpathOpt {
+enum RealpathOpt {
     Existing,
     Missing,
     Logical,

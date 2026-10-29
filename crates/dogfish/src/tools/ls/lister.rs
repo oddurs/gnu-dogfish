@@ -43,7 +43,7 @@ pub(crate) struct LsFile {
 }
 
 impl LsFile {
-    pub(crate) fn is_dir(&self) -> bool {
+    fn is_dir(&self) -> bool {
         match &self.meta {
             Some(m) => m.is_dir(),
             None => self.type_letter == b'd',
@@ -60,7 +60,7 @@ impl LsFile {
         }
     }
 
-    pub(crate) fn size(&self) -> u64 {
+    fn size(&self) -> u64 {
         self.meta.as_ref().map_or(0, |m| m.size())
     }
 }
@@ -106,12 +106,12 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8)>> {
 struct LsWidths {
     pub(crate) inode: usize,
     pub(crate) blocks: usize,
-    pub(crate) nlink: usize,
+    nlink: usize,
     pub(crate) owner: usize,
     pub(crate) group: usize,
     pub(crate) author: usize,
     pub(crate) context: usize,
-    pub(crate) size: usize,
+    size: usize,
     major: usize,
     minor: usize,
     any_acl: bool,
@@ -159,7 +159,7 @@ impl<W: Write> Lister<'_, W> {
         Ok(())
     }
 
-    pub(crate) fn fail(&mut self, msg: String, serious: bool) {
+    fn fail(&mut self, msg: String, serious: bool) {
         eprintln!("ls: {msg}");
         self.status = self.status.max(if serious { 2 } else { 1 });
     }
@@ -279,7 +279,7 @@ impl<W: Write> Lister<'_, W> {
         }
     }
 
-    pub(crate) fn ignored(&self, name: &[u8]) -> bool {
+    fn ignored(&self, name: &[u8]) -> bool {
         let o = self.opts;
         let dot = name.first() == Some(&b'.');
         let dot_or_dotdot = name == b"." || name == b"..";

@@ -15,7 +15,7 @@ pub(crate) struct ToolOpt<T> {
     shorts: &'static str,
     pub(crate) long: &'static str,
     pub(crate) arg: HasArg,
-    pub(crate) id: T,
+    id: T,
 }
 
 pub(crate) const fn opt<T>(

@@ -91,25 +91,25 @@ const STAT_FS_TERSE_FORMAT: &str = "%n %i %l %t %s %S %b %f %a %c %d\n";
 
 #[derive(Serialize)]
 struct StatRecord {
-    pub(crate) name: String,
-    pub(crate) file_type: String,
-    pub(crate) size: u64,
-    pub(crate) size_human: String,
-    pub(crate) blocks: u64,
+    name: String,
+    file_type: String,
+    size: u64,
+    size_human: String,
+    blocks: u64,
     io_block: u64,
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
-    pub(crate) links: u64,
-    pub(crate) mode_octal: String,
+    device: u64,
+    inode: u64,
+    links: u64,
+    mode_octal: String,
     mode_symbolic: String,
-    pub(crate) uid: u32,
-    pub(crate) user: String,
-    pub(crate) gid: u32,
-    pub(crate) group: String,
+    uid: u32,
+    user: String,
+    gid: u32,
+    group: String,
     accessed: String,
-    pub(crate) modified: String,
-    pub(crate) changed: String,
-    pub(crate) modified_relative: String,
+    modified: String,
+    changed: String,
+    modified_relative: String,
     symlink_target: Option<String>,
 }
 
@@ -262,14 +262,14 @@ pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
 /// One parsed `%` directive of a `stat` format: `%[flags][width][.precision][H|L]conv`.
 struct StatDirective<'a> {
-    pub(crate) flags: &'a str,
-    pub(crate) width: Option<usize>,
+    flags: &'a str,
+    width: Option<usize>,
     precision: Option<usize>,
     /// A `.` with no digits after it.
     bare_precision: bool,
     /// `H` (major) or `L` (minor) before `d`/`r`.
     modifier: Option<char>,
-    pub(crate) conv: char,
+    conv: char,
 }
 
 /// A value produced by a directive; rendered with the C `printf` rules GNU uses.
@@ -554,12 +554,12 @@ fn stat_human_time(t: Timespec) -> Vec<u8> {
 }
 
 /// A file being described by `stat` (without `-f`).
-pub(crate) struct StatFile<'a> {
-    pub(crate) name: &'a str,
-    pub(crate) path: &'a Path,
-    pub(crate) meta: &'a fs::Metadata,
+struct StatFile<'a> {
+    name: &'a str,
+    path: &'a Path,
+    meta: &'a fs::Metadata,
     /// How `%N` quotes names.
-    pub(crate) quoting: Quoting,
+    quoting: Quoting,
 }
 
 impl StatFile<'_> {
@@ -632,23 +632,23 @@ impl StatFile<'_> {
 }
 
 /// File system statistics for `stat -f` (from `statfs` on Linux, `statvfs` elsewhere).
-pub(crate) struct FsStats {
-    pub(crate) block_size: u64,
+struct FsStats {
+    block_size: u64,
     fragment_size: u64,
-    pub(crate) blocks: u64,
-    pub(crate) free: u64,
-    pub(crate) available: u64,
-    pub(crate) files: u64,
-    pub(crate) free_files: u64,
+    blocks: u64,
+    free: u64,
+    available: u64,
+    files: u64,
+    free_files: u64,
     fsid: u64,
     name_max: u64,
-    pub(crate) fs_type: u64,
+    fs_type: u64,
     type_name: String,
 }
 
 impl FsStats {
     #[cfg(target_os = "linux")]
-    pub(crate) fn query(path: &Path) -> io::Result<Self> {
+    fn query(path: &Path) -> io::Result<Self> {
         let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
         // SAFETY: statfs fills the zeroed struct for a valid C path.
         let mut s: libc::statfs = unsafe { std::mem::zeroed() };
@@ -678,7 +678,7 @@ impl FsStats {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn query(path: &Path) -> io::Result<Self> {
+    fn query(path: &Path) -> io::Result<Self> {
         let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
         // SAFETY: statvfs fills the zeroed struct for a valid C path.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };

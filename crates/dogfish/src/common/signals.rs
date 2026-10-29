@@ -130,3 +130,48 @@ pub(crate) fn parse_signal(spec: &str) -> Option<libc::c_int> {
     };
     sig_known(sig).then_some(sig)
 }
+
+/// Writes the name of `sig` (`TERM`, `RTMIN+2`, or the number when unnamed)
+/// into `buf` without allocating, so a signal handler may use it.
+pub(crate) fn sig_name_into(sig: libc::c_int, buf: &mut [u8; 16]) -> &[u8] {
+    fn put_num(buf: &mut [u8], mut at: usize, n: libc::c_int) -> usize {
+        let mut digits = [0u8; 10];
+        let mut len = 0;
+        let mut v = n.unsigned_abs();
+        loop {
+            digits[len] = b'0' + (v % 10) as u8;
+            len += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for i in (0..len).rev() {
+            buf[at] = digits[i];
+            at += 1;
+        }
+        at
+    }
+    if let Some((name, _)) = SIGNAL_NAMES.iter().find(|(_, n)| *n == sig) {
+        buf[..name.len()].copy_from_slice(name.as_bytes());
+        return &buf[..name.len()];
+    }
+    if let Some((min, max)) = rt_signal_range()
+        && (min..=max).contains(&sig)
+    {
+        let (base, offset) = if sig - min <= (max - min) / 2 {
+            (b"RTMIN", sig - min)
+        } else {
+            (b"RTMAX", sig - max)
+        };
+        buf[..5].copy_from_slice(base);
+        let mut len = 5;
+        if offset != 0 {
+            buf[len] = if offset > 0 { b'+' } else { b'-' };
+            len = put_num(buf, len + 1, offset);
+        }
+        return &buf[..len];
+    }
+    let len = put_num(buf, 0, sig);
+    &buf[..len]
+}

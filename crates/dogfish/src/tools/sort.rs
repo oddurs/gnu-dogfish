@@ -23,7 +23,7 @@ use crate::common::lines::{is_blank, looks_like_json, lossy_lines, split_lines};
     about = "Sort lines of text files or NDJSON object streams",
     disable_help_flag = true
 )]
-pub(crate) struct SortArgs {
+struct SortArgs {
     /// Print help
     #[arg(long = "help", action = ArgAction::Help)]
     help: Option<bool>,
@@ -38,7 +38,7 @@ pub(crate) struct SortArgs {
 
     /// Fold lower case to upper case characters
     #[arg(short = 'f', long = "ignore-case")]
-    pub(crate) ignore_case: bool,
+    ignore_case: bool,
 
     /// Compare according to general numerical value
     #[arg(short = 'g', long = "general-numeric-sort")]
@@ -79,7 +79,7 @@ pub(crate) struct SortArgs {
 
     /// Reverse the result of comparisons
     #[arg(short = 'r', long = "reverse", visible_alias = "desc")]
-    pub(crate) reverse: bool,
+    reverse: bool,
 
     /// Check for sorted input; do not sort
     #[arg(short = 'c', long = "check")]
@@ -91,7 +91,7 @@ pub(crate) struct SortArgs {
 
     /// Write result to FILE instead of standard output
     #[arg(short = 'o', long = "output")]
-    pub(crate) output: Option<String>,
+    output: Option<String>,
 
     /// Stabilize sort by disabling last-resort comparison
     #[arg(short = 's', long = "stable")]
@@ -99,29 +99,29 @@ pub(crate) struct SortArgs {
 
     /// Use SEP instead of non-blank to blank transition
     #[arg(short = 't', long = "field-separator")]
-    pub(crate) separator: Option<String>,
+    separator: Option<String>,
 
     /// Output only the first of an equal run
     #[arg(short = 'u', long = "unique")]
-    pub(crate) unique: bool,
+    unique: bool,
 
     /// Modern Dogfish extension: Sort NDJSON objects by named field (e.g., `--by size`)
     #[arg(long = "by")]
-    pub(crate) by_field: Option<String>,
+    by_field: Option<String>,
 
     /// Filter NDJSON objects before sorting (e.g., `--where "size>10K"`)
     #[arg(short = 'w', long = "where")]
-    pub(crate) where_expr: Option<String>,
+    where_expr: Option<String>,
 
     /// Emit JSON / NDJSON output
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct SortOpts {
+struct SortOpts {
     skip_sblanks: bool,
     skip_eblanks: bool,
     dictionary: bool,
@@ -132,7 +132,7 @@ pub(crate) struct SortOpts {
     month: bool,
     numeric: bool,
     random: bool,
-    pub(crate) reverse: bool,
+    reverse: bool,
     version: bool,
 }
 
@@ -158,7 +158,7 @@ impl SortOpts {
     }
 
     /// GNU `key_to_opts`: the key's option letters, in GNU's canonical order.
-    pub(crate) fn letters(&self) -> String {
+    fn letters(&self) -> String {
         [
             (self.skip_sblanks || self.skip_eblanks, 'b'),
             (self.dictionary, 'd'),
@@ -196,14 +196,14 @@ impl SortOpts {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct SortKey {
+struct SortKey {
     /// Zero-based start field and character offset.
     sword: usize,
     schar: usize,
     /// Zero-based end field (`None` = end of line) and 1-based char (0 = end of field).
     eword: Option<usize>,
     echar: usize,
-    pub(crate) opts: SortOpts,
+    opts: SortOpts,
 }
 
 fn parse_sort_key(spec: &str) -> std::result::Result<SortKey, String> {
@@ -277,12 +277,12 @@ fn parse_sort_key(spec: &str) -> std::result::Result<SortKey, String> {
     })
 }
 
-pub(crate) struct Sorter {
+struct Sorter {
     keys: Vec<SortKey>,
     tab: Option<u8>,
     /// Disable the last-resort whole-line comparison (`-s` / `-u`).
     no_last_resort: bool,
-    pub(crate) reverse: bool,
+    reverse: bool,
     /// MD5 state primed with the `-R` seed; each key is hashed with a clone.
     random_seed: Md5,
 }

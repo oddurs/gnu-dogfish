@@ -13,13 +13,13 @@ use crate::common::users::get_username_by_uid;
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct WhoamiArgs {
+struct WhoamiArgs {
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 }
 
 pub fn run_whoami(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {

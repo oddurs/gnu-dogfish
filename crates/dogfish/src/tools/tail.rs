@@ -22,7 +22,7 @@ use crate::common::lines::{looks_like_json, lossy_lines};
     name = "tail",
     about = "Output the last part of files (or NDJSON object streams)"
 )]
-pub(crate) struct TailArgs {
+struct TailArgs {
     /// Output the last NUM lines (default 10); or use -n +NUM to skip NUM-1 lines at the start
     #[arg(
         short = 'n',
@@ -30,7 +30,7 @@ pub(crate) struct TailArgs {
         value_name = "[+]NUM",
         allow_hyphen_values = true
     )]
-    pub(crate) lines: Option<String>,
+    lines: Option<String>,
 
     /// Output the last NUM bytes; or use -c +NUM to output starting with byte NUM
     #[arg(
@@ -39,22 +39,22 @@ pub(crate) struct TailArgs {
         value_name = "[+]NUM",
         allow_hyphen_values = true
     )]
-    pub(crate) bytes: Option<String>,
+    bytes: Option<String>,
 
     /// Output appended data as the file grows
     #[arg(short = 'f', long = "follow")]
     follow: bool,
 
     #[arg(short = 'q', long = "quiet", visible_alias = "silent")]
-    pub(crate) quiet: bool,
+    quiet: bool,
 
     #[arg(short = 'v', long = "verbose")]
-    pub(crate) verbose: bool,
+    verbose: bool,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 /// Offset at which tail output starts.

@@ -14,7 +14,7 @@ use dogfish_core::{
     name = "shuf",
     about = "Generate random permutations of lines, ranges, or NDJSON objects"
 )]
-pub(crate) struct ShufArgs {
+struct ShufArgs {
     /// Treat each ARG as an input line
     #[arg(short = 'e', long = "echo")]
     echo: bool,
@@ -28,9 +28,9 @@ pub(crate) struct ShufArgs {
     head_count: Option<usize>,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
-    pub(crate) args: Vec<String>,
+    args: Vec<String>,
 }
 
 pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

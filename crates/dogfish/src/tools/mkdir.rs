@@ -30,7 +30,7 @@ Create the DIRECTORY(ies), if they do not already exist.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MkdirOpt {
+enum MkdirOpt {
     Mode,
     Parents,
     Verbose,
@@ -100,8 +100,8 @@ pub fn run_mkdir(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
 /// The umasks `mkdir` creates directories under.
 #[derive(Clone, Copy)]
-pub(crate) struct MkdirMasks {
-    pub(crate) own: u32,
+struct MkdirMasks {
+    own: u32,
     ancestor: u32,
 }
 

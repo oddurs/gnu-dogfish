@@ -15,10 +15,10 @@ use serde_json::{Map, Value};
     visible_alias = "filter",
     about = "Filter, sort, and project NDJSON object streams (`dogfish ls -J | dogfish query -w \"size>1K\" -s size -d -f name,size`)"
 )]
-pub(crate) struct QueryArgs {
+struct QueryArgs {
     /// Filter expression (`size>10K`, `kind=file`, `name~rs`, `lines>=100`)
     #[arg(short = 'w', long = "where")]
-    pub(crate) where_expr: Vec<String>,
+    where_expr: Vec<String>,
 
     /// Sort by field name
     #[arg(short = 's', long = "sort", visible_alias = "by")]
@@ -38,7 +38,7 @@ pub(crate) struct QueryArgs {
 
     /// Emit raw JSON / NDJSON instead of auto-table on TTY
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 }
 
 pub fn run_query(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

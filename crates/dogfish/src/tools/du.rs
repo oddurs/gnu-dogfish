@@ -126,23 +126,23 @@ with usage bars.
 ";
 
 #[derive(Serialize, Clone)]
-pub(crate) struct DuRecord {
-    pub(crate) path: String,
-    pub(crate) size: u64,
-    pub(crate) size_human: String,
-    pub(crate) files: u64,
+struct DuRecord {
+    path: String,
+    size: u64,
+    size_human: String,
+    files: u64,
 }
 
 /// What `du` measures and how it walks (shared by the parallel collectors).
-pub(crate) struct DuConfig {
-    pub(crate) all: bool,
+struct DuConfig {
+    all: bool,
     apparent: bool,
-    pub(crate) inodes: bool,
+    inodes: bool,
     count_links: bool,
     /// Directories are de-duplicated too (several operands, or `-L`).
     hash_all: bool,
     follow_all: bool,
-    pub(crate) one_file_system: bool,
+    one_file_system: bool,
     excludes: Vec<Vec<u8>>,
 }
 
@@ -188,17 +188,17 @@ impl DuConfig {
 
 /// A directory read during the parallel collection phase.
 struct DuDir {
-    pub(crate) meta: fs::Metadata,
+    meta: fs::Metadata,
     /// Combined size and count of entries that need neither printing nor
     /// de-duplication (single-link files without `-a`).
     plain_size: u64,
     plain_files: u64,
-    pub(crate) entries: Vec<DuEntry>,
+    entries: Vec<DuEntry>,
     read_error: Option<io::Error>,
 }
 
 impl DuDir {
-    pub(crate) fn empty(meta: fs::Metadata) -> Self {
+    fn empty(meta: fs::Metadata) -> Self {
         Self {
             meta,
             plain_size: 0,
@@ -341,26 +341,26 @@ fn du_collect(
 }
 
 /// One line of output.
-pub(crate) struct DuLine {
-    pub(crate) path: Vec<u8>,
-    pub(crate) size: u64,
-    pub(crate) files: u64,
+struct DuLine {
+    path: Vec<u8>,
+    size: u64,
+    files: u64,
 }
 
 /// Where streamed `du` lines go.
-pub(crate) type DuSink<'a> = &'a mut dyn FnMut(&DuLine) -> io::Result<()>;
+type DuSink<'a> = &'a mut dyn FnMut(&DuLine) -> io::Result<()>;
 
 /// The sequential, GNU-ordered pass: de-duplication, depth and threshold
 /// filtering, and output.
-pub(crate) struct DuWalker<'a> {
-    pub(crate) cfg: &'a DuConfig,
-    pub(crate) seen: std::collections::HashSet<(u64, u64)>,
-    pub(crate) max_depth: usize,
+struct DuWalker<'a> {
+    cfg: &'a DuConfig,
+    seen: std::collections::HashSet<(u64, u64)>,
+    max_depth: usize,
     separate_dirs: bool,
     threshold: i128,
-    pub(crate) lines: Vec<DuLine>,
+    lines: Vec<DuLine>,
     sink: Option<DuSink<'a>>,
-    pub(crate) status: i32,
+    status: i32,
 }
 
 impl DuWalker<'_> {

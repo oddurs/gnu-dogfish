@@ -12,21 +12,21 @@ use dogfish_core::{DogfishContext, gnu_quote};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct NprocArgs {
+struct NprocArgs {
     /// Print the number of installed processors
     #[arg(long = "all")]
-    pub(crate) all: bool,
+    all: bool,
 
     /// If possible, exclude N processing units
     #[arg(long = "ignore", value_name = "N")]
     ignore: Option<String>,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 }
 
 /// Parses an OpenMP thread count like gnulib: a decimal number, optionally

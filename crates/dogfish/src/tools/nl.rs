@@ -15,14 +15,14 @@ use crate::common::lines::chomp;
     name = "nl",
     about = "Write each FILE to standard output, with line numbers added"
 )]
-pub(crate) struct NlArgs {
+struct NlArgs {
     /// Use STYLE for numbering body lines (a: all, t: nonempty, n: none)
     #[arg(short = 'b', long = "body-numbering", default_value = "t")]
-    pub(crate) body: String,
+    body: String,
 
     /// Number all lines (including empty ones; equivalent to -ba)
     #[arg(short = 'a', long = "all")]
-    pub(crate) all: bool,
+    all: bool,
 
     /// Line number increment at each line
     #[arg(
@@ -35,11 +35,11 @@ pub(crate) struct NlArgs {
 
     /// Insert line numbers according to FORMAT (ln, rn, rz)
     #[arg(short = 'n', long = "number-format", default_value = "rn")]
-    pub(crate) format: String,
+    format: String,
 
     /// Add STRING after (possible) line number
     #[arg(short = 's', long = "number-separator", default_value = "\t")]
-    pub(crate) separator: String,
+    separator: String,
 
     /// First line number
     #[arg(
@@ -48,13 +48,13 @@ pub(crate) struct NlArgs {
         default_value_t = 1,
         allow_hyphen_values = true
     )]
-    pub(crate) start: i64,
+    start: i64,
 
     /// Use NUMBER columns for line numbers
     #[arg(short = 'w', long = "number-width", default_value_t = 6)]
-    pub(crate) width: usize,
+    width: usize,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

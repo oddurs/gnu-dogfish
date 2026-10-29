@@ -339,14 +339,14 @@ fn lex_date(s: &str) -> Option<Vec<DateTok>> {
 /// Parser state, mirroring gnulib's `parser_control`.
 #[derive(Default)]
 struct DateParse {
-    pub(crate) year: i64,
+    year: i64,
     year_digits: usize,
     month: i64,
     day: i64,
     hour: i64,
     minutes: i64,
     seconds: i64,
-    pub(crate) ns: i64,
+    ns: i64,
     /// None = 24-hour clock; Some(true) = PM.
     meridian: Option<bool>,
     day_ordinal: i64,
@@ -447,7 +447,7 @@ struct DateParser<'a> {
 }
 
 impl DateParser<'_> {
-    pub(crate) fn peek(&self, k: usize) -> Option<&DateTok> {
+    fn peek(&self, k: usize) -> Option<&DateTok> {
         self.toks.get(self.pos + k)
     }
 
@@ -525,7 +525,7 @@ impl DateParser<'_> {
         self.pc.apply_rel(unit, n.checked_mul(sign)?, ns * sign)
     }
 
-    pub(crate) fn item(&mut self) -> Option<()> {
+    fn item(&mut self) -> Option<()> {
         let tok = self.peek(0)?.clone();
         self.pos += 1;
         match tok {

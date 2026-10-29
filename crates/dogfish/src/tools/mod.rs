@@ -1,7 +1,10 @@
 //! One module per utility. Each exports the `run_*` entry point `main` dispatches to.
 
 pub(crate) mod basename;
+pub(crate) mod basenc;
+pub(crate) mod bench;
 pub(crate) mod cat;
+pub(crate) mod checksum;
 pub(crate) mod chmod;
 pub(crate) mod chown;
 pub(crate) mod cp;
@@ -13,8 +16,11 @@ pub(crate) mod du;
 pub(crate) mod echo;
 pub(crate) mod env;
 pub(crate) mod head;
+pub(crate) mod history;
 pub(crate) mod hostname;
 pub(crate) mod id;
+pub(crate) mod init;
+pub(crate) mod install_links;
 pub(crate) mod ln;
 pub(crate) mod ls;
 pub(crate) mod mkdir;
@@ -41,6 +47,7 @@ pub(crate) mod touch;
 pub(crate) mod tr;
 pub(crate) mod true_false;
 pub(crate) mod uname;
+pub(crate) mod undo;
 pub(crate) mod uniq;
 pub(crate) mod watch;
 pub(crate) mod wc;

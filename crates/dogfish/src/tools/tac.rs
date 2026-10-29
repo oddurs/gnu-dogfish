@@ -14,8 +14,8 @@ use memchr::memrchr_iter;
     name = "tac",
     about = "Concatenate and print files in reverse (last line first)"
 )]
-pub(crate) struct TacArgs {
-    pub(crate) files: Vec<String>,
+struct TacArgs {
+    files: Vec<String>,
 }
 
 pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

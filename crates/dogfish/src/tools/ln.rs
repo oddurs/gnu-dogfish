@@ -44,7 +44,7 @@ Create links to each TARGET; hard links by default, symbolic links with -s.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LnOpt {
+enum LnOpt {
     Backup,
     BackupArg,
     Directory,
@@ -61,15 +61,15 @@ pub(crate) enum LnOpt {
     Verbose,
 }
 
-pub(crate) struct LnOpts {
-    pub(crate) backup: BackupMode,
-    pub(crate) suffix: String,
-    pub(crate) force: bool,
-    pub(crate) interactive: bool,
-    pub(crate) logical: bool,
+struct LnOpts {
+    backup: BackupMode,
+    suffix: String,
+    force: bool,
+    interactive: bool,
+    logical: bool,
     relative: bool,
-    pub(crate) symbolic: bool,
-    pub(crate) verbose: bool,
+    symbolic: bool,
+    verbose: bool,
 }
 
 pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

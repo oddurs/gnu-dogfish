@@ -15,17 +15,17 @@ use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct PrintenvArgs {
+struct PrintenvArgs {
     /// End each output line with NUL, not newline
     #[arg(short = '0', long = "null")]
-    pub(crate) null: bool,
+    null: bool,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     vars: Vec<String>,
 }

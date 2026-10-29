@@ -5,8 +5,6 @@
 #![allow(rustdoc::broken_intra_doc_links)]
 
 mod common;
-mod hash;
-mod meta;
 mod tools;
 
 use std::path::Path;
@@ -486,11 +484,11 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
         "query" | "filter" => tools::query::run_query(args, ctx),
 
         // Tier 3: Hashing & Encoding
-        "b2sum" => hash::run_b2sum(args, ctx),
-        "sha256sum" => hash::run_sha256sum(args, ctx),
-        "md5sum" => hash::run_md5sum(args, ctx),
-        "base64" => hash::run_base64(args, ctx),
-        "basenc" => hash::run_basenc(args, ctx),
+        "b2sum" => tools::checksum::run_b2sum(args, ctx),
+        "sha256sum" => tools::checksum::run_sha256sum(args, ctx),
+        "md5sum" => tools::checksum::run_md5sum(args, ctx),
+        "base64" => tools::basenc::run_base64(args, ctx),
+        "basenc" => tools::basenc::run_basenc(args, ctx),
 
         // Tier 4: Shell & System
         "echo" => tools::echo::run_echo(args, ctx),
@@ -513,11 +511,11 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
         "tee" => tools::tee::run_tee(args, ctx),
 
         // Meta-Tools
-        "bench" => meta::run_bench(args, ctx),
-        "undo" => meta::run_undo(args, ctx),
-        "history" => meta::run_history(args, ctx),
-        "init" => meta::run_init(args, &tool_names, ctx),
-        "install-links" => meta::run_install_links(args, &tool_names, ctx),
+        "bench" => tools::bench::run_bench(args, ctx),
+        "undo" => tools::undo::run_undo(args, ctx),
+        "history" => tools::history::run_history(args, ctx),
+        "init" => tools::init::run_init(args, &tool_names, ctx),
+        "install-links" => tools::install_links::run_install_links(args, &tool_names, ctx),
 
         other => Err(anyhow::anyhow!(
             "unknown utility '{}'. Run `dogfish --help` to see all 44 utilities.",

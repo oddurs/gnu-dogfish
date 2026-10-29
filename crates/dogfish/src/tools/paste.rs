@@ -9,7 +9,7 @@ use dogfish_core::{DogfishContext, FastReader, InputSource, gnu_io_error, io::ig
 
 #[derive(Parser)]
 #[command(name = "paste", about = "Merge lines of files")]
-pub(crate) struct PasteArgs {
+struct PasteArgs {
     /// Use characters from LIST instead of TABs
     #[arg(short = 'd', long = "delimiters", default_value = "\t")]
     delimiters: String,
@@ -18,7 +18,7 @@ pub(crate) struct PasteArgs {
     #[arg(short = 's', long = "serial")]
     serial: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

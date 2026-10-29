@@ -18,10 +18,10 @@ use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct IdArgs {
+struct IdArgs {
     /// Ignore, for compatibility with other versions
     #[arg(short = 'a')]
-    pub(crate) ignored: bool,
+    ignored: bool,
 
     /// Print only the security context of the process
     #[arg(short = 'Z', long = "context")]
@@ -37,7 +37,7 @@ pub(crate) struct IdArgs {
 
     /// Print a name instead of a number, for -u, -g, -G
     #[arg(short = 'n', long = "name")]
-    pub(crate) name: bool,
+    name: bool,
 
     /// Print the real ID instead of the effective ID, with -u, -g, -G
     #[arg(short = 'r', long = "real")]
@@ -49,24 +49,24 @@ pub(crate) struct IdArgs {
 
     /// Delimit entries with NUL characters, not whitespace
     #[arg(short = 'z', long = "zero")]
-    pub(crate) zero: bool,
+    zero: bool,
 
     /// Emit structured JSON
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     users: Vec<String>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct IdRecord {
-    pub(crate) uid: u32,
+struct IdRecord {
+    uid: u32,
     user: String,
-    pub(crate) gid: u32,
+    gid: u32,
     group: String,
     groups: Vec<(u32, String)>,
 }
@@ -153,12 +153,12 @@ fn group_list(user: Option<&CStr>, primary: u32) -> Vec<u32> {
 }
 
 /// The identity `id` reports on: a named user, or the current process.
-pub(crate) struct Identity {
+struct Identity {
     ruid: u32,
     euid: u32,
     rgid: u32,
     egid: u32,
-    pub(crate) name: Option<CString>,
+    name: Option<CString>,
 }
 
 impl Identity {

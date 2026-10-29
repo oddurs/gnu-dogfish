@@ -12,7 +12,7 @@ use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT}
 use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error};
 use crate::common::interval::{duration_from_secs, parse_interval};
 use crate::common::signals::parse_signal;
-use crate::tools::env::sig_name_into;
+use crate::common::signals::sig_name_into;
 
 const TIMEOUT_HELP: &str = "\
 Usage: timeout [OPTION] DURATION COMMAND [ARG]...

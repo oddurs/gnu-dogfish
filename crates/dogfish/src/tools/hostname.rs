@@ -13,14 +13,14 @@ use crate::common::uname_info::get_uname_info;
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct HostnameArgs {
+struct HostnameArgs {
     /// Print the host name cut at the first dot
     #[arg(short = 's', long = "short")]
-    pub(crate) short: bool,
+    short: bool,
 
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 }
 
 pub fn run_hostname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {

@@ -36,7 +36,7 @@ Each MODE is of the form '[ugoa]*([-+=]([rwxXst]*|[ugo]))+|[-+=][0-7]+'.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChmodOpt {
+enum ChmodOpt {
     Changes,
     Quiet,
     Verbose,
@@ -46,14 +46,14 @@ pub(crate) enum ChmodOpt {
     Recursive,
 }
 
-pub(crate) struct ChmodRun {
-    pub(crate) changes: Option<Vec<ModeChange>>,
+struct ChmodRun {
+    changes: Option<Vec<ModeChange>>,
     reference_mode: u32,
-    pub(crate) umask: u32,
-    pub(crate) recursive: bool,
-    pub(crate) report_changes: bool,
-    pub(crate) verbose: bool,
-    pub(crate) quiet: bool,
+    umask: u32,
+    recursive: bool,
+    report_changes: bool,
+    verbose: bool,
+    quiet: bool,
     diagnose_surprises: bool,
 }
 

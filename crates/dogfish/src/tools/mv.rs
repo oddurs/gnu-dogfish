@@ -45,7 +45,7 @@ If you specify more than one of -i, -f, -n, only the final one takes effect.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MvOpt {
+enum MvOpt {
     Backup,
     BackupArg,
     Force,
@@ -62,13 +62,13 @@ pub(crate) enum MvOpt {
     Context,
 }
 
-pub(crate) struct MvOpts {
-    pub(crate) clobber: Clobber,
-    pub(crate) update_older: bool,
-    pub(crate) backup: BackupMode,
-    pub(crate) suffix: String,
-    pub(crate) verbose: bool,
-    pub(crate) stdin_tty: bool,
+struct MvOpts {
+    clobber: Clobber,
+    update_older: bool,
+    backup: BackupMode,
+    suffix: String,
+    verbose: bool,
+    stdin_tty: bool,
 }
 
 pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

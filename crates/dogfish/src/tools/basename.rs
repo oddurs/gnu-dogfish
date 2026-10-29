@@ -23,7 +23,7 @@ If specified, also remove a trailing SUFFIX.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BasenameOpt {
+enum BasenameOpt {
     Multiple,
     Suffix,
     Zero,

@@ -51,9 +51,9 @@ static SEQ_OPTS: [OptSpec; 5] = [
 /// A scanned `seq` operand: its value and the output width and precision
 /// GNU derives from how it was written.
 #[derive(Clone, Copy)]
-pub(crate) struct SeqOperand {
-    pub(crate) value: f64,
-    pub(crate) width: usize,
+struct SeqOperand {
+    value: f64,
+    width: usize,
     /// Fraction digits; `None` means "unknown" (hex or non-finite input).
     precision: Option<usize>,
     /// The exact value when it is an integer that fits `i64` (not `-0`).
@@ -144,17 +144,17 @@ fn scan_seq_operand(arg: &str) -> std::result::Result<SeqOperand, String> {
 
 /// A validated `-f` format: the text around its single floating-point
 /// directive, and the directive itself.
-pub(crate) struct SeqFormat {
-    pub(crate) prefix: Vec<u8>,
-    pub(crate) flags: PrintfFlags,
-    pub(crate) width: usize,
+struct SeqFormat {
+    prefix: Vec<u8>,
+    flags: PrintfFlags,
+    width: usize,
     precision: Option<usize>,
-    pub(crate) conv: u8,
+    conv: u8,
     suffix: Vec<u8>,
 }
 
 impl SeqFormat {
-    pub(crate) fn parse(fmt: &str) -> std::result::Result<Self, String> {
+    fn parse(fmt: &str) -> std::result::Result<Self, String> {
         let b = fmt.as_bytes();
         let unescape_pct = |part: &[u8]| -> Vec<u8> {
             let mut out = Vec::with_capacity(part.len());
@@ -243,7 +243,7 @@ impl SeqFormat {
         })
     }
 
-    pub(crate) fn render(&self, v: f64) -> Vec<u8> {
+    fn render(&self, v: f64) -> Vec<u8> {
         let mut out = self.prefix.clone();
         out.extend(self.render_number(v));
         out.extend_from_slice(&self.suffix);

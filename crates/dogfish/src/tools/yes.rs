@@ -13,10 +13,10 @@ use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct YesArgs {
+struct YesArgs {
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     /// String(s) to repeat
     strings: Vec<String>,

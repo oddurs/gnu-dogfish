@@ -11,14 +11,14 @@ use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 
 /// State shared while rendering: diagnostics flip the exit status to 1.
-pub(crate) struct PrintfRun<'a> {
-    pub(crate) args: &'a [String],
-    pub(crate) next: usize,
+struct PrintfRun<'a> {
+    args: &'a [String],
+    next: usize,
     failed: bool,
 }
 
 impl<'a> PrintfRun<'a> {
-    pub(crate) fn take(&mut self) -> Option<&'a str> {
+    fn take(&mut self) -> Option<&'a str> {
         let v = self.args.get(self.next).map(|s| s.as_str());
         if v.is_some() {
             self.next += 1;

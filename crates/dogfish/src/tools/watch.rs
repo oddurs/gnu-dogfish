@@ -16,17 +16,17 @@ use crate::common::interval::{duration_from_secs, parse_interval};
     name = "watch",
     about = "Execute a program periodically, showing output fullscreen"
 )]
-pub(crate) struct WatchArgs {
+struct WatchArgs {
     /// Specify update interval (e.g. 2s, 500ms, or 1.5)
     #[arg(short = 'n', long = "interval", default_value = "2s")]
     interval: String,
 
     ///Iterations limit (useful for scripts/testing; 0 = infinite)
     #[arg(short = 'c', long = "count", default_value_t = 0)]
-    pub(crate) count: usize,
+    count: usize,
 
     #[arg(required = true, trailing_var_arg = true)]
-    pub(crate) command: Vec<String>,
+    command: Vec<String>,
 }
 
 pub fn run_watch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

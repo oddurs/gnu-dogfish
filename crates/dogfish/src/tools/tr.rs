@@ -12,10 +12,10 @@ use memchr::memmem;
     name = "tr",
     about = "Translate, squeeze, and/or delete characters from standard input"
 )]
-pub(crate) struct TrArgs {
+struct TrArgs {
     /// Use the complement of SET1
     #[arg(short = 'c', visible_short_alias = 'C', long = "complement")]
-    pub(crate) complement: bool,
+    complement: bool,
 
     /// Delete characters in SET1, do not translate
     #[arg(short = 'd', long = "delete")]
@@ -23,11 +23,11 @@ pub(crate) struct TrArgs {
 
     /// Replace each sequence of a repeated character with a single occurrence
     #[arg(short = 's', long = "squeeze-repeats")]
-    pub(crate) squeeze: bool,
+    squeeze: bool,
 
     /// First truncate SET1 to length of SET2
     #[arg(short = 't', long = "truncate-set1")]
-    pub(crate) truncate: bool,
+    truncate: bool,
 
     /// Like GNU (`getopt "+..."`), options end at the first set: `tr a -b` maps `a`
     /// to `-b`, while `tr --bogus a b` is an unrecognized option.
@@ -37,7 +37,7 @@ pub(crate) struct TrArgs {
 
 /// An expanded tr SET: the bytes, plus where a `[c*]` fill repeat goes (SET2 only).
 struct TrSet {
-    pub(crate) bytes: Vec<u8>,
+    bytes: Vec<u8>,
     fill: Option<(usize, u8)>,
 }
 

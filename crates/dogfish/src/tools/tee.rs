@@ -16,7 +16,7 @@ use crate::common::getopt::argmatch;
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct TeeArgs {
+struct TeeArgs {
     /// Append to the given FILEs, do not overwrite
     #[arg(short = 'a', long = "append")]
     append: bool,
@@ -41,7 +41,7 @@ pub(crate) struct TeeArgs {
 
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 
     /// Output file paths
     files: Vec<String>,
@@ -49,7 +49,7 @@ pub(crate) struct TeeArgs {
 
 /// GNU tee's `--output-error` modes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputError {
+enum OutputError {
     /// No option: SIGPIPE kills tee, other errors are diagnosed.
     Sigpipe,
     Warn,
@@ -59,8 +59,8 @@ pub(crate) enum OutputError {
 }
 
 /// One destination of `tee`; `None` once it has failed and been dropped.
-pub(crate) struct TeeOutput {
-    pub(crate) name: String,
+struct TeeOutput {
+    name: String,
     sink: Option<Box<dyn Write>>,
 }
 

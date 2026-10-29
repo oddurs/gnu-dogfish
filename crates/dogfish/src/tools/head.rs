@@ -20,7 +20,7 @@ use crate::common::lines::{looks_like_json, lossy_lines};
     name = "head",
     about = "Output the first part of files (or NDJSON object streams)"
 )]
-pub(crate) struct HeadArgs {
+struct HeadArgs {
     /// Print the first NUM lines (default 10); with a leading '-', all but the last NUM lines
     #[arg(
         short = 'n',
@@ -28,7 +28,7 @@ pub(crate) struct HeadArgs {
         value_name = "[-]NUM",
         allow_hyphen_values = true
     )]
-    pub(crate) lines: Option<String>,
+    lines: Option<String>,
 
     /// Print the first NUM bytes; with a leading '-', all but the last NUM bytes
     #[arg(
@@ -37,21 +37,21 @@ pub(crate) struct HeadArgs {
         value_name = "[-]NUM",
         allow_hyphen_values = true
     )]
-    pub(crate) bytes: Option<String>,
+    bytes: Option<String>,
 
     /// Never print headers giving file names
     #[arg(short = 'q', long = "quiet", visible_alias = "silent")]
-    pub(crate) quiet: bool,
+    quiet: bool,
 
     /// Always print headers giving file names
     #[arg(short = 'v', long = "verbose")]
-    pub(crate) verbose: bool,
+    verbose: bool,
 
     /// Force JSON output when processing NDJSON
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 /// Copies the first `n` lines of `r` to `out`.

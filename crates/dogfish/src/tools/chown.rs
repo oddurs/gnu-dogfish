@@ -50,7 +50,7 @@ one takes effect.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChownOpt {
+enum ChownOpt {
     Changes,
     Quiet,
     Verbose,
@@ -67,7 +67,7 @@ pub(crate) enum ChownOpt {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Traverse {
+enum Traverse {
     None,
     CommandLine,
     All,
@@ -75,23 +75,23 @@ pub(crate) enum Traverse {
 
 /// A parsed `[OWNER][:[GROUP]]`: ids to set and the names to report.
 #[derive(Default)]
-pub(crate) struct OwnerSpec {
-    pub(crate) uid: Option<u32>,
-    pub(crate) gid: Option<u32>,
-    pub(crate) user: Option<String>,
-    pub(crate) group: Option<String>,
+struct OwnerSpec {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    user: Option<String>,
+    group: Option<String>,
 }
 
-pub(crate) struct ChownRun {
-    pub(crate) spec: OwnerSpec,
+struct ChownRun {
+    spec: OwnerSpec,
     from_uid: Option<u32>,
     from_gid: Option<u32>,
-    pub(crate) recursive: bool,
+    recursive: bool,
     traverse: Traverse,
     affect_referent: bool,
-    pub(crate) report_changes: bool,
-    pub(crate) verbose: bool,
-    pub(crate) quiet: bool,
+    report_changes: bool,
+    verbose: bool,
+    quiet: bool,
 }
 
 pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

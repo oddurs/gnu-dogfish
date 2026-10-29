@@ -91,8 +91,8 @@ pub(crate) const fn opt(
 /// argument vectors rewritten mid-parse (`env -S`), and option arguments that
 /// are only ever attached (`date -I`). Diagnostics use glibc's exact wording.
 pub(crate) struct GetOpt {
-    pub(crate) args: Vec<String>,
-    pub(crate) idx: usize,
+    args: Vec<String>,
+    idx: usize,
     /// Byte offset of the next short option inside `args[idx]`, or 0.
     cluster: usize,
     /// Accept options after operands (GNU's default permuting mode).

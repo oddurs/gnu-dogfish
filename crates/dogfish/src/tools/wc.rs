@@ -17,18 +17,18 @@ use unicode_width::UnicodeWidthChar;
     name = "wc",
     about = "Print newline, word, and byte counts for each FILE"
 )]
-pub(crate) struct WcArgs {
+struct WcArgs {
     /// Print the byte counts
     #[arg(short = 'c', long = "bytes")]
-    pub(crate) bytes: bool,
+    bytes: bool,
 
     /// Print the character counts
     #[arg(short = 'm', long = "chars")]
-    pub(crate) chars: bool,
+    chars: bool,
 
     /// Print the newline counts
     #[arg(short = 'l', long = "lines")]
-    pub(crate) lines: bool,
+    lines: bool,
 
     /// Print the word counts
     #[arg(short = 'w', long = "words")]
@@ -40,30 +40,30 @@ pub(crate) struct WcArgs {
 
     /// Emit structured JSON / NDJSON
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
     /// Render a rich visual breakdown table with sparklines
     #[arg(short = 't', long = "table")]
     table: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 #[derive(Serialize, Clone, Default)]
-pub(crate) struct WcRecord {
-    pub(crate) file: String,
-    pub(crate) lines: u64,
+struct WcRecord {
+    file: String,
+    lines: u64,
     words: u64,
-    pub(crate) chars: u64,
-    pub(crate) bytes: u64,
+    chars: u64,
+    bytes: u64,
     max_line_length: u64,
 }
 
 #[derive(Clone, Copy, Default)]
 struct WcScan {
-    pub(crate) lines: u64,
+    lines: u64,
     words: u64,
-    pub(crate) chars: u64,
+    chars: u64,
     max_line: u64,
 }
 

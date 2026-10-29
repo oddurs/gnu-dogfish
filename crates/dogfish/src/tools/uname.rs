@@ -13,28 +13,28 @@ use crate::common::uname_info::{UNKNOWN, get_uname_info};
     disable_help_flag = true,
     infer_long_args = true
 )]
-pub(crate) struct UnameArgs {
+struct UnameArgs {
     /// Print all information, in the following order, except omit -p and -i if unknown
     #[arg(short = 'a', long = "all")]
-    pub(crate) all: bool,
+    all: bool,
     /// Print the kernel name
     #[arg(short = 's', long = "kernel-name")]
-    pub(crate) sysname: bool,
+    sysname: bool,
     /// Print the network node hostname
     #[arg(short = 'n', long = "nodename")]
-    pub(crate) nodename: bool,
+    nodename: bool,
     /// Print the kernel release
     #[arg(short = 'r', long = "kernel-release")]
-    pub(crate) release: bool,
+    release: bool,
     /// Print the kernel version
     #[arg(short = 'v', long = "kernel-version")]
-    pub(crate) version: bool,
+    version: bool,
     /// Print the machine hardware name
     #[arg(short = 'm', long = "machine")]
-    pub(crate) machine: bool,
+    machine: bool,
     /// Print the processor type (non-portable)
     #[arg(short = 'p', long = "processor")]
-    pub(crate) processor: bool,
+    processor: bool,
     /// Print the hardware platform (non-portable)
     #[arg(short = 'i', long = "hardware-platform")]
     platform: bool,
@@ -43,10 +43,10 @@ pub(crate) struct UnameArgs {
     os: bool,
     /// Emit structured JSON
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
     /// Display this help and exit
     #[arg(long, action = ArgAction::Help)]
-    pub(crate) help: Option<bool>,
+    help: Option<bool>,
 }
 
 pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {

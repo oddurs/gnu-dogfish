@@ -69,12 +69,12 @@ const LS_COLOR_TERMS: [&str; 25] = [
 
 /// A `*suffix=seq` entry of LS_COLORS (GNU `struct color_ext_type`).
 pub(crate) struct ColorExt {
-    pub(crate) suffix: Vec<u8>,
+    suffix: Vec<u8>,
     pub(crate) seq: Vec<u8>,
     /// Compare case-sensitively (set when differently-cased suffixes differ).
     exact: bool,
     /// Shadowed by an entry of higher precedence.
-    pub(crate) ignored: bool,
+    ignored: bool,
 }
 
 /// GNU `ls`'s colour table: the indicators and the suffix list.
@@ -138,7 +138,7 @@ impl LsColors {
         parsed
     }
 
-    pub(crate) fn parse(spec: &[u8]) -> Option<Self> {
+    fn parse(spec: &[u8]) -> Option<Self> {
         let at = |i: usize| spec.get(i).copied().unwrap_or(0);
         let mut c = Self::defaults();
         let mut exts = Vec::new();

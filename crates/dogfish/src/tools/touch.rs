@@ -41,7 +41,7 @@ STRING may be '@SECONDS', an ISO date such as '2020-01-31 13:45:00.5 +0100',
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TouchOpt {
+enum TouchOpt {
     Access,
     NoCreate,
     Date,
@@ -411,9 +411,9 @@ fn rel_unit(word: &str) -> Option<(i64, i64)> {
 /// The items of a date string, as GNU `parse_datetime` collects them.
 #[derive(Default)]
 struct DateItems {
-    pub(crate) year: Option<(i64, usize)>,
+    year: Option<(i64, usize)>,
     month_day: Option<(u32, u32)>,
-    pub(crate) time: Option<(u32, u32, u32, u32)>,
+    time: Option<(u32, u32, u32, u32)>,
     meridian: Option<bool>,
     zone: Option<i64>,
     /// Day of the week (0 = Sunday) and its ordinal (`next` = 1, `last` = -1).
@@ -461,12 +461,12 @@ impl DateItems {
 
 /// A cursor over the lowercased input.
 struct DateLexer<'a> {
-    pub(crate) s: &'a [u8],
-    pub(crate) i: usize,
+    s: &'a [u8],
+    i: usize,
 }
 
 impl DateLexer<'_> {
-    pub(crate) fn peek(&self) -> Option<u8> {
+    fn peek(&self) -> Option<u8> {
         self.s.get(self.i).copied()
     }
 
@@ -476,7 +476,7 @@ impl DateLexer<'_> {
         }
     }
 
-    pub(crate) fn digits(&mut self) -> Option<(i64, usize)> {
+    fn digits(&mut self) -> Option<(i64, usize)> {
         let start = self.i;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.i += 1;
@@ -494,7 +494,7 @@ impl DateLexer<'_> {
         ))
     }
 
-    pub(crate) fn word(&mut self) -> &str {
+    fn word(&mut self) -> &str {
         let start = self.i;
         while self
             .peek()

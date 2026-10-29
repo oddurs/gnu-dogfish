@@ -72,7 +72,7 @@ are recorded so that `dogfish undo` can reverse them.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CpOpt {
+enum CpOpt {
     Archive,
     AttributesOnly,
     Backup,
@@ -129,47 +129,47 @@ const PRESERVE_ARGS: &[(&str, PreserveAttr)] = &[
     ("all", PreserveAttr::All),
 ];
 
-pub(crate) struct CpOpts {
-    pub(crate) recursive: bool,
-    pub(crate) deref: Deref,
+struct CpOpts {
+    recursive: bool,
+    deref: Deref,
     preserve_mode: bool,
     preserve_ownership: bool,
     preserve_timestamps: bool,
     preserve_links: bool,
     /// `--no-preserve=mode`: new files get default permissions, not the source's.
     no_preserve_mode: bool,
-    pub(crate) clobber: Clobber,
-    pub(crate) update_older: bool,
-    pub(crate) backup: BackupMode,
-    pub(crate) suffix: String,
-    pub(crate) force: bool,
+    clobber: Clobber,
+    update_older: bool,
+    backup: BackupMode,
+    suffix: String,
+    force: bool,
     remove_destination: bool,
-    pub(crate) hard_link: bool,
-    pub(crate) symbolic_link: bool,
-    pub(crate) parents: bool,
-    pub(crate) one_file_system: bool,
-    pub(crate) verbose: bool,
+    hard_link: bool,
+    symbolic_link: bool,
+    parents: bool,
+    one_file_system: bool,
+    verbose: bool,
     attributes_only: bool,
     keep_dir_symlink: bool,
 }
 
 /// What the undo journal needs to restore an overwritten destination.
 struct UndoPlan {
-    pub(crate) created: PathBuf,
-    pub(crate) backup: Option<String>,
+    created: PathBuf,
+    backup: Option<String>,
 }
 
 /// State for one `cp` invocation.
-pub(crate) struct Copier<'a> {
-    pub(crate) o: CpOpts,
-    pub(crate) journal: Option<UndoJournal>,
-    pub(crate) umask: u32,
-    pub(crate) ctx: &'a DogfishContext,
+struct Copier<'a> {
+    o: CpOpts,
+    journal: Option<UndoJournal>,
+    umask: u32,
+    ctx: &'a DogfishContext,
     /// Command-line sources already copied, by name and inode (GNU warns about repeats).
     seen_sources: HashSet<(OsString, u64, u64)>,
     /// Destination of each multiply-linked source inode, for `--preserve=links`.
-    pub(crate) linked: HashMap<(u64, u64), PathBuf>,
-    pub(crate) top_dev: u64,
+    linked: HashMap<(u64, u64), PathBuf>,
+    top_dev: u64,
 }
 
 fn apply_preserve(o: &mut CpOpts, list: &str, on: bool) -> std::result::Result<(), i32> {
@@ -1170,7 +1170,7 @@ impl Copier<'_> {
         true
     }
 
-    pub(crate) fn create_new(
+    fn create_new(
         &self,
         dst: &Path,
         src_meta: &fs::Metadata,

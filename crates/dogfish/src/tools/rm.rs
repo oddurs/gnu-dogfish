@@ -42,7 +42,7 @@ Remove (unlink) the FILE(s).
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RmOpt {
+enum RmOpt {
     Dir,
     Force,
     EveryFile,
@@ -56,19 +56,19 @@ pub(crate) enum RmOpt {
     Safe,
 }
 
-pub(crate) struct RmRun {
-    pub(crate) force: bool,
-    pub(crate) interactive: Interactive,
-    pub(crate) recursive: bool,
-    pub(crate) dir: bool,
-    pub(crate) verbose: bool,
-    pub(crate) one_file_system: bool,
-    pub(crate) stdin_tty: bool,
+struct RmRun {
+    force: bool,
+    interactive: Interactive,
+    recursive: bool,
+    dir: bool,
+    verbose: bool,
+    one_file_system: bool,
+    stdin_tty: bool,
 }
 
 /// Outcome of removing one file or tree.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RmStatus {
+enum RmStatus {
     Removed,
     Declined,
     /// Declined to descend: the directory stays, so its ancestors are left alone.

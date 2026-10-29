@@ -10,7 +10,7 @@ use dogfish_core::{
 
 #[derive(Parser)]
 #[command(name = "cat", about = "Concatenate FILE(s) to standard output")]
-pub(crate) struct CatArgs {
+struct CatArgs {
     /// Equivalent to -vET
     #[arg(short = 'A', long = "show-all")]
     show_all: bool,
@@ -29,7 +29,7 @@ pub(crate) struct CatArgs {
 
     /// Number all output lines
     #[arg(short = 'n', long = "number")]
-    pub(crate) number: bool,
+    number: bool,
 
     /// Suppress repeated empty output lines
     #[arg(short = 's', long = "squeeze-blank")]
@@ -52,20 +52,20 @@ pub(crate) struct CatArgs {
     show_nonprinting: bool,
 
     /// Files to concatenate
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
-pub(crate) struct CatOpts {
-    pub(crate) number: bool,
+struct CatOpts {
+    number: bool,
     number_nonblank: bool,
-    pub(crate) squeeze: bool,
+    squeeze: bool,
     show_ends: bool,
     show_tabs: bool,
     show_nonprinting: bool,
 }
 
 /// Cross-file state, exactly like GNU cat's `newlines2` / line counter.
-pub(crate) struct CatState {
+struct CatState {
     /// Number of consecutive empty lines seen; -1 while inside a line.
     newlines: i32,
     line_num: u64,

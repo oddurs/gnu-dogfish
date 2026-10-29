@@ -18,10 +18,10 @@ use crate::common::lines::{chomp, is_blank, looks_like_json, lossy_lines};
     name = "uniq",
     about = "Report or omit repeated lines or NDJSON objects"
 )]
-pub(crate) struct UniqArgs {
+struct UniqArgs {
     /// Prefix lines by the number of occurrences
     #[arg(short = 'c', long = "count")]
-    pub(crate) count: bool,
+    count: bool,
 
     /// Only print duplicate lines, one for each group
     #[arg(short = 'd', long = "repeated")]
@@ -33,7 +33,7 @@ pub(crate) struct UniqArgs {
 
     /// Ignore differences in case when comparing
     #[arg(short = 'i', long = "ignore-case")]
-    pub(crate) ignore_case: bool,
+    ignore_case: bool,
 
     /// Avoid comparing the first N characters
     #[arg(short = 's', long = "skip-chars", default_value_t = 0)]
@@ -41,7 +41,7 @@ pub(crate) struct UniqArgs {
 
     /// Only print unique lines
     #[arg(short = 'u', long = "unique")]
-    pub(crate) unique: bool,
+    unique: bool,
 
     /// Compare no more than N characters in lines
     #[arg(short = 'w', long = "check-chars")]
@@ -49,14 +49,14 @@ pub(crate) struct UniqArgs {
 
     /// Deduplicate NDJSON objects by named field
     #[arg(long = "by")]
-    pub(crate) by_field: Option<String>,
+    by_field: Option<String>,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
     input: Option<String>,
 
-    pub(crate) output: Option<String>,
+    output: Option<String>,
 }
 
 fn uniq_key<'a>(line: &'a [u8], p: &UniqArgs) -> &'a [u8] {

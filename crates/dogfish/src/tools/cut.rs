@@ -18,14 +18,14 @@ use crate::common::lines::{looks_like_json, lossy_lines, split_lines};
     name = "cut",
     about = "Remove sections from each line of files or project fields from NDJSON"
 )]
-pub(crate) struct CutArgs {
+struct CutArgs {
     /// Select only these bytes (e.g. 1-5, 2,4)
     #[arg(short = 'b', long = "bytes", allow_hyphen_values = true)]
-    pub(crate) bytes: Option<String>,
+    bytes: Option<String>,
 
     /// Select only these characters (bytes, as in GNU coreutils)
     #[arg(short = 'c', long = "characters", allow_hyphen_values = true)]
-    pub(crate) chars: Option<String>,
+    chars: Option<String>,
 
     /// (ignored)
     #[arg(short = 'n')]
@@ -46,7 +46,7 @@ pub(crate) struct CutArgs {
 
     /// Complement the set of selected bytes, characters or fields
     #[arg(long = "complement")]
-    pub(crate) complement: bool,
+    complement: bool,
 
     /// Do not print lines not containing delimiters
     #[arg(short = 's', long = "only-delimited")]
@@ -58,23 +58,23 @@ pub(crate) struct CutArgs {
 
     /// Filter NDJSON objects before projecting (e.g., `--where "size>1K"`)
     #[arg(short = 'w', long = "where")]
-    pub(crate) where_expr: Option<String>,
+    where_expr: Option<String>,
 
     #[arg(short = 'J', long = "json")]
-    pub(crate) json: bool,
+    json: bool,
 
-    pub(crate) files: Vec<String>,
+    files: Vec<String>,
 }
 
 /// `-b` and `-c` are the same byte selection (as in GNU coreutils, which has
 /// no multibyte `cut`); `-f` selects delimited fields.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum CutMode {
+enum CutMode {
     Bytes,
     Fields,
 }
 
-pub(crate) struct CutSpec {
+struct CutSpec {
     mode: CutMode,
     /// Sorted, disjoint 1-based selected ranges (already complemented).
     ranges: Vec<(usize, usize)>,

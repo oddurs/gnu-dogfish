@@ -95,9 +95,9 @@ On a terminal Dogfish draws usage bars unless -P, -i or --output is given.
 ";
 
 #[derive(Serialize)]
-pub(crate) struct DfRecord {
+struct DfRecord {
     filesystem: String,
-    pub(crate) fs_type: String,
+    fs_type: String,
     total_bytes: u64,
     used_bytes: u64,
     available_bytes: u64,
@@ -107,7 +107,7 @@ pub(crate) struct DfRecord {
 
 /// The columns `df` can print, in `--output` order.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DfField {
+enum DfField {
     Source,
     FsType,
     ITotal,
@@ -138,7 +138,7 @@ impl DfField {
         Self::Target,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::Source => "source",
             Self::FsType => "fstype",
@@ -156,7 +156,7 @@ impl DfField {
     }
 
     /// GNU's column title and minimum width.
-    pub(crate) fn header(self) -> (&'static str, usize) {
+    fn header(self) -> (&'static str, usize) {
         match self {
             Self::Source => ("Filesystem", 14),
             Self::FsType => ("Type", 4),
@@ -184,18 +184,18 @@ impl DfField {
 /// One entry of the mount table (gnulib `struct mount_entry`).
 #[derive(Clone)]
 struct MountEntry {
-    pub(crate) device: String,
+    device: String,
     mount_dir: String,
-    pub(crate) fs_type: String,
+    fs_type: String,
     /// Root of the mount within its file system (`/proc/self/mountinfo`).
     mount_root: Option<String>,
     dummy: bool,
     remote: bool,
-    pub(crate) dev: Option<u64>,
+    dev: Option<u64>,
 }
 
 impl MountEntry {
-    pub(crate) fn new(device: String, mount_dir: String, fs_type: String) -> Self {
+    fn new(device: String, mount_dir: String, fs_type: String) -> Self {
         let dummy = is_dummy_fs(&fs_type);
         let remote = is_remote_fs(&device, &fs_type);
         Self {
@@ -353,17 +353,17 @@ fn read_mount_table() -> Vec<MountEntry> {
 
 /// gnulib `fs_usage`, from `statvfs`.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct FsUsage {
-    pub(crate) block_size: u64,
-    pub(crate) blocks: u64,
-    pub(crate) free: u64,
-    pub(crate) available: u64,
-    pub(crate) files: u64,
-    pub(crate) free_files: u64,
+struct FsUsage {
+    block_size: u64,
+    blocks: u64,
+    free: u64,
+    available: u64,
+    files: u64,
+    free_files: u64,
 }
 
 impl FsUsage {
-    pub(crate) fn query(path: &str) -> io::Result<Self> {
+    fn query(path: &str) -> io::Result<Self> {
         let c_path = CString::new(path).map_err(io::Error::other)?;
         // SAFETY: statvfs fills the zeroed struct for a valid C path.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -389,12 +389,12 @@ impl FsUsage {
 }
 
 /// Options that shape `df` output.
-pub(crate) struct DfConfig {
-    pub(crate) show_all: bool,
+struct DfConfig {
+    show_all: bool,
     local_only: bool,
-    pub(crate) inodes: bool,
-    pub(crate) human_opts: u32,
-    pub(crate) block_size: u64,
+    inodes: bool,
+    human_opts: u32,
+    block_size: u64,
     posix: bool,
     fields: Vec<DfField>,
     output_mode: bool,
@@ -410,11 +410,11 @@ impl DfConfig {
 }
 
 /// One output row before formatting.
-pub(crate) struct DfRow {
+struct DfRow {
     source: String,
-    pub(crate) fs_type: String,
-    pub(crate) file: String,
-    pub(crate) target: String,
+    fs_type: String,
+    file: String,
+    target: String,
     usage: FsUsage,
     /// Placeholder row: every number prints as `-`.
     unknown: bool,
@@ -840,10 +840,10 @@ fn df_file_row(
 
 /// Block and inode figures of a row in the units GNU prints them.
 struct DfFigures {
-    pub(crate) total: u64,
+    total: u64,
     used: u64,
     used_negative: bool,
-    pub(crate) available: u64,
+    available: u64,
     input_units: u64,
     output_units: u64,
 }

@@ -12,56 +12,11 @@ use serde::Serialize;
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
 use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
-use crate::common::signals::{SIGNAL_NAMES, parse_signal, rt_signal_range};
+use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
 
 /// Largest signal number worth probing (GNU's SIGNUM_BOUND).
 fn signum_bound() -> libc::c_int {
     rt_signal_range().map_or(31, |(_, max)| max)
-}
-
-/// Writes the name of `sig` (`TERM`, `RTMIN+2`, or the number when unnamed)
-/// into `buf` without allocating, so a signal handler may use it.
-pub(crate) fn sig_name_into(sig: libc::c_int, buf: &mut [u8; 16]) -> &[u8] {
-    fn put_num(buf: &mut [u8], mut at: usize, n: libc::c_int) -> usize {
-        let mut digits = [0u8; 10];
-        let mut len = 0;
-        let mut v = n.unsigned_abs();
-        loop {
-            digits[len] = b'0' + (v % 10) as u8;
-            len += 1;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        for i in (0..len).rev() {
-            buf[at] = digits[i];
-            at += 1;
-        }
-        at
-    }
-    if let Some((name, _)) = SIGNAL_NAMES.iter().find(|(_, n)| *n == sig) {
-        buf[..name.len()].copy_from_slice(name.as_bytes());
-        return &buf[..name.len()];
-    }
-    if let Some((min, max)) = rt_signal_range()
-        && (min..=max).contains(&sig)
-    {
-        let (base, offset) = if sig - min <= (max - min) / 2 {
-            (b"RTMIN", sig - min)
-        } else {
-            (b"RTMAX", sig - max)
-        };
-        buf[..5].copy_from_slice(base);
-        let mut len = 5;
-        if offset != 0 {
-            buf[len] = if offset > 0 { b'+' } else { b'-' };
-            len = put_num(buf, len + 1, offset);
-        }
-        return &buf[..len];
-    }
-    let len = put_num(buf, 0, sig);
-    &buf[..len]
 }
 
 fn sig_name(sig: libc::c_int) -> String {
@@ -237,7 +192,7 @@ fn split_env_string(s: &str) -> std::result::Result<Vec<String>, String> {
 
 /// What to do with the signals named by `--block/default/ignore-signal`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SignalAction {
+enum SignalAction {
     Block,
     Default,
     Ignore,
@@ -327,7 +282,7 @@ fn list_signal_handling() {
 
 /// The environment GNU `env` builds: `NAME=VALUE` entries in `environ` order,
 /// with `putenv` semantics (replace in place, else append).
-pub(crate) struct EnvList(Vec<Vec<u8>>);
+struct EnvList(Vec<Vec<u8>>);
 
 impl EnvList {
     fn name_of(entry: &[u8]) -> &[u8] {
@@ -347,7 +302,7 @@ impl EnvList {
         }
     }
 
-    pub(crate) fn get(&self, name: &[u8]) -> Option<&[u8]> {
+    fn get(&self, name: &[u8]) -> Option<&[u8]> {
         self.0
             .iter()
             .find(|e| Self::name_of(e) == name)
@@ -427,8 +382,8 @@ fn exec_with_env(argv: &[String], env: &EnvList) -> io::Error {
 
 #[derive(Serialize)]
 struct EnvRecord {
-    pub(crate) key: String,
-    pub(crate) value: String,
+    key: String,
+    value: String,
 }
 
 pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {

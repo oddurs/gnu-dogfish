@@ -39,7 +39,7 @@ Files are created u+rw, and directories u+rwx, minus umask restrictions.
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MktempOpt {
+enum MktempOpt {
     Directory,
     DryRun,
     Quiet,
