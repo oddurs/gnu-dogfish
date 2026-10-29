@@ -466,7 +466,7 @@ fn decode_base2(bits: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("base2 input length must be a multiple of 8"));
     }
     let mut out = Vec::with_capacity(bits.len() / 8);
-    for chunk in bits.chunks_exact(8) {
+    for chunk in bits.as_chunks::<8>().0 {
         let s = std::str::from_utf8(chunk)?;
         let b = u8::from_str_radix(s, 2)?;
         out.push(b);

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
@@ -1242,12 +1244,12 @@ fn get_mounted_filesystems() -> Result<Vec<DfRecord>> {
     let slice = unsafe { std::slice::from_raw_parts(mntbuf, count as usize) };
     let mut records = Vec::new();
     for s in slice {
-        let total = (s.f_blocks as u64).saturating_mul(s.f_bsize as u64);
+        let total = s.f_blocks.saturating_mul(s.f_bsize as u64);
         if total == 0 {
             continue;
         }
-        let avail = (s.f_bavail as u64).saturating_mul(s.f_bsize as u64);
-        let free = (s.f_bfree as u64).saturating_mul(s.f_bsize as u64);
+        let avail = s.f_bavail.saturating_mul(s.f_bsize as u64);
+        let free = s.f_bfree.saturating_mul(s.f_bsize as u64);
         let used = total.saturating_sub(free);
         let denom = used + avail;
         let pct = if denom > 0 {

@@ -2147,8 +2147,8 @@ fn sort_random_seed(source: Option<&str>) -> std::result::Result<[u8; 16], Strin
         None => {
             // std's `RandomState` keys are drawn from the OS entropy source.
             let state = RandomState::new();
-            for (i, chunk) in seed.chunks_exact_mut(8).enumerate() {
-                chunk.copy_from_slice(&state.hash_one(i).to_ne_bytes());
+            for (i, chunk) in seed.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                *chunk = state.hash_one(i).to_ne_bytes();
             }
         }
     }
