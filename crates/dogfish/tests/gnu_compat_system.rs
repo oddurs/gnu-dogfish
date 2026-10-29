@@ -960,3 +960,127 @@ fn timeout_kills_grandchildren() {
         start.elapsed()
     );
 }
+
+// ---------------------------------------------------- getopt_long & stdout
+//
+// `--help` and `--version` text differs by design, so these compare exit
+// status and stderr: like glibc getopt_long, both are ordinary options that
+// may come anywhere (and be abbreviated), and the first one wins.
+
+/// Exit status and stderr of one run.
+type Outcome = (Option<i32>, String);
+
+/// Runs `tool args` through both implementations, with `env` set and stdout
+/// sent to `stdout`; returns `(dogfish, GNU)`, or `None` without GNU.
+fn run_both(
+    tool: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdout: impl Fn() -> Stdio,
+) -> Option<(Outcome, Outcome)> {
+    let Some(gnu) = gnu_tool(tool) else {
+        eprintln!("note: skipping — system `{tool}` is missing or not GNU coreutils");
+        return None;
+    };
+    let run = |mut cmd: Command| {
+        let out = cmd
+            .args(args)
+            .current_dir(fixtures())
+            .env("LC_ALL", "C")
+            .env_remove("POSIXLY_CORRECT")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(stdout())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut ours = Command::new(dogfish_bin());
+    ours.arg(tool);
+    let mut theirs = Command::new(gnu);
+    theirs.arg0(tool);
+    Some((run(ours), run(theirs)))
+}
+
+#[test]
+fn help_and_version_anywhere_like_gnu() {
+    let cases: &[(&str, &[&str])] = &[
+        ("sleep", &["100", "--help"]),
+        ("cat", &["nonexist", "--help"]),
+        ("head", &["--he"]),
+        ("tail", &["--vers"]),
+        ("yes", &["x", "--version"]),
+        ("seq", &["--help", "--bogus"]),
+        ("wc", &["--bogus", "--help"]),
+        ("sort", &["--help", "--version"]),
+        ("env", &["--version", "--help"]),
+        ("timeout", &["--he"]),
+        ("printenv", &["--he"]),
+        ("true", &["--help", "x"]),
+        ("false", &["--version"]),
+        ("echo", &["--help", "x"]),
+    ];
+    for (tool, args) in cases {
+        let Some((ours, theirs)) = run_both(tool, args, &[], Stdio::null) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "{tool} {args:?}");
+    }
+}
+
+#[test]
+fn posixly_correct_stops_at_first_operand() {
+    let cases: &[(&str, &[&str])] = &[
+        ("cat", &["a.txt", "-n"]),
+        ("head", &["a.txt", "-n", "1"]),
+        ("wc", &["a.txt", "-l"]),
+        ("uniq", &["a.txt", "-c"]),
+    ];
+    for (tool, args) in cases {
+        let env = [("POSIXLY_CORRECT", "1")];
+        let Some((ours, theirs)) = run_both(tool, args, &env, Stdio::null) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "POSIXLY_CORRECT {tool} {args:?}");
+    }
+}
+
+/// Like GNU's `close_stdout`, a failed write to standard output is
+/// diagnosed once and fails the tool.
+#[test]
+fn write_error_like_gnu() {
+    if !Path::new("/dev/full").exists() {
+        eprintln!("note: skipping — no /dev/full");
+        return;
+    }
+    let full = || {
+        let f = std::fs::OpenOptions::new().write(true).open("/dev/full");
+        Stdio::from(f.expect("open /dev/full"))
+    };
+    let cases: &[(&str, &[&str])] = &[
+        ("cat", &["a.txt"]),
+        ("echo", &["hi"]),
+        ("printf", &["x"]),
+        ("seq", &["3"]),
+        ("head", &["a.txt"]),
+        ("tail", &["a.txt"]),
+        ("wc", &["a.txt"]),
+        ("md5sum", &["a.txt"]),
+        ("base64", &["a.txt"]),
+        ("date", &["-d", "@0"]),
+        ("id", &["-u"]),
+        ("uname", &[]),
+        ("cat", &["--help"]),
+        ("sleep", &["--version"]),
+    ];
+    for (tool, args) in cases {
+        let Some((ours, theirs)) = run_both(tool, args, &[("TZ", "UTC")], full) else {
+            continue;
+        };
+        assert_eq!(ours, theirs, "{tool} {args:?} >/dev/full");
+    }
+}
