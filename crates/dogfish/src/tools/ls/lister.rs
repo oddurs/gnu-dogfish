@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use dogfish_core::{ColumnAlign, Style, Table, format_mode_rwx, format_size, gnu_io_error};
 
 use crate::common::file_info::{
-    dev_major, dev_minor, group_name, lgetxattr_bytes, meta_atime, meta_birth, meta_ctime,
-    meta_mtime, path_bytes, security_context, user_name,
+    dev_major, dev_minor, group_name, has_xattrs, lgetxattr_bytes, meta_atime, meta_birth,
+    meta_ctime, meta_mtime, path_bytes, security_context, user_name,
 };
 use crate::common::fnmatch::fnmatch;
 use crate::common::human::{HUMAN_AUTOSCALE, human_readable};
@@ -131,6 +131,8 @@ pub(crate) struct Lister<'a, W: Write> {
     pub(crate) active: Vec<(u64, u64)>,
     /// GNU `used_color`: whether a colour sequence has been written yet.
     pub(crate) used_color: std::cell::Cell<bool>,
+    /// The last `-l` timestamp formatted: (seconds, recent, text).
+    pub(crate) time_cache: std::cell::RefCell<Option<(i64, bool, Option<String>)>>,
 }
 
 impl<W: Write> Lister<'_, W> {
@@ -142,13 +144,15 @@ impl<W: Write> Lister<'_, W> {
                 files.push(f);
             }
         }
-        self.sort(&mut files);
-        let (dirs, plain): (Vec<&LsFile>, Vec<&LsFile>) = files.iter().partition(|f| f.list_as_dir);
+        let mut sorted: Vec<&LsFile> = files.iter().collect();
+        self.sort(&mut sorted);
+        let (dirs, plain): (Vec<&LsFile>, Vec<&LsFile>) =
+            sorted.iter().copied().partition(|f| f.list_as_dir);
         // GNU names each directory unless a lone directory operand is listed.
         let print_names =
             o.recursive || !(plain.is_empty() && targets.len() <= 1 && dirs.len() == 1);
         if !plain.is_empty() {
-            self.print_files(&plain, &files.iter().collect::<Vec<_>>(), false)?;
+            self.print_files(&plain, &sorted, false)?;
             if !dirs.is_empty() {
                 self.out.write_all(&[o.eol])?;
             }
@@ -230,8 +234,19 @@ impl<W: Write> Lister<'_, W> {
                     || (letter == b'-'
                         && (o.indicator == Indicator::Classify
                             || colored(&[C_EXEC, C_SETUID, C_SETGID, C_CAP])))));
+        // Nothing in a plain listing reads more than the name and readdir's
+        // type unless GNU would stat: skip the stat then, as GNU does.
+        let unused = !gnu_stat
+            && colors.is_none()
+            && o.indicator == Indicator::None
+            && !o.inode
+            && !o.dirs_first
+            && !o.json
+            && self.rich.is_none();
         let follow = o.deref == LsDeref::Always && gnu_stat;
-        let meta = if follow {
+        let meta = if unused {
+            None
+        } else if follow {
             match fs::metadata(&path) {
                 Ok(m) => Some(m),
                 Err(e) => {
@@ -247,7 +262,11 @@ impl<W: Write> Lister<'_, W> {
             fs::symlink_metadata(&path).ok()
         };
         let is_dot = name == b"." || name == b"..";
-        let list_as_dir = o.recursive && !is_dot && meta.as_ref().is_some_and(|m| m.is_dir());
+        let is_dir = match &meta {
+            Some(m) => m.is_dir(),
+            None => unused && letter == b'd',
+        };
+        let list_as_dir = o.recursive && !is_dot && is_dir;
         let mut f = LsFile {
             name,
             path,
@@ -345,15 +364,15 @@ impl<W: Write> Lister<'_, W> {
                 files.push(f);
             }
         }
-        self.sort(&mut files);
-        let refs: Vec<&LsFile> = files.iter().collect();
+        let mut refs: Vec<&LsFile> = files.iter().collect();
+        self.sort(&mut refs);
         self.print_files(&refs, &refs, true)?;
 
         if o.recursive {
             if let Some(id) = id {
                 self.active.push(id);
             }
-            for f in files.iter().filter(|f| f.list_as_dir) {
+            for f in refs.iter().filter(|f| f.list_as_dir) {
                 let mut sub_name = name.to_vec();
                 if sub_name.last() != Some(&b'/') {
                     sub_name.push(b'/');
@@ -368,7 +387,7 @@ impl<W: Write> Lister<'_, W> {
         Ok(())
     }
 
-    pub(crate) fn sort(&self, files: &mut [LsFile]) {
+    pub(crate) fn sort(&self, files: &mut [&LsFile]) {
         use std::cmp::Ordering;
         let o = self.opts;
         if o.sort == LsSort::None {
@@ -397,7 +416,7 @@ impl<W: Write> Lister<'_, W> {
             let ord = primary.then_with(|| by_name(a, b));
             if o.reverse { ord.reverse() } else { ord }
         };
-        files.sort_by(|a, b| {
+        files.sort_by(|&a, &b| {
             if o.dirs_first {
                 let dir =
                     |f: &LsFile| f.is_dir() || f.target_meta.as_ref().is_some_and(|m| m.is_dir());
@@ -1109,7 +1128,22 @@ impl<W: Write> Lister<'_, W> {
             nsec: now.nsec,
         };
         let recent = six_months_ago < t && t < now;
-        format_local_time(&self.opts.time_formats[usize::from(recent)], t)
+        let fmt = &self.opts.time_formats[usize::from(recent)];
+        // Files in one directory often share a second: unless the format
+        // shows fractions (`%N`), reuse the text of the last one.
+        let cacheable = !fmt.contains('N');
+        if cacheable
+            && let Some((sec, was_recent, text)) = &*self.time_cache.borrow()
+            && *sec == t.sec
+            && *was_recent == recent
+        {
+            return text.clone();
+        }
+        let text = format_local_time(fmt, t);
+        if cacheable {
+            *self.time_cache.borrow_mut() = Some((t.sec, recent, text.clone()));
+        }
+        text
     }
 
     /// Width GNU pads `?` times to: that of the epoch in the non-recent format.
@@ -1182,7 +1216,7 @@ impl<W: Write> Lister<'_, W> {
 /// `+` for a POSIX ACL, `.` for an SELinux context only (GNU's mode suffix).
 fn acl_marker(f: &LsFile) -> Option<u8> {
     let m = f.meta.as_ref()?;
-    if m.file_type().is_symlink() {
+    if m.file_type().is_symlink() || has_xattrs(&f.path) == Some(false) {
         return None;
     }
     let has_acl = lgetxattr_bytes(&f.path, "system.posix_acl_access").is_some()

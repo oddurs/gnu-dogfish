@@ -151,6 +151,23 @@ pub(crate) fn lgetxattr_bytes(path: &Path, name: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Whether `path` (not following a symlink) has any extended attributes:
+/// one `llistxattr` that, when it finds none, saves probing for each name.
+/// `None` if the file system cannot tell.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_xattrs(path: &Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a valid C string; a zero size asks only for the list's length.
+    let len = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+    (len >= 0).then_some(len > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn has_xattrs(_path: &Path) -> Option<bool> {
+    None
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn lgetxattr_bytes(_path: &Path, _name: &str) -> Option<Vec<u8>> {
     None
