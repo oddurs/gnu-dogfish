@@ -89,6 +89,9 @@ fn build_fixture(dir: &Path) {
         ("names/\u{fc}n\u{ef}", b""),
         ("names/tab\tin", b""),
         ("names/new\nline", b""),
+        ("names/bell\u{7}", b""),
+        ("two/a", b""),
+        ("two/b", b""),
         ("vers/file1", b""),
         ("vers/file10", b""),
         ("vers/file2", b""),
@@ -113,6 +116,14 @@ fn build_fixture(dir: &Path) {
     match fs::write(dir.join(OsStr::from_bytes(b"names/bad\xffbyte")), b"") {
         Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
         res => res.unwrap(),
+    }
+    // A directory with such a name, holding one.
+    match fs::create_dir(dir.join(OsStr::from_bytes(b"bad\xffdir"))) {
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
+        res => {
+            res.unwrap();
+            fs::write(dir.join(OsStr::from_bytes(b"bad\xffdir/f\xff")), b"xyz").unwrap();
+        }
     }
     fs::create_dir_all(p("empty_dir")).unwrap();
     // Enough subdirectories for du to read them on several threads.
@@ -471,6 +482,63 @@ gnu_cases! {
     ls_bad_tabsize: "ls" ["-T", "x"];
     ls_bad_block_size: "ls" ["--block-size=x"];
     ls_bad_block_size_suffix: "ls" ["--block-size=1x"];
+    ls_bad_tabsize_overflow: "ls" ["-T", "99999999999999999999"];
+    ls_bad_tabsize_negative: "ls" ["-T-1"];
+    ls_bad_width_octal: "ls" ["-w08"];
+
+    // ------------------------------------- ls numbers, widths, -f and --zero
+    ls_tabsize_hex_width_octal: "ls" ["-x", "-T0x10", "-w010", "vers"];
+    ls_tabsize_env: "ls" ["-C", "-w", "40", "vers"] env [("TABSIZE", "4")];
+    ls_tabsize_env_invalid: "ls" ["-C", "vers"] env [("TABSIZE", "x")];
+    ls_tabsize_env_unused: "ls" ["-1", "vers"] env [("TABSIZE", "x")];
+    ls_width_exact_fit: "ls" ["-w4", "-x", "-T0", "two"];
+    ls_width_overflow: "ls" ["-x", "-w", "99999999999999999999", "vers"];
+    ls_unsorted_all_drops_long_and_size: "ls" ["-l", "-s", "-f", "dir"];
+    ls_unsorted_all_then_long: "ls" ["-f", "-l", "dir"];
+    ls_zero_then_across: "ls" ["--zero", "-x", "dir"];
+    ls_across_then_zero: "ls" ["-x", "-Q", "--zero", "names"];
+    ls_quoting_style_env_abbreviated: "ls" ["names"] env [("QUOTING_STYLE", "esc")];
+    ls_quoting_style_env_ambiguous: "ls" ["names"] env [("QUOTING_STYLE", "sh")];
+    ls_quoting_style_env_invalid: "ls" ["dir"] env [("QUOTING_STYLE", "nope")];
+    ls_names_shell_indicators: "ls" ["--quoting-style=shell", "-F", "names"];
+    ls_names_escape_file_type: "ls" ["--quoting-style=escape", "--file-type", "names"];
+    ls_names_c_classify: "ls" ["--quoting-style=c", "-F", "names"];
+
+    // ---------------------------------------------------------- ls --dired
+    ls_dired: "ls" ["-l", "--dired", "dir"];
+    ls_dired_short: "ls" ["-lD", "empty_dir"];
+    ls_dired_recursive: "ls" ["-lR", "--dired", "dir"];
+    ls_dired_operands: "ls" ["-l", "--dired", "a.txt", "nonexist", "dir", "empty_dir", "link_dir"];
+    ls_dired_quote_name: "ls" ["-lR", "--dired", "-Q", "names"];
+    ls_dired_escape_inode_size: "ls" ["-lis", "--dired", "-b", "names"];
+    ls_dired_shell_escape: "ls" ["-l", "--dired", "--quoting-style=shell-escape", "names"];
+    ls_dired_classify_symlinks: "ls" ["-lF", "--dired", "link_dir", "link_dangling", "link_file", "dir"];
+    ls_dired_color: "ls" ["--color=always", "-l", "--dired", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+    ls_dired_needs_long: "ls" ["--dired", "dir"];
+    ls_dired_zero: "ls" ["-l", "--dired", "--zero", "dir"];
+    ls_dired_zero_needs_long: "ls" ["--dired", "--zero", "dir"];
+    ls_dired_hyperlink_wins: "ls" ["-l", "--dired", "--hyperlink", "dir"];
+
+    // ------------------------------------------------------- ls --hyperlink
+    ls_hyperlink: "ls" ["--hyperlink", "dir", "names"];
+    ls_hyperlink_always_long: "ls" ["-l", "--hyperlink=always", "link_dir", "link_dangling", "dir"];
+    ls_hyperlink_recursive: "ls" ["-R", "--hyperlink", "dir"];
+    ls_hyperlink_aligned_quotes: "ls" ["-C", "--hyperlink", "--quoting-style=shell-escape", "names"];
+    ls_hyperlink_commas_classify: "ls" ["-mF", "--hyperlink", "dir"];
+    ls_hyperlink_dot_dot: "ls" ["--hyperlink", "-d", ".", "..", "dir/../dir/sub"];
+    ls_hyperlink_never: "ls" ["--hyperlink=never", "dir"];
+    ls_hyperlink_auto: "ls" ["--hyperlink=auto", "dir"];
+    ls_hyperlink_unsorted_all_disables: "ls" ["--hyperlink", "-f", "dir"];
+    ls_hyperlink_color: "ls" ["--color=always", "--hyperlink", "-l", "colors"] env [("LS_COLORS", ""), ("TERM", "xterm"), ("COLORTERM", "")];
+
+    // --------------------------------------------- ls names that aren't UTF-8
+    ls_non_utf8_operand: "ls" ["names/bad@xff@byte"];
+    ls_non_utf8_long: "ls" ["-l", "--quoting-style=shell-escape", "names/bad@xff@byte"];
+    ls_non_utf8_missing: "ls" ["no@xff@such", "names/bad@xff@byte"];
+    ls_non_utf8_directory: "ls" ["-R", "bad@xff@dir"];
+    ls_non_utf8_directory_escaped: "ls" ["-lb", "bad@xff@dir", "dir/sub"];
+    ls_non_utf8_directory_c: "ls" ["-Q", "--dired", "-l", "bad@xff@dir"];
+    ls_non_utf8_hyperlink: "ls" ["--hyperlink", "bad@xff@dir"];
 
     // ------------------------------------------------------------------- du
     du_default: "du" [];

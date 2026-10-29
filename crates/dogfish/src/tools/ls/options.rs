@@ -7,7 +7,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, try_help,
-    unsupported,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, parse_block_size,
@@ -23,7 +22,7 @@ const LS_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'a', "all", HasArg::No, "all"),
     OptSpec::both(b'b', "escape", HasArg::No, "escape"),
     OptSpec::both(b'd', "directory", HasArg::No, "directory"),
-    OptSpec::both(b'D', "dired", HasArg::No, "unsupported"),
+    OptSpec::both(b'D', "dired", HasArg::No, "dired"),
     OptSpec::long("full-time", HasArg::No, "full-time"),
     OptSpec::long(
         "group-directories-first",
@@ -142,6 +141,7 @@ Sort entries alphabetically if none of -cftuvSUX nor --sort is specified.
                                ctime and sort by name; otherwise: sort by ctime
   -C                         list entries by columns
   -d, --directory            list directories themselves, not their contents
+  -D, --dired                generate output designed for Emacs' dired mode
   -f                         same as -a -U
   -F, --classify[=WHEN]      append indicator (one of */=>@|) to entries
       --file-type            likewise, except do not append '*'
@@ -155,6 +155,7 @@ Sort entries alphabetically if none of -cftuvSUX nor --sort is specified.
       --si                   likewise, but use powers of 1000 not 1024
   -H, --dereference-command-line  follow symbolic links listed on the command line
       --hide=PATTERN         do not list implied entries matching shell PATTERN
+      --hyperlink[=WHEN]     hyperlink file names WHEN
       --indicator-style=WORD  none, slash (-p), file-type, classify (-F)
   -i, --inode                print the index number of each file
   -I, --ignore=PATTERN       do not list implied entries matching shell PATTERN
@@ -293,6 +294,10 @@ pub(crate) struct LsOpts {
     pub(crate) colors: Option<LsColors>,
     /// GNU `check_symlink_mode`: follow symlinks to colour or group them.
     pub(crate) check_symlink_mode: bool,
+    /// `--dired` (only with `-l`): Emacs dired byte offsets after the listing.
+    pub(crate) dired: bool,
+    /// `--hyperlink`: names as OSC 8 `file://` links.
+    pub(crate) hyperlink: bool,
     pub(crate) tree: bool,
     pub(crate) level: usize,
     pub(crate) json: bool,
@@ -396,18 +401,15 @@ pub(crate) fn parse_ls_args(
         color_mode: None,
         colors: None,
         check_symlink_mode: false,
+        dired: false,
+        hyperlink: false,
         tree: false,
         level: 3,
         json: false,
         now: std::cell::Cell::new(Timespec::now()),
     };
     let mut width_opt: Option<usize> = None;
-    if let Some(tab) = std::env::var("TABSIZE")
-        .ok()
-        .and_then(|t| t.parse::<usize>().ok())
-    {
-        o.tab_size = tab;
-    }
+    let mut tab_size_opt: Option<usize> = None;
     let mut deref: Option<LsDeref> = None;
     let mut sort_specified = false;
     let mut time_style: Option<String> = std::env::var("TIME_STYLE").ok();
@@ -416,14 +418,10 @@ pub(crate) fn parse_ls_args(
     let mut time_explicit = false;
     let mut quoting: Option<Quoting> = None;
     let mut hide_control: Option<bool> = None;
-    let width_arg = |value: &str, what: &str| -> std::result::Result<usize, i32> {
-        value.parse::<usize>().map_err(|_| {
-            eprintln!(
-                "ls: invalid {what}: {}",
-                quote_bytes(value.as_bytes(), Quoting::Locale)
-            );
-            2
-        })
+    let default_format = if stdout_is_tty {
+        LsFormat::Columns
+    } else {
+        LsFormat::OnePerLine
     };
     while let Some(item) = parsed.next() {
         let (key, raw) = item.map_err(|e| getopt_error("ls", &e))?;
@@ -477,18 +475,27 @@ pub(crate) fn parse_ls_args(
                     None => "always",
                     Some(v) => argmatch("ls", &format!("--{key}"), v, &when)?,
                 };
-                // Hyperlinks are accepted but not emitted.
+                let on = when == "always" || (when == "auto" && stdout_is_tty);
                 if key == "color" {
-                    o.color = when == "always" || (when == "auto" && stdout_is_tty);
+                    o.color = on;
                     o.color_mode = ColorMode::from_when(when);
+                } else {
+                    o.hyperlink = on;
                 }
             }
             "directory" => o.immediate_dirs = true,
+            "dired" => o.dired = true,
+            // GNU: like -a -U, without colours, hyperlinks, -s or -l.
             "unsorted-all" => {
                 o.ignore = LsIgnore::Minimal;
                 o.sort = LsSort::None;
                 sort_specified = true;
+                if o.format == LsFormat::Long {
+                    o.format = default_format;
+                }
                 o.color = false;
+                o.hyperlink = false;
+                o.blocks = false;
             }
             "classify" => {
                 let when = [
@@ -656,7 +663,7 @@ pub(crate) fn parse_ls_args(
                 time_explicit = o.time != LsTime::Mtime;
             }
             "time-style" => time_style = Some(value),
-            "tabsize" => o.tab_size = width_arg(&value, "tab size")?,
+            "tabsize" => tab_size_opt = Some(tab_size_arg(&value)?),
             "width" => match decode_line_length(&value) {
                 Some(n) => width_opt = Some(n),
                 None => {
@@ -670,7 +677,12 @@ pub(crate) fn parse_ls_args(
             "context" => o.context = true,
             "zero" => {
                 o.eol = b'\0';
+                hide_control = Some(false);
+                if o.format != LsFormat::Long {
+                    o.format = LsFormat::OnePerLine;
+                }
                 o.color = false;
+                quoting = Some(Quoting::Literal);
             }
             "tree" => o.tree = true,
             "level" => {
@@ -683,14 +695,10 @@ pub(crate) fn parse_ls_args(
                 })?
             }
             "json" => o.json = true,
-            "unsupported" => return Err(unsupported("ls", &spelled)),
             "help" => return Err(print_help(LS_HELP)),
             "version" => return Err(print_version("ls")),
             _ => unreachable!("unhandled ls option"),
         }
-    }
-    if o.eol == b'\0' && o.format != LsFormat::Long {
-        o.format = LsFormat::OnePerLine;
     }
     // GNU consults COLUMNS only when the format or colouring needs a width.
     o.line_length = match width_opt {
@@ -714,6 +722,12 @@ pub(crate) fn parse_ls_args(
         }
         None => 80,
     };
+    if matches!(
+        o.format,
+        LsFormat::Columns | LsFormat::Across | LsFormat::Commas
+    ) {
+        o.tab_size = tab_size(tab_size_opt);
+    }
     if kibibytes && !explicit_sizes && std::env::var_os("LS_BLOCK_SIZE").is_none() {
         (o.human_opts, o.block_size) = (0, 1024);
     }
@@ -730,20 +744,52 @@ pub(crate) fn parse_ls_args(
             LsDeref::CommandLineSymlinkToDir
         },
     );
-    o.quoting = quoting.unwrap_or_else(|| {
-        std::env::var("QUOTING_STYLE")
-            .ok()
-            .and_then(|s| Quoting::from_name(&s))
-            .unwrap_or(Quoting::Literal)
+    o.quoting = quoting.unwrap_or_else(|| match std::env::var_os("QUOTING_STYLE") {
+        None => Quoting::Literal,
+        // GNU ARGMATCH: an exact name or an unambiguous abbreviation.
+        Some(s) => Quoting::from_name(&s.to_string_lossy())
+            .or_else(|| {
+                let mut found = Quoting::NAMES
+                    .iter()
+                    .filter(|n| !s.is_empty() && n.as_bytes().starts_with(s.as_encoded_bytes()));
+                match (found.next(), found.next()) {
+                    (Some(name), None) => Quoting::from_name(name),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "ls: ignoring invalid value of environment variable QUOTING_STYLE: {}",
+                    quote_bytes(s.as_encoded_bytes(), Quoting::Locale)
+                );
+                Quoting::Literal
+            }),
     });
     o.hide_control = hide_control.unwrap_or(false);
+    // GNU: --dired means something only for -l without --hyperlink.
+    o.dired &= o.format == LsFormat::Long && !o.hyperlink;
+    if o.dired && o.eol == b'\0' {
+        eprintln!("ls: --dired and --zero are incompatible");
+        return Err(2);
+    }
     Ok((o, parsed.operands()))
 }
 
-/// GNU `decode_line_length` (for `-w` and COLUMNS): a number in C syntax
-/// (decimal, `0x` hex or `0` octal), where too large means unlimited (0).
-fn decode_line_length(spec: &str) -> Option<usize> {
+/// Why [`xstrtoumax`] rejected a number.
+#[derive(Debug, PartialEq, Eq)]
+enum NumError {
+    Invalid,
+    Overflow,
+}
+
+/// gnulib `xstrtoumax (spec, nullptr, 0, &val, "")`: optional leading
+/// blanks and `+`, then a number in C syntax (decimal, `0x` hex or `0`
+/// octal) and nothing after it.
+fn xstrtoumax(spec: &str) -> Result<u64, NumError> {
     let s = spec.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    if s.starts_with('-') {
+        return Err(NumError::Invalid);
+    }
     let s = s.strip_prefix('+').unwrap_or(s);
     let (digits, radix) = if let Some(hex) = s
         .strip_prefix("0x")
@@ -757,13 +803,79 @@ fn decode_line_length(spec: &str) -> Option<usize> {
         (s, 10)
     };
     if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return None;
+        return Err(NumError::Invalid);
     }
-    Some(
-        u64::from_str_radix(digits, radix)
-            .ok()
-            .and_then(|n| usize::try_from(n).ok())
-            .filter(|n| *n <= isize::MAX as usize)
-            .unwrap_or(0),
-    )
+    // The digits are valid, so the only possible failure is overflow.
+    u64::from_str_radix(digits, radix).map_err(|_| NumError::Overflow)
+}
+
+/// The largest line length or tab size GNU accepts (`MIN (PTRDIFF_MAX, SIZE_MAX)`).
+const MAX_COLUMNS: u64 = isize::MAX as u64;
+
+/// GNU `decode_line_length` (for `-w` and COLUMNS): too large means
+/// unlimited (0).
+fn decode_line_length(spec: &str) -> Option<usize> {
+    match xstrtoumax(spec) {
+        Ok(n) if n <= MAX_COLUMNS => Some(usize::try_from(n).unwrap_or(0)),
+        Ok(_) | Err(NumError::Overflow) => Some(0),
+        Err(NumError::Invalid) => None,
+    }
+}
+
+/// GNU's `-T` argument (`xnumtoumax (optarg, 0, 0, MAX, "", ...)`); `Err`
+/// carries the exit status after the diagnostic.
+fn tab_size_arg(value: &str) -> std::result::Result<usize, i32> {
+    let quoted = quote_bytes(value.as_bytes(), Quoting::Locale);
+    match xstrtoumax(value) {
+        Ok(n) if n <= MAX_COLUMNS => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+        Err(NumError::Invalid) => {
+            eprintln!("ls: invalid tab size: {quoted}");
+            Err(2)
+        }
+        // Out of range: GNU adds strerror (EOVERFLOW).
+        _ => {
+            eprintln!("ls: invalid tab size: {quoted}: Value too large for defined data type");
+            Err(2)
+        }
+    }
+}
+
+/// The tab size for the grid formats: `-T`, else a valid TABSIZE, else 8.
+fn tab_size(opt: Option<usize>) -> usize {
+    if let Some(n) = opt {
+        return n;
+    }
+    match std::env::var_os("TABSIZE") {
+        None => 8,
+        Some(v) => match xstrtoumax(&v.to_string_lossy()) {
+            Ok(n) => usize::try_from(n).unwrap_or(usize::MAX),
+            Err(_) => {
+                eprintln!(
+                    "ls: ignoring invalid tab size in environment variable TABSIZE: {}",
+                    quote_bytes(v.as_encoded_bytes(), Quoting::Locale)
+                );
+                8
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_in_c_syntax() {
+        assert_eq!(xstrtoumax("010"), Ok(8));
+        assert_eq!(xstrtoumax("0x10"), Ok(16));
+        assert_eq!(xstrtoumax(" +7"), Ok(7));
+        assert_eq!(xstrtoumax("0"), Ok(0));
+        assert_eq!(xstrtoumax("08"), Err(NumError::Invalid));
+        assert_eq!(xstrtoumax("0x"), Err(NumError::Invalid));
+        assert_eq!(xstrtoumax("-1"), Err(NumError::Invalid));
+        assert_eq!(xstrtoumax("1k"), Err(NumError::Invalid));
+        assert_eq!(xstrtoumax("99999999999999999999"), Err(NumError::Overflow));
+        assert_eq!(decode_line_length("99999999999999999999"), Some(0));
+        assert_eq!(decode_line_length("08"), None);
+    }
 }

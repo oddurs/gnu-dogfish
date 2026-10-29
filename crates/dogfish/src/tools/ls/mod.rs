@@ -6,8 +6,9 @@ mod options;
 mod rich;
 mod version_sort;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use anyhow::Result;
@@ -15,10 +16,9 @@ use dogfish_core::{
     ColorMode, DogfishContext, emit_objects_or_table, io::ignore_broken_pipe, stdout,
 };
 
-use crate::common::getopt::lossy_all;
-
+use crate::common::uname_info::get_uname_info;
 use crate::tools::ls::colors::{C_EXEC, C_MISSING, C_ORPHAN, LsColors};
-use crate::tools::ls::lister::Lister;
+use crate::tools::ls::lister::{Counted, Dired, Lister, file_escape};
 use crate::tools::ls::options::{LsFormat, LsIgnore, parse_ls_args};
 use crate::tools::ls::rich::render_tree;
 
@@ -35,10 +35,10 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     if ctx.color_mode() == ColorMode::Never {
         opts.color = false;
     }
-    let targets = if operands.is_empty() {
-        vec![".".to_string()]
+    let targets: Vec<Vec<u8>> = if operands.is_empty() {
+        vec![b".".to_vec()]
     } else {
-        lossy_all(operands)
+        operands.into_iter().map(OsString::into_vec).collect()
     };
     let st = ctx.style();
 
@@ -46,9 +46,9 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         ctx.telemetry.set_strategy("recursive visual tree renderer");
         let mut out = io::BufWriter::new(stdout::stdout());
         for t in &targets {
-            writeln!(out, "{}", st.bold_blue(t))?;
+            writeln!(out, "{}", st.bold_blue(&String::from_utf8_lossy(t)))?;
             render_tree(
-                Path::new(t),
+                Path::new(OsStr::from_bytes(t)),
                 "",
                 0,
                 opts.level,
@@ -64,6 +64,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let rich = ctx.stdout_is_tty
         && !opts.json
+        && !opts.dired
         && matches!(
             opts.format,
             LsFormat::Long | LsFormat::OnePerLine | LsFormat::Columns
@@ -80,9 +81,17 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             || (c.is_colored(C_MISSING) && opts.format == LsFormat::Long);
     }
     opts.check_symlink_mode |= opts.dirs_first;
+    // GNU ignores a failure to get the host name (links then name no host).
+    let mut hostname = Vec::new();
+    if opts.hyperlink {
+        let name = get_uname_info().map(|u| u.nodename).unwrap_or_default();
+        file_escape(&mut hostname, name.as_bytes(), false);
+    }
     let mut lister = Lister {
         opts: &opts,
-        out: io::BufWriter::new(stdout::stdout()),
+        out: Counted::new(io::BufWriter::new(stdout::stdout())),
+        dired: Dired::default(),
+        hostname,
         status: 0,
         first_header: true,
         rich: rich.then_some(st),
@@ -93,7 +102,8 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     };
     let res = lister
         .run(&targets)
-        .and_then(|()| lister.restore_default_color());
+        .and_then(|()| lister.restore_default_color())
+        .and_then(|()| lister.dump_dired());
     match res {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(lister.status),
         res => res?,

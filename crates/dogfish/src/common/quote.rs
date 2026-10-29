@@ -53,6 +53,22 @@ impl Quoting {
         "clocale",
     ];
 
+    /// The style's name, as `--quoting-style` spells it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Literal => "literal",
+            Self::Shell => "shell",
+            Self::ShellAlways => "shell-always",
+            Self::ShellEscape => "shell-escape",
+            Self::ShellEscapeAlways => "shell-escape-always",
+            Self::C => "c",
+            Self::CMaybe => "c-maybe",
+            Self::Escape => "escape",
+            Self::Locale => "locale",
+            Self::CLocale => "clocale",
+        }
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "literal" => Self::Literal,
@@ -189,7 +205,10 @@ pub(crate) fn quote_bytes_raw(arg: &[u8], style: Quoting, extra: &[u8]) -> Vec<u
                     b'\r' => b'r',
                     _ => b't',
                 };
-                if shell && elide {
+                // gnulib `c_and_shell_escape`: only newline, CR and tab
+                // force the outer quotes of the shell style; the other
+                // control characters are stored as they are.
+                if shell && elide && matches!(c, b'\n' | b'\r' | b'\t') {
                     return force();
                 }
                 if backslash {

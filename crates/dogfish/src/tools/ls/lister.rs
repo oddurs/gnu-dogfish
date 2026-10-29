@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::{ColumnAlign, Style, Table, format_mode_rwx, format_size, gnu_io_error};
 
+use crate::common::canonicalize::{CanMode, canonicalize_mode};
 use crate::common::file_info::{
     dev_major, dev_minor, group_name, has_xattrs, lgetxattr_bytes, meta_atime, meta_birth,
     meta_ctime, meta_mtime, path_bytes, security_context, user_name,
 };
 use crate::common::fnmatch::fnmatch;
 use crate::common::human::{HUMAN_AUTOSCALE, human_readable};
-use crate::common::quote::{Quoting, char_at, display_width, quote_af, quote_bytes_raw, quote_f};
+use crate::common::quote::{Quoting, char_at, display_width, qa, qf, quote_bytes_raw};
 use crate::common::strftime::{Timespec, format_local_time};
 use crate::tools::ls::colors::{
     C_BLK, C_CAP, C_CHR, C_CLR_TO_EOL, C_DIR, C_END, C_EXEC, C_FIFO, C_FILE, C_LEFT, C_LINK,
@@ -41,6 +42,10 @@ pub(crate) struct LsFile {
     /// Whether GNU would have stat'ed this file (its `stat_ok`, given that the
     /// stat succeeded): otherwise GNU colours it by its `readdir` type alone.
     gnu_stat: bool,
+    /// With `--hyperlink`: the canonical absolute name the link points to.
+    absolute: Option<Vec<u8>>,
+    /// The inode number `readdir` gave (GNU shows it for `-i` without a stat).
+    d_ino: Option<u64>,
 }
 
 impl LsFile {
@@ -64,10 +69,15 @@ impl LsFile {
     fn size(&self) -> u64 {
         self.meta.as_ref().map_or(0, |m| m.size())
     }
+
+    /// The inode number for `-i`: the stat's, else readdir's.
+    fn ino(&self) -> Option<u64> {
+        self.meta.as_ref().map(|m| m.ino()).or(self.d_ino)
+    }
 }
 
 /// Raw `readdir` (keeps `.`/`..` and directory order): `(name, file-type letter)`.
-fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8)>> {
+fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8, u64)>> {
     let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
     // SAFETY: opendir/readdir/closedir on a valid C path; each dirent is
     // copied out before the next readdir call.
@@ -95,7 +105,8 @@ fn read_dir_entries(path: &Path) -> io::Result<Vec<(Vec<u8>, u8)>> {
                 libc::DT_BLK => b'b',
                 _ => b'?',
             };
-            entries.push((name, letter));
+            #[allow(clippy::unnecessary_cast)] // `ino_t` varies by platform
+            entries.push((name, letter, (*ent).d_ino as u64));
         }
         libc::closedir(dir);
         Ok(entries)
@@ -119,10 +130,56 @@ struct LsWidths {
     some_quoted: bool,
 }
 
+/// A writer that counts the bytes written through it.
+pub(crate) struct Counted<W: Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> Counted<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.count += buf.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// `--dired` bookkeeping: GNU's `dired_pos` counts every byte written except
+/// colour sequences, and the offsets of names are collected for the
+/// `//DIRED//` and `//SUBDIRED//` lines.
+#[derive(Default)]
+pub(crate) struct Dired {
+    /// Bytes of colour sequences produced so far (written or buffered).
+    color_bytes: std::cell::Cell<u64>,
+    /// (start, end) of each file name in a `-l` line.
+    names: std::cell::RefCell<Vec<u64>>,
+    /// (start, end) of each directory name in a header.
+    subdirs: Vec<u64>,
+}
+
 /// Walks operands and directories, printing them as GNU `ls` does.
 pub(crate) struct Lister<'a, W: Write> {
     pub(crate) opts: &'a LsOpts,
-    pub(crate) out: W,
+    pub(crate) out: Counted<W>,
+    pub(crate) dired: Dired,
+    /// With `--hyperlink`: this host's name, percent-encoded.
+    pub(crate) hostname: Vec<u8>,
     pub(crate) status: i32,
     pub(crate) first_header: bool,
     /// Dogfish styling on a terminal.
@@ -137,7 +194,7 @@ pub(crate) struct Lister<'a, W: Write> {
 }
 
 impl<W: Write> Lister<'_, W> {
-    pub(crate) fn run(&mut self, targets: &[String]) -> io::Result<()> {
+    pub(crate) fn run(&mut self, targets: &[Vec<u8>]) -> io::Result<()> {
         let o = self.opts;
         let mut files = Vec::new();
         for t in targets {
@@ -165,13 +222,36 @@ impl<W: Write> Lister<'_, W> {
     }
 
     fn fail(&mut self, msg: String, serious: bool) {
+        // Like gnulib `error`, flush what was listed so far first, so that
+        // the two streams interleave as GNU's do. A failed flush shows up
+        // again on the next write.
+        let _ = self.out.flush();
         eprintln!("ls: {msg}");
         self.status = self.status.max(if serious { 2 } else { 1 });
     }
 
-    fn gobble_operand(&mut self, name: &str) -> Option<LsFile> {
+    /// GNU's `absolute_name` for `--hyperlink` (`canonicalize_filename_mode`
+    /// with `CAN_MISSING`), reporting a failure as GNU does.
+    fn absolute_name(&mut self, path: &Path, command_line: bool) -> Option<Vec<u8>> {
+        if !self.opts.hyperlink {
+            return None;
+        }
+        match canonicalize_mode(path, CanMode::Missing, false) {
+            Ok(p) => Some(p.into_os_string().into_vec()),
+            Err(e) => {
+                self.fail(
+                    format!("error canonicalizing {}: {}", qa(path), gnu_io_error(&e)),
+                    command_line,
+                );
+                None
+            }
+        }
+    }
+
+    fn gobble_operand(&mut self, name: &[u8]) -> Option<LsFile> {
         let o = self.opts;
-        let path = PathBuf::from(name);
+        let path = bytes_path(name).to_path_buf();
+        let absolute = self.absolute_name(&path, true);
         let meta = match o.deref {
             LsDeref::Always | LsDeref::CommandLine => fs::metadata(&path),
             LsDeref::CommandLineSymlinkToDir => match fs::metadata(&path) {
@@ -184,7 +264,7 @@ impl<W: Write> Lister<'_, W> {
             Ok(m) => m,
             Err(e) => {
                 self.fail(
-                    format!("cannot access {}: {}", quote_af(name), gnu_io_error(&e)),
+                    format!("cannot access {}: {}", qa(&path), gnu_io_error(&e)),
                     true,
                 );
                 return None;
@@ -192,7 +272,7 @@ impl<W: Write> Lister<'_, W> {
         };
         let list_as_dir = meta.is_dir() && !o.immediate_dirs;
         let mut f = LsFile {
-            name: name.as_bytes().to_vec(),
+            name: name.to_vec(),
             path,
             meta: Some(meta),
             type_letter: b'?',
@@ -200,12 +280,14 @@ impl<W: Write> Lister<'_, W> {
             target_meta: None,
             list_as_dir,
             gnu_stat: true,
+            absolute,
+            d_ino: None,
         };
         self.inspect_link(&mut f);
         Some(f)
     }
 
-    fn gobble_entry(&mut self, dir: &Path, name: Vec<u8>, letter: u8) -> LsFile {
+    fn gobble_entry(&mut self, dir: &Path, name: Vec<u8>, letter: u8, ino: u64) -> LsFile {
         let o = self.opts;
         let d = path_bytes(dir);
         // `dir == "."` component-wise (which also takes `./`), without
@@ -234,6 +316,7 @@ impl<W: Write> Lister<'_, W> {
         let needs_type = !needs_stat
             && (o.recursive || colors.is_some() || o.indicator != Indicator::None || o.dirs_first);
         let gnu_stat = needs_stat
+            || o.hyperlink
             || (letter == b'd' && colored(&[C_OTHER_WRITABLE, C_STICKY, C_STICKY_OTHER_WRITABLE]))
             || ((o.inode || needs_type)
                 && matches!(letter, b'l' | b'?')
@@ -245,32 +328,36 @@ impl<W: Write> Lister<'_, W> {
                     || (letter == b'-'
                         && (o.indicator == Indicator::Classify
                             || colored(&[C_EXEC, C_SETUID, C_SETGID, C_CAP])))));
-        // Nothing in a plain listing reads more than the name and readdir's
-        // type unless GNU would stat: skip the stat then, as GNU does.
-        let unused = !gnu_stat
-            && colors.is_none()
-            && o.indicator == Indicator::None
-            && !o.inode
-            && !o.dirs_first
-            && !o.json
-            && self.rich.is_none();
+        // Without a stat, GNU goes by readdir's type and inode number (for
+        // colours, indicators, -i, recursion and grouping): skip it then too.
+        // Only the Dogfish JSON and terminal views read more.
+        let unused = !gnu_stat && !o.json && self.rich.is_none();
         let follow = o.deref == LsDeref::Always && gnu_stat;
+        let absolute = if gnu_stat {
+            self.absolute_name(&path, false)
+        } else {
+            None
+        };
         let meta = if unused {
             None
-        } else if follow {
-            match fs::metadata(&path) {
+        } else {
+            let stat = if follow {
+                fs::metadata(&path)
+            } else {
+                fs::symlink_metadata(&path)
+            };
+            match stat {
                 Ok(m) => Some(m),
                 Err(e) => {
-                    let shown = String::from_utf8_lossy(path_bytes(&path)).into_owned();
-                    self.fail(
-                        format!("cannot access {}: {}", quote_af(&shown), gnu_io_error(&e)),
-                        false,
-                    );
+                    if gnu_stat {
+                        self.fail(
+                            format!("cannot access {}: {}", qa(&path), gnu_io_error(&e)),
+                            false,
+                        );
+                    }
                     None
                 }
             }
-        } else {
-            fs::symlink_metadata(&path).ok()
         };
         let is_dot = name == b"." || name == b"..";
         let is_dir = match &meta {
@@ -287,6 +374,8 @@ impl<W: Write> Lister<'_, W> {
             target_meta: None,
             list_as_dir,
             gnu_stat,
+            absolute,
+            d_ino: Some(ino),
         };
         self.inspect_link(&mut f);
         f
@@ -329,12 +418,12 @@ impl<W: Write> Lister<'_, W> {
     ) -> io::Result<()> {
         let o = self.opts;
         let id = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        let shown = bytes_path(name);
         if let Some(id) = id
             && self.active.contains(&id)
         {
-            let shown = String::from_utf8_lossy(name).into_owned();
             self.fail(
-                format!("{}: not listing already-listed directory", quote_f(&shown)),
+                format!("{}: not listing already-listed directory", qf(shown)),
                 true,
             );
             return Ok(());
@@ -342,13 +431,8 @@ impl<W: Write> Lister<'_, W> {
         let entries = match read_dir_entries(path) {
             Ok(e) => e,
             Err(e) => {
-                let shown = String::from_utf8_lossy(name).into_owned();
                 self.fail(
-                    format!(
-                        "cannot open directory {}: {}",
-                        quote_af(&shown),
-                        gnu_io_error(&e)
-                    ),
+                    format!("cannot open directory {}: {}", qa(shown), gnu_io_error(&e)),
                     command_line,
                 );
                 return Ok(());
@@ -358,20 +442,30 @@ impl<W: Write> Lister<'_, W> {
             if !self.first_header {
                 self.out.write_all(&[o.eol])?;
             }
-            let mut header = quote_bytes_raw(name, o.quoting, b":");
+            if o.dired {
+                self.out.write_all(b"  ")?;
+            }
+            let (mut header, _) = self.quote_with(name, b":");
             if let Some(st) = self.rich {
                 header = st.bold_blue(&String::from_utf8_lossy(&header)).into_bytes();
             }
-            self.out.write_all(&header)?;
-            self.out.write_all(b":")?;
-            self.out.write_all(&[o.eol])?;
+            let absolute = self.absolute_name(path, command_line);
+            let mut buf = Vec::with_capacity(header.len() + 64);
+            let (start, end) = self.hyperlinked(&mut buf, &header, absolute.as_deref(), false);
+            if o.dired {
+                let (start, end) = (self.dired_pos(start), self.dired_pos(end));
+                self.dired.subdirs.extend([start, end]);
+            }
+            buf.extend_from_slice(b":");
+            buf.push(o.eol);
+            self.out.write_all(&buf)?;
         }
         self.first_header = false;
 
         let mut files: Vec<LsFile> = Vec::with_capacity(entries.len());
-        for (entry, letter) in entries {
+        for (entry, letter, ino) in entries {
             if !self.ignored(&entry) {
-                let f = self.gobble_entry(path, entry, letter);
+                let f = self.gobble_entry(path, entry, letter, ino);
                 files.push(f);
             }
         }
@@ -453,11 +547,24 @@ impl<W: Write> Lister<'_, W> {
     /// The quoted name; the bool says whether quoting changed it.
     fn quoted_name(&self, name: &[u8]) -> (Vec<u8>, bool) {
         let o = self.opts;
-        let extra: &[u8] = if o.quoting == Quoting::Escape {
-            b" "
-        } else {
-            b""
+        // GNU `filename_quoting_options`: the escape style also escapes
+        // spaces, and with indicators the indicator characters (GNU's
+        // `&"*=>@|"[indicator_style - file_type]`: `*` only for --file-type).
+        let extra: &[u8] = match (o.quoting == Quoting::Escape, o.indicator) {
+            (false, Indicator::None | Indicator::Slash) => b"",
+            (true, Indicator::None | Indicator::Slash) => b" ",
+            (false, Indicator::FileType) => b"*=>@|",
+            (true, Indicator::FileType) => b" *=>@|",
+            (false, Indicator::Classify) => b"=>@|",
+            (true, Indicator::Classify) => b" =>@|",
         };
+        self.quote_with(name, extra)
+    }
+
+    /// `name` quoted in the listing's style with `extra` bytes escaped too,
+    /// and with `-q` applied (GNU `quote_name_buf`).
+    fn quote_with(&self, name: &[u8], extra: &[u8]) -> (Vec<u8>, bool) {
+        let o = self.opts;
         let mut q = quote_bytes_raw(name, o.quoting, extra);
         let changed = q != name;
         if o.hide_control {
@@ -486,6 +593,79 @@ impl<W: Write> Lister<'_, W> {
             self.prep_non_filename_text(c, buf);
         }
         buf.extend_from_slice(seq);
+        let colored = &self.dired.color_bytes;
+        colored.set(colored.get() + seq.len() as u64);
+    }
+
+    /// GNU's `dired_pos` at offset `at` of the buffer about to be written:
+    /// every byte so far except colour sequences (all of which are either
+    /// written or in that buffer before `at`).
+    fn dired_pos(&self, at: usize) -> u64 {
+        (self.out.count + at as u64).saturating_sub(self.dired.color_bytes.get())
+    }
+
+    /// Appends the quoted `name`, as an OSC 8 hyperlink to `absolute` when
+    /// there is one (GNU `quote_name`); returns where the name's text starts
+    /// and ends in `buf`. With `skip_quotes`, the outer quotes stay outside
+    /// the link.
+    fn hyperlinked(
+        &self,
+        buf: &mut Vec<u8>,
+        name: &[u8],
+        absolute: Option<&[u8]>,
+        skip_quotes: bool,
+    ) -> (usize, usize) {
+        let Some(absolute) = absolute else {
+            let start = buf.len();
+            buf.extend_from_slice(name);
+            return (start, buf.len());
+        };
+        let skip_quotes = skip_quotes && name.len() >= 2;
+        let inner = if skip_quotes {
+            buf.push(name[0]);
+            &name[1..name.len() - 1]
+        } else {
+            name
+        };
+        buf.extend_from_slice(b"\x1b]8;;file://");
+        buf.extend_from_slice(&self.hostname);
+        if absolute.first() != Some(&b'/') {
+            buf.push(b'/');
+        }
+        file_escape(buf, absolute, true);
+        buf.push(0x07);
+        let start = buf.len();
+        buf.extend_from_slice(inner);
+        let end = buf.len();
+        buf.extend_from_slice(b"\x1b]8;;\x07");
+        if skip_quotes {
+            buf.push(name[name.len() - 1]);
+        }
+        (start, end)
+    }
+
+    /// GNU's `--dired` trailer: the name offsets and the quoting style.
+    pub(crate) fn dump_dired(&mut self) -> io::Result<()> {
+        if !self.opts.dired {
+            return Ok(());
+        }
+        let mut text = Vec::new();
+        for (prefix, positions) in [
+            ("//DIRED//", &*self.dired.names.borrow()),
+            ("//SUBDIRED//", &self.dired.subdirs),
+        ] {
+            if !positions.is_empty() {
+                text.extend_from_slice(prefix.as_bytes());
+                for p in positions {
+                    text.extend_from_slice(format!(" {p}").as_bytes());
+                }
+                text.push(b'\n');
+            }
+        }
+        text.extend_from_slice(b"//DIRED-OPTIONS// --quoting-style=");
+        text.extend_from_slice(self.opts.quoting.name().as_bytes());
+        text.push(b'\n');
+        self.out.write_all(&text)
     }
 
     /// GNU `prep_non_filename_text`: `ec`, or `lc` `rs` `rc`.
@@ -545,12 +725,8 @@ impl<W: Write> Lister<'_, W> {
             buf.push(b' ');
         }
         let len = name.len() + usize::from(pad);
-        let Some(c) = colors else {
-            buf.extend_from_slice(&name);
-            return len;
-        };
-        let color = self.color_of(c, f, target);
-        if let Some(seq) = color {
+        let color = colors.and_then(|c| self.color_of(c, f, target));
+        if let (Some(c), Some(seq)) = (colors, color) {
             if c.is_colored(C_NORM) {
                 self.put_indicator(c, buf, c.seq(C_LEFT));
                 self.put_indicator(c, buf, c.seq(C_RIGHT));
@@ -559,7 +735,17 @@ impl<W: Write> Lister<'_, W> {
             self.put_indicator(c, buf, seq);
             self.put_indicator(c, buf, c.seq(C_RIGHT));
         }
-        buf.extend_from_slice(&name);
+        // GNU leaves the outer quotes of an aligned name out of its link.
+        let skip_quotes = w.some_quoted && quoted;
+        let (start, end) = self.hyperlinked(buf, &name, f.absolute.as_deref(), skip_quotes);
+        if self.opts.dired && !target {
+            let pos = self.dired_pos(start);
+            let end = self.dired_pos(end);
+            self.dired.names.borrow_mut().extend([pos, end]);
+        }
+        let Some(c) = colors else {
+            return len;
+        };
         if color.is_some() || c.is_colored(C_NORM) {
             self.prep_non_filename_text(c, buf);
             // GNU clears to the end of the line when the name might wrap (it
@@ -731,7 +917,7 @@ impl<W: Write> Lister<'_, W> {
                 w.some_quoted = true;
             }
             if o.inode {
-                let ino = f.meta.as_ref().map_or(1, |m| m.ino().to_string().len());
+                let ino = f.ino().map_or(1, |i| i.to_string().len());
                 w.inode = w.inode.max(ino);
             }
             if o.blocks || o.format == LsFormat::Long {
@@ -799,7 +985,8 @@ impl<W: Write> Lister<'_, W> {
                 .map(|m| m.blocks())
                 .sum();
             let line = format!(
-                "total {}",
+                "{}total {}",
+                if o.dired { "  " } else { "" },
                 human_readable(blocks, o.human_opts, 512, o.block_size)
             );
             self.out.write_all(line.as_bytes())?;
@@ -857,10 +1044,12 @@ impl<W: Write> Lister<'_, W> {
         let by_columns = o.format == LsFormat::Columns;
         let n = cells.len();
         const MIN_COLUMN_WIDTH: usize = 3;
+        // GNU `max_idx`: the first column has no separator, so a partial
+        // column's worth of width still counts.
         let max_idx = if o.line_length == 0 {
             n
         } else {
-            (o.line_length / MIN_COLUMN_WIDTH).max(1)
+            o.line_length.div_ceil(MIN_COLUMN_WIDTH)
         };
         let max_cols = max_idx.min(n);
         // (valid, line length, column widths) for 1..=max_cols columns.
@@ -898,7 +1087,7 @@ impl<W: Write> Lister<'_, W> {
         let widths = &configs[cols - 1].2;
         // GNU pads with tabs where possible, except for unlimited width.
         let tabs = o.tab_size != 0 && o.line_length != 0;
-        let indent = |out: &mut W, mut from: usize, to: usize| -> io::Result<()> {
+        let indent = |out: &mut Counted<W>, mut from: usize, to: usize| -> io::Result<()> {
             while from < to {
                 if tabs && to / o.tab_size > (from + 1) / o.tab_size {
                     out.write_all(b"\t")?;
@@ -979,13 +1168,16 @@ impl<W: Write> Lister<'_, W> {
         plain: &[u8],
     ) -> io::Result<()> {
         let o = self.opts;
-        let Some(c) = &o.colors else {
+        let colors = o.colors.as_ref();
+        if colors.is_none() && f.absolute.is_none() {
             return self.out.write_all(plain);
-        };
+        }
         let mut buf = Vec::with_capacity(plain.len() + 24);
-        self.set_normal_color(c, &mut buf);
+        if let Some(c) = colors {
+            self.set_normal_color(c, &mut buf);
+        }
         buf.extend_from_slice(&self.short_prefix(f, w, commas));
-        self.name_with_quoting(Some(c), &mut buf, f, w, false, start_col);
+        self.name_with_quoting(colors, &mut buf, f, w, false, start_col);
         if let Some(ch) = indicator_char(o.indicator, f.meta.as_ref(), f.type_letter) {
             buf.push(ch);
         }
@@ -1004,7 +1196,7 @@ impl<W: Write> Lister<'_, W> {
             cell.push(b' ');
         };
         if o.inode {
-            let ino = f.meta.as_ref().map_or("?".into(), |m| m.ino().to_string());
+            let ino = f.ino().map_or("?".into(), |i| i.to_string());
             pad_left(&mut cell, &ino, w.inode);
         }
         if o.blocks {
@@ -1040,7 +1232,7 @@ impl<W: Write> Lister<'_, W> {
             );
         };
         if o.inode {
-            let ino = f.meta.as_ref().map_or("?".into(), |m| m.ino().to_string());
+            let ino = f.ino().map_or("?".into(), |i| i.to_string());
             right(&mut line, &ino, w.inode);
             line.push(b' ');
         }
@@ -1087,6 +1279,14 @@ impl<W: Write> Lister<'_, W> {
             left(&mut line, &self.context_cell(f), w.context);
             line.push(b' ');
         }
+        // GNU restarts its line buffer after these columns, and so counts
+        // the name's starting column (for clearing to the end of the line)
+        // from here.
+        let col_origin = if o.owner || o.group || o.author || o.context {
+            line.len()
+        } else {
+            0
+        };
         match &f.meta {
             Some(m) if m.file_type().is_char_device() || m.file_type().is_block_device() => {
                 let blanks = w.size.saturating_sub(w.major + 2 + w.minor);
@@ -1110,10 +1310,15 @@ impl<W: Write> Lister<'_, W> {
         }
         line.push(b' ');
         let colors = o.colors.as_ref();
-        let name_col = line.len();
-        if let Some(c) = colors {
+        let name_col = line.len() - col_origin;
+        if colors.is_some() || o.dired {
             let mut prefixed = Vec::with_capacity(line.len() + 32);
-            self.set_normal_color(c, &mut prefixed);
+            if let Some(c) = colors {
+                self.set_normal_color(c, &mut prefixed);
+            }
+            if o.dired {
+                prefixed.extend_from_slice(b"  ");
+            }
             prefixed.append(&mut line);
             line = prefixed;
         }
@@ -1297,4 +1502,19 @@ fn indicator_char(style: Indicator, meta: Option<&fs::Metadata>, letter: u8) -> 
 fn bytes_path(b: &[u8]) -> &Path {
     use std::os::unix::ffi::OsStrExt;
     Path::new(std::ffi::OsStr::from_bytes(b))
+}
+
+/// GNU `file_escape`: `%XX` for every byte outside RFC 3986's unreserved
+/// set (letters, digits, `-._~`), keeping `/` in a `path`.
+pub(crate) fn file_escape(buf: &mut Vec<u8>, s: &[u8], path: bool) {
+    for &c in s {
+        if c.is_ascii_alphanumeric()
+            || matches!(c, b'-' | b'.' | b'_' | b'~')
+            || (path && c == b'/')
+        {
+            buf.push(c);
+        } else {
+            buf.extend_from_slice(format!("%{c:02x}").as_bytes());
+        }
+    }
 }
