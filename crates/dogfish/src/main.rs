@@ -12,9 +12,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, Table, gnu_io_error,
-    io::{install_sigbus_handler, install_sigpipe_handler},
-    outln, stdout, strip_os_error_suffix,
+    ColumnAlign, DogfishContext, Table, gnu_io_error, io::install_sigbus_handler, outln, stdout,
+    strip_os_error_suffix,
 };
 
 use crate::common::getopt::exit_failure;
@@ -314,8 +313,10 @@ pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_cha
             } else {
                 libc::O_RDWR
             };
+            // Close-on-exec: a program run by this one (`timeout`, `env`, ...)
+            // gets the descriptor closed, as it was given to us.
             // SAFETY: a NUL-terminated path; the lowest free descriptor is `fd`.
-            unsafe { libc::open(c"/dev/null".as_ptr(), mode) };
+            unsafe { libc::open(c"/dev/null".as_ptr(), mode | libc::O_CLOEXEC) };
             if fd == libc::STDOUT_FILENO {
                 stdout::started_closed();
             }
@@ -361,7 +362,10 @@ fn trivial_exit_status(
 /// Runs the multicall binary on `raw_args` (`argv`); returns the exit status.
 #[cfg_attr(test, allow(dead_code))]
 fn run(raw_args: Vec<OsString>) -> u8 {
-    install_sigpipe_handler();
+    // SIGPIPE keeps the disposition it was given (the C `main` skips the
+    // standard library's, which would ignore it), as in GNU: by default a
+    // write to a closed pipe ends the process, and with `trap '' PIPE` it
+    // fails with EPIPE.
 
     // Determine if invoked via symlink (e.g. `ls`, `df-ls`) or as `dogfish <subcommand>`
     let argv0_name = raw_args
