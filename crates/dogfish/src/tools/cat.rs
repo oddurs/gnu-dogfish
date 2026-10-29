@@ -1,17 +1,16 @@
-//! cat — Zero-copy mmap + GNU line numbering / squeeze / -v ^X M- notation
+//! cat — copy_file_range / large reads + GNU line numbering / squeeze / -v ^X M- notation
 
 use std::fs::File;
-use std::io::{self, BufRead, Seek, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{self, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
-};
+use dogfish_core::{DogfishContext, InputSource, gnu_io_error, io::ignore_broken_pipe};
+use memchr::memchr;
 
-use crate::common::input::{bytes_available, stdin_file};
+use crate::common::input::{RawStdout, bytes_available, safe_read, stdin_file};
 use crate::common::quote::qf;
 
 #[derive(Parser)]
@@ -104,8 +103,7 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     });
 
     let sources = InputSource::from_args(&p.files);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(IO_SIZE, RawStdout);
     let mut state = CatState {
         newlines: 0,
         line_num: 0,
@@ -114,18 +112,25 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut exit_code = 0;
     // GNU refuses to copy a non-empty regular file onto itself.
     let out_id = stdout_identity();
+    let mut buf = vec![0u8; IO_SIZE];
 
     for src in &sources {
         let res = open_input(src, out_id).and_then(|input| {
-            let Some((reader, fd)) = input else {
+            let Some(mut file) = input else {
                 let _ = out.flush();
                 eprintln!("cat: {}: input file is output file", qf(src.display_name()));
                 return Ok(false);
             };
+            let mut stdin = stdin_file();
+            let input: &mut File = match file {
+                Some(ref mut f) => f,
+                None => &mut stdin,
+            };
             if plain {
-                cat_plain(reader, &mut out, ctx)?;
+                out.flush()?;
+                cat_plain(input, out_id.is_some(), &mut buf, ctx)?;
             } else {
-                cat_decorated(reader.into_bufread(), fd, &opts, &mut state, &mut out, ctx)?;
+                cat_decorated(input, &mut buf, &opts, &mut state, &mut out, ctx)?;
             }
             Ok(true)
         });
@@ -147,6 +152,9 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     Ok(exit_code)
 }
 
+/// Read and write size: large enough that syscalls are not the cost.
+const IO_SIZE: usize = 128 * 1024;
+
 /// Device and inode of standard output when it is a regular file.
 fn stdout_identity() -> Option<(u64, u64)> {
     // Safety: fstat only writes the stat buffer.
@@ -156,13 +164,10 @@ fn stdout_identity() -> Option<(u64, u64)> {
         .then_some((st.st_dev as u64, st.st_ino as u64))
 }
 
-/// Opens one input, or `None` when it is the regular file standard output
-/// writes to and unread data remains (GNU's `input file is output file`).
-/// Also returns the descriptor, kept open by the reader, for `FIONREAD`.
-fn open_input(
-    src: &InputSource,
-    out_id: Option<(u64, u64)>,
-) -> io::Result<Option<(FastReader, Option<RawFd>)>> {
+/// Opens one input: `Some(None)` is standard input, `None` the regular file
+/// standard output writes to while unread data remains (GNU's `input file
+/// is output file`).
+fn open_input(src: &InputSource, out_id: Option<(u64, u64)>) -> io::Result<Option<Option<File>>> {
     let is_output = |file: &mut File| -> io::Result<bool> {
         if out_id.is_none() {
             return Ok(false);
@@ -172,37 +177,62 @@ fn open_input(
             && file.stream_position().unwrap_or(0) < meta.len())
     };
     match src {
-        InputSource::Stdin => {
-            if is_output(&mut stdin_file())? {
-                return Ok(None);
-            }
-            Ok(Some((FastReader::open(src)?, Some(0))))
-        }
+        InputSource::Stdin => Ok((!is_output(&mut stdin_file())?).then_some(None)),
         InputSource::File(path) => {
             let mut file = File::open(path)?;
-            if is_output(&mut file)? {
-                return Ok(None);
-            }
-            let fd = file.as_raw_fd();
-            Ok(Some((FastReader::from_file(file)?, Some(fd))))
+            Ok((!is_output(&mut file)?).then_some(Some(file)))
         }
     }
 }
 
-fn cat_plain<W: Write>(reader: FastReader, out: &mut W, ctx: &DogfishContext) -> io::Result<()> {
-    match reader {
-        FastReader::Mapped(map) => {
-            ctx.telemetry.add_read(map.len() as u64);
-            out.write_all(&map)?;
-            ctx.telemetry.add_written(map.len() as u64);
-        }
-        FastReader::Buffered(mut r) => {
-            let n = io::copy(&mut r, out)?;
-            ctx.telemetry.add_read(n);
-            ctx.telemetry.add_written(n);
+/// Plain copy (GNU's `copy_cat` / `simple_cat`): `copy_file_range` from a
+/// regular file to a regular file, else large reads and writes.
+fn cat_plain(
+    input: &mut File,
+    out_is_regular: bool,
+    buf: &mut [u8],
+    ctx: &DogfishContext,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if out_is_regular && input.metadata().is_ok_and(|m| m.is_file()) {
+        let fd = input.as_raw_fd();
+        loop {
+            // Safety: both descriptors are open; null offsets use (and
+            // advance) the file offsets.
+            let n = unsafe {
+                libc::copy_file_range(
+                    fd,
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null_mut(),
+                    1 << 30,
+                    0,
+                )
+            };
+            match n {
+                0 => return Ok(()),
+                n if n > 0 => {
+                    ctx.telemetry.add_read(n as u64);
+                    ctx.telemetry.add_written(n as u64);
+                }
+                // Not supported here (another file system, ...): copy below
+                // from the current offsets.
+                _ => break,
+            }
         }
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    let _ = out_is_regular;
+    let mut out = RawStdout;
+    loop {
+        let n = safe_read(input, buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        out.write_all(&buf[..n])?;
+        ctx.telemetry.add_read(n as u64);
+        ctx.telemetry.add_written(n as u64);
+    }
 }
 
 fn cat_push_number(buf: &mut Vec<u8>, state: &mut CatState) {
@@ -248,22 +278,25 @@ fn cat_push_visible(buf: &mut Vec<u8>, b: u8, o: &CatOpts) {
     }
 }
 
-/// Decorates one input. `fd` is the input's descriptor: when nothing more
-/// can be read from it right away, the output so far is written before the
-/// read blocks, as GNU does (so `cat -v` in a pipeline is not held back).
+/// Decorates one input (GNU's `cat`). When nothing more can be read
+/// right away, the output so far is written before the read blocks, as
+/// GNU does (so `cat -v` in a pipeline is not held back).
 fn cat_decorated<W: Write>(
-    mut reader: Box<dyn BufRead>,
-    fd: Option<RawFd>,
+    input: &mut File,
+    buf: &mut [u8],
     o: &CatOpts,
     state: &mut CatState,
     out: &mut W,
     ctx: &DogfishContext,
 ) -> io::Result<()> {
-    let mut obuf: Vec<u8> = Vec::with_capacity(DEFAULT_BUF_SIZE + 1024);
-    let mut use_fionread = fd.is_some();
+    let mut obuf: Vec<u8> = Vec::with_capacity(4 * IO_SIZE + 1024);
+    let fd = input.as_raw_fd();
+    let mut use_fionread = true;
+    // Only -n, -b and -s: runs of text are copied as they are.
+    let simple = !(o.show_nonprinting || o.show_tabs || o.show_ends);
     loop {
         if use_fionread {
-            match fd.and_then(bytes_available) {
+            match bytes_available(fd) {
                 Some(0) => {
                     out.write_all(&obuf)?;
                     ctx.telemetry.add_written(obuf.len() as u64);
@@ -274,19 +307,22 @@ fn cat_decorated<W: Write>(
                 None => use_fionread = false,
             }
         }
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
+        let n = safe_read(input, buf)?;
+        if n == 0 {
             break;
         }
-        let n = chunk.len();
         ctx.telemetry.add_read(n as u64);
-        for &b in chunk {
-            // GNU 9.x `-E`: a CR immediately before LF is shown as ^M.
-            if state.pending_cr {
-                state.pending_cr = false;
-                obuf.extend_from_slice(if b == b'\n' { b"^M" } else { b"\r" });
-            }
+        let data = &buf[..n];
+        let mut i = 0;
+        while i < n {
+            let b = data[i];
             if b == b'\n' {
+                i += 1;
+                // GNU 9.x `-E`: a CR immediately before LF is shown as ^M.
+                if state.pending_cr {
+                    state.pending_cr = false;
+                    obuf.extend_from_slice(b"^M");
+                }
                 state.newlines += 1;
                 if state.newlines > 0 {
                     if state.newlines >= 2 {
@@ -303,22 +339,34 @@ fn cat_decorated<W: Write>(
                     obuf.push(b'$');
                 }
                 obuf.push(b'\n');
-            } else {
-                if state.newlines >= 0 {
-                    if o.number {
-                        cat_push_number(&mut obuf, state);
-                    }
-                    state.newlines = -1;
+                continue;
+            }
+            if state.newlines >= 0 {
+                if o.number {
+                    cat_push_number(&mut obuf, state);
                 }
-                if b == b'\r' && o.show_ends && !o.show_nonprinting {
+                state.newlines = -1;
+            }
+            let end = memchr(b'\n', &data[i..]).map_or(n, |p| i + p);
+            let run = &data[i..end];
+            i = end;
+            if simple {
+                obuf.extend_from_slice(run);
+                continue;
+            }
+            for &c in run {
+                if state.pending_cr {
+                    state.pending_cr = false;
+                    obuf.push(b'\r');
+                }
+                if c == b'\r' && o.show_ends && !o.show_nonprinting {
                     state.pending_cr = true;
                 } else {
-                    cat_push_visible(&mut obuf, b, o);
+                    cat_push_visible(&mut obuf, c, o);
                 }
             }
         }
-        reader.consume(n);
-        if obuf.len() >= DEFAULT_BUF_SIZE {
+        if obuf.len() >= IO_SIZE {
             out.write_all(&obuf)?;
             ctx.telemetry.add_written(obuf.len() as u64);
             obuf.clear();
