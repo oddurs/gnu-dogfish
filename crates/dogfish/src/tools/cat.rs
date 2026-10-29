@@ -1,12 +1,18 @@
 //! cat — Zero-copy mmap + GNU line numbering / squeeze / -v ^X M- notation
 
-use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead, Seek, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
 };
+
+use crate::common::input::{bytes_available, stdin_file};
+use crate::common::quote::qf;
 
 #[derive(Parser)]
 #[command(name = "cat", about = "Concatenate FILE(s) to standard output")]
@@ -69,6 +75,9 @@ struct CatState {
     /// Number of consecutive empty lines seen; -1 while inside a line.
     newlines: i32,
     line_num: u64,
+    /// `-E` saw a CR at the end of a read: `^M` if a newline follows, even
+    /// in the next file (GNU's `pending_cr`).
+    pending_cr: bool,
 }
 
 pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
@@ -100,28 +109,84 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut state = CatState {
         newlines: 0,
         line_num: 0,
+        pending_cr: false,
     };
     let mut exit_code = 0;
+    // GNU refuses to copy a non-empty regular file onto itself.
+    let out_id = stdout_identity();
 
     for src in &sources {
-        let res = FastReader::open(src).and_then(|reader| {
+        let res = open_input(src, out_id).and_then(|input| {
+            let Some((reader, fd)) = input else {
+                let _ = out.flush();
+                eprintln!("cat: {}: input file is output file", qf(src.display_name()));
+                return Ok(false);
+            };
             if plain {
-                cat_plain(reader, &mut out, ctx)
+                cat_plain(reader, &mut out, ctx)?;
             } else {
-                cat_decorated(reader.into_bufread(), &opts, &mut state, &mut out, ctx)
+                cat_decorated(reader.into_bufread(), fd, &opts, &mut state, &mut out, ctx)?;
             }
+            Ok(true)
         });
-        if let Err(e) = res {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(exit_code);
+        match res {
+            Ok(true) => {}
+            Ok(false) => exit_code = 1,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
+            Err(e) => {
+                let _ = out.flush();
+                eprintln!("cat: {}: {}", qf(src.display_name()), gnu_io_error(&e));
+                exit_code = 1;
             }
-            let _ = out.flush();
-            eprintln!("cat: {}: {}", src.display_name(), gnu_io_error(&e));
-            exit_code = 1;
         }
+    }
+    if state.pending_cr {
+        ignore_broken_pipe(out.write_all(b"\r"))?;
     }
     ignore_broken_pipe(out.flush())?;
     Ok(exit_code)
+}
+
+/// Device and inode of standard output when it is a regular file.
+fn stdout_identity() -> Option<(u64, u64)> {
+    // Safety: fstat only writes the stat buffer.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstat(1, &mut st) } == 0;
+    (ok && st.st_mode & libc::S_IFMT == libc::S_IFREG)
+        .then_some((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// Opens one input, or `None` when it is the regular file standard output
+/// writes to and unread data remains (GNU's `input file is output file`).
+/// Also returns the descriptor, kept open by the reader, for `FIONREAD`.
+fn open_input(
+    src: &InputSource,
+    out_id: Option<(u64, u64)>,
+) -> io::Result<Option<(FastReader, Option<RawFd>)>> {
+    let is_output = |file: &mut File| -> io::Result<bool> {
+        if out_id.is_none() {
+            return Ok(false);
+        }
+        let meta = file.metadata()?;
+        Ok(out_id == Some((meta.dev(), meta.ino()))
+            && file.stream_position().unwrap_or(0) < meta.len())
+    };
+    match src {
+        InputSource::Stdin => {
+            if is_output(&mut stdin_file())? {
+                return Ok(None);
+            }
+            Ok(Some((FastReader::open(src)?, Some(0))))
+        }
+        InputSource::File(path) => {
+            let mut file = File::open(path)?;
+            if is_output(&mut file)? {
+                return Ok(None);
+            }
+            let fd = file.as_raw_fd();
+            Ok(Some((FastReader::from_file(file)?, Some(fd))))
+        }
+    }
 }
 
 fn cat_plain<W: Write>(reader: FastReader, out: &mut W, ctx: &DogfishContext) -> io::Result<()> {
@@ -183,16 +248,32 @@ fn cat_push_visible(buf: &mut Vec<u8>, b: u8, o: &CatOpts) {
     }
 }
 
+/// Decorates one input. `fd` is the input's descriptor: when nothing more
+/// can be read from it right away, the output so far is written before the
+/// read blocks, as GNU does (so `cat -v` in a pipeline is not held back).
 fn cat_decorated<W: Write>(
     mut reader: Box<dyn BufRead>,
+    fd: Option<RawFd>,
     o: &CatOpts,
     state: &mut CatState,
     out: &mut W,
     ctx: &DogfishContext,
 ) -> io::Result<()> {
     let mut obuf: Vec<u8> = Vec::with_capacity(DEFAULT_BUF_SIZE + 1024);
-    let mut pending_cr = false;
+    let mut use_fionread = fd.is_some();
     loop {
+        if use_fionread {
+            match fd.and_then(bytes_available) {
+                Some(0) => {
+                    out.write_all(&obuf)?;
+                    ctx.telemetry.add_written(obuf.len() as u64);
+                    obuf.clear();
+                    out.flush()?;
+                }
+                Some(_) => {}
+                None => use_fionread = false,
+            }
+        }
         let chunk = reader.fill_buf()?;
         if chunk.is_empty() {
             break;
@@ -201,8 +282,8 @@ fn cat_decorated<W: Write>(
         ctx.telemetry.add_read(n as u64);
         for &b in chunk {
             // GNU 9.x `-E`: a CR immediately before LF is shown as ^M.
-            if pending_cr {
-                pending_cr = false;
+            if state.pending_cr {
+                state.pending_cr = false;
                 obuf.extend_from_slice(if b == b'\n' { b"^M" } else { b"\r" });
             }
             if b == b'\n' {
@@ -230,7 +311,7 @@ fn cat_decorated<W: Write>(
                     state.newlines = -1;
                 }
                 if b == b'\r' && o.show_ends && !o.show_nonprinting {
-                    pending_cr = true;
+                    state.pending_cr = true;
                 } else {
                     cat_push_visible(&mut obuf, b, o);
                 }
@@ -242,9 +323,6 @@ fn cat_decorated<W: Write>(
             ctx.telemetry.add_written(obuf.len() as u64);
             obuf.clear();
         }
-    }
-    if pending_cr {
-        obuf.push(b'\r');
     }
     out.write_all(&obuf)?;
     ctx.telemetry.add_written(obuf.len() as u64);

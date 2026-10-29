@@ -1,10 +1,12 @@
 //! Helpers shared by head and tail: `==> NAME <==` headers, GNU counts and
-//! the legacy `-N` syntax.
+//! the last-N-lines scan.
 
 use dogfish_core::InputSource;
 use memchr::memrchr_iter;
 
-/// Name GNU uses for an input in `==> NAME <==` headers.
+use crate::common::xstrtol::xdectoumax;
+
+/// Name GNU uses for an input in `==> NAME <==` headers and messages.
 pub(crate) fn header_name(src: &InputSource) -> &str {
     match src {
         InputSource::Stdin => "standard input",
@@ -12,56 +14,69 @@ pub(crate) fn header_name(src: &InputSource) -> &str {
     }
 }
 
-/// Parses a GNU count with optional multiplier suffix (`b`, `K`, `kB`, `MiB`, ...).
-pub(crate) fn parse_gnu_count(s: &str) -> Option<u64> {
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num, suffix) = s.split_at(split);
-    if num.is_empty() {
-        return None;
-    }
-    let n: u64 = num.parse().unwrap_or(u64::MAX);
-    let pow = |base: u64, exp: u32| base.checked_pow(exp).unwrap_or(u64::MAX);
-    let mult = match suffix {
-        "" => 1,
-        "b" => 512,
-        "kB" | "KB" => 1000,
-        "k" | "K" | "KiB" | "kiB" => 1024,
-        _ => {
-            let letters = "KMGTPEZYRQ";
-            let mut chars = suffix.chars();
-            let first = chars.next()?.to_ascii_uppercase();
-            let exp = letters.find(first)? as u32 + 1;
-            match chars.as_str() {
-                "" | "iB" => pow(1024, exp),
-                "B" => pow(1000, exp),
-                _ => return None,
+/// The suffixes head and tail accept on counts (`2b`, `1k`, `1MiB`, `1kB`).
+pub(crate) const COUNT_SUFFIXES: &str = "bkKmMGTPEZYRQ0";
+
+/// Parses the count of `-n`/`-c` (sign already removed) like GNU's
+/// `xdectoumax`, or returns the `invalid number of lines: 'X'` message.
+pub(crate) fn parse_count(s: &str, count_lines: bool) -> Result<u64, String> {
+    let what = if count_lines {
+        "invalid number of lines"
+    } else {
+        "invalid number of bytes"
+    };
+    xdectoumax(s, 0, u64::MAX, COUNT_SUFFIXES, what)
+}
+
+/// The first digit getopt would return as an option (`-3` after the
+/// obsolete first argument, or `-2cX`): head and tail list `0`-`9` among
+/// their options only to reject them with their own message. `with_arg` and
+/// `long_with_arg` are the options that take a separate argument. Scans like
+/// a permuting getopt, up to `--`.
+pub(crate) fn digit_option(
+    args: &[String],
+    with_arg: &[u8],
+    long_with_arg: &[&str],
+) -> Option<char> {
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if !long.contains('=') && long_with_arg.iter().any(|l| l.starts_with(long)) {
+                iter.next();
+            }
+            continue;
+        }
+        let bytes = arg.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'-' {
+            continue;
+        }
+        for (i, &c) in bytes.iter().enumerate().skip(1) {
+            if c.is_ascii_digit() {
+                return Some(c as char);
+            }
+            if with_arg.contains(&c) {
+                if i + 1 == bytes.len() {
+                    iter.next();
+                }
+                break;
             }
         }
-    };
-    Some(n.saturating_mul(mult))
-}
-
-/// Converts the obsolete `-5` shorthand (first argument only, as in GNU) to `-n 5`.
-pub(crate) fn normalize_legacy_num_arg(mut args: Vec<String>) -> Vec<String> {
-    if let Some(a) = args.get(1)
-        && a.len() > 1
-        && a.starts_with('-')
-        && a[1..].chars().all(|c| c.is_ascii_digit())
-    {
-        let n = a[1..].to_string();
-        args.splice(1..2, ["-n".to_string(), n]);
     }
-    args
+    None
 }
 
-/// Offset where the last `n` lines of `bytes` begin (an unterminated final line counts).
-pub(crate) fn last_lines_start(bytes: &[u8], n: u64) -> usize {
+/// Offset where the last `n` records of `bytes` begin (an unterminated final
+/// record counts), for records ending in `eol`.
+pub(crate) fn last_lines_start(bytes: &[u8], n: u64, eol: u8) -> usize {
     if n == 0 || bytes.is_empty() {
         return bytes.len();
     }
-    let search = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let search = bytes.strip_suffix(&[eol]).unwrap_or(bytes);
     let nth = usize::try_from(n - 1).unwrap_or(usize::MAX);
-    memrchr_iter(b'\n', search)
+    memrchr_iter(eol, search)
         .nth(nth)
         .map(|pos| pos + 1)
         .unwrap_or(0)

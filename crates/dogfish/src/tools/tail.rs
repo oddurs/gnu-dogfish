@@ -13,9 +13,12 @@ use dogfish_core::{
 use memchr::memchr_iter;
 
 use crate::common::head_tail::{
-    header_name, last_lines_start, normalize_legacy_num_arg, parse_gnu_count, to_usize,
+    digit_option, header_name, last_lines_start, parse_count, to_usize,
 };
-use crate::common::lines::{looks_like_json, lossy_lines};
+use crate::common::lines::{line_end, looks_like_json, lossy_lines};
+use crate::common::posixver::posix2_version;
+use crate::common::quote::{qa, quote_locale};
+use crate::common::xstrtol::{StrtolError, xstrtoumax};
 
 #[derive(Parser)]
 #[command(
@@ -51,14 +54,98 @@ struct TailArgs {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
+    /// Line delimiter is NUL, not newline
+    #[arg(short = 'z', long = "zero-terminated")]
+    zero_terminated: bool,
+
     #[arg(short = 'J', long = "json")]
     json: bool,
 
     files: Vec<String>,
 }
 
+/// GNU's `parse_obsolete_option`: with at most one file operand, a first
+/// argument such as `-5`, `+2c`, `-l`, `-3bf` is the whole option list. It
+/// is rewritten as the equivalent options; `Err` is the exit status after
+/// GNU's `invalid number` diagnostic.
+fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
+    let argc = args.len();
+    let operand_ok = argc == 2
+        || (argc == 3 && !(args[2].starts_with('-') && args[2].len() > 1))
+        || ((3..=4).contains(&argc) && args[2] == "--");
+    if !operand_ok {
+        return Ok(args);
+    }
+    let posix_ver = posix2_version();
+    let obsolete_usage = posix_ver < 200112;
+    let traditional_usage = obsolete_usage || 200809 <= posix_ver;
+    let arg = args[1].as_bytes();
+    let from_start = match arg.first() {
+        Some(b'+') if traditional_usage => true,
+        // "-" alone is standard input and "-c" needs an argument, except in
+        // the obsolete usage; "-5" and the like are always accepted.
+        Some(b'-')
+            if obsolete_usage
+                || arg
+                    .get(1 + usize::from(arg.get(1) == Some(&b'c')))
+                    .is_some() =>
+        {
+            false
+        }
+        _ => return Ok(args),
+    };
+    let rest = &arg[1..];
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut p = digits;
+    let mut default_count = 10u64;
+    let mut count_lines = true;
+    match rest.get(p) {
+        Some(b'b') => {
+            default_count *= 512;
+            count_lines = false;
+            p += 1;
+        }
+        Some(b'c') => {
+            count_lines = false;
+            p += 1;
+        }
+        Some(b'l') => p += 1,
+        _ => {}
+    }
+    let forever = rest.get(p) == Some(&b'f');
+    if forever {
+        p += 1;
+    }
+    if p != rest.len() {
+        return Ok(args);
+    }
+    let count = if digits == 0 {
+        default_count
+    } else {
+        let digits = std::str::from_utf8(&rest[..digits]).unwrap_or_default();
+        match xstrtoumax(digits, "b") {
+            (n, None | Some(StrtolError::InvalidSuffix)) => n,
+            _ => {
+                eprintln!(
+                    "tail: invalid number: {}: Numerical result out of range",
+                    quote_locale(&args[1])
+                );
+                return Err(1);
+            }
+        }
+    };
+    let option = if count_lines { "-n" } else { "-c" };
+    let sign = if from_start { "+" } else { "" };
+    let mut replacement = vec![option.to_string(), format!("{sign}{count}")];
+    if forever {
+        replacement.push("-f".to_string());
+    }
+    args.splice(1..2, replacement);
+    Ok(args)
+}
+
 /// Offset at which tail output starts.
-fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64) -> usize {
+fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64, eol: u8) -> usize {
     let len = bytes.len();
     match (by_bytes, from_start) {
         (true, true) => to_usize(count.saturating_sub(1)).min(len),
@@ -67,19 +154,35 @@ fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64) -> usi
             if count <= 1 {
                 0
             } else {
-                memchr_iter(b'\n', bytes)
+                memchr_iter(eol, bytes)
                     .nth(to_usize(count - 2))
                     .map(|p| p + 1)
                     .unwrap_or(len)
             }
         }
-        (false, false) => last_lines_start(bytes, count),
+        (false, false) => last_lines_start(bytes, count, eol),
     }
 }
 
 pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TailArgs::try_parse_from(normalize_legacy_num_arg(args))?;
+    let args = match expand_obsolete(args) {
+        Ok(args) => args,
+        Err(status) => return Ok(status),
+    };
+    let long_with_arg = [
+        "bytes",
+        "lines",
+        "max-unchanged-stats",
+        "pid",
+        "sleep-interval",
+    ];
+    if let Some(c) = digit_option(&args, b"cns", &long_with_arg) {
+        eprintln!("tail: option used in invalid context -- {c}");
+        return Ok(1);
+    }
+    let parsed = TailArgs::try_parse_from(args)?;
     let by_bytes = parsed.bytes.is_some();
+    let eol = line_end(parsed.zero_terminated);
     let spec = parsed
         .bytes
         .as_deref()
@@ -89,14 +192,17 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         Some(rest) => (true, rest),
         None => (false, spec.strip_prefix('-').unwrap_or(spec)),
     };
-    let Some(count) = parse_gnu_count(num_str) else {
-        eprintln!(
-            "tail: invalid number of {}: '{}'",
-            if by_bytes { "bytes" } else { "lines" },
-            spec
-        );
-        return Ok(1);
+    let count = match parse_count(num_str, !by_bytes) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("tail: {msg}");
+            return Ok(1);
+        }
     };
+    // Don't read anything if nothing will be output.
+    if count == 0 && !parsed.follow && !from_start {
+        return Ok(0);
+    }
     let sources = InputSource::from_args(&parsed.files);
 
     let stdout = io::stdout();
@@ -108,7 +214,9 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         && !from_start
         && !parsed.follow
         && !parsed.verbose
+        && !parsed.zero_terminated
         && !ctx.stdin_is_tty
+        && (ctx.stdout_is_tty || parsed.json)
     {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;
@@ -124,7 +232,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
             return Ok(0);
         }
-        let start = tail_start(&all, false, false, count);
+        let start = tail_start(&all, false, false, count, eol);
         ignore_broken_pipe(out.write_all(&all[start..]))?;
         ignore_broken_pipe(out.flush())?;
         return Ok(0);
@@ -142,8 +250,8 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => {
                 let _ = out.flush();
                 eprintln!(
-                    "tail: cannot open '{}' for reading: {}",
-                    src.display_name(),
+                    "tail: cannot open {} for reading: {}",
+                    qa(src.display_name()),
                     gnu_io_error(&e)
                 );
                 exit_code = 1;
@@ -159,7 +267,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
         let res = reader
             .with_bytes(|bytes| {
-                let start = tail_start(bytes, by_bytes, from_start, count);
+                let start = tail_start(bytes, by_bytes, from_start, count, eol);
                 let slice = &bytes[start..];
                 ctx.telemetry.add_read(slice.len() as u64);
                 ctx.telemetry.add_written(slice.len() as u64);
@@ -172,8 +280,8 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => {
                 let _ = out.flush();
                 eprintln!(
-                    "tail: error reading '{}': {}",
-                    src.display_name(),
+                    "tail: error reading {}: {}",
+                    qa(header_name(src)),
                     gnu_io_error(&e)
                 );
                 exit_code = 1;

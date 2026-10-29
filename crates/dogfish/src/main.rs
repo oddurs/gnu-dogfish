@@ -272,6 +272,7 @@ pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
 
 fn main() -> ExitCode {
     install_sigpipe_handler();
+    common::input::restore_closed_stdin();
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Determine if invoked via symlink (e.g. `ls`, `df-ls`) or as `dogfish <subcommand>`

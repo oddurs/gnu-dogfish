@@ -70,29 +70,32 @@ impl FastReader {
                 DEFAULT_BUF_SIZE,
                 Box::new(io::stdin()),
             ))),
-            InputSource::File(path) => {
-                let file = File::open(path)?;
-                let meta = file.metadata()?;
-                if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
-                    // Safety: read-only memory map for fast sequential scan
-                    if let Ok(mmap) = unsafe { Mmap::map(&file) } {
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::madvise(
-                                mmap.as_ptr() as *mut libc::c_void,
-                                mmap.len(),
-                                libc::MADV_SEQUENTIAL,
-                            );
-                        }
-                        return Ok(Self::Mapped(mmap));
-                    }
+            InputSource::File(path) => Self::from_file(File::open(path)?),
+        }
+    }
+
+    /// Wraps an already open file, mapping it when it is a non-empty regular
+    /// file of at most 16 GiB (for callers that inspect the file first).
+    pub fn from_file(file: File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
+            // Safety: read-only memory map for fast sequential scan
+            if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                #[cfg(unix)]
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_SEQUENTIAL,
+                    );
                 }
-                Ok(Self::Buffered(BufReader::with_capacity(
-                    DEFAULT_BUF_SIZE,
-                    Box::new(file),
-                )))
+                return Ok(Self::Mapped(mmap));
             }
         }
+        Ok(Self::Buffered(BufReader::with_capacity(
+            DEFAULT_BUF_SIZE,
+            Box::new(file),
+        )))
     }
 
     /// Reads the entire input as a byte slice (zero-copy if `mmap` succeeded).
