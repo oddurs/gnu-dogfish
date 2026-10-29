@@ -3,36 +3,87 @@
 use std::io::{self, Read, Write};
 
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, io::ignore_broken_pipe, stdout};
 use memchr::memmem;
 
-#[derive(Parser)]
-#[command(
-    name = "tr",
-    about = "Translate, squeeze, and/or delete characters from standard input"
-)]
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version,
+};
+
+const TR_HELP: &str = "\
+Translate, squeeze, and/or delete characters from standard input
+
+Usage: tr [OPTIONS] [SETS]...
+
+Arguments:
+  [SETS]...  Like GNU (`getopt \"+...\"`), options end at the first set: `tr a -b` maps `a` to `-b`,
+             while `tr --bogus a b` is an unrecognized option
+
+Options:
+  -c, --complement       Use the complement of SET1 [alias: -C]
+  -d, --delete           Delete characters in SET1, do not translate
+  -s, --squeeze-repeats  Replace each sequence of a repeated character with a single occurrence
+  -t, --truncate-set1    First truncate SET1 to length of SET2
+      --help             Print help
+";
+
+#[derive(Default)]
 struct TrArgs {
-    /// Use the complement of SET1
-    #[arg(short = 'c', visible_short_alias = 'C', long = "complement")]
     complement: bool,
-
-    /// Delete characters in SET1, do not translate
-    #[arg(short = 'd', long = "delete")]
     delete: bool,
-
-    /// Replace each sequence of a repeated character with a single occurrence
-    #[arg(short = 's', long = "squeeze-repeats")]
     squeeze: bool,
-
-    /// First truncate SET1 to length of SET2
-    #[arg(short = 't', long = "truncate-set1")]
     truncate: bool,
-
-    /// Like GNU (`getopt "+..."`), options end at the first set: `tr a -b` maps `a`
-    /// to `-b`, while `tr --bogus a b` is an unrecognized option.
-    #[arg(trailing_var_arg = true)]
     sets: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrArgsOpt {
+    Complement,
+    Delete,
+    Squeeze,
+    Truncate,
+    CLocale,
+    Help,
+    Version,
+}
+
+/// GNU's `long_options` and `"+AcCdst"` (but `-A`): options end at the first SET,
+/// so `tr a -b` maps `a` to `-b`.
+const SPECS: &[OptSpec<TrArgsOpt>] = &[
+    OptSpec::both(b'c', "complement", HasArg::No, TrArgsOpt::Complement),
+    OptSpec::both(b'd', "delete", HasArg::No, TrArgsOpt::Delete),
+    OptSpec::both(b's', "squeeze-repeats", HasArg::No, TrArgsOpt::Squeeze),
+    OptSpec::both(b't', "truncate-set1", HasArg::No, TrArgsOpt::Truncate),
+    OptSpec::long("help", HasArg::No, TrArgsOpt::Help),
+    OptSpec::long("version", HasArg::No, TrArgsOpt::Version),
+    OptSpec::short(b'C', HasArg::No, TrArgsOpt::Complement),
+    // Undocumented, for AIX: the C locale, which is all Dogfish's tr knows.
+    OptSpec::short(b'A', HasArg::No, TrArgsOpt::CLocale),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_tr_args(args: Vec<std::ffi::OsString>) -> std::result::Result<TrArgs, i32> {
+    let mut parsed = TrArgs::default();
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        SPECS,
+        Order::StopAtOperand,
+    );
+    while let Some(opt) = opts.next() {
+        let (o, _) = opt.map_err(|e| getopt_error("tr", &e))?;
+        match o {
+            TrArgsOpt::Complement => parsed.complement = true,
+            TrArgsOpt::Delete => parsed.delete = true,
+            TrArgsOpt::Squeeze => parsed.squeeze = true,
+            TrArgsOpt::Truncate => parsed.truncate = true,
+            TrArgsOpt::CLocale => {}
+            TrArgsOpt::Help => return Err(print_help(TR_HELP)),
+            TrArgsOpt::Version => return Err(print_version("tr")),
+        }
+    }
+    parsed.sets = lossy_all(opts.operands());
+    Ok(parsed)
 }
 
 /// An expanded tr SET: the bytes, plus where a `[c*]` fill repeat goes (SET2 only).
@@ -175,8 +226,11 @@ fn parse_tr_set(raw: &str) -> std::result::Result<TrSet, String> {
     Ok(out)
 }
 
-pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TrArgs::try_parse_from(args)?;
+pub fn run_tr(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_tr_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let usage_err = |msg: String| {
         eprintln!("tr: {}\nTry 'tr --help' for more information.", msg);
         Ok(1)

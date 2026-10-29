@@ -7,6 +7,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, try_help,
+    unsupported,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, parse_block_size,
@@ -22,6 +23,7 @@ const LS_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'a', "all", HasArg::No, "all"),
     OptSpec::both(b'b', "escape", HasArg::No, "escape"),
     OptSpec::both(b'd', "directory", HasArg::No, "directory"),
+    OptSpec::both(b'D', "dired", HasArg::No, "unsupported"),
     OptSpec::long("full-time", HasArg::No, "full-time"),
     OptSpec::long(
         "group-directories-first",
@@ -676,6 +678,7 @@ pub(crate) fn parse_ls_args(
                 })?
             }
             "json" => o.json = true,
+            "unsupported" => return Err(unsupported("ls", &spelled)),
             "help" => return Err(print_help(LS_HELP)),
             "version" => return Err(print_version("ls")),
             _ => unreachable!("unhandled ls option"),

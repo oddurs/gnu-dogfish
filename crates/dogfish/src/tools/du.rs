@@ -15,7 +15,8 @@ use serde::Serialize;
 
 use crate::common::fnmatch::fnmatch;
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, unsupported,
+    usage_error,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, SizeError, env_block_size, human_readable,
@@ -33,6 +34,7 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'D', "dereference-args", HasArg::No, "dereference-args"),
     OptSpec::long("exclude", HasArg::Required, "exclude"),
     OptSpec::both(b'X', "exclude-from", HasArg::Required, "exclude-from"),
+    OptSpec::long("files0-from", HasArg::Required, "unsupported"),
     OptSpec::both(b'h', "human-readable", HasArg::No, "human-readable"),
     OptSpec::long("inodes", HasArg::No, "inodes"),
     OptSpec::long("si", HasArg::No, "si"),
@@ -44,6 +46,8 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b's', "summarize", HasArg::No, "summarize"),
     OptSpec::both(b'c', "total", HasArg::No, "total"),
     OptSpec::both(b't', "threshold", HasArg::Required, "threshold"),
+    OptSpec::long("time", HasArg::Optional, "unsupported"),
+    OptSpec::long("time-style", HasArg::Required, "unsupported"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
@@ -544,6 +548,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             }
             "one-file-system" => cfg.one_file_system = true,
             "json" => json = true,
+            "unsupported" => return Ok(unsupported("du", &opt.spelled)),
             "help" => return Ok(print_help(DU_HELP)),
             "version" => return Ok(print_version("du")),
             _ => unreachable!("unhandled du option"),

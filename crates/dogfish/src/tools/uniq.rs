@@ -3,60 +3,206 @@
 use std::cmp::Ordering;
 use std::io::{self, BufRead, Read, Write};
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
     io::ignore_broken_pipe, read_ndjson_stdin, stdout, table::compare_json_field,
 };
 use serde_json::Value;
 
+use crate::common::getopt::{
+    Arg, Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version,
+    unsupported, usage_error,
+};
 use crate::common::lines::{chomp, is_blank, looks_like_json, lossy_lines};
+use crate::common::quote::quote_locale;
 
-#[derive(Parser)]
-#[command(
-    name = "uniq",
-    about = "Report or omit repeated lines or NDJSON objects"
-)]
+const UNIQ_HELP: &str = "\
+Report or omit repeated lines or NDJSON objects
+
+Usage: uniq [OPTIONS] [INPUT] [OUTPUT]
+
+Arguments:
+  [INPUT]   
+  [OUTPUT]  
+
+Options:
+  -c, --count                      Prefix lines by the number of occurrences
+  -d, --repeated                   Only print duplicate lines, one for each group
+  -f, --skip-fields <SKIP_FIELDS>  Avoid comparing the first N fields [default: 0]
+  -i, --ignore-case                Ignore differences in case when comparing
+  -s, --skip-chars <SKIP_CHARS>    Avoid comparing the first N characters [default: 0]
+  -u, --unique                     Only print unique lines
+  -w, --check-chars <CHECK_CHARS>  Compare no more than N characters in lines
+      --by <BY_FIELD>              Deduplicate NDJSON objects by named field
+  -J, --json                       
+      --help                       Print help
+";
+
+#[derive(Default)]
 struct UniqArgs {
-    /// Prefix lines by the number of occurrences
-    #[arg(short = 'c', long = "count")]
     count: bool,
-
-    /// Only print duplicate lines, one for each group
-    #[arg(short = 'd', long = "repeated")]
     repeated: bool,
-
-    /// Avoid comparing the first N fields
-    #[arg(short = 'f', long = "skip-fields", default_value_t = 0)]
     skip_fields: usize,
-
-    /// Ignore differences in case when comparing
-    #[arg(short = 'i', long = "ignore-case")]
     ignore_case: bool,
-
-    /// Avoid comparing the first N characters
-    #[arg(short = 's', long = "skip-chars", default_value_t = 0)]
     skip_chars: usize,
-
-    /// Only print unique lines
-    #[arg(short = 'u', long = "unique")]
     unique: bool,
-
-    /// Compare no more than N characters in lines
-    #[arg(short = 'w', long = "check-chars")]
     check_chars: Option<usize>,
-
-    /// Deduplicate NDJSON objects by named field
-    #[arg(long = "by")]
     by_field: Option<String>,
-
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     input: Option<String>,
-
     output: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UniqOpt {
+    Count,
+    Repeated,
+    IgnoreCase,
+    Unique,
+    SkipFields,
+    SkipChars,
+    CheckChars,
+    By,
+    Json,
+    /// GNU's obsolete `-N`: skip N fields.
+    Digit(u8),
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    Version,
+}
+
+const fn digit(c: u8) -> OptSpec<UniqOpt> {
+    OptSpec::short(c, HasArg::No, UniqOpt::Digit(c))
+}
+
+/// GNU's `longopts` and `"-0123456789Dcdf:is:uw:z"`, plus the Dogfish `--by`
+/// and `-J, --json`.
+const SPECS: &[OptSpec<UniqOpt>] = &[
+    OptSpec::both(b'c', "count", HasArg::No, UniqOpt::Count),
+    OptSpec::both(b'd', "repeated", HasArg::No, UniqOpt::Repeated),
+    OptSpec::long("all-repeated", HasArg::Optional, UniqOpt::Unsupported),
+    OptSpec::long("group", HasArg::Optional, UniqOpt::Unsupported),
+    OptSpec::both(b'i', "ignore-case", HasArg::No, UniqOpt::IgnoreCase),
+    OptSpec::both(b'u', "unique", HasArg::No, UniqOpt::Unique),
+    OptSpec::both(b'f', "skip-fields", HasArg::Required, UniqOpt::SkipFields),
+    OptSpec::both(b's', "skip-chars", HasArg::Required, UniqOpt::SkipChars),
+    OptSpec::both(b'w', "check-chars", HasArg::Required, UniqOpt::CheckChars),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, UniqOpt::Unsupported),
+    OptSpec::long("help", HasArg::No, UniqOpt::Help),
+    OptSpec::long("version", HasArg::No, UniqOpt::Version),
+    OptSpec::long("by", HasArg::Required, UniqOpt::By),
+    OptSpec::both(b'J', "json", HasArg::No, UniqOpt::Json),
+    digit(b'0'),
+    digit(b'1'),
+    digit(b'2'),
+    digit(b'3'),
+    digit(b'4'),
+    digit(b'5'),
+    digit(b'6'),
+    digit(b'7'),
+    digit(b'8'),
+    digit(b'9'),
+    OptSpec::short(b'D', HasArg::No, UniqOpt::Unsupported),
+];
+
+/// GNU `xstrtoumax` with no suffixes: a decimal count, too large meaning the
+/// largest.
+fn count_arg(s: &str) -> Option<usize> {
+    let t = s.trim_start();
+    let t = t.strip_prefix('+').unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(t.parse().unwrap_or(usize::MAX))
+}
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a diagnostic.
+fn parse_uniq_args(args: Vec<OsString>) -> std::result::Result<UniqArgs, i32> {
+    let mut p = UniqArgs::default();
+    let mut files: Vec<String> = Vec::new();
+    // Whether the field count came from `-N` (digits accumulate) or `-f`.
+    let mut obsolete_fields = false;
+    let size_opt = |v: &str, what: &str| {
+        count_arg(v).ok_or_else(|| {
+            eprintln!("uniq: {v}: {what}");
+            1
+        })
+    };
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::InPlace);
+    let posixly_correct = std::env::var_os("POSIXLY_CORRECT").is_some();
+    while let Some(item) = opts.next_in_order() {
+        let (o, v) = match item.map_err(|e| getopt_error("uniq", &e))? {
+            Arg::Operand(arg) => {
+                let arg = lossy(&arg);
+                // GNU's obsolete `+N`: skip N characters.
+                if let Some(n) = arg.strip_prefix('+').and_then(count_arg) {
+                    p.skip_chars = n;
+                } else if files.len() == 2 {
+                    return Err(usage_error(
+                        "uniq",
+                        format!("extra operand {}", quote_locale(&arg)),
+                    ));
+                } else {
+                    files.push(arg);
+                }
+                // Under POSIXLY_CORRECT, options end with the first file.
+                if posixly_correct && !files.is_empty() {
+                    while let Some(rest) = opts.take_next() {
+                        let rest = lossy(&rest);
+                        if files.len() == 2 {
+                            return Err(usage_error(
+                                "uniq",
+                                format!("extra operand {}", quote_locale(&rest)),
+                            ));
+                        }
+                        files.push(rest);
+                    }
+                    break;
+                }
+                continue;
+            }
+            Arg::Opt(o, v) => (o, v.as_deref().map(lossy).unwrap_or_default()),
+        };
+        match o {
+            UniqOpt::Count => p.count = true,
+            UniqOpt::Repeated => p.repeated = true,
+            UniqOpt::IgnoreCase => p.ignore_case = true,
+            UniqOpt::Unique => p.unique = true,
+            UniqOpt::Digit(c) => {
+                if !obsolete_fields {
+                    p.skip_fields = 0;
+                }
+                p.skip_fields = p
+                    .skip_fields
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add(usize::from(c - b'0')))
+                    .unwrap_or(usize::MAX);
+                obsolete_fields = true;
+            }
+            UniqOpt::SkipFields => {
+                obsolete_fields = false;
+                p.skip_fields = size_opt(&v, "invalid number of fields to skip")?;
+            }
+            UniqOpt::SkipChars => p.skip_chars = size_opt(&v, "invalid number of bytes to skip")?,
+            UniqOpt::CheckChars => {
+                p.check_chars = Some(size_opt(&v, "invalid number of bytes to compare")?)
+            }
+            UniqOpt::By => p.by_field = Some(v),
+            UniqOpt::Json => p.json = true,
+            UniqOpt::Unsupported => return Err(unsupported("uniq", &opts.last_spelling())),
+            UniqOpt::Help => return Err(print_help(UNIQ_HELP)),
+            UniqOpt::Version => return Err(print_version("uniq")),
+        }
+    }
+    let mut files = files.into_iter();
+    p.input = files.next();
+    p.output = files.next();
+    Ok(p)
 }
 
 fn uniq_key<'a>(line: &'a [u8], p: &UniqArgs) -> &'a [u8] {
@@ -77,8 +223,11 @@ fn uniq_key<'a>(line: &'a [u8], p: &UniqArgs) -> &'a [u8] {
     &line[start..end]
 }
 
-pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = UniqArgs::try_parse_from(args)?;
+pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_uniq_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let src = match parsed.input {
         Some(ref f) if f != "-" => InputSource::File(f.clone()),
         _ => InputSource::Stdin,

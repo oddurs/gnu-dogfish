@@ -2,8 +2,10 @@
 
 use std::io::{self, Read, Write};
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table,
     eval_json_where, gnu_io_error, io::ignore_broken_pipe, read_ndjson_stdin, stdout,
@@ -11,59 +13,145 @@ use dogfish_core::{
 use memchr::memmem;
 use serde_json::{Map, Value};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, unsupported,
+    usage_error,
+};
 use crate::common::lines::{looks_like_json, lossy_lines, split_lines};
 
-#[derive(Parser)]
-#[command(
-    name = "cut",
-    about = "Remove sections from each line of files or project fields from NDJSON"
-)]
+const CUT_HELP: &str = "\
+Remove sections from each line of files or project fields from NDJSON
+
+Usage: cut [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+  -b, --bytes <BYTES>
+          Select only these bytes (e.g. 1-5, 2,4)
+  -c, --characters <CHARS>
+          Select only these characters (bytes, as in GNU coreutils)
+  -n
+          (ignored)
+  -f, --fields <FIELDS>
+          Select only these fields (1-indexed numbers or NDJSON field names like `name,size`)
+          [alias: --field]
+  -d, --delimiter <DELIMITER>
+          Use DELIM instead of TAB for field delimiter
+      --complement
+          Complement the set of selected bytes, characters or fields
+  -s, --only-delimited
+          Do not print lines not containing delimiters
+      --output-delimiter <OUTPUT_DELIMITER>
+          Output delimiter (defaults to input delimiter)
+  -w, --where <WHERE_EXPR>
+          Filter NDJSON objects before projecting (e.g., `--where \"size>1K\"`)
+  -J, --json
+          
+      --help
+          Print help
+";
+
+#[derive(Default)]
 struct CutArgs {
-    /// Select only these bytes (e.g. 1-5, 2,4)
-    #[arg(short = 'b', long = "bytes", allow_hyphen_values = true)]
     bytes: Option<String>,
-
-    /// Select only these characters (bytes, as in GNU coreutils)
-    #[arg(short = 'c', long = "characters", allow_hyphen_values = true)]
     chars: Option<String>,
-
-    /// (ignored)
-    #[arg(short = 'n')]
-    no_split: bool,
-
-    /// Select only these fields (1-indexed numbers or NDJSON field names like `name,size`)
-    #[arg(
-        short = 'f',
-        long = "fields",
-        visible_alias = "field",
-        allow_hyphen_values = true
-    )]
     fields: Option<String>,
-
-    /// Use DELIM instead of TAB for field delimiter
-    #[arg(short = 'd', long = "delimiter", allow_hyphen_values = true)]
-    delimiter: Option<String>,
-
-    /// Complement the set of selected bytes, characters or fields
-    #[arg(long = "complement")]
+    /// One byte, as in GNU (`-d ''` is NUL).
+    delimiter: Option<Vec<u8>>,
     complement: bool,
-
-    /// Do not print lines not containing delimiters
-    #[arg(short = 's', long = "only-delimited")]
     only_delimited: bool,
-
-    /// Output delimiter (defaults to input delimiter)
-    #[arg(long = "output-delimiter")]
-    output_delimiter: Option<String>,
-
-    /// Filter NDJSON objects before projecting (e.g., `--where "size>1K"`)
-    #[arg(short = 'w', long = "where")]
+    output_delimiter: Option<Vec<u8>>,
     where_expr: Option<String>,
-
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     files: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CutOpt {
+    Bytes,
+    Chars,
+    Fields,
+    Delimiter,
+    OnlyDelimited,
+    OutputDelimiter,
+    Complement,
+    NoSplit,
+    Where,
+    Json,
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    Version,
+}
+
+/// GNU's `longopts` and `"b:c:d:f:nsz"`, plus the Dogfish `--field`,
+/// `-w, --where` and `-J, --json`.
+const SPECS: &[OptSpec<CutOpt>] = &[
+    OptSpec::both(b'b', "bytes", HasArg::Required, CutOpt::Bytes),
+    OptSpec::both(b'c', "characters", HasArg::Required, CutOpt::Chars),
+    OptSpec::both(b'f', "fields", HasArg::Required, CutOpt::Fields),
+    OptSpec::both(b'd', "delimiter", HasArg::Required, CutOpt::Delimiter),
+    OptSpec::both(b's', "only-delimited", HasArg::No, CutOpt::OnlyDelimited),
+    OptSpec::long(
+        "output-delimiter",
+        HasArg::Required,
+        CutOpt::OutputDelimiter,
+    ),
+    OptSpec::long("complement", HasArg::No, CutOpt::Complement),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, CutOpt::Unsupported),
+    OptSpec::long("help", HasArg::No, CutOpt::Help),
+    OptSpec::long("version", HasArg::No, CutOpt::Version),
+    OptSpec::long("field", HasArg::Required, CutOpt::Fields),
+    OptSpec::both(b'w', "where", HasArg::Required, CutOpt::Where),
+    OptSpec::both(b'J', "json", HasArg::No, CutOpt::Json),
+    OptSpec::short(b'n', HasArg::No, CutOpt::NoSplit),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a diagnostic.
+fn parse_cut_args(args: Vec<OsString>) -> std::result::Result<CutArgs, i32> {
+    let mut p = CutArgs::default();
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("cut", &e))?;
+        let raw = v.map(OsString::into_vec).unwrap_or_default();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        match o {
+            CutOpt::Bytes | CutOpt::Chars | CutOpt::Fields => {
+                // GNU checks this as it meets the second list.
+                if p.bytes.is_some() || p.chars.is_some() || p.fields.is_some() {
+                    return Err(usage_error("cut", "only one list may be specified"));
+                }
+                *match o {
+                    CutOpt::Bytes => &mut p.bytes,
+                    CutOpt::Chars => &mut p.chars,
+                    _ => &mut p.fields,
+                } = Some(text);
+            }
+            CutOpt::Delimiter => {
+                if raw.len() > 1 {
+                    return Err(usage_error(
+                        "cut",
+                        "the delimiter must be a single character",
+                    ));
+                }
+                p.delimiter = Some(vec![raw.first().copied().unwrap_or(0)]);
+            }
+            CutOpt::OnlyDelimited => p.only_delimited = true,
+            CutOpt::OutputDelimiter => p.output_delimiter = Some(raw),
+            CutOpt::Complement => p.complement = true,
+            CutOpt::NoSplit => {}
+            CutOpt::Where => p.where_expr = Some(text),
+            CutOpt::Json => p.json = true,
+            CutOpt::Unsupported => return Err(unsupported("cut", &opts.last_spelling())),
+            CutOpt::Help => return Err(print_help(CUT_HELP)),
+            CutOpt::Version => return Err(print_version("cut")),
+        }
+    }
+    p.files = lossy_all(opts.operands());
+    Ok(p)
 }
 
 /// `-b` and `-c` are the same byte selection (as in GNU coreutils, which has
@@ -222,8 +310,11 @@ fn cut_buffer<W: Write>(bytes: &[u8], spec: &CutSpec, out: &mut W) -> io::Result
     Ok(())
 }
 
-pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = CutArgs::try_parse_from(args)?;
+pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_cut_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let sources = InputSource::from_args(&parsed.files);
 
     let mut all_stdin: Option<Vec<u8>> = None;
@@ -268,17 +359,14 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         eprintln!("cut: {msg}\nTry 'cut --help' for more information.");
         Ok(1)
     };
-    let delim = parsed.delimiter.clone().unwrap_or_else(|| "\t".to_string());
-    if delim.chars().count() != 1 {
-        return usage_error("the delimiter must be a single character");
-    }
+    let delim = parsed.delimiter.clone().unwrap_or_else(|| b"\t".to_vec());
     let (mode, list) = match (&parsed.bytes, &parsed.chars, &parsed.fields) {
         (Some(l), None, None) | (None, Some(l), None) => (CutMode::Bytes, l),
         (None, None, Some(l)) => (CutMode::Fields, l),
         (None, None, None) => {
             return usage_error("you must specify a list of bytes, characters, or fields");
         }
-        _ => return usage_error("only one type of list may be specified"),
+        _ => return usage_error("only one list may be specified"),
     };
     if mode == CutMode::Bytes && parsed.delimiter.is_some() {
         return usage_error("an input delimiter may be specified only when operating on fields");
@@ -301,11 +389,11 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         delimit_bytes: parsed.output_delimiter.is_some(),
         out_delim: match parsed.output_delimiter.as_deref() {
             // GNU treats an empty `--output-delimiter` as a NUL byte.
-            Some("") => vec![0],
-            Some(d) => d.as_bytes().to_vec(),
-            None => delim.as_bytes().to_vec(),
+            Some([]) => vec![0],
+            Some(d) => d.to_vec(),
+            None => delim.clone(),
         },
-        delim: delim.into_bytes(),
+        delim,
         only_delimited: parsed.only_delimited,
     };
 
@@ -322,6 +410,8 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             match res {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
+                // A failed write ends the run with GNU's `write error`.
+                Err(e) if stdout::is_write_error(&e) => return Err(e.into()),
                 Err(e) => {
                     let _ = out.flush();
                     eprintln!("cut: {}: {}", src.display_name(), gnu_io_error(&e));

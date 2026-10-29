@@ -216,6 +216,14 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
         self.args.get(self.idx).map(OsString::as_os_str)
     }
 
+    /// Takes the argument [`Getopt::peek`] shows, as an operand's own
+    /// argument (`sort +1 -3`).
+    pub(crate) fn take_next(&mut self) -> Option<OsString> {
+        let arg = self.peek()?.to_os_string();
+        self.idx += 1;
+        Some(arg)
+    }
+
     /// Replaces the arguments parsed so far with `items` and resumes at the
     /// first of them (how GNU `env -S` re-injects its split string).
     pub(crate) fn splice_front(&mut self, items: Vec<OsString>) {
@@ -478,6 +486,14 @@ pub(crate) fn getopt_error(tool: &str, err: &GetoptError) -> i32 {
     try_help(tool)
 }
 
+/// Refuses a GNU option Dogfish does not implement yet. Such options are in
+/// the tools' option tables all the same, so that abbreviations resolve (and
+/// are ambiguous) exactly as in GNU. Returns exit status 1.
+pub(crate) fn unsupported(tool: &str, spelled: &str) -> i32 {
+    eprintln!("{tool}: option '{spelled}' is not supported yet");
+    1
+}
+
 /// Prints `--help` text; returns 0. A write error is reported at exit.
 pub(crate) fn print_help(text: &str) -> i32 {
     dogfish_core::stdout::print_str(text);
@@ -537,6 +553,47 @@ pub(crate) fn argmatch<V: Copy + PartialEq>(
     eprintln!("{msg}");
     eprintln!("Try '{tool} --help' for more information.");
     Err(1)
+}
+
+/// gnulib `xdectoimax`: `arg` as a decimal integer within `min..=max`;
+/// otherwise prints GNU's `tool: WHAT: 'ARG'` diagnostic (with the reason
+/// when the number is out of range) and returns exit status 1.
+pub(crate) fn xdectoimax(
+    tool: &str,
+    arg: &str,
+    min: i64,
+    max: i64,
+    what: &str,
+) -> Result<i64, i32> {
+    const EOVERFLOW: &str = "Value too large for defined data type";
+    const ERANGE: &str = "Numerical result out of range";
+    let fail = |why: Option<&str>| {
+        match why {
+            Some(why) => eprintln!("{tool}: {what}: {}: {why}", quote_locale(arg)),
+            None => eprintln!("{tool}: {what}: {}", quote_locale(arg)),
+        }
+        1
+    };
+    let t = arg.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if len == 0 {
+        return Err(fail(None));
+    }
+    let value = format!("{}{}", if neg { "-" } else { "" }, &digits[..len]).parse::<i64>();
+    if len < digits.len() {
+        return Err(fail(None));
+    }
+    let n = value.map_err(|_| fail(Some(EOVERFLOW)))?;
+    if n < min || n > max {
+        let type_overflow = n > i64::from(i32::MAX / 2) || n < i64::from(i32::MIN / 2);
+        return Err(fail(Some(if type_overflow { EOVERFLOW } else { ERANGE })));
+    }
+    Ok(n)
 }
 
 /// An argument as text, for tools whose logic works on `str`. Bytes that
@@ -841,6 +898,15 @@ mod tests {
         assert_eq!(argmatch("t", "--x", "o", &table), Ok(1));
         assert_eq!(argmatch("t", "--x", "x", &table), Err(1));
         assert_eq!(argmatch("t", "--x", "", &table), Err(1));
+    }
+
+    #[test]
+    fn xdectoimax_ranges() {
+        assert_eq!(xdectoimax("t", " +7", 1, 9, "w"), Ok(7));
+        assert_eq!(xdectoimax("t", "-3", i64::MIN, i64::MAX, "w"), Ok(-3));
+        assert_eq!(xdectoimax("t", "0", 1, 9, "w"), Err(1));
+        assert_eq!(xdectoimax("t", "5x", 1, 9, "w"), Err(1));
+        assert_eq!(xdectoimax("t", "99999999999999999999", 1, 9, "w"), Err(1));
     }
 
     #[test]

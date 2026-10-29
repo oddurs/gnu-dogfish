@@ -5,8 +5,10 @@ use std::cmp::Ordering;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Read, Write};
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
+
 use anyhow::Result;
-use clap::{ArgAction, Parser};
 use digest::Digest;
 use dogfish_core::{
     DogfishContext, FastReader, InputSource, emit_objects_or_table, eval_json_where, gnu_io_error,
@@ -15,109 +17,336 @@ use dogfish_core::{
 use md5::Md5;
 use rayon::prelude::*;
 
+use crate::common::getopt::{
+    Arg, Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
+    print_version, unsupported,
+};
 use crate::common::lines::{is_blank, looks_like_json, lossy_lines, split_lines};
 
-#[derive(Parser)]
-#[command(
-    name = "sort",
-    about = "Sort lines of text files or NDJSON object streams",
-    disable_help_flag = true
-)]
+const SORT_HELP: &str = "\
+Sort lines of text files or NDJSON object streams
+
+Usage: sort [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+      --help                         Print help
+  -b, --ignore-leading-blanks        Ignore leading blanks
+  -d, --dictionary-order             Consider only blanks and alphanumeric characters
+  -f, --ignore-case                  Fold lower case to upper case characters
+  -g, --general-numeric-sort         Compare according to general numerical value
+  -h, --human-numeric-sort           Compare human readable numbers (e.g., 2K, 1G)
+  -i, --ignore-nonprinting           Consider only printable characters
+  -M, --month-sort                   Compare (unknown) < 'JAN' < ... < 'DEC'
+  -n, --numeric-sort                 Compare according to string numerical value
+  -R, --random-sort                  Shuffle, but group identical keys
+      --random-source <FILE>         Get random bytes from FILE
+      --sort <WORD>                  Sort according to WORD: general-numeric -g, human-numeric -h,
+                                     month -M, numeric -n, random -R, version -V
+  -V, --version-sort                 Natural sort of (version) numbers within text
+  -r, --reverse                      Reverse the result of comparisons [alias: --desc]
+  -c, --check                        Check for sorted input; do not sort
+  -k, --key <KEYS>                   Sort via a key; KEYDEF gives location and type
+                                     (F[.C][OPTS][,F[.C][OPTS]])
+  -o, --output <OUTPUT>              Write result to FILE instead of standard output
+  -s, --stable                       Stabilize sort by disabling last-resort comparison
+  -t, --field-separator <SEPARATOR>  Use SEP instead of non-blank to blank transition
+  -u, --unique                       Output only the first of an equal run
+      --by <BY_FIELD>                Modern Dogfish extension: Sort NDJSON objects by named field
+                                     (e.g., `--by size`)
+  -w, --where <WHERE_EXPR>           Filter NDJSON objects before sorting (e.g., `--where
+                                     \"size>10K\"`)
+  -J, --json                         Emit JSON / NDJSON output
+";
+
+#[derive(Default)]
 struct SortArgs {
-    /// Print help
-    #[arg(long = "help", action = ArgAction::Help)]
-    help: Option<bool>,
-
-    /// Ignore leading blanks
-    #[arg(short = 'b', long = "ignore-leading-blanks")]
     ignore_blanks: bool,
-
-    /// Consider only blanks and alphanumeric characters
-    #[arg(short = 'd', long = "dictionary-order")]
     dictionary: bool,
-
-    /// Fold lower case to upper case characters
-    #[arg(short = 'f', long = "ignore-case")]
     ignore_case: bool,
-
-    /// Compare according to general numerical value
-    #[arg(short = 'g', long = "general-numeric-sort")]
     general_numeric: bool,
-
-    /// Compare human readable numbers (e.g., 2K, 1G)
-    #[arg(short = 'h', long = "human-numeric-sort")]
     human_numeric: bool,
-
-    /// Consider only printable characters
-    #[arg(short = 'i', long = "ignore-nonprinting")]
     ignore_nonprinting: bool,
-
-    /// Compare (unknown) < 'JAN' < ... < 'DEC'
-    #[arg(short = 'M', long = "month-sort")]
     month: bool,
-
-    /// Compare according to string numerical value
-    #[arg(short = 'n', long = "numeric-sort")]
     numeric: bool,
-
-    /// Shuffle, but group identical keys
-    #[arg(short = 'R', long = "random-sort")]
     random: bool,
-
-    /// Get random bytes from FILE
-    #[arg(long = "random-source", value_name = "FILE")]
     random_source: Option<String>,
-
-    /// Sort according to WORD: general-numeric -g, human-numeric -h, month -M,
-    /// numeric -n, random -R, version -V
-    #[arg(long = "sort", value_name = "WORD", action = ArgAction::Append)]
     sort_words: Vec<String>,
-
-    /// Natural sort of (version) numbers within text
-    #[arg(short = 'V', long = "version-sort")]
     version: bool,
-
-    /// Reverse the result of comparisons
-    #[arg(short = 'r', long = "reverse", visible_alias = "desc")]
     reverse: bool,
-
-    /// Check for sorted input; do not sort
-    #[arg(short = 'c', long = "check")]
     check: bool,
-
-    /// Sort via a key; KEYDEF gives location and type (F[.C][OPTS][,F[.C][OPTS]])
-    #[arg(short = 'k', long = "key", action = ArgAction::Append)]
+    /// `-C`: check without reporting the disorder.
+    check_quiet: bool,
     keys: Vec<String>,
-
-    /// Write result to FILE instead of standard output
-    #[arg(short = 'o', long = "output")]
     output: Option<String>,
-
-    /// Stabilize sort by disabling last-resort comparison
-    #[arg(short = 's', long = "stable")]
     stable: bool,
-
-    /// Use SEP instead of non-blank to blank transition
-    #[arg(short = 't', long = "field-separator")]
     separator: Option<String>,
-
-    /// Output only the first of an equal run
-    #[arg(short = 'u', long = "unique")]
     unique: bool,
-
-    /// Modern Dogfish extension: Sort NDJSON objects by named field (e.g., `--by size`)
-    #[arg(long = "by")]
     by_field: Option<String>,
-
-    /// Filter NDJSON objects before sorting (e.g., `--where "size>10K"`)
-    #[arg(short = 'w', long = "where")]
     where_expr: Option<String>,
-
-    /// Emit JSON / NDJSON output
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     files: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortOpt {
+    IgnoreBlanks,
+    Check,
+    CheckQuiet,
+    CheckWhen,
+    Dictionary,
+    IgnoreCase,
+    General,
+    Nonprinting,
+    Key,
+    Month,
+    Numeric,
+    Human,
+    Version,
+    Random,
+    RandomSource,
+    Sort,
+    Output,
+    Reverse,
+    Stable,
+    Separator,
+    Unique,
+    By,
+    Where,
+    Json,
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    PrintVersion,
+}
+
+/// GNU's `long_options` (in its order: it decides ambiguity diagnostics) and
+/// `short_options` for the options Dogfish implements, plus the Dogfish
+/// `--desc`, `--by`, `-w, --where` and `-J, --json`.
+const SPECS: &[OptSpec<SortOpt>] = &[
+    OptSpec::both(
+        b'b',
+        "ignore-leading-blanks",
+        HasArg::No,
+        SortOpt::IgnoreBlanks,
+    ),
+    OptSpec::long("check", HasArg::Optional, SortOpt::CheckWhen),
+    OptSpec::long("compress-program", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::long("debug", HasArg::No, SortOpt::Unsupported),
+    OptSpec::both(b'd', "dictionary-order", HasArg::No, SortOpt::Dictionary),
+    OptSpec::both(b'f', "ignore-case", HasArg::No, SortOpt::IgnoreCase),
+    OptSpec::long("files0-from", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::both(b'g', "general-numeric-sort", HasArg::No, SortOpt::General),
+    OptSpec::both(b'i', "ignore-nonprinting", HasArg::No, SortOpt::Nonprinting),
+    OptSpec::both(b'k', "key", HasArg::Required, SortOpt::Key),
+    OptSpec::both(b'm', "merge", HasArg::No, SortOpt::Unsupported),
+    OptSpec::both(b'M', "month-sort", HasArg::No, SortOpt::Month),
+    OptSpec::both(b'n', "numeric-sort", HasArg::No, SortOpt::Numeric),
+    OptSpec::both(b'h', "human-numeric-sort", HasArg::No, SortOpt::Human),
+    OptSpec::both(b'V', "version-sort", HasArg::No, SortOpt::Version),
+    OptSpec::both(b'R', "random-sort", HasArg::No, SortOpt::Random),
+    OptSpec::long("random-source", HasArg::Required, SortOpt::RandomSource),
+    OptSpec::long("sort", HasArg::Required, SortOpt::Sort),
+    OptSpec::both(b'o', "output", HasArg::Required, SortOpt::Output),
+    OptSpec::both(b'r', "reverse", HasArg::No, SortOpt::Reverse),
+    OptSpec::both(b's', "stable", HasArg::No, SortOpt::Stable),
+    OptSpec::long("batch-size", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::both(b'S', "buffer-size", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::both(
+        b't',
+        "field-separator",
+        HasArg::Required,
+        SortOpt::Separator,
+    ),
+    OptSpec::both(
+        b'T',
+        "temporary-directory",
+        HasArg::Required,
+        SortOpt::Unsupported,
+    ),
+    OptSpec::both(b'u', "unique", HasArg::No, SortOpt::Unique),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, SortOpt::Unsupported),
+    OptSpec::long("parallel", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::long("help", HasArg::No, SortOpt::Help),
+    OptSpec::long("version", HasArg::No, SortOpt::PrintVersion),
+    OptSpec::long("desc", HasArg::No, SortOpt::Reverse),
+    OptSpec::long("by", HasArg::Required, SortOpt::By),
+    OptSpec::both(b'w', "where", HasArg::Required, SortOpt::Where),
+    OptSpec::both(b'J', "json", HasArg::No, SortOpt::Json),
+    OptSpec::short(b'c', HasArg::No, SortOpt::Check),
+    OptSpec::short(b'C', HasArg::No, SortOpt::CheckQuiet),
+];
+
+/// `N[.M]` of an obsolete key position and the ordering letters after it.
+fn obsolete_pos(pos: &[u8]) -> Option<(u64, u64, &[u8])> {
+    let digits = |s: &[u8]| s.iter().take_while(|c| c.is_ascii_digit()).count();
+    let number = |s: &[u8]| std::str::from_utf8(s).ok()?.parse::<u64>().ok();
+    let n = digits(pos);
+    let field = number(&pos[..n])?;
+    let mut rest = &pos[n..];
+    let mut chr = 0;
+    if let Some(r) = rest.strip_prefix(b".") {
+        let m = digits(r);
+        chr = number(&r[..m])?;
+        rest = &r[m..];
+    }
+    rest.iter()
+        .all(|c| b"bdfgiMhnRrV".contains(c))
+        .then_some((field, chr, rest))
+}
+
+/// The `-k` spelling of GNU's obsolete `+POS1 [-POS2]` key (`+1 -3` is
+/// `-k 2.1,3`), or `None` when `pos1` (after the `+`) is no valid position:
+/// GNU then takes the operand for a file. `pos2` is after its `-`.
+fn obsolete_key(pos1: &[u8], pos2: Option<&[u8]>) -> Option<String> {
+    let (sword, schar, sopts) = obsolete_pos(pos1)?;
+    let mut key = format!(
+        "{}.{}{}",
+        sword.saturating_add(1),
+        schar.saturating_add(1),
+        String::from_utf8_lossy(sopts)
+    );
+    if let Some(pos2) = pos2 {
+        let (eword, echar, eopts) = obsolete_pos(pos2)?;
+        let eopts = String::from_utf8_lossy(eopts);
+        // `-B` ends with field B; `-B.y` at character y of field B+1.
+        if echar == 0 {
+            key.push_str(&format!(",{}{eopts}", eword.max(1)));
+        } else {
+            key.push_str(&format!(",{}.{echar}{eopts}", eword.saturating_add(1)));
+        }
+    }
+    Some(key)
+}
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a diagnostic.
+fn parse_sort_args(args: Vec<OsString>) -> std::result::Result<SortArgs, i32> {
+    use SortOpt::*;
+    let mut p = SortArgs::default();
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::InPlace);
+    let posixly_correct = std::env::var_os("POSIXLY_CORRECT").is_some();
+    // GNU's `checkonly`: `c` reports the first disorder, `C` does not.
+    let mut checkonly: Option<char> = None;
+    let incompatible = |opts: &str| {
+        eprintln!("sort: options '-{opts}' are incompatible");
+        2
+    };
+    while let Some(item) = opts.next_in_order() {
+        let (o, v) = match item.map_err(|e| getopt_error("sort", &e))? {
+            Arg::Operand(file) => {
+                // GNU's obsolete `+POS1 [-POS2]` keys, as in its getopt loop.
+                if let Some(pos1) = file.as_bytes().strip_prefix(b"+") {
+                    let pos2 = opts
+                        .peek()
+                        .map(|n| n.as_bytes())
+                        .filter(|n| !posixly_correct && n.len() > 1 && n[1].is_ascii_digit())
+                        .and_then(|n| n.strip_prefix(b"-"))
+                        .map(<[u8]>::to_vec);
+                    if let Some(key) = obsolete_key(pos1, pos2.as_deref()) {
+                        if pos2.is_some() {
+                            opts.take_next();
+                        }
+                        p.keys.push(key);
+                        continue;
+                    }
+                }
+                p.files.push(lossy(&file));
+                continue;
+            }
+            Arg::Opt(o, v) => (o, v.as_deref().map(lossy)),
+        };
+        match o {
+            IgnoreBlanks => p.ignore_blanks = true,
+            Check | CheckQuiet | CheckWhen => {
+                let c = match (o, v) {
+                    (CheckQuiet, _) => 'C',
+                    (CheckWhen, Some(when)) => argmatch(
+                        "sort",
+                        "--check",
+                        when,
+                        &[("quiet", 'C'), ("silent", 'C'), ("diagnose-first", 'c')],
+                    )?,
+                    _ => 'c',
+                };
+                if checkonly.is_some_and(|k| k != c) {
+                    return Err(incompatible("cC"));
+                }
+                checkonly = Some(c);
+                (p.check, p.check_quiet) = (true, c == 'C');
+            }
+            Dictionary => p.dictionary = true,
+            IgnoreCase => p.ignore_case = true,
+            General => p.general_numeric = true,
+            Nonprinting => p.ignore_nonprinting = true,
+            Key => p.keys.extend(v),
+            Month => p.month = true,
+            Numeric => p.numeric = true,
+            Human => p.human_numeric = true,
+            Version => p.version = true,
+            Random => p.random = true,
+            RandomSource => p.random_source = v,
+            Sort => p.sort_words.extend(v),
+            Output => {
+                if p.output.is_some() && p.output != v {
+                    eprintln!("sort: multiple output files specified");
+                    return Err(2);
+                }
+                p.output = v;
+            }
+            Reverse => p.reverse = true,
+            Stable => p.stable = true,
+            Separator => {
+                if p.separator.is_some() && p.separator != v {
+                    eprintln!("sort: incompatible tabs");
+                    return Err(2);
+                }
+                p.separator = v;
+            }
+            Unique => p.unique = true,
+            By => p.by_field = v,
+            Where => p.where_expr = v,
+            Json => p.json = true,
+            Unsupported => return Err(unsupported("sort", &opts.last_spelling())),
+            Help => return Err(print_help(SORT_HELP)),
+            PrintVersion => return Err(print_version("sort")),
+        }
+    }
+    p.files.extend(lossy_all(opts.operands()));
+    if let Some(c) = checkonly {
+        if let Some(extra) = p.files.get(1) {
+            eprintln!(
+                "sort: extra operand {} not allowed with -{c}",
+                crate::common::quote::qa(extra)
+            );
+            return Err(2);
+        }
+        if p.output.is_some() {
+            return Err(incompatible(&format!("{c}o")));
+        }
+    }
+    Ok(p)
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn obsolete_keys_translate_to_k() {
+        assert_eq!(obsolete_key(b"1", Some(b"3")).as_deref(), Some("2.1,3"));
+        assert_eq!(obsolete_key(b"0", Some(b"1")).as_deref(), Some("1.1,1"));
+        assert_eq!(
+            obsolete_key(b"1.1", Some(b"1.2")).as_deref(),
+            Some("2.2,2.2")
+        );
+        assert_eq!(obsolete_key(b"1n", None).as_deref(), Some("2.1n"));
+        assert_eq!(obsolete_key(b"x", None), None);
+        assert_eq!(obsolete_key(b"", None), None);
+        assert_eq!(obsolete_key(b"1.", None), None);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -841,9 +1070,11 @@ fn sort_random_seed(source: Option<&str>) -> std::result::Result<[u8; 16], Strin
     Ok(seed)
 }
 
-pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = SortArgs::try_parse_from(args)?;
-    let _ = parsed.help;
+pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_sort_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
 
     let mut global = SortOpts {
         skip_sblanks: parsed.ignore_blanks,
@@ -985,12 +1216,14 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         for (idx, pair) in lines.windows(2).enumerate() {
             let ord = sorter.compare(pair[0], pair[1]);
             if ord == Ordering::Greater || (parsed.unique && ord == Ordering::Equal) {
-                eprintln!(
-                    "sort: {}:{}: disorder: {}",
-                    name,
-                    idx + 2,
-                    String::from_utf8_lossy(pair[1])
-                );
+                if !parsed.check_quiet {
+                    eprintln!(
+                        "sort: {}:{}: disorder: {}",
+                        name,
+                        idx + 2,
+                        String::from_utf8_lossy(pair[1])
+                    );
+                }
                 return Ok(1);
             }
         }
@@ -1014,6 +1247,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         lines.dedup_by(|cur, prev| sorter.compare(prev, cur) == Ordering::Equal);
     }
 
+    let to_stdout = parsed.output.as_deref().is_none_or(|o| o == "-");
     let sink: Box<dyn Write> = match parsed.output.as_deref() {
         Some(path) if path != "-" => match std::fs::File::create(path) {
             Ok(f) => Box::new(f),
@@ -1026,13 +1260,31 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let mut out = io::BufWriter::with_capacity(256 * 1024, sink);
     let mut written = 0u64;
+    // GNU names a failed write to standard output, then exits with its
+    // `close_stdout` diagnostic (`sort: write error`).
+    let stdout_failed = |what: &str, e: &io::Error| {
+        let failed = to_stdout && stdout::is_write_error(e);
+        if failed {
+            eprintln!("sort: {what}: 'standard output': {}", gnu_io_error(e));
+        }
+        failed
+    };
     for s in &lines {
-        ignore_broken_pipe(out.write_all(s))?;
-        ignore_broken_pipe(out.write_all(b"\n"))?;
+        if let Err(e) = out.write_all(s).and_then(|()| out.write_all(b"\n")) {
+            if stdout_failed("write failed", &e) {
+                return Ok(2);
+            }
+            ignore_broken_pipe(Err(e))?;
+        }
         written += s.len() as u64 + 1;
     }
     ctx.telemetry.add_items(lines.len() as u64);
     ctx.telemetry.add_written(written);
-    ignore_broken_pipe(out.flush())?;
+    if let Err(e) = out.flush() {
+        if stdout_failed("fflush failed", &e) {
+            return Ok(2);
+        }
+        ignore_broken_pipe(Err(e))?;
+    }
     Ok(0)
 }
