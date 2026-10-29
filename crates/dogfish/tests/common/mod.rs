@@ -101,6 +101,8 @@ pub struct Case<'a> {
     pub stdin: Option<&'a [u8]>,
     pub compare_stderr: bool,
     pub locale: &'a str,
+    /// Extra environment variables (e.g. a fixed `TZ`) set for both runs.
+    pub env: &'a [(&'a str, &'a str)],
 }
 
 /// True when the system C library actually provides `locale` with UTF-8
@@ -140,10 +142,15 @@ pub fn check(dir: &Path, case: Case<'_>) {
     }
 
     let mut ours = Command::new(dogfish_bin());
-    ours.arg(case.tool).args(case.args);
+    ours.arg(case.tool)
+        .args(case.args)
+        .envs(case.env.iter().copied());
     let mut theirs = Command::new(&gnu);
     // GNU prints argv[0] in diagnostics; make it the bare tool name.
-    theirs.arg0(case.tool).args(case.args);
+    theirs
+        .arg0(case.tool)
+        .args(case.args)
+        .envs(case.env.iter().copied());
 
     let a = exec(ours, dir, case.stdin, case.locale);
     let b = exec(theirs, dir, case.stdin, case.locale);
@@ -157,7 +164,8 @@ pub fn check(dir: &Path, case: Case<'_>) {
         )
     };
     let ctx = format!(
-        "\ncase: {} {:?} (stdin: {:?})\n=== dogfish ===\n{}\n=== GNU ===\n{}\n",
+        "\ncase: {:?} {} {:?} (stdin: {:?})\n=== dogfish ===\n{}\n=== GNU ===\n{}\n",
+        case.env,
         case.tool,
         case.args,
         case.stdin.map(String::from_utf8_lossy),
@@ -171,9 +179,10 @@ pub fn check(dir: &Path, case: Case<'_>) {
     }
 }
 
-/// `name: tool [args...] (@ "LOCALE")? (stdin b"...")? (=> nostderr)?;`
+/// `name: tool [args...] (@ "LOCALE")? (env [("VAR", "value"), ...])? (stdin b"...")? (=> nostderr)?;`
 ///
-/// Cases run under `LC_ALL=C` unless a locale is given. Dogfish is always
+/// Cases run under `LC_ALL=C` unless a locale is given; `env` adds variables
+/// (such as a fixed `TZ`) to both runs. Dogfish is always
 /// UTF-8 aware, so multibyte cases (`wc -m`, `wc -L`) compare against GNU in
 /// `C.UTF-8`.
 #[macro_export]
@@ -182,6 +191,7 @@ macro_rules! gnu_cases {
         $(#[$meta:meta])*
         $name:ident : $tool:literal [$($arg:expr),* $(,)?]
             $(@ $locale:literal)?
+            $(env [$(($var:literal, $val:expr)),* $(,)?])?
             $(stdin $input:expr)?
             $(=> $nostderr:ident)?
         ;
@@ -205,6 +215,7 @@ macro_rules! gnu_cases {
                     stdin,
                     compare_stderr,
                     locale,
+                    env: &[$($(($var, $val)),*)?],
                 });
             }
         )*

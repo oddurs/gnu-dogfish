@@ -340,14 +340,25 @@ fn main() -> ExitCode {
     match res {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
-            // If clap printed --help or --version, exit 0
             if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
-                let _ = clap_err.print();
-                return match clap_err.kind() {
-                    clap::error::ErrorKind::DisplayHelp
-                    | clap::error::ErrorKind::DisplayVersion => ExitCode::SUCCESS,
-                    _ => ExitCode::from(1),
-                };
+                use clap::error::ErrorKind;
+                if matches!(
+                    clap_err.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) {
+                    let _ = clap_err.print();
+                    return ExitCode::SUCCESS;
+                }
+                // Usage errors read like glibc getopt's, then GNU's "Try" hint.
+                match gnu_usage_message(clap_err) {
+                    Some(msg) => eprintln!(
+                        "{tool_name}: {msg}\nTry '{tool_name} --help' for more information."
+                    ),
+                    None => {
+                        let _ = clap_err.print();
+                    }
+                }
+                return ExitCode::from(usage_error_status(&tool_name));
             }
             // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
             let msg = match err.downcast_ref::<std::io::Error>() {
@@ -360,6 +371,73 @@ fn main() -> ExitCode {
             eprintln!("{}: {}", st.bold(&tool_name), msg);
             ExitCode::from(1)
         }
+    }
+}
+
+/// Exit status GNU uses for command-line usage errors: most tools exit 1, but
+/// the ones whose own failures are reported with 1 reserve a distinct status.
+fn usage_error_status(tool: &str) -> u8 {
+    match tool {
+        "ls" | "sort" | "printenv" => 2,
+        "env" | "timeout" => 125,
+        _ => 1,
+    }
+}
+
+/// Translates a clap parse error into glibc `getopt_long` wording
+/// (`invalid option -- 'x'`, `unrecognized option '--xyz'`, ...), or `None`
+/// for kinds GNU has no generic message for.
+fn gnu_usage_message(err: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let context = |kind| match err.get(kind) {
+        Some(ContextValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    // clap names an option as it is declared (`--wrap <COLS>`); keep the flag.
+    let declared =
+        || context(ContextKind::InvalidArg).map(|a| a.split([' ', '=']).next().unwrap_or(a));
+    match err.kind() {
+        ErrorKind::UnknownArgument => {
+            let arg = context(ContextKind::InvalidArg)?;
+            Some(if arg.starts_with("--") {
+                // clap drops any `=VALUE`; GNU echoes the argument as typed.
+                let typed = std::env::args()
+                    .find(|a| a.strip_prefix(arg).is_some_and(|v| v.starts_with('=')))
+                    .unwrap_or_else(|| arg.to_string());
+                format!("unrecognized option '{typed}'")
+            } else if let Some(short) = arg.strip_prefix('-').and_then(|s| s.chars().next()) {
+                format!("invalid option -- '{short}'")
+            } else {
+                format!("extra operand '{arg}'")
+            })
+        }
+        ErrorKind::InvalidValue if context(ContextKind::InvalidValue) == Some("") => {
+            // A missing option argument: GNU names the option the way it was typed,
+            // which clap does not record, so look at the last option-like argument.
+            let typed = std::env::args().rev().find(|a| a.starts_with('-'));
+            Some(match typed {
+                Some(t) if !t.starts_with("--") => {
+                    let short = t.chars().last().unwrap_or('?');
+                    format!("option requires an argument -- '{short}'")
+                }
+                _ => format!("option '{}' requires an argument", declared()?),
+            })
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => Some(format!(
+            "invalid argument '{}' for '{}'",
+            context(ContextKind::InvalidValue)?,
+            declared()?
+        )),
+        ErrorKind::TooManyValues => {
+            let arg = declared()?;
+            Some(if arg.starts_with('-') {
+                format!("option '{arg}' doesn't allow an argument")
+            } else {
+                format!("extra operand '{}'", context(ContextKind::InvalidValue)?)
+            })
+        }
+        ErrorKind::MissingRequiredArgument => Some("missing operand".to_string()),
+        _ => None,
     }
 }
 

@@ -122,8 +122,9 @@ fn test_whoami_id_uname_hostname_nproc() {
 
 #[test]
 fn test_env_and_printenv() {
+    // Like GNU env, assignments keep the order they were given in.
     let out = run(&["env", "-i", "FOO=bar", "BAZ=qux"]);
-    assert_eq!(stdout_str(&out), "BAZ=qux\nFOO=bar\n");
+    assert_eq!(stdout_str(&out), "FOO=bar\nBAZ=qux\n");
 
     let p_out = Command::new(bin())
         .env("DOGFISH_SECRET_VAR", "4242")
