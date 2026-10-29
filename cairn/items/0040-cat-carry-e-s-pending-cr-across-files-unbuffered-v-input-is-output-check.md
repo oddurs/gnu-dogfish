@@ -3,7 +3,10 @@ id: 40
 uid: ada47e88-e3e1-488f-8f78-29b4c56438fb
 title: "cat: carry -E's pending CR across files, unbuffered -v, input-is-output check"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -36,5 +39,9 @@ All three tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`-E` carries a pending CR across files, `-v` writes each chunk when input would block, and `input file is output file` is detected. cat-E, cat-buf and cat-self pass.

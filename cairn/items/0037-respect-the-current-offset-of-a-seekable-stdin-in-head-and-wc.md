@@ -3,7 +3,10 @@ id: 37
 uid: 47330a95-326e-4015-8e00-7c495988ac8b
 title: "Respect the current offset of a seekable stdin in head and wc"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -38,5 +41,9 @@ regular file is O(1); all listed tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+head leaves a seekable stdin's offset just after what it printed and handles `-c -N` from a non-zero offset; `wc -c` (and `-m` in non-UTF-8 locales) on a regular file uses fstat size minus offset. head-pos, head-c and wc-proc pass.

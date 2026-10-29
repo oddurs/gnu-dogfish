@@ -784,11 +784,28 @@ fn test_large_multi_chunk_tail_and_head() {
 #[test]
 fn test_unicode_multibyte_cut_wc_and_tr() {
     let unicode_text = "🦈🦀🦬\nαβγδε\n";
-    let wc_j: serde_json::Value =
-        serde_json::from_slice(&run_stdin(&["wc", "-J"], unicode_text.as_bytes()).stdout).unwrap();
+    // Like GNU, characters are UTF-8 sequences only in a UTF-8 locale.
+    let wc_json = |locale: &str| -> serde_json::Value {
+        let mut child = Command::new(bin())
+            .args(["wc", "-J"])
+            .env("LC_ALL", locale)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn dogfish");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(unicode_text.as_bytes())
+            .unwrap();
+        serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap()
+    };
+    let wc_j = wc_json("C.UTF-8");
     assert_eq!(wc_j["lines"].as_u64(), Some(2));
     assert_eq!(wc_j["chars"].as_u64(), Some(10)); // 3 emojis + \n + 5 greek + \n = 10 chars
     assert_eq!(wc_j["bytes"].as_u64(), Some(24)); // 12 + 1 + 10 + 1 = 24 bytes
+    assert_eq!(wc_json("C")["chars"].as_u64(), Some(24)); // a character is a byte
 
     // Like GNU coreutils, `cut -c` selects bytes, so it can split a character.
     let cut_c = run_stdin(&["cut", "-c", "2-3"], unicode_text.as_bytes());

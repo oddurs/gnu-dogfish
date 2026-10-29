@@ -85,7 +85,8 @@ pub fn run_echo(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut out = stdout::stdout();
 
     let (rendered, stop) = if interpret_escapes || posixly_correct {
-        unescape_echo_bytes(&payload, false)
+        // `\NNN` is octal as well as `\0NNN` (GNU echo).
+        unescape_echo_bytes(&payload, true)
     } else {
         (payload, false)
     };

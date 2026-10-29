@@ -17,11 +17,20 @@ use dogfish_core::{
 use md5::Md5;
 use rayon::prelude::*;
 
+use crate::common::files0::{Files0From, extra_operand_error};
 use crate::common::getopt::{
     Arg, Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
     print_version, unsupported,
 };
-use crate::common::lines::{is_blank, looks_like_json, lossy_lines, split_lines};
+use crate::common::input::RawStdout;
+use crate::common::lines::{is_blank, line_end, looks_like_json, lossy_lines, split_records};
+use crate::common::quote::{qa, qf};
+
+/// GNU's `field_sep`: the blanks that separate fields, which include newline
+/// (part of a record only with `-z`).
+fn field_sep(c: u8) -> bool {
+    is_blank(c) || c == b'\n'
+}
 
 const SORT_HELP: &str = "\
 Sort lines of text files or NDJSON object streams
@@ -54,6 +63,10 @@ Options:
   -s, --stable                       Stabilize sort by disabling last-resort comparison
   -t, --field-separator <SEPARATOR>  Use SEP instead of non-blank to blank transition
   -u, --unique                       Output only the first of an equal run
+  -z, --zero-terminated              Line delimiter is NUL, not newline
+      --files0-from <F>              Read input from the files specified by NUL-terminated
+                                     names in file F; if F is - then read names from
+                                     standard input
       --by <BY_FIELD>                Modern Dogfish extension: Sort NDJSON objects by named field
                                      (e.g., `--by size`)
   -w, --where <WHERE_EXPR>           Filter NDJSON objects before sorting (e.g., `--where
@@ -87,6 +100,8 @@ struct SortArgs {
     by_field: Option<String>,
     where_expr: Option<String>,
     json: bool,
+    zero_terminated: bool,
+    files0_from: Option<String>,
     files: Vec<String>,
 }
 
@@ -116,6 +131,8 @@ enum SortOpt {
     By,
     Where,
     Json,
+    ZeroTerminated,
+    Files0From,
     /// A GNU option Dogfish does not implement yet.
     Unsupported,
     Help,
@@ -137,7 +154,7 @@ const SPECS: &[OptSpec<SortOpt>] = &[
     OptSpec::long("debug", HasArg::No, SortOpt::Unsupported),
     OptSpec::both(b'd', "dictionary-order", HasArg::No, SortOpt::Dictionary),
     OptSpec::both(b'f', "ignore-case", HasArg::No, SortOpt::IgnoreCase),
-    OptSpec::long("files0-from", HasArg::Required, SortOpt::Unsupported),
+    OptSpec::long("files0-from", HasArg::Required, SortOpt::Files0From),
     OptSpec::both(b'g', "general-numeric-sort", HasArg::No, SortOpt::General),
     OptSpec::both(b'i', "ignore-nonprinting", HasArg::No, SortOpt::Nonprinting),
     OptSpec::both(b'k', "key", HasArg::Required, SortOpt::Key),
@@ -167,7 +184,7 @@ const SPECS: &[OptSpec<SortOpt>] = &[
         SortOpt::Unsupported,
     ),
     OptSpec::both(b'u', "unique", HasArg::No, SortOpt::Unique),
-    OptSpec::both(b'z', "zero-terminated", HasArg::No, SortOpt::Unsupported),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, SortOpt::ZeroTerminated),
     OptSpec::long("parallel", HasArg::Required, SortOpt::Unsupported),
     OptSpec::long("help", HasArg::No, SortOpt::Help),
     OptSpec::long("version", HasArg::No, SortOpt::PrintVersion),
@@ -309,6 +326,8 @@ fn parse_sort_args(args: Vec<OsString>) -> std::result::Result<SortArgs, i32> {
             By => p.by_field = v,
             Where => p.where_expr = v,
             Json => p.json = true,
+            ZeroTerminated => p.zero_terminated = true,
+            Files0From => p.files0_from = v,
             Unsupported => return Err(unsupported("sort", &opts.last_spelling())),
             Help => return Err(print_help(SORT_HELP)),
             PrintVersion => return Err(print_version("sort")),
@@ -534,16 +553,16 @@ impl Sorter {
         } else {
             while p < lim && sword > 0 {
                 sword -= 1;
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
-                while p < lim && !is_blank(line[p]) {
+                while p < lim && !field_sep(line[p]) {
                     p += 1;
                 }
             }
         }
         if key.opts.skip_sblanks {
-            while p < lim && is_blank(line[p]) {
+            while p < lim && field_sep(line[p]) {
                 p += 1;
             }
         }
@@ -573,17 +592,17 @@ impl Sorter {
         } else {
             while p < lim && eword > 0 {
                 eword -= 1;
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
-                while p < lim && !is_blank(line[p]) {
+                while p < lim && !field_sep(line[p]) {
                     p += 1;
                 }
             }
         }
         if echar != 0 {
             if key.opts.skip_eblanks {
-                while p < lim && is_blank(line[p]) {
+                while p < lim && field_sep(line[p]) {
                     p += 1;
                 }
             }
@@ -599,9 +618,24 @@ impl Sorter {
     }
 
     fn keycompare(&self, a: &[u8], b: &[u8]) -> Ordering {
-        for key in &self.keys {
-            let ka = self.key_slice(a, key);
-            let kb = self.key_slice(b, key);
+        self.keycompare_from(0, a, b)
+    }
+
+    /// Compares by the keys from `first` on.
+    fn keycompare_from(&self, first: usize, a: &[u8], b: &[u8]) -> Ordering {
+        for key in &self.keys[first..] {
+            let ord = self.key_order(key, self.key_slice(a, key), self.key_slice(b, key));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// The order of two extracted keys under `key`'s options (reversal
+    /// included).
+    fn key_order(&self, key: &SortKey, ka: &[u8], kb: &[u8]) -> Ordering {
+        {
             let o = &key.opts;
             let ord = if o.numeric || o.general || o.human || o.month || o.random || o.version {
                 // As in GNU, these orderings see the key after `-d`/`-i`/`-f` rewriting.
@@ -633,11 +667,46 @@ impl Sorter {
             } else {
                 ka.cmp(kb)
             };
-            if ord != Ordering::Equal {
-                return if o.reverse { ord.reverse() } else { ord };
-            }
+            if o.reverse { ord.reverse() } else { ord }
         }
-        Ordering::Equal
+    }
+
+    /// [`Sorter::compare`] for lines whose first key was extracted (and,
+    /// for a plain `-n` key, parsed) once, before sorting.
+    fn compare_keyed(&self, a: &Keyed<'_>, b: &Keyed<'_>) -> Ordering {
+        let first = &self.keys[0];
+        let ord = match (&a.num, &b.num) {
+            (Some(x), Some(y)) => {
+                let ord = num_order(x, y);
+                if first.opts.reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
+            // A plain byte key: its first 8 bytes decide most comparisons.
+            _ if first.opts.is_default() => {
+                let ord = a
+                    .key_prefix
+                    .cmp(&b.key_prefix)
+                    .then_with(|| a.key.cmp(b.key));
+                if first.opts.reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
+            _ => self.key_order(first, a.key, b.key),
+        };
+        let ord = ord.then_with(|| self.keycompare_from(1, a.line, b.line));
+        if ord != Ordering::Equal || self.no_last_resort {
+            return ord;
+        }
+        let ord = a
+            .line_prefix
+            .cmp(&b.line_prefix)
+            .then_with(|| a.line.cmp(b.line));
+        if self.reverse { ord.reverse() } else { ord }
     }
 
     /// GNU `compare_random`: order by the seeded MD5 of each key, falling back
@@ -659,6 +728,44 @@ impl Sorter {
     }
 }
 
+/// One input's bytes: mapped, or read into memory.
+enum SortInput {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for SortInput {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SortInput::Mapped(m) => m,
+            SortInput::Owned(v) => v,
+        }
+    }
+}
+
+/// A line with its first key extracted ahead of the sort.
+struct Keyed<'a> {
+    line: &'a [u8],
+    key: &'a [u8],
+    /// The key parsed as a number, for a plain `-n` first key.
+    num: Option<SortNum<'a>>,
+    /// The first 8 bytes of the key and of the line, big-endian and
+    /// zero-padded: equal-length prefixes order like the bytes, and are
+    /// compared without touching the line.
+    key_prefix: u64,
+    line_prefix: u64,
+}
+
+/// See [`Keyed::key_prefix`].
+fn prefix8(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
+}
+
 struct SortNum<'a> {
     neg: bool,
     int: &'a [u8],
@@ -668,7 +775,7 @@ struct SortNum<'a> {
 /// Parses the leading `[blanks][-]digits[.digits]` of a key, like GNU `strnumcmp`.
 fn parse_sort_num(s: &[u8]) -> SortNum<'_> {
     let mut i = 0;
-    while i < s.len() && is_blank(s[i]) {
+    while i < s.len() && field_sep(s[i]) {
         i += 1;
     }
     let mut neg = false;
@@ -703,7 +810,10 @@ fn parse_sort_num(s: &[u8]) -> SortNum<'_> {
 }
 
 fn numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
-    let (x, y) = (parse_sort_num(a), parse_sort_num(b));
+    num_order(&parse_sort_num(a), &parse_sort_num(b))
+}
+
+fn num_order(x: &SortNum<'_>, y: &SortNum<'_>) -> Ordering {
     let mag = |p: &SortNum, q: &SortNum| {
         p.int
             .len()
@@ -714,15 +824,15 @@ fn numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
     match (x.neg, y.neg) {
         (false, true) => Ordering::Greater,
         (true, false) => Ordering::Less,
-        (false, false) => mag(&x, &y),
-        (true, true) => mag(&y, &x),
+        (false, false) => mag(x, y),
+        (true, true) => mag(y, x),
     }
 }
 
 /// GNU `find_unit_order`: signed SI-suffix magnitude of a human-readable number.
 fn human_unit_order(s: &[u8]) -> i32 {
     let mut i = 0;
-    while i < s.len() && is_blank(s[i]) {
+    while i < s.len() && field_sep(s[i]) {
         i += 1;
     }
     let neg = i < s.len() && s[i] == b'-';
@@ -885,7 +995,7 @@ fn key_filter<'a>(key: &'a [u8], o: &SortOpts) -> impl Iterator<Item = u8> + 'a 
         .copied()
         .filter(move |&c| {
             if dictionary {
-                c.is_ascii_alphanumeric() || is_blank(c)
+                c.is_ascii_alphanumeric() || field_sep(c)
             } else if nonprinting {
                 (0x20..0x7f).contains(&c)
             } else {
@@ -902,7 +1012,7 @@ fn month_of(key: &[u8]) -> u8 {
         b"JAN", b"FEB", b"MAR", b"APR", b"MAY", b"JUN", b"JUL", b"AUG", b"SEP", b"OCT", b"NOV",
         b"DEC",
     ];
-    let start = key.iter().position(|&c| !is_blank(c)).unwrap_or(key.len());
+    let start = key.iter().position(|&c| !field_sep(c)).unwrap_or(key.len());
     let Some(abbr) = key[start..].get(..3) else {
         return 0;
     };
@@ -1070,6 +1180,25 @@ fn sort_random_seed(source: Option<&str>) -> std::result::Result<[u8; 16], Strin
     Ok(seed)
 }
 
+/// The inputs named in `--files0-from=FROM` (GNU reads them all first and
+/// stops at the first bad name), or GNU's message.
+fn files0_sources(from: &str) -> std::result::Result<Vec<InputSource>, String> {
+    let mut list = Files0From::open(from)
+        .map_err(|e| format!("open failed: {}: {}", qf(from), gnu_io_error(&e)))?;
+    let names = list
+        .read_all()
+        .map_err(|_| format!("cannot read file names from {}", qa(from)))?;
+    if names.is_empty() {
+        return Err(format!("no input from {}", qa(from)));
+    }
+    for (i, name) in names.iter().enumerate() {
+        if let Some(msg) = list.check_name(name, i as u64 + 1, false) {
+            return Err(msg);
+        }
+    }
+    Ok(names.into_iter().map(InputSource::File).collect())
+}
+
 pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = match parse_sort_args(args) {
         Ok(p) => p,
@@ -1159,10 +1288,31 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         random_seed,
     };
 
-    let sources = InputSource::from_args(&parsed.files);
-    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+    let eol = line_end(parsed.zero_terminated);
+    let sources = match parsed.files0_from.as_deref() {
+        None => InputSource::from_args(&parsed.files),
+        Some(from) => {
+            if let Some(extra) = parsed.files.first() {
+                return Ok(extra_operand_error("sort", extra, 2));
+            }
+            match files0_sources(from) {
+                Ok(sources) => sources,
+                Err(msg) => {
+                    eprintln!("sort: {msg}");
+                    return Ok(2);
+                }
+            }
+        }
+    };
+    // Inputs stay mapped, except with -o, which may truncate one of them.
+    let keep_mapped = parsed.output.is_none();
+    let mut bufs: Vec<SortInput> = Vec::with_capacity(sources.len());
     for src in &sources {
-        match FastReader::open(src).and_then(|r| r.into_bytes()) {
+        let data = FastReader::open(src).and_then(|r| match r {
+            FastReader::Mapped(m) if keep_mapped => Ok(SortInput::Mapped(m)),
+            r => r.into_bytes().map(SortInput::Owned),
+        });
+        match data {
             Ok(b) => {
                 ctx.telemetry.add_read(b.len() as u64);
                 bufs.push(b);
@@ -1179,7 +1329,14 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     // Check if input is an NDJSON object stream!
+    // Rich output: NDJSON objects are sorted by field on a terminal, with
+    // -J, or when --by/--where ask for it. Piped output is GNU's.
     if !parsed.check
+        && !parsed.zero_terminated
+        && (ctx.stdout_is_tty
+            || parsed.json
+            || parsed.by_field.is_some()
+            || parsed.where_expr.is_some())
         && bufs
             .iter()
             .find(|b| !b.is_empty())
@@ -1209,7 +1366,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let mut lines: Vec<&[u8]> = bufs.iter().flat_map(|b| split_lines(b)).collect();
+    let mut lines: Vec<&[u8]> = bufs.iter().flat_map(|b| split_records(b, eol)).collect();
 
     if parsed.check {
         let name = sources[0].display_name();
@@ -1241,9 +1398,36 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     } else {
         ctx.telemetry
             .set_strategy("zero-alloc &[u8] slices + rayon stable par_sort_by (GNU keys)");
-        lines.par_sort_by(|a, b| sorter.compare(a, b));
+        // Extract (and for -n parse) the first key once per line rather
+        // than in every comparison.
+        let first = &sorter.keys[0];
+        let numeric = first.opts.numeric && !first.opts.filters();
+        let mut keyed: Vec<Keyed> = lines
+            .par_iter()
+            .map(|&line| {
+                let key = sorter.key_slice(line, first);
+                Keyed {
+                    line,
+                    key,
+                    num: numeric.then(|| parse_sort_num(key)),
+                    key_prefix: prefix8(key),
+                    line_prefix: prefix8(line),
+                }
+            })
+            .collect();
+        // With the last-resort comparison only identical lines tie, so an
+        // unstable sort gives the same output, faster.
+        if sorter.no_last_resort {
+            keyed.par_sort_by(|a, b| sorter.compare_keyed(a, b));
+        } else {
+            keyed.par_sort_unstable_by(|a, b| sorter.compare_keyed(a, b));
+        }
+        if parsed.unique {
+            keyed.dedup_by(|cur, prev| sorter.compare_keyed(prev, cur) == Ordering::Equal);
+        }
+        lines = keyed.into_iter().map(|k| k.line).collect();
     }
-    if parsed.unique {
+    if parsed.unique && sorter.keys.is_empty() {
         lines.dedup_by(|cur, prev| sorter.compare(prev, cur) == Ordering::Equal);
     }
 
@@ -1256,7 +1440,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 return Ok(2);
             }
         },
-        _ => Box::new(stdout::stdout()),
+        _ => Box::new(RawStdout),
     };
     let mut out = io::BufWriter::with_capacity(256 * 1024, sink);
     let mut written = 0u64;
@@ -1270,7 +1454,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         failed
     };
     for s in &lines {
-        if let Err(e) = out.write_all(s).and_then(|()| out.write_all(b"\n")) {
+        if let Err(e) = out.write_all(s).and_then(|()| out.write_all(&[eol])) {
             if stdout_failed("write failed", &e) {
                 return Ok(2);
             }

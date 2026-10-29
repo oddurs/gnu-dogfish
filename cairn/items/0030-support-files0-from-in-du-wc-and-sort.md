@@ -3,7 +3,9 @@ id: 30
 uid: ee4d9658-4eca-4b38-9751-5d5805e33a9e
 title: "Support --files0-from in du, wc and sort"
 type: bug
-status: backlog
+status: doing
+assignee: claude
+claimed: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -41,3 +43,7 @@ names from stdin, no file name of '-' allowed`, ...).
 
 - [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
 - [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## 2026-10-29
+
+`--files0-from` for wc and sort (common/files0.rs, GNU's diagnostics); wc-files0-from.pl, wc-files0.sh and sort-files0-from.pl pass. du remains (the ls/du/rm work).

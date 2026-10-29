@@ -3,7 +3,10 @@ id: 29
 uid: 63ff42ae-af17-4add-b8ce-d50ffdfdb9b0
 title: "Support -z/--zero-terminated in cut, head, tail, uniq, paste, sort and shuf"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -41,5 +44,9 @@ GNU gives `-z` accepts it and uses NUL for both input and output records.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`-z/--zero-terminated` in cut, head, tail, uniq, paste, sort and shuf through one record-separator abstraction; the listed tests pass and are in the baseline.

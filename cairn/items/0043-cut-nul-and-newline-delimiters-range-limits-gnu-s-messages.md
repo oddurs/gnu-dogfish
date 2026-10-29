@@ -3,7 +3,10 @@ id: 43
 uid: 4a59a3c4-f9b5-4ffd-a209-ccdbd0339795
 title: "cut: NUL and newline delimiters, range limits, GNU's messages"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -36,5 +39,9 @@ Both tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+NUL and newline delimiters, `-b` range limits and GNU's messages; cut.pl (including the non-UTF-8 delimiter, now that argv is OsString) and cut-huge-range pass.

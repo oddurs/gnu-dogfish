@@ -3,7 +3,10 @@ id: 52
 uid: 118ab315-e9e8-4a6c-abd8-3d01a0275370
 title: "tac: -b, -r and -s; read errors on closed stdin"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -34,5 +37,9 @@ Both tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`-b`, `-r`, `-s` (separator as bytes) and the closed-stdin read error; tac.pl and tac-2-nonseekable pass. Known gap: `tac -r` anchors `^`/`$` at the data ends where GNU anchors at its read-buffer edges.

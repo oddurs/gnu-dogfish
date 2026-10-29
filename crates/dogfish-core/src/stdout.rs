@@ -143,6 +143,24 @@ impl Write for Stdout {
     }
 }
 
+/// Writes `data` out now, after anything buffered, without line buffering:
+/// for tools that buffer large blocks themselves. Errors are recorded and
+/// sticky as for [`stdout()`].
+pub fn write_whole(data: &[u8]) -> io::Result<()> {
+    let mut st = state();
+    if let Some(err) = st.sticky() {
+        return Err(err);
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    if st.closed {
+        return Err(st.fail(libc::EBADF));
+    }
+    st.flush_buf()?;
+    write_fd(data).map_err(|errno| st.fail(errno))
+}
+
 /// Records that descriptor 1 was closed when the process started. The
 /// caller keeps the descriptor number taken (on `/dev/null`) so that no file
 /// the tool opens lands on it, and every write fails with `EBADF`, as it
