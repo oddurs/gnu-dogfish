@@ -458,9 +458,9 @@ fn test_mkdir_touch_ln_chmod_stat_realpath_basename_dirname_mktemp() {
         0o640
     );
 
-    // stat -c and -J
+    // stat -c and -J (GNU output: `%a` has no leading zero; an empty file is "regular empty file")
     let st_fmt = run(&["stat", "-c", "%a %F", file_p.to_str().unwrap()]);
-    assert_eq!(stdout_str(&st_fmt).trim(), "0640 regular file");
+    assert_eq!(stdout_str(&st_fmt).trim(), "640 regular empty file");
 
     // realpath resolves symlink to canonical file
     let rp = run(&["realpath", link_p.to_str().unwrap()]);
