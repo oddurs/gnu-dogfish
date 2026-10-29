@@ -5,12 +5,9 @@ use std::path::Path;
 
 use crate::common::path::c_path;
 
-/// A time to set with `utimensat`.
+/// A time to set with `utimensat`: seconds and nanoseconds.
 #[derive(Clone, Copy)]
 pub(crate) enum Stamp {
-    /// Used for APFS clones on macOS.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Now,
     At(i64, u32),
 }
 
@@ -21,10 +18,6 @@ pub(crate) fn set_file_times(
     follow: bool,
 ) -> io::Result<()> {
     let spec = |s: Stamp| match s {
-        Stamp::Now => libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_NOW,
-        },
         Stamp::At(sec, nsec) => libc::timespec {
             tv_sec: sec,
             tv_nsec: nsec.into(),
@@ -33,6 +26,7 @@ pub(crate) fn set_file_times(
     let times = [spec(atime), spec(mtime)];
     let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
     let c = c_path(path)?;
+    // SAFETY: `c` is a NUL-terminated path and `times` holds two timespecs.
     if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) } == 0 {
         Ok(())
     } else {

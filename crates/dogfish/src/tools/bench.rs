@@ -6,28 +6,79 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, sparkline_bar};
+use dogfish_core::{ColumnAlign, DogfishContext, Table, outln, sparkline_bar, stdout};
 use serde::Serialize;
 
-#[derive(Parser)]
-#[command(
-    name = "bench",
-    about = "Run head-to-head benchmarks comparing Dogfish against system utilities"
-)]
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, count_arg, getopt_error, lossy, print_help, print_version, usage_error,
+};
+use crate::common::quote::quote_locale;
+
+const BENCH_HELP: &str = "\
+Run head-to-head benchmarks comparing Dogfish against system utilities
+
+Usage: bench [OPTIONS]
+
+Options:
+  -n, --iterations <ITERATIONS>  Number of iterations per benchmark [default: 7]
+  -s, --size-mb <SIZE_MB>        Size of generated benchmark payload in MiB [default: 32]
+  -J, --json                     Emit JSON benchmark results
+  -h, --help                     Print help
+";
+
 struct BenchArgs {
-    /// Number of iterations per benchmark
-    #[arg(short = 'n', long = "iterations", default_value_t = 7)]
     iterations: usize,
-
-    /// Size of generated benchmark payload in MiB
-    #[arg(short = 's', long = "size-mb", default_value_t = 32)]
     size_mb: usize,
-
-    /// Emit JSON benchmark results
-    #[arg(short = 'J', long = "json")]
     json: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BenchOpt {
+    Iterations,
+    SizeMb,
+    Json,
+    Help,
+    Version,
+}
+
+const SPECS: &[OptSpec<BenchOpt>] = &[
+    OptSpec::both(b'n', "iterations", HasArg::Required, BenchOpt::Iterations),
+    OptSpec::both(b's', "size-mb", HasArg::Required, BenchOpt::SizeMb),
+    OptSpec::both(b'J', "json", HasArg::No, BenchOpt::Json),
+    OptSpec::both(b'h', "help", HasArg::No, BenchOpt::Help),
+    OptSpec::long("version", HasArg::No, BenchOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_bench_args(args: Vec<OsString>) -> std::result::Result<BenchArgs, i32> {
+    let mut p = BenchArgs {
+        iterations: 7,
+        size_mb: 32,
+        json: false,
+    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("bench", &e))?;
+        let v = v.as_deref().map(lossy).unwrap_or_default();
+        match o {
+            BenchOpt::Iterations => p.iterations = count_arg("bench", "--iterations", &v)?,
+            BenchOpt::SizeMb => p.size_mb = count_arg("bench", "--size-mb", &v)?,
+            BenchOpt::Json => p.json = true,
+            BenchOpt::Help => return Err(print_help(BENCH_HELP)),
+            BenchOpt::Version => return Err(print_version("bench")),
+        }
+    }
+    if let Some(extra) = opts.operands().first() {
+        return Err(usage_error(
+            "bench",
+            format!("extra operand {}", quote_locale(extra)),
+        ));
+    }
+    Ok(p)
 }
 
 #[derive(Serialize)]
@@ -39,8 +90,11 @@ struct BenchRow {
     strategy: String,
 }
 
-pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = BenchArgs::try_parse_from(args)?;
+pub fn run_bench(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_bench_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let st = ctx.style();
     let exe = std::env::current_exe()?;
 
@@ -212,7 +266,7 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        outln!("{}", serde_json::to_string_pretty(&results)?);
         return Ok(0);
     }
 
@@ -242,11 +296,10 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         ]);
     }
 
-    println!();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    outln!();
+    let mut out = stdout::stdout();
     tbl.render(&mut out, st)?;
-    println!();
+    outln!();
     Ok(0)
 }
 

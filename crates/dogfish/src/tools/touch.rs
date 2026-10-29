@@ -1,8 +1,10 @@
 //! touch — GNU date strings (`-d`), `-t STAMP` and the obsolete `MMDDhhmm[YY]` operand
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -10,10 +12,12 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error};
 
 use crate::common::date_format::Stamp;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::parse_datetime::parse_datetime;
 use crate::common::path::c_path;
 use crate::common::quote::{qa, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const TOUCH_HELP: &str = "\
 Usage: touch [OPTION]... FILE...
@@ -53,41 +57,50 @@ enum TouchOpt {
     Reference,
     StampArg,
     Time,
+    Help,
+    Version,
 }
+
+/// GNU's `longopts` and `"acd:fhmr:t:"`.
+const SPECS: &[OptSpec<TouchOpt>] = &[
+    OptSpec::long("time", HasArg::Required, TouchOpt::Time),
+    OptSpec::both(b'c', "no-create", HasArg::No, TouchOpt::NoCreate),
+    OptSpec::both(b'd', "date", HasArg::Required, TouchOpt::Date),
+    OptSpec::both(b'r', "reference", HasArg::Required, TouchOpt::Reference),
+    OptSpec::both(b'h', "no-dereference", HasArg::No, TouchOpt::NoDeref),
+    OptSpec::long("help", HasArg::No, TouchOpt::Help),
+    OptSpec::long("version", HasArg::No, TouchOpt::Version),
+    OptSpec::short(b'a', HasArg::No, TouchOpt::Access),
+    OptSpec::short(b'f', HasArg::No, TouchOpt::Ignored),
+    OptSpec::short(b'm', HasArg::No, TouchOpt::Modify),
+    OptSpec::short(b't', HasArg::Required, TouchOpt::StampArg),
+];
 
 /// Which times to change (`-a`, `-m`, `--time`).
 const CH_ATIME: u8 = 1;
 const CH_MTIME: u8 = 2;
 
-pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use TouchOpt::*;
-    const SPECS: &[ToolOpt<TouchOpt>] = &[
-        opt("a", "", HasArg::No, Access),
-        opt("c", "no-create", HasArg::No, NoCreate),
-        opt("d", "date", HasArg::Required, Date),
-        opt("f", "", HasArg::No, Ignored),
-        opt("h", "no-dereference", HasArg::No, NoDeref),
-        opt("m", "", HasArg::No, Modify),
-        opt("r", "reference", HasArg::Required, Reference),
-        opt("t", "", HasArg::Required, StampArg),
-        opt("", "time", HasArg::Required, Time),
-    ];
-    let parsed = match parse_tool_args("touch", &args, SPECS, TOUCH_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut change_times = 0;
     let (mut no_create, mut no_deref) = (false, false);
-    let (mut flex_date, mut reference) = (None, None);
+    let (mut flex_date, mut reference): (Option<String>, Option<OsString>) = (None, None);
     let mut newtime = [Stamp { sec: 0, ns: 0 }; 2];
     let mut date_set = false;
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("touch", &e)),
+        };
         match o {
+            Help => return Ok(print_help(TOUCH_HELP)),
+            Version => return Ok(print_version("touch")),
             Access => change_times |= CH_ATIME,
             Modify => change_times |= CH_MTIME,
             NoCreate => no_create = true,
             NoDeref => no_deref = true,
-            Date => flex_date = v,
+            Date => flex_date = v.as_deref().map(lossy),
             Reference => reference = v,
             StampArg => {
                 let t = v.unwrap_or_default();
@@ -107,7 +120,7 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ("mtime", CH_MTIME),
                     ("modify", CH_MTIME),
                 ];
-                match argmatch("touch", "--time", v.as_deref().unwrap_or_default(), WORDS) {
+                match argmatch("touch", "--time", v.unwrap_or_default(), WORDS) {
                     Ok(bit) => change_times |= bit,
                     Err(code) => return Ok(code),
                 }
@@ -195,7 +208,8 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // The obsolete `touch MMDDhhmm[YY] FILE...`: valid only with two or more
     // operands and an old _POSIX2_VERSION.
-    let mut operands = parsed.operands.as_slice();
+    let all_operands = opts.operands();
+    let mut operands = all_operands.as_slice();
     if !date_set
         && operands.len() >= 2
         && posix2_version() < 200112
@@ -208,7 +222,7 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         {
             eprintln!(
                 "touch: warning: 'touch {}' is obsolete; use 'touch -t {:04}{:02}{:02}{:02}{:02}.{:02}'",
-                operands[0],
+                operands[0].to_string_lossy(),
                 i64::from(tm.tm_year) + 1900,
                 tm.tm_mon + 1,
                 tm.tm_mday,
@@ -266,14 +280,14 @@ fn same_time(a: Stamp, b: Stamp) -> bool {
 /// GNU's `touch (file)`: creates FILE unless -c or -h, then sets its times;
 /// `-` means standard output. Returns whether it succeeded.
 fn touch_one(
-    file: &str,
+    file: &OsStr,
     times: Option<&[libc::timespec; 2]>,
     no_create: bool,
     no_deref: bool,
 ) -> bool {
     let mut opened = None;
     let mut open_err = None;
-    let fd: Option<RawFd> = if file == "-" {
+    let fd: Option<RawFd> = if file.as_bytes() == b"-" {
         Some(libc::STDOUT_FILENO)
     } else if !(no_create || no_deref) {
         // O_CREAT without O_TRUNC: never truncates, even if the file appeared meanwhile.
@@ -300,9 +314,13 @@ fn touch_one(
     };
     let ts = times.map_or(std::ptr::null(), |t| t.as_ptr());
     let result = match fd {
-        // SAFETY: `ts` is null or points at two timespecs; `fd` is open (or
-        // is standard output, which futimens reports if closed).
+        // A standard output closed at startup now holds /dev/null: report
+        // what GNU's futimens on the closed descriptor reports.
+        Some(libc::STDOUT_FILENO) if dogfish_core::stdout::was_closed() => {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
         Some(fd) => {
+            // SAFETY: `ts` is null or points at two timespecs; `fd` is open.
             if unsafe { libc::futimens(fd, ts) } == 0 {
                 Ok(())
             } else {

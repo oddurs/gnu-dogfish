@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dogfish_core::{
     DogfishContext, emit_objects_or_table, format_size, gnu_io_error, io::ignore_broken_pipe,
-    sparkline_bar,
+    sparkline_bar, stdout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::common::fnmatch::fnmatch;
-use crate::common::gnu_getopt::{
-    OptArg, OptSpec, gnu_getopt, gnu_usage_error, print_help_text, print_tool_version,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, unsupported,
+    usage_error,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, SizeError, env_block_size, human_readable,
@@ -23,68 +24,38 @@ use crate::common::human::{
 };
 use crate::common::quote::{Quoting, quote_af, quote_bytes, quote_f};
 
-const DU_OPTIONS: &[OptSpec] = &[
-    OptSpec::new("null", Some('0'), Some("null"), OptArg::No),
-    OptSpec::new("all", Some('a'), Some("all"), OptArg::No),
-    OptSpec::new("apparent-size", None, Some("apparent-size"), OptArg::No),
-    OptSpec::new(
-        "block-size",
-        Some('B'),
-        Some("block-size"),
-        OptArg::Required,
-    ),
-    OptSpec::new("bytes", Some('b'), Some("bytes"), OptArg::No),
-    OptSpec::new("total", Some('c'), Some("total"), OptArg::No),
-    OptSpec::new(
-        "dereference-args",
-        Some('D'),
-        Some("dereference-args"),
-        OptArg::No,
-    ),
-    OptSpec::new("dereference-args", Some('H'), None, OptArg::No),
-    OptSpec::new("max-depth", Some('d'), Some("max-depth"), OptArg::Required),
-    OptSpec::new(
-        "human-readable",
-        Some('h'),
-        Some("human-readable"),
-        OptArg::No,
-    ),
-    OptSpec::new("inodes", None, Some("inodes"), OptArg::No),
-    OptSpec::new("kilobytes", Some('k'), None, OptArg::No),
-    OptSpec::new("dereference", Some('L'), Some("dereference"), OptArg::No),
-    OptSpec::new("count-links", Some('l'), Some("count-links"), OptArg::No),
-    OptSpec::new("megabytes", Some('m'), None, OptArg::No),
-    OptSpec::new(
-        "no-dereference",
-        Some('P'),
-        Some("no-dereference"),
-        OptArg::No,
-    ),
-    OptSpec::new(
-        "separate-dirs",
-        Some('S'),
-        Some("separate-dirs"),
-        OptArg::No,
-    ),
-    OptSpec::new("si", None, Some("si"), OptArg::No),
-    OptSpec::new("summarize", Some('s'), Some("summarize"), OptArg::No),
-    OptSpec::new("threshold", Some('t'), Some("threshold"), OptArg::Required),
-    OptSpec::new("exclude", None, Some("exclude"), OptArg::Required),
-    OptSpec::new(
-        "exclude-from",
-        Some('X'),
-        Some("exclude-from"),
-        OptArg::Required,
-    ),
-    OptSpec::new(
-        "one-file-system",
-        Some('x'),
-        Some("one-file-system"),
-        OptArg::No,
-    ),
-    OptSpec::new("json", Some('J'), Some("json"), OptArg::No),
-    OptSpec::new("help", None, Some("help"), OptArg::No),
-    OptSpec::new("version", None, Some("version"), OptArg::No),
+const DU_OPTIONS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'a', "all", HasArg::No, "all"),
+    OptSpec::long("apparent-size", HasArg::No, "apparent-size"),
+    OptSpec::both(b'B', "block-size", HasArg::Required, "block-size"),
+    OptSpec::both(b'b', "bytes", HasArg::No, "bytes"),
+    OptSpec::both(b'l', "count-links", HasArg::No, "count-links"),
+    OptSpec::both(b'L', "dereference", HasArg::No, "dereference"),
+    OptSpec::both(b'D', "dereference-args", HasArg::No, "dereference-args"),
+    OptSpec::long("exclude", HasArg::Required, "exclude"),
+    OptSpec::both(b'X', "exclude-from", HasArg::Required, "exclude-from"),
+    OptSpec::long("files0-from", HasArg::Required, "unsupported"),
+    OptSpec::both(b'h', "human-readable", HasArg::No, "human-readable"),
+    OptSpec::long("inodes", HasArg::No, "inodes"),
+    OptSpec::long("si", HasArg::No, "si"),
+    OptSpec::both(b'd', "max-depth", HasArg::Required, "max-depth"),
+    OptSpec::both(b'0', "null", HasArg::No, "null"),
+    OptSpec::both(b'P', "no-dereference", HasArg::No, "no-dereference"),
+    OptSpec::both(b'x', "one-file-system", HasArg::No, "one-file-system"),
+    OptSpec::both(b'S', "separate-dirs", HasArg::No, "separate-dirs"),
+    OptSpec::both(b's', "summarize", HasArg::No, "summarize"),
+    OptSpec::both(b'c', "total", HasArg::No, "total"),
+    OptSpec::both(b't', "threshold", HasArg::Required, "threshold"),
+    OptSpec::long("time", HasArg::Optional, "unsupported"),
+    OptSpec::long("time-style", HasArg::Required, "unsupported"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    // Dogfish extensions.
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    // Short-only options.
+    OptSpec::short(b'H', HasArg::No, "dereference-args"),
+    OptSpec::short(b'k', HasArg::No, "kilobytes"),
+    OptSpec::short(b'm', HasArg::No, "megabytes"),
 ];
 
 const DU_HELP: &str = "\
@@ -447,11 +418,8 @@ impl DuWalker<'_> {
     }
 }
 
-pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = match gnu_getopt(DU_OPTIONS, &args[1..]) {
-        Ok(p) => p,
-        Err(msg) => return Ok(gnu_usage_error("du", &msg, 1)),
-    };
+pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut parsed = Getopt::new(args.into_iter().skip(1).collect(), DU_OPTIONS);
     let (mut human_opts, mut block_size) = env_block_size("DU_BLOCK_SIZE");
     let mut explicit_units = false;
     let mut cfg = DuConfig {
@@ -472,7 +440,11 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut separate_dirs = false;
     let mut threshold: i128 = 0;
     let mut json = false;
-    for opt in parsed.opts {
+    while let Some(item) = parsed.next_text() {
+        let opt = match item {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("du", &e)),
+        };
         let value = opt.value.clone().unwrap_or_default();
         match opt.key {
             "null" => null = true,
@@ -502,7 +474,7 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                         "invalid maximum depth {}",
                         quote_bytes(value.as_bytes(), Quoting::Locale)
                     );
-                    return Ok(gnu_usage_error("du", &msg, 1));
+                    return Ok(usage_error("du", &msg));
                 }
             },
             "human-readable" => {
@@ -576,20 +548,17 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
             "one-file-system" => cfg.one_file_system = true,
             "json" => json = true,
-            "help" => return print_help_text(DU_HELP),
-            "version" => {
-                print_tool_version("du");
-                return Ok(0);
-            }
+            "unsupported" => return Ok(unsupported("du", &opt.spelled)),
+            "help" => return Ok(print_help(DU_HELP)),
+            "version" => return Ok(print_version("du")),
             _ => unreachable!("unhandled du option"),
         }
     }
 
     if cfg.all && summarize {
-        return Ok(gnu_usage_error(
+        return Ok(usage_error(
             "du",
             "cannot both summarize and show all entries",
-            1,
         ));
     }
     if summarize && max_depth == Some(0) {
@@ -599,7 +568,7 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         && d != 0
     {
         let msg = format!("warning: summarizing conflicts with --max-depth={d}");
-        return Ok(gnu_usage_error("du", &msg, 1));
+        return Ok(usage_error("du", &msg));
     }
     if cfg.inodes {
         if cfg.apparent {
@@ -607,10 +576,11 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
         block_size = 1;
     }
-    let targets = if parsed.operands.is_empty() {
+    let operands = lossy_all(parsed.operands());
+    let targets = if operands.is_empty() {
         vec![".".to_string()]
     } else {
-        parsed.operands
+        operands
     };
     cfg.hash_all = targets.len() > 1 || cfg.follow_all;
 
@@ -627,8 +597,7 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     ctx.telemetry
         .set_strategy("rayon parallel traversal, GNU-ordered accounting");
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let eol = if null { b'\0' } else { b'\n' };
     let format_size_gnu = |n: u64| human_readable(n, human_opts, 1, block_size);
     let mut write_line = |line: &DuLine| -> io::Result<()> {

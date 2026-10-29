@@ -3,7 +3,10 @@ id: 11
 uid: a295696f-a7d8-480c-8926-bca8a42175a5
 title: "One GNU compatibility layer for options, quoting, errors and exit codes"
 type: chore
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 10
@@ -39,10 +42,10 @@ its place (e.g. for `--help` text), otherwise remove it.
 
 ## Acceptance criteria
 
-- [ ] Exactly one option parser and one quoting implementation remain.
-- [ ] `cat --s` and `sort --vers` print GNU's ambiguity message; `cat --vers` prints the version.
-- [ ] GNU test-suite pass count does not drop; differential suites unchanged.
-- [ ] The parser-level GNU test failures found by 0008 are gone: unique-prefix
+- [x] Exactly one option parser and one quoting implementation remain.
+- [x] `cat --s` and `sort --vers` print GNU's ambiguity message; `cat --vers` prints the version.
+- [x] GNU test-suite pass count does not drop; differential suites unchanged.
+- [x] The parser-level GNU test failures found by 0008 are gone: unique-prefix
   long options (`cut --out=`), the last of a repeated option wins (`sort -o`
   twice, `shuf -n` twice), `--help`/`--version` among other operands
   (`tests/help/help-version-getopt.sh`, `tests/misc/nl.sh`), and non-UTF-8
@@ -50,3 +53,7 @@ its place (e.g. for `--help` text), otherwise remove it.
   aborts with exit 134). Tests: `tests/help/help-version-getopt.sh`, plus the
   parser cases inside `tests/cut/cut.pl`, `tests/sort/sort.pl`,
   `tests/shuf/shuf.sh`, `tests/misc/nl.sh`, `tests/date/date.pl`.
+
+## Result
+
+`common/getopt.rs` is a port of glibc 2.39 `getopt_long` (permutation, `+`/POSIXLY_CORRECT, clustering, optional arguments, unique-prefix abbreviation with glibc's ambiguity message, `--`); every tool's option table mirrors GNU 9.4's `long_options`; `common/tool_args`, `gnu_getopt`, the old `getopt` and clap are gone. Arguments are OsString end to end. Dogfish-only switches (`--stats`, `--color`, `--no-color`, `-J`) are declared per tool, exact-match only, and never given to echo, printf, true, false or yes. GNU tests now passing and added to the baseline: help/help-version-getopt, misc/false-status, misc/close-stdout, misc/yes, misc/write-errors, head/head-write-error, rm/dangling-symlink, rm/dir-no-w, rm/empty-inacc, rm/interactive-once, rm/isatty. About 60 new differential cases (abbreviations, ambiguity, --help anywhere, POSIXLY_CORRECT, /dev/full, per-tool switches, 0xff names) and 25 parser unit tests; `cargo xtask ci` passes (6,453 tests).

@@ -1,51 +1,105 @@
 //! tee — copy standard input to standard output and files
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
 use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file};
 
-use crate::common::getopt::argmatch;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy_all, print_help, print_version,
+};
 
-#[derive(Parser)]
-#[command(
-    name = "tee",
-    about = "Copy standard input to each FILE, and also to standard output",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
+const TEE_HELP: &str = "\
+Copy standard input to each FILE, and also to standard output
+
+Usage: tee [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  Output file paths
+
+Options:
+  -a, --append                 Append to the given FILEs, do not overwrite
+  -i, --ignore-interrupts      Ignore interrupt signals
+  -p                           Operate in a more appropriate MODE with pipes (same as
+                               --output-error=warn-nopipe)
+      --output-error[=<MODE>]  Set behavior on write error: warn, warn-nopipe, exit, exit-nopipe
+      --help                   Display this help and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TeeOpt {
+    Append,
+    IgnoreInterrupts,
+    NoPipe,
+    OutputError,
+    Help,
+    Version,
+}
+
+/// GNU's `long_options` and `"aip"`.
+const SPECS: &[OptSpec<TeeOpt>] = &[
+    OptSpec::both(b'a', "append", HasArg::No, TeeOpt::Append),
+    OptSpec::both(
+        b'i',
+        "ignore-interrupts",
+        HasArg::No,
+        TeeOpt::IgnoreInterrupts,
+    ),
+    OptSpec::long("output-error", HasArg::Optional, TeeOpt::OutputError),
+    OptSpec::long("help", HasArg::No, TeeOpt::Help),
+    OptSpec::long("version", HasArg::No, TeeOpt::Version),
+    OptSpec::short(b'p', HasArg::No, TeeOpt::NoPipe),
+];
+
 struct TeeArgs {
-    /// Append to the given FILEs, do not overwrite
-    #[arg(short = 'a', long = "append")]
     append: bool,
-
-    /// Ignore interrupt signals
-    #[arg(short = 'i', long = "ignore-interrupts")]
     ignore_interrupts: bool,
-
-    /// Operate in a more appropriate MODE with pipes (same as --output-error=warn-nopipe)
-    #[arg(short = 'p')]
-    nopipe: bool,
-
-    /// Set behavior on write error: warn, warn-nopipe, exit, exit-nopipe
-    #[arg(
-        long = "output-error",
-        value_name = "MODE",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "warn-nopipe"
-    )]
-    output_error: Option<String>,
-
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
-
-    /// Output file paths
+    mode: OutputError,
     files: Vec<String>,
+}
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a diagnostic. As in GNU, the last of `-p` and
+/// `--output-error` decides the mode.
+fn parse_tee_args(args: Vec<OsString>) -> std::result::Result<TeeArgs, i32> {
+    let mut p = TeeArgs {
+        append: false,
+        ignore_interrupts: false,
+        mode: OutputError::Sigpipe,
+        files: Vec::new(),
+    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("tee", &e))?;
+        match o {
+            TeeOpt::Append => p.append = true,
+            TeeOpt::IgnoreInterrupts => p.ignore_interrupts = true,
+            TeeOpt::NoPipe => p.mode = OutputError::WarnNopipe,
+            TeeOpt::OutputError => {
+                p.mode = match v {
+                    None => OutputError::WarnNopipe,
+                    Some(m) => argmatch(
+                        "tee",
+                        "--output-error",
+                        m,
+                        &[
+                            ("warn", OutputError::Warn),
+                            ("warn-nopipe", OutputError::WarnNopipe),
+                            ("exit", OutputError::Exit),
+                            ("exit-nopipe", OutputError::ExitNopipe),
+                        ],
+                    )?,
+                };
+            }
+            TeeOpt::Help => return Err(print_help(TEE_HELP)),
+            TeeOpt::Version => return Err(print_version("tee")),
+        }
+    }
+    p.files = lossy_all(opts.operands());
+    Ok(p)
 }
 
 /// GNU tee's `--output-error` modes.
@@ -161,23 +215,12 @@ fn write_wait(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn run_tee(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TeeArgs::try_parse_from(args)?;
-    let mut mode = if parsed.nopipe {
-        OutputError::WarnNopipe
-    } else {
-        OutputError::Sigpipe
+pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_tee_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
-    if let Some(m) = &parsed.output_error {
-        let modes = ["warn", "warn-nopipe", "exit", "exit-nopipe"];
-        mode = match argmatch("tee", "--output-error", m, &modes, 1) {
-            Ok(0) => OutputError::Warn,
-            Ok(1) => OutputError::WarnNopipe,
-            Ok(2) => OutputError::Exit,
-            Ok(_) => OutputError::ExitNopipe,
-            Err(status) => return Ok(status),
-        };
-    }
+    let mode = parsed.mode;
     // SAFETY: changing this process's signal dispositions before any I/O.
     unsafe {
         if parsed.ignore_interrupts {

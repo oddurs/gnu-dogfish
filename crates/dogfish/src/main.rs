@@ -1,21 +1,23 @@
 //! `dogfish`: the GNU/Dogfish multicall binary.
 
-// Doc comments on clap structs are the `--help` text, where usage syntax such as
-// `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
-#![allow(rustdoc::broken_intra_doc_links)]
+// The C `main` below is the entry point: Rust's own start-up code would
+// reopen a closed standard output on /dev/null, hiding `>&-` from the tools.
+#![cfg_attr(not(test), no_main)]
 
 mod common;
 mod tools;
 
+use std::ffi::OsString;
 use std::path::Path;
-use std::process::ExitCode;
 
 use anyhow::Result;
 use dogfish_core::{
     ColumnAlign, DogfishContext, Table, gnu_io_error,
     io::{install_sigbus_handler, install_sigpipe_handler},
-    strip_os_error_suffix,
+    outln, stdout, strip_os_error_suffix,
 };
+
+use crate::common::getopt::exit_failure;
 
 pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     // Tier 1: File & Directory
@@ -270,9 +272,45 @@ pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn main() -> ExitCode {
+/// The process entry point, as C sees it. Before anything else, standard
+/// input, output and error are made safe: a descriptor the shell closed
+/// (`>&-`) is taken by `/dev/null`, so that no file the tool opens becomes
+/// its standard output, and a closed standard output makes every write
+/// fail, as in GNU.
+///
+/// # Safety
+///
+/// Called by the C runtime only, with `argc` valid strings in `argv`.
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
+    use std::os::unix::ffi::OsStringExt;
+    for fd in 0..3 {
+        // SAFETY: fcntl(F_GETFD) only queries the descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            // SAFETY: a NUL-terminated path; the lowest free descriptor is `fd`.
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if fd == libc::STDOUT_FILENO {
+                stdout::started_closed();
+            }
+        }
+    }
+    let args = (0..usize::try_from(argc).unwrap_or(0))
+        .filter_map(|i| {
+            // SAFETY: the C runtime passes `argc` valid NUL-terminated strings.
+            let arg = unsafe { *argv.add(i) };
+            (!arg.is_null()).then(|| {
+                OsString::from_vec(unsafe { std::ffi::CStr::from_ptr(arg) }.to_bytes().to_vec())
+            })
+        })
+        .collect();
+    libc::c_int::from(run(args))
+}
+
+/// Runs the multicall binary on `raw_args` (`argv`); returns the exit status.
+#[cfg_attr(test, allow(dead_code))]
+fn run(raw_args: Vec<OsString>) -> u8 {
     install_sigpipe_handler();
-    let raw_args: Vec<String> = std::env::args().collect();
 
     // Determine if invoked via symlink (e.g. `ls`, `df-ls`) or as `dogfish <subcommand>`
     let argv0_name = raw_args
@@ -291,32 +329,33 @@ fn main() -> ExitCode {
     {
         let mut a = raw_args;
         if !a.is_empty() {
-            a[0] = stripped_argv0.clone();
+            a[0] = OsString::from(&stripped_argv0);
         }
         (stripped_argv0, a)
     } else {
-        match raw_args.get(1).map(|s| s.as_str()) {
+        let sub = raw_args.get(1).map(|s| s.to_string_lossy().into_owned());
+        match sub.as_deref() {
             None | Some("-h") | Some("--help") | Some("help") => {
                 print_banner_and_help();
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some("-V") | Some("--version") | Some("version") => {
-                println!(
+                outln!(
                     "GNU/Dogfish (gnu-dogfish) {} — Libre, Object-Aware Coreutils",
                     env!("CARGO_PKG_VERSION")
                 );
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some("--list") | Some("list") => {
                 for (name, _, _) in ALL_TOOLS {
-                    println!("{}", name);
+                    outln!("{}", name);
                 }
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some(sub) => {
                 let sub_clean = sub.strip_prefix("df-").unwrap_or(sub).to_string();
                 let mut a = Vec::with_capacity(raw_args.len() - 1);
-                a.push(sub_clean.clone());
+                a.push(OsString::from(&sub_clean));
                 a.extend_from_slice(&raw_args[2..]);
                 (sub_clean, a)
             }
@@ -324,122 +363,68 @@ fn main() -> ExitCode {
     };
 
     install_sigbus_handler(&tool_name);
-    let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
-    // Like every GNU utility (scripts probe `tool --version`), a lone `--version`
-    // prints the version instead of being parsed as an operand or rejected.
-    if filtered_args.len() == 2 && filtered_args[1] == "--version" {
-        println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
-        // GNU `false` fails even when asked for its version.
-        return if tool_name == "false" {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
-    }
-    let res = dispatch(&tool_name, filtered_args, &ctx);
+    let ctx = DogfishContext::new(&tool_name);
+    // Each tool parses its own arguments, Dogfish's switches included.
+    common::getopt::install_switches(
+        common::getopt::switches_for(&tool_name),
+        ctx.switches.clone(),
+    );
+    let res = dispatch(&tool_name, tool_args, &ctx);
     ctx.finish();
 
-    match res {
-        Ok(code) => ExitCode::from(code as u8),
+    let code = match res {
+        Ok(code) => code,
         Err(err) => {
-            if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
-                use clap::error::ErrorKind;
-                if matches!(
-                    clap_err.kind(),
-                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-                ) {
-                    let _ = clap_err.print();
-                    return ExitCode::SUCCESS;
+            match err.downcast_ref::<std::io::Error>() {
+                // A failed write to standard output is reported as GNU's
+                // `close_stdout` does, once.
+                Some(io_err) if stdout::is_write_error(io_err) => {
+                    stdout::mark_reported();
+                    report_write_error(&tool_name, io_err);
+                    exit_failure(&tool_name)
                 }
-                // Usage errors read like glibc getopt's, then GNU's "Try" hint.
-                match gnu_usage_message(clap_err) {
-                    Some(msg) => eprintln!(
-                        "{tool_name}: {msg}\nTry '{tool_name} --help' for more information."
-                    ),
-                    None => {
-                        let _ = clap_err.print();
-                    }
+                _ => {
+                    // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
+                    let msg = match err.downcast_ref::<std::io::Error>() {
+                        Some(io_err) => gnu_io_error(io_err),
+                        None => strip_os_error_suffix(&err.to_string()),
+                    };
+                    let prefix = format!("{}: ", tool_name);
+                    let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
+                    let st = ctx.stderr_style();
+                    eprintln!("{}: {}", st.bold(&tool_name), msg);
+                    1
                 }
-                return ExitCode::from(usage_error_status(&tool_name));
             }
-            // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
-            let msg = match err.downcast_ref::<std::io::Error>() {
-                Some(io_err) => gnu_io_error(io_err),
-                None => strip_os_error_suffix(&err.to_string()),
-            };
-            let prefix = format!("{}: ", tool_name);
-            let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
-            let st = ctx.stderr_style();
-            eprintln!("{}: {}", st.bold(&tool_name), msg);
-            ExitCode::from(1)
         }
-    }
-}
-
-/// Exit status GNU uses for command-line usage errors: most tools exit 1, but
-/// the ones whose own failures are reported with 1 reserve a distinct status.
-fn usage_error_status(tool: &str) -> u8 {
-    match tool {
-        "ls" | "sort" | "printenv" => 2,
-        "env" | "timeout" => 125,
-        _ => 1,
-    }
-}
-
-/// Translates a clap parse error into glibc `getopt_long` wording
-/// (`invalid option -- 'x'`, `unrecognized option '--xyz'`, ...), or `None`
-/// for kinds GNU has no generic message for.
-fn gnu_usage_message(err: &clap::Error) -> Option<String> {
-    use clap::error::{ContextKind, ContextValue, ErrorKind};
-    let context = |kind| match err.get(kind) {
-        Some(ContextValue::String(s)) => Some(s.as_str()),
-        _ => None,
     };
-    // clap names an option as it is declared (`--wrap <COLS>`); keep the flag.
-    let declared =
-        || context(ContextKind::InvalidArg).map(|a| a.split([' ', '=']).next().unwrap_or(a));
-    match err.kind() {
-        ErrorKind::UnknownArgument => {
-            let arg = context(ContextKind::InvalidArg)?;
-            Some(if arg.starts_with("--") {
-                // clap drops any `=VALUE`; GNU echoes the argument as typed.
-                let typed = std::env::args()
-                    .find(|a| a.strip_prefix(arg).is_some_and(|v| v.starts_with('=')))
-                    .unwrap_or_else(|| arg.to_string());
-                format!("unrecognized option '{typed}'")
-            } else if let Some(short) = arg.strip_prefix('-').and_then(|s| s.chars().next()) {
-                format!("invalid option -- '{short}'")
-            } else {
-                format!("extra operand '{arg}'")
-            })
+    finish(&tool_name, code)
+}
+
+/// Flushes standard output and exits with `code`, or, when output was lost to
+/// a write error nobody has reported, reports it and fails (gnulib's
+/// `close_stdout`).
+fn finish(tool: &str, code: i32) -> u8 {
+    let code = match stdout::close() {
+        Some(err) => {
+            report_write_error(tool, &err);
+            exit_failure(tool)
         }
-        ErrorKind::InvalidValue if context(ContextKind::InvalidValue) == Some("") => {
-            // A missing option argument: GNU names the option the way it was typed,
-            // which clap does not record, so look at the last option-like argument.
-            let typed = std::env::args().rev().find(|a| a.starts_with('-'));
-            Some(match typed {
-                Some(t) if !t.starts_with("--") => {
-                    let short = t.chars().last().unwrap_or('?');
-                    format!("option requires an argument -- '{short}'")
-                }
-                _ => format!("option '{}' requires an argument", declared()?),
-            })
+        None => code,
+    };
+    code as u8
+}
+
+/// GNU's diagnostic for output lost to a write error: `tool: write error:
+/// No space left on device`. The tools whose output GNU flushes as it goes
+/// find the error before exit, when `errno` no longer says why, and print
+/// just `write error`.
+fn report_write_error(tool: &str, err: &std::io::Error) {
+    match tool {
+        "wc" | "md5sum" | "sha256sum" | "b2sum" | "du" | "sort" => {
+            eprintln!("{tool}: write error")
         }
-        ErrorKind::InvalidValue | ErrorKind::ValueValidation => Some(format!(
-            "invalid argument '{}' for '{}'",
-            context(ContextKind::InvalidValue)?,
-            declared()?
-        )),
-        ErrorKind::TooManyValues => {
-            let arg = declared()?;
-            Some(if arg.starts_with('-') {
-                format!("option '{arg}' doesn't allow an argument")
-            } else {
-                format!("extra operand '{}'", context(ContextKind::InvalidValue)?)
-            })
-        }
-        ErrorKind::MissingRequiredArgument => Some("missing operand".to_string()),
-        _ => None,
+        _ => eprintln!("{tool}: write error: {}", gnu_io_error(err)),
     }
 }
 
@@ -447,7 +432,7 @@ fn is_known_tool(name: &str) -> bool {
     ALL_TOOLS.iter().any(|(n, _, _)| *n == name)
 }
 
-fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let tool_names: Vec<&str> = ALL_TOOLS.iter().map(|(n, _, _)| *n).collect();
     match tool {
         // Tier 1: File & Directory
@@ -525,7 +510,7 @@ fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> 
 }
 
 fn print_banner_and_help() {
-    let (ctx, _) = DogfishContext::from_raw_args("dogfish", vec![]);
+    let ctx = DogfishContext::new("dogfish");
     let st = ctx.style();
     let logo = r#"
              .              /\
@@ -538,38 +523,38 @@ fn print_banner_and_help() {
         `._     `--' /   \_\           /  ##  ## (oo)
            `-.___..-'   / /           / \## __   ./
                        /_/               |//YY \|/"#;
-    println!("{}", st.bold_cyan(logo));
-    println!(
+    outln!("{}", st.bold_cyan(logo));
+    outln!(
         "\n  {} {} — {}",
         st.bold_cyan("🦈 GNU/DOGFISH"),
         st.dim(env!("CARGO_PKG_VERSION")),
         st.bold("Libre, High-Velocity, Object-Aware Coreutils in Rust")
     );
-    println!(
+    outln!(
         "  {}",
         st.yellow(
             "Free Software Foundation Spirit • Four Essential Freedoms • Zero Proprietary Bloat"
         )
     );
-    println!(
+    outln!(
         "  {}\n",
         st.dim("Usage: gnu/dogfish <UTILITY> [ARGS]... [--stats] [--json|-J] [--color=auto|always|never]")
     );
 
-    println!("  {}", st.bold_yellow("Killer Features:"));
-    println!(
+    outln!("  {}", st.bold_yellow("Killer Features:"));
+    outln!(
         "    • {}   `dogfish ls -J | dogfish sort --by size --desc | dogfish head -n 5`",
         st.bold_green("NDJSON Object Piping:")
     );
-    println!(
+    outln!(
         "    • {}       Pass `--stats` to any command for microsecond timing & I/O speed",
         st.bold_green("Global Telemetry:")
     );
-    println!(
+    outln!(
         "    • {}     `dogfish rm --safe <file>`, `mv`, `cp` -> rollback with `dogfish undo`",
         st.bold_green("Reversible File Ops:")
     );
-    println!(
+    outln!(
         "    • {}        Run `dogfish bench` to race Dogfish against system `/bin/*` utilities\n",
         st.bold_green("Live Benchmarks:")
     );
@@ -584,8 +569,6 @@ fn print_banner_and_help() {
         tbl.add_row(vec![st.bold_cyan(name), st.yellow(cat), desc.to_string()]);
     }
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let _ = tbl.render(&mut out, st);
-    println!();
+    let _ = tbl.render(&mut stdout::stdout(), st);
+    outln!();
 }

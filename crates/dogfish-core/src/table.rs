@@ -160,8 +160,7 @@ pub fn emit_objects_or_table<T: Serialize>(
     explicit_json: bool,
     render_tty_table: bool,
 ) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(crate::stdout::stdout());
 
     let values: Vec<Value> = items
         .iter()

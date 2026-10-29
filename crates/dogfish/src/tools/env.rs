@@ -1,17 +1,21 @@
 //! env — run a program in a modified environment (`-i`, `-u`, `-S`, `-C`)
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, io::ignore_broken_pipe,
+    ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, io::ignore_broken_pipe, stdout,
 };
 use serde::Serialize;
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, error_bytes, getopt_error, lossy, print_help, print_version,
+    try_help, usage_error,
+};
+use crate::common::quote::quote_locale;
 use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
 
 /// Largest signal number worth probing (GNU's SIGNUM_BOUND).
@@ -57,46 +61,35 @@ Exit status:
   -    the exit status of COMMAND otherwise
 ";
 
-static ENV_OPTS: [OptSpec; 14] = [
-    opt(
-        Some('i'),
-        Some("ignore-environment"),
-        HasArg::No,
-        "ignore-environment",
-    ),
-    opt(Some('0'), Some("null"), HasArg::No, "null"),
-    opt(Some('u'), Some("unset"), HasArg::Required, "unset"),
-    opt(Some('C'), Some("chdir"), HasArg::Required, "chdir"),
-    opt(
-        Some('S'),
-        Some("split-string"),
-        HasArg::Required,
-        "split-string",
-    ),
-    opt(Some('v'), Some("debug"), HasArg::No, "debug"),
-    opt(None, Some("block-signal"), HasArg::Optional, "block-signal"),
-    opt(
-        None,
-        Some("default-signal"),
-        HasArg::Optional,
-        "default-signal",
-    ),
-    opt(
-        None,
-        Some("ignore-signal"),
-        HasArg::Optional,
-        "ignore-signal",
-    ),
-    opt(
-        None,
-        Some("list-signal-handling"),
-        HasArg::No,
-        "list-signal-handling",
-    ),
-    opt(Some('J'), Some("json"), HasArg::No, "json"),
-    opt(Some('t'), Some("table"), HasArg::No, "table"),
-    opt(None, Some("help"), HasArg::No, "help"),
-    opt(None, Some("version"), HasArg::No, "version"),
+/// A whitespace character in an option cluster: GNU's option string has
+/// them to catch `#!/usr/bin/env -i command` shebang lines.
+const fn shebang_space(c: u8) -> OptSpec<&'static str> {
+    OptSpec::short(c, HasArg::No, "shebang-space")
+}
+
+/// GNU's `longopts` and `"+C:iS:u:v0"` plus whitespace, plus the Dogfish
+/// `-J, --json` and `-t, --table`. Options end at the first operand.
+const ENV_OPTS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'i', "ignore-environment", HasArg::No, "ignore-environment"),
+    OptSpec::both(b'0', "null", HasArg::No, "null"),
+    OptSpec::both(b'u', "unset", HasArg::Required, "unset"),
+    OptSpec::both(b'C', "chdir", HasArg::Required, "chdir"),
+    OptSpec::long("default-signal", HasArg::Optional, "default-signal"),
+    OptSpec::long("ignore-signal", HasArg::Optional, "ignore-signal"),
+    OptSpec::long("block-signal", HasArg::Optional, "block-signal"),
+    OptSpec::long("list-signal-handling", HasArg::No, "list-signal-handling"),
+    OptSpec::both(b'v', "debug", HasArg::No, "debug"),
+    OptSpec::both(b'S', "split-string", HasArg::Required, "split-string"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    OptSpec::both(b't', "table", HasArg::No, "table").exact(),
+    shebang_space(b' '),
+    shebang_space(b'\t'),
+    shebang_space(b'\n'),
+    shebang_space(0x0b),
+    shebang_space(0x0c),
+    shebang_space(b'\r'),
 ];
 
 /// Splits an `env -S` string into arguments like GNU: whitespace separates,
@@ -313,7 +306,7 @@ impl EnvList {
 /// Replaces this process with `argv[0]`, searching `PATH` (taken from the new
 /// environment, defaulting to `/bin:/usr/bin`) the way `execvp` does. Returns
 /// only on failure, with the error to report.
-fn exec_with_env(argv: &[String], env: &EnvList) -> io::Error {
+fn exec_with_env(argv: &[OsString], env: &EnvList) -> io::Error {
     let to_c = |b: &[u8]| CString::new(b.to_vec()).ok();
     let Some(c_args) = argv
         .iter()
@@ -394,9 +387,13 @@ fn is_c_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
-pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let usage = |msg: String| Ok(usage_error("env", msg, EXIT_CANCELED));
-    let mut opts = GetOpt::new(args.into_iter().skip(1).collect(), &ENV_OPTS, false);
+pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let usage = |msg: String| Ok(usage_error("env", msg));
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        ENV_OPTS,
+        Order::StopAtOperand,
+    );
     let mut ignore_env = false;
     let mut null = false;
     let mut debug = false;
@@ -406,22 +403,20 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut unset: Vec<String> = Vec::new();
     let mut chdir: Option<String> = None;
     let mut signal_actions: Vec<(SignalAction, Option<Vec<libc::c_int>>)> = Vec::new();
-    while let Some(item) = opts.next_opt() {
+    while let Some(item) = opts.next() {
         let (key, value) = match item {
-            Ok(kv) => kv,
-            Err(msg) => {
+            Ok((key, value)) => (key, value.as_deref().map(lossy)),
+            Err(e) => {
                 // A space in the first argument means a shebang line like
                 // `#!/usr/bin/env -i command`, which needs -S (GNU's hint).
-                if let Some(c) = msg
-                    .strip_prefix("invalid option -- '")
-                    .and_then(|r| r.chars().next())
-                    && c.is_ascii()
-                    && is_c_space(c as u8)
+                if let Some(&[c, b'\'']) = e.as_bytes().strip_prefix(b"invalid option -- '")
+                    && is_c_space(c)
                 {
-                    eprintln!("env: {msg}");
-                    return usage(SHEBANG_HINT.to_string());
+                    error_bytes("env", e.as_bytes());
+                    eprintln!("env: {SHEBANG_HINT}");
+                    return Ok(try_help("env"));
                 }
-                return usage(msg);
+                return Ok(getopt_error("env", &e));
             }
         };
         match key {
@@ -433,11 +428,14 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "json" => json = true,
             "table" => table = true,
             "list-signal-handling" => list_signals = true,
-            "help" => return print_help(ENV_HELP),
-            "version" => {
-                println!("env (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
-                return Ok(0);
+            "shebang-space" => {
+                let spelled = opts.last_spelling();
+                eprintln!("env: invalid option -- '{}'", &spelled[1..]);
+                eprintln!("env: use -[v]S to pass options in shebang lines");
+                return Ok(try_help("env"));
             }
+            "help" => return Ok(print_help(ENV_HELP)),
+            "version" => return Ok(print_version("env")),
             "split-string" => {
                 let s = value.unwrap_or_default();
                 match split_env_string(&s) {
@@ -449,7 +447,7 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                                 eprintln!("{lead}{}", gnu_quote(item));
                             }
                         }
-                        opts.splice_front(items);
+                        opts.splice_front(items.into_iter().map(OsString::from).collect());
                     }
                     Err(msg) => {
                         eprintln!("env: {msg}");
@@ -470,7 +468,7 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    let mut rest = opts.into_operands();
+    let mut rest = opts.operands();
     if rest.first().is_some_and(|a| a == "-") {
         ignore_env = true;
         rest.remove(0);
@@ -504,10 +502,13 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             env.unset(name.as_bytes());
         }
     }
-    let assignments = rest.iter().take_while(|a| a.contains('=')).count();
+    let assignments = rest
+        .iter()
+        .take_while(|a| a.as_bytes().contains(&b'='))
+        .count();
     for a in &rest[..assignments] {
         if debug {
-            eprintln!("setenv:   {a}");
+            eprintln!("setenv:   {}", a.to_string_lossy());
         }
         env.put(a.as_bytes());
     }
@@ -544,20 +545,20 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     if debug {
-        eprintln!("executing: {}", command[0]);
+        eprintln!("executing: {}", command[0].to_string_lossy());
         for (i, a) in command.iter().enumerate() {
-            eprintln!("   arg[{i}]= {}", gnu_quote(a));
+            eprintln!("   arg[{i}]= {}", quote_locale(a));
         }
     }
-    let _ = io::stdout().flush();
+    let _ = stdout::flush();
     let err = exec_with_env(command, &env);
     let status = if err.raw_os_error() == Some(libc::ENOENT) {
         EXIT_ENOENT
     } else {
         EXIT_CANNOT_INVOKE
     };
-    eprintln!("env: {}: {}", gnu_quote(&command[0]), gnu_io_error(&err));
-    if status == EXIT_ENOENT && command[0].bytes().any(is_c_space) {
+    eprintln!("env: {}: {}", quote_locale(&command[0]), gnu_io_error(&err));
+    if status == EXIT_ENOENT && command[0].as_bytes().iter().copied().any(is_c_space) {
         eprintln!("env: {SHEBANG_HINT}");
     }
     Ok(status)
@@ -594,14 +595,12 @@ fn print_env(
             for r in &records {
                 tbl.add_row(vec![st.bold_cyan(&r.key), r.value.clone()]);
             }
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
+            let mut out = stdout::stdout();
             tbl.render(&mut out, st)?;
         }
         return Ok(0);
     }
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let term: &[u8] = if null { b"\0" } else { b"\n" };
     for e in &env.0 {
         out.write_all(e)?;
