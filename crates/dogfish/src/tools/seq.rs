@@ -641,6 +641,12 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     Ok(0)
 }
 
+/// seq's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("seq", SEQ_HELP, SEQ_OPTS)
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]

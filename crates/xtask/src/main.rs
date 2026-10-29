@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod dist;
+mod docs_gen;
 mod sha256;
 mod unsafe_audit;
 
@@ -29,6 +30,7 @@ const CI: &[&str] = &[
     "test-release",
     "unprivileged",
     "doc",
+    "docs-gen",
     "package",
 ];
 
@@ -52,6 +54,10 @@ const STEPS: &[(&str, &str)] = &[
         "as root: run every test binary again as nobody",
     ),
     ("doc", "cargo doc, warnings denied"),
+    (
+        "docs-gen",
+        "man pages and shell completions into target/docs-gen, linted",
+    ),
     ("package", "cargo package (crates.io dry run)"),
     (
         "gnu",
@@ -149,6 +155,7 @@ fn run_step(root: &Path, step: &str, args: &[String]) -> Step {
             .args(["doc", "--workspace", "--no-deps", "--locked"])
             .env("RUSTDOCFLAGS", "-D warnings")
             .current_dir(root)),
+        "docs-gen" => docs_gen::docs_gen(root),
         "package" => package(root),
         "gnu" => run(Command::new(root.join("util/gnu-tests.sh")).current_dir(root)),
         "unsafe-audit" => unsafe_audit::audit(root).map(|summary| eprintln!("xtask: {summary}")),

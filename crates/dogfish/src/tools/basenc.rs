@@ -682,6 +682,16 @@ const BASENC_SPECS: &[OptSpec<CodecOpt>] = &[
     OptSpec::long("z85", HasArg::No, CodecOpt::Encoding(Encoding::Z85)),
 ];
 
+/// `tool`'s table: basenc's, or base64's, which is the same without the
+/// encodings (they come last).
+fn specs_for(tool: &str) -> &'static [OptSpec<CodecOpt>] {
+    if tool == "basenc" {
+        BASENC_SPECS
+    } else {
+        &BASENC_SPECS[..5]
+    }
+}
+
 /// The command line of `base64` or `basenc`.
 struct CodecArgs {
     decode: bool,
@@ -699,12 +709,6 @@ fn parse_codec_args(
     args: Vec<OsString>,
     help: &str,
 ) -> std::result::Result<CodecArgs, i32> {
-    // base64 has the same table without the encodings (they come last).
-    let specs = if tool == "basenc" {
-        BASENC_SPECS
-    } else {
-        &BASENC_SPECS[..5]
-    };
     let mut p = CodecArgs {
         decode: false,
         ignore_garbage: false,
@@ -712,7 +716,7 @@ fn parse_codec_args(
         encoding: None,
         file: None,
     };
-    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), specs);
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), specs_for(tool));
     while let Some(opt) = opts.next() {
         let (o, v) = opt.map_err(|e| getopt_error(tool, &e))?;
         match o {
@@ -764,6 +768,17 @@ pub fn run_basenc(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         file: parsed.file.as_deref(),
     };
     run_codec("basenc", encoding, opts, ctx)
+}
+
+/// The option table and help text of `tool` (base64 or basenc), for its
+/// manual page and shell completions (`crate::manual`).
+pub(crate) fn manual(tool: &'static str) -> crate::manual::Manual {
+    let help = if tool == "basenc" {
+        BASENC_HELP
+    } else {
+        BASE64_HELP
+    };
+    crate::manual::Manual::new(tool, help, specs_for(tool))
 }
 
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).

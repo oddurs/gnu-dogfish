@@ -338,3 +338,12 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(status)
 }
+
+/// tee's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("tee", TEE_HELP, SPECS).choices(
+        "output-error",
+        ["warn", "warn-nopipe", "exit", "exit-nopipe"],
+    )
+}

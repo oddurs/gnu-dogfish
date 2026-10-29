@@ -488,6 +488,13 @@ fn posixtime(s: &[u8], bits: u32) -> Option<i64> {
     }
 }
 
+/// touch's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("touch", TOUCH_HELP, SPECS)
+        .choices("time", ["atime", "access", "use", "mtime", "modify"])
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]

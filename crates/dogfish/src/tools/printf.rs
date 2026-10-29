@@ -8,7 +8,7 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
-use crate::common::getopt::{lossy_all, print_help, print_version};
+use crate::common::getopt::{HasArg, OptSpec, lossy_all, print_help, print_version};
 use crate::common::locale::utf8_locale;
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field_into};
 use crate::common::strtod::strtod_prefix;
@@ -549,6 +549,19 @@ pub fn run_printf(raw: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(1);
     }
     Ok(if ok && !run.failed { 0 } else { 1 })
+}
+
+/// printf's options as a table, for its manual page and completions:
+/// printf compares a lone argument with them itself (`run_printf`).
+const DOC_SPECS: &[OptSpec<bool>] = &[
+    OptSpec::long("help", HasArg::No, true),
+    OptSpec::long("version", HasArg::No, false),
+];
+
+/// printf's options and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("printf", PRINTF_HELP, DOC_SPECS)
 }
 
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).

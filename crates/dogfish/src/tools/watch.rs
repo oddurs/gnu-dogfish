@@ -144,3 +144,9 @@ pub fn run_watch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// watch's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("watch", WATCH_HELP, SPECS)
+}

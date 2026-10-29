@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use dogfish_core::DogfishContext;
 
-use crate::common::getopt::{print_help, print_version};
+use crate::common::getopt::{HasArg, OptSpec, print_help, print_version};
 
 const TRUE_HELP: &str = "\
 Usage: true [ignored command line arguments]
@@ -47,4 +47,22 @@ pub fn run_true(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 pub fn run_false(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry.set_strategy("immediate exit(1)");
     run_trivial("false", &args, 1, FALSE_HELP)
+}
+
+/// The options of true and false as a table, for their manual pages and
+/// completions: `run_trivial` compares a lone argument with them itself.
+const DOC_SPECS: &[OptSpec<bool>] = &[
+    OptSpec::long("help", HasArg::No, true),
+    OptSpec::long("version", HasArg::No, false),
+];
+
+/// The options and help text of true or false, for their manual pages and
+/// shell completions (`crate::manual`).
+pub(crate) fn manual(tool: &'static str) -> crate::manual::Manual {
+    let help = if tool == "true" {
+        TRUE_HELP
+    } else {
+        FALSE_HELP
+    };
+    crate::manual::Manual::new(tool, help, DOC_SPECS)
 }

@@ -92,3 +92,9 @@ pub fn run_undo(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// undo's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("undo", UNDO_HELP, SPECS)
+}

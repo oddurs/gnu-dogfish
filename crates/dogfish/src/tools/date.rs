@@ -314,6 +314,14 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     Ok(if emit(&mut out, stamp)? { 0 } else { 1 })
 }
 
+/// date's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("date", DATE_HELP, DATE_OPTS)
+        .choices("iso-8601", ISO_8601_FORMATS.iter().map(|(w, _)| *w))
+        .choices("rfc-3339", RFC_3339_FORMATS.iter().map(|(w, _)| *w))
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]

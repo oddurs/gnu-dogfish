@@ -343,3 +343,9 @@ pub fn run_paste(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     out.flush()?;
     Ok(if ok { 0 } else { 1 })
 }
+
+/// paste's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("paste", PASTE_HELP, SPECS)
+}

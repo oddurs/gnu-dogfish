@@ -742,6 +742,12 @@ fn copy_first_lines<R: BufRead + ?Sized, W: Write>(
     Ok(written)
 }
 
+/// head's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("head", HEAD_HELP, SPECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::expand_obsolete;

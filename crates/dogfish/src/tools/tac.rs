@@ -262,6 +262,12 @@ pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     Ok(i32::from(!ok))
 }
 
+/// tac's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("tac", TAC_HELP, SPECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Separator, tac_buffer};

@@ -76,3 +76,9 @@ pub fn run_yes(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 }
+
+/// yes's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("yes", YES_HELP, SPECS)
+}

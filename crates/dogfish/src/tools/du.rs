@@ -1232,3 +1232,11 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     out.flush()?;
     Ok(status)
 }
+
+/// du's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("du", DU_HELP, DU_OPTIONS)
+        .choices("time", ["atime", "access", "use", "ctime", "status"])
+        .choices("time-style", ["full-iso", "long-iso", "iso"])
+}

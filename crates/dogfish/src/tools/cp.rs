@@ -802,3 +802,15 @@ fn re_protect(copier: &Copier<'_>, dst: &Path, attrs: &[DirAttr]) -> bool {
     }
     true
 }
+
+/// cp's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("cp", CP_HELP, SPECS)
+        .choices("backup", crate::common::backup::backup_words())
+        .choices("reflink", ["auto", "always", "never"])
+        .choices("sparse", ["never", "auto", "always"])
+        .choices("update", ["all", "none", "older"])
+        .choices("preserve", PRESERVE_ARGS.iter().map(|(w, _)| *w))
+        .choices("no-preserve", PRESERVE_ARGS.iter().map(|(w, _)| *w))
+}

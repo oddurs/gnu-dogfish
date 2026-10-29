@@ -385,3 +385,9 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     out.flush()?;
     Ok(status)
 }
+
+/// id's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("id", ID_HELP, SPECS)
+}

@@ -252,3 +252,9 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         quote_locale(&full_template)
     ))
 }
+
+/// mktemp's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("mktemp", MKTEMP_HELP, SPECS)
+}

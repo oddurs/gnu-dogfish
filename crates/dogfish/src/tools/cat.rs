@@ -434,3 +434,9 @@ fn cat_decorated<W: Write>(
     ctx.telemetry.add_written(obuf.len() as u64);
     Ok(())
 }
+
+/// cat's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("cat", CAT_HELP, SPECS)
+}

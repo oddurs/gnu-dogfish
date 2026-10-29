@@ -15,7 +15,11 @@ macro_rules! eprintln {
 }
 
 mod common;
+mod manual;
+mod tool_list;
 mod tools;
+
+use tool_list::ALL_TOOLS;
 
 #[doc(hidden)]
 pub mod fuzz_api;

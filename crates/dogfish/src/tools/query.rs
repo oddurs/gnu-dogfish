@@ -161,3 +161,9 @@ pub fn run_query(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
     Ok(0)
 }
+
+/// query's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("query", QUERY_HELP, SPECS)
+}

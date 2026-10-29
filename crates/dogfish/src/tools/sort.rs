@@ -1510,6 +1510,24 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     Ok(0)
 }
 
+/// sort's option table and help text, for its manual page and shell
+/// completions (`crate::manual`).
+pub(crate) fn manual() -> crate::manual::Manual {
+    crate::manual::Manual::new("sort", SORT_HELP, SPECS)
+        .choices(
+            "sort",
+            [
+                "general-numeric",
+                "human-numeric",
+                "month",
+                "numeric",
+                "random",
+                "version",
+            ],
+        )
+        .choices("check", ["quiet", "silent", "diagnose-first"])
+}
+
 /// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
 #[cfg(feature = "fuzzing")]
 #[allow(dead_code)]
