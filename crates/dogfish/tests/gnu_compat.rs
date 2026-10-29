@@ -219,6 +219,14 @@ gnu_cases! {
 
     // ----------------------------------------------------------------- tr
     tr_upper: "tr" ["a-z", "A-Z"] stdin b"Hello, World!\n";
+    // Options end at the first set (GNU getopt "+").
+    tr_unknown_long_option: "tr" ["--bogus", "a", "b"] stdin b"ab\n";
+    tr_unknown_short_option: "tr" ["-Q", "a", "b"] stdin b"ab\n";
+    tr_hyphen_set_after_operand: "tr" ["a", "-b"] stdin b"aab-c\n";
+    tr_option_after_operands_is_a_set: "tr" ["a", "b", "-d"] stdin b"aab-c\n";
+    tr_double_dash_set: "tr" ["--", "-a", "b"] stdin b"aab-c\n";
+    tr_delete_squeeze_needs_two_sets: "tr" ["-ds", "a"] stdin b"aab\n";
+    tr_delete_squeeze_two_sets: "tr" ["-ds", "a", "b"] stdin b"aabbc\n";
     tr_class: "tr" ["[:lower:]", "[:upper:]"] stdin b"abc xyz\n";
     tr_delete: "tr" ["-d", "aeiou"] stdin b"education\n";
     tr_squeeze: "tr" ["-s", " "] stdin b"a   b    c\n";

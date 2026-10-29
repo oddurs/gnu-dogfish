@@ -2882,7 +2882,9 @@ struct TrArgs {
     #[arg(short = 't', long = "truncate-set1")]
     truncate: bool,
 
-    #[arg(allow_hyphen_values = true)]
+    /// Like GNU (`getopt "+..."`), options end at the first set: `tr a -b` maps `a`
+    /// to `-b`, while `tr --bogus a b` is an unrecognized option.
+    #[arg(trailing_var_arg = true)]
     sets: Vec<String>,
 }
 
@@ -3040,6 +3042,12 @@ pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     if nsets == 1 && !parsed.delete && !parsed.squeeze {
         return usage_err(format!(
             "missing operand after '{}'\nTwo strings must be given when translating.",
+            parsed.sets[0]
+        ));
+    }
+    if parsed.delete && parsed.squeeze && nsets == 1 {
+        return usage_err(format!(
+            "missing operand after '{}'\nTwo strings must be given when both deleting and squeezing repeats.",
             parsed.sets[0]
         ));
     }
