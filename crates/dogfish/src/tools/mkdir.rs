@@ -107,8 +107,11 @@ struct MkdirMasks {
 
 /// mkdir(2) under a given umask (restored afterwards).
 fn mkdir_with_umask(path: &str, mode: u32, umask: u32) -> io::Result<()> {
+    // SAFETY: umask has no preconditions and cannot fail; mkdir runs on one
+    // thread, so nothing else creates files under the temporary mask.
     let old = unsafe { libc::umask(u32_to_mode_t(umask)) };
     let res = fs::DirBuilder::new().mode(mode).create(path);
+    // SAFETY: restores the mask saved just above.
     unsafe { libc::umask(old) };
     res
 }

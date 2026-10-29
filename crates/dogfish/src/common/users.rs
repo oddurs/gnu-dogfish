@@ -12,6 +12,9 @@ pub fn get_username_by_uid(uid: u32) -> Option<String> {
         if let Some(cached) = cache.borrow().get(&uid) {
             return cached.clone();
         }
+        // SAFETY: getpwuid returns null or a pointer to static storage that
+        // stays valid until the next getpw* call; the name is copied out before
+        // anything else can call it (Dogfish looks names up on one thread).
         let resolved = unsafe {
             let pw = libc::getpwuid(uid);
             if pw.is_null() || (*pw).pw_name.is_null() {
@@ -35,6 +38,9 @@ pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
         if let Some(cached) = cache.borrow().get(&gid) {
             return cached.clone();
         }
+        // SAFETY: getgrgid returns null or a pointer to static storage that
+        // stays valid until the next getgr* call; the name is copied out before
+        // anything else can call it (Dogfish looks names up on one thread).
         let resolved = unsafe {
             let gr = libc::getgrgid(gid);
             if gr.is_null() || (*gr).gr_name.is_null() {

@@ -118,6 +118,7 @@ struct JournalLock(File);
 
 impl Drop for JournalLock {
     fn drop(&mut self) {
+        // SAFETY: flock takes an open descriptor (owned by self.0) and no pointers.
         unsafe {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
@@ -237,6 +238,7 @@ impl UndoJournal {
             .truncate(false)
             .write(true)
             .open(self.base_dir.join("journal.lock"))?;
+        // SAFETY: flock takes an open descriptor (owned by `f`) and no pointers.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error());
         }

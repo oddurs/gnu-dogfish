@@ -272,10 +272,12 @@ fn open_dir(d: &Path, no_deref: bool) -> io::Result<()> {
     let flags =
         base | libc::O_DIRECTORY | libc::O_CLOEXEC | if no_deref { libc::O_NOFOLLOW } else { 0 };
     let c = c_path(d)?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
     let fd = unsafe { libc::open(c.as_ptr(), flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fd` was opened just above and is closed exactly once.
     unsafe { libc::close(fd) };
     Ok(())
 }
@@ -294,6 +296,7 @@ fn atomic_link(o: &LnOpts, src: &Path, dest: &Path) -> Option<io::Result<()>> {
 fn link_at(src: &Path, dest: &Path, follow: bool) -> io::Result<()> {
     let (s, d) = (c_path(src)?, c_path(dest)?);
     let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+    // SAFETY: `s` and `d` are NUL-terminated paths that outlive the call.
     if unsafe {
         libc::linkat(
             libc::AT_FDCWD,

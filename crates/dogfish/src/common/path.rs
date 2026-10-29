@@ -149,6 +149,7 @@ pub(crate) fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     let (s, d) = (c_path(src)?, c_path(dst)?);
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: `s` and `d` are NUL-terminated paths that outlive the call.
         let r = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,
@@ -170,6 +171,7 @@ pub(crate) fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
         Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         Err(_) => {
+            // SAFETY: `s` and `d` are NUL-terminated paths that outlive the call.
             if unsafe { libc::rename(s.as_ptr(), d.as_ptr()) } == 0 {
                 Ok(())
             } else {

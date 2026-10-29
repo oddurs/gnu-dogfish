@@ -329,7 +329,11 @@ fn read_mount_table() -> Vec<MountEntry> {
     if count <= 0 || mntbuf.is_null() {
         return Vec::new();
     }
+    // SAFETY: getmntinfo returned `count` > 0 entries at a non-null `mntbuf`,
+    // which stays valid until the next getmntinfo call.
     let slice = unsafe { std::slice::from_raw_parts(mntbuf, count as usize) };
+    // SAFETY: called only on the NUL-terminated name arrays of the entries
+    // above, which live as long as `slice`.
     let cstr =
         |ptr: *const libc::c_char| unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
     slice
@@ -367,6 +371,8 @@ impl FsUsage {
         let c_path = CString::new(path).map_err(io::Error::other)?;
         // SAFETY: statvfs fills the zeroed struct for a valid C path.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c_path` is a NUL-terminated path and `s` a writable statvfs;
+        // both outlive the call.
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut s) } != 0 {
             return Err(io::Error::last_os_error());
         }
