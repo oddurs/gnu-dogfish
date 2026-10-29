@@ -13,7 +13,7 @@ use dogfish_core::{DogfishContext, gnu_io_error};
 
 use crate::common::date_format::{Stamp, local_time};
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, print_help, print_version, usage_error,
 };
 use crate::common::parse_datetime::{TimeZone, parse_datetime, zero_tm};
 use crate::common::path::c_path;
@@ -85,7 +85,7 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut change_times = 0;
     let (mut no_create, mut no_deref) = (false, false);
-    let (mut flex_date, mut reference): (Option<String>, Option<OsString>) = (None, None);
+    let (mut flex_date, mut reference): (Option<OsString>, Option<OsString>) = (None, None);
     let mut newtime = [Stamp { sec: 0, ns: 0 }; 2];
     let mut date_set = false;
     while let Some(opt) = opts.next() {
@@ -100,7 +100,7 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Modify => change_times |= CH_MTIME,
             NoCreate => no_create = true,
             NoDeref => no_deref = true,
-            Date => flex_date = v.as_deref().map(lossy),
+            Date => flex_date = v,
             Reference => reference = v,
             StampArg => {
                 let t = v.unwrap_or_default();
@@ -138,7 +138,7 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         ));
     }
 
-    let date_relative = |d: &str, now: Stamp| {
+    let date_relative = |d: &std::ffi::OsStr, now: Stamp| {
         let parsed = parse_datetime(d.as_bytes(), now);
         if parsed.is_none() {
             eprintln!("touch: invalid date format {}", quote_locale(d));

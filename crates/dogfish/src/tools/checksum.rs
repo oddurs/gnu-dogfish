@@ -1,22 +1,25 @@
 //! b2sum, sha256sum, md5sum — one engine, as in GNU (`md5sum.c`).
 
-use std::ffi::OsString;
-use std::io::{self, BufRead, Read, Write};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
 use blake2::Blake2bVar;
 use digest::{Digest, Update, VariableOutput};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
+    gnu_quote, io::ignore_broken_pipe, stdout,
 };
 use md5::Md5;
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version,
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version,
 };
+use crate::common::quote::qf;
 use crate::common::sha256::Sha256;
 
 /// SHA-256 ([`Sha256`]: `ring`, or an AVX2 path where that is faster), adapted
@@ -252,7 +255,7 @@ struct HashMode {
     json: bool,
     /// b2sum's digest length in bits.
     bits: usize,
-    files: Vec<String>,
+    files: Vec<OsString>,
 }
 
 impl HashMode {
@@ -300,7 +303,7 @@ impl HashMode {
                 SumOpt::Version => return Err(print_version(tool)),
             }
         }
-        m.files = lossy_all(opts.operands());
+        m.files = opts.operands();
         Ok(m)
     }
 
@@ -348,8 +351,58 @@ impl HashMode {
 struct HashRecord {
     algorithm: String,
     file: String,
+    /// The file name as given (raw bytes), for the GNU output lines.
+    #[serde(skip)]
+    name: Vec<u8>,
     digest: String,
     bytes: u64,
+}
+
+/// A file to hash or a checksum list to read: names stay raw bytes, so one that
+/// is not UTF-8 is opened and printed exactly as given.
+enum Source {
+    Stdin,
+    File(OsString),
+}
+
+impl Source {
+    fn from_args(files: &[OsString]) -> Vec<Self> {
+        if files.is_empty() {
+            return vec![Self::Stdin];
+        }
+        files
+            .iter()
+            .map(|f| {
+                if f == "-" {
+                    Self::Stdin
+                } else {
+                    Self::File(f.clone())
+                }
+            })
+            .collect()
+    }
+
+    fn name(&self) -> &OsStr {
+        match self {
+            Self::Stdin => OsStr::new("-"),
+            Self::File(p) => p,
+        }
+    }
+
+    /// Opens the input: `mmap` through `FastReader` when the name is UTF-8 (all
+    /// `InputSource` can carry), a plain buffered read otherwise.
+    fn open(&self) -> io::Result<FastReader> {
+        match self {
+            Self::Stdin => FastReader::open(&InputSource::Stdin),
+            Self::File(p) => match p.to_str() {
+                Some(s) => FastReader::open(&InputSource::File(s.to_owned())),
+                None => Ok(FastReader::Buffered(BufReader::with_capacity(
+                    DEFAULT_BUF_SIZE,
+                    Box::new(File::open(p)?),
+                ))),
+            },
+        }
+    }
 }
 
 /// b2sum's `--length`: a multiple of 8 up to 512 bits, 0 meaning 512.
@@ -395,7 +448,7 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
         eprintln!("{tool}: {msg}\nTry '{tool} --help' for more information.");
         return Ok(1);
     }
-    let sources = InputSource::from_args(&mode.files);
+    let sources = Source::from_args(&mode.files);
 
     if mode.check {
         return verify_checksums(algo, &sources, &mode, ctx);
@@ -408,9 +461,8 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
     });
 
     // If multiple file sources and none is stdin, hash in parallel using Rayon!
-    let can_parallel =
-        sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
-    let hash_one = |src: &InputSource| compute_source_hash(algo, src, ctx);
+    let can_parallel = sources.len() > 1 && sources.iter().all(|s| matches!(s, Source::File(_)));
+    let hash_one = |src: &Source| compute_source_hash(algo, src, ctx);
     let results: Vec<io::Result<HashRecord>> = if can_parallel {
         sources.par_iter().map(hash_one).collect()
     } else {
@@ -430,11 +482,7 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
             }
             Err(e) => {
                 ignore_broken_pipe(out.flush())?;
-                eprintln!(
-                    "{tool}: {}: {}",
-                    gnu_quote_file(src.display_name()),
-                    gnu_io_error(&e)
-                );
+                eprintln!("{tool}: {}: {}", qf(src.name()), gnu_io_error(&e));
                 exit_code = 1;
             }
         }
@@ -448,16 +496,29 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
 }
 
 /// GNU escapes `\`, newline and carriage return in file names, and marks such
-/// lines with a leading backslash.
-fn escape_file_name(name: &str) -> Option<String> {
-    if !name.contains(['\\', '\n', '\r']) {
+/// lines with a leading backslash. Other bytes, UTF-8 or not, are kept.
+fn escape_file_name(name: &[u8]) -> Option<Vec<u8>> {
+    if !name.iter().any(|c| matches!(c, b'\\' | b'\n' | b'\r')) {
         return None;
     }
-    Some(
-        name.replace('\\', "\\\\")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r"),
-    )
+    let mut out = Vec::with_capacity(name.len() + 4);
+    for &c in name {
+        match c {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// A file name as a `--check` verdict line shows it (escaped, `\`-prefixed).
+fn shown_name(name: &[u8]) -> Vec<u8> {
+    match escape_file_name(name) {
+        Some(esc) => [b"\\".as_slice(), &esc].concat(),
+        None => name.to_vec(),
+    }
 }
 
 fn write_digest_line<W: Write>(
@@ -469,28 +530,37 @@ fn write_digest_line<W: Write>(
     let escaped = if mode.zero {
         None
     } else {
-        escape_file_name(&rec.file)
+        escape_file_name(&rec.name)
     };
-    let name = escaped.as_deref().unwrap_or(&rec.file);
-    let prefix = if escaped.is_some() { "\\" } else { "" };
-    let term = if mode.zero { '\0' } else { '\n' };
-    let line = if mode.tag {
-        format!("{prefix}{} ({name}) = {}{term}", algo.tag(), rec.digest)
+    let name = escaped.as_deref().unwrap_or(&rec.name);
+    let mut line = Vec::with_capacity(rec.digest.len() + name.len() + 16);
+    if escaped.is_some() {
+        line.push(b'\\');
+    }
+    if mode.tag {
+        line.extend_from_slice(algo.tag().as_bytes());
+        line.extend_from_slice(b" (");
+        line.extend_from_slice(name);
+        line.extend_from_slice(b") = ");
+        line.extend_from_slice(rec.digest.as_bytes());
     } else {
-        let marker = if mode.binary == Some(true) { '*' } else { ' ' };
-        format!("{prefix}{} {marker}{name}{term}", rec.digest)
-    };
-    out.write_all(line.as_bytes())
+        line.extend_from_slice(rec.digest.as_bytes());
+        line.push(b' ');
+        line.push(if mode.binary == Some(true) {
+            b'*'
+        } else {
+            b' '
+        });
+        line.extend_from_slice(name);
+    }
+    line.push(if mode.zero { b'\0' } else { b'\n' });
+    out.write_all(&line)
 }
 
-fn compute_source_hash(
-    algo: Algo,
-    src: &InputSource,
-    ctx: &DogfishContext,
-) -> io::Result<HashRecord> {
+fn compute_source_hash(algo: Algo, src: &Source, ctx: &DogfishContext) -> io::Result<HashRecord> {
     let mut hasher = algo.hasher();
     let mut bytes_len = 0u64;
-    match FastReader::open(src)? {
+    match src.open()? {
         FastReader::Mapped(map) => {
             hasher.update(&map);
             bytes_len = map.len() as u64;
@@ -513,7 +583,8 @@ fn compute_source_hash(
     ctx.telemetry.add_items(1);
     Ok(HashRecord {
         algorithm: algo.tag(),
-        file: src.display_name().to_string(),
+        file: src.name().to_string_lossy().into_owned(),
+        name: src.name().as_bytes().to_vec(),
         digest: hasher.finalize_hex(),
         bytes: bytes_len,
     })
@@ -686,7 +757,7 @@ struct CheckTally {
 
 fn verify_checksums(
     algo: Algo,
-    sources: &[InputSource],
+    sources: &[Source],
     mode: &HashMode,
     ctx: &DogfishContext,
 ) -> Result<i32> {
@@ -697,12 +768,11 @@ fn verify_checksums(
     let mut style = LineStyle::Unknown;
 
     for src in sources {
-        let list_name = gnu_quote_file(match src {
-            InputSource::Stdin => "standard input",
-            InputSource::File(p) => p,
-        })
-        .into_owned();
-        let mut reader = match FastReader::open(src) {
+        let list_name = qf(match src {
+            Source::Stdin => OsStr::new("standard input"),
+            Source::File(p) => p,
+        });
+        let mut reader = match src.open() {
             Ok(r) => r.into_bufread(),
             Err(e) => {
                 ignore_broken_pipe(out.flush())?;
@@ -746,15 +816,12 @@ fn verify_checksums(
                 continue;
             };
             tally.properly_formatted = true;
+            let mut shown = shown_name(&entry.file);
             let file = String::from_utf8_lossy(&entry.file).into_owned();
-            let shown = match escape_file_name(&file) {
-                Some(esc) => format!("\\{esc}"),
-                None => file.clone(),
-            };
-            let target = if file == "-" {
-                InputSource::Stdin
+            let target = if entry.file == b"-" {
+                Source::Stdin
             } else {
-                InputSource::File(file.clone())
+                Source::File(OsString::from_vec(entry.file))
             };
             let check_algo = match algo {
                 Algo::Blake2b(_) => Algo::Blake2b(entry.digest.len() * 4),
@@ -765,7 +832,7 @@ fn verify_checksums(
                 Err(e) => {
                     tally.unreadable += 1;
                     ignore_broken_pipe(out.flush())?;
-                    eprintln!("{tool}: {}: {}", gnu_quote_file(&file), gnu_io_error(&e));
+                    eprintln!("{tool}: {}: {}", qf(target.name()), gnu_io_error(&e));
                     if mode.json {
                         json_results.push(serde_json::json!({
                             "file": file,
@@ -773,7 +840,8 @@ fn verify_checksums(
                             "expected": entry.digest,
                         }));
                     } else if !mode.status_only {
-                        ignore_broken_pipe(writeln!(out, "{shown}: FAILED open or read"))?;
+                        shown.extend_from_slice(b": FAILED open or read\n");
+                        ignore_broken_pipe(out.write_all(&shown))?;
                     }
                 }
                 Ok(actual) => {
@@ -791,7 +859,8 @@ fn verify_checksums(
                             "actual": actual.digest,
                         }));
                     } else if !mode.status_only && (!ok || !mode.quiet) {
-                        ignore_broken_pipe(writeln!(out, "{shown}: {verdict}"))?;
+                        shown.extend_from_slice(format!(": {verdict}\n").as_bytes());
+                        ignore_broken_pipe(out.write_all(&shown))?;
                     }
                 }
             }
