@@ -61,6 +61,16 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo xtask doc
 
+      # The checkers docs-gen lints the man pages and completions with; it
+      # skips any that is missing, so CI installs them all.
+      - name: Install man page and shell checkers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends groff-base mandoc zsh fish
+
+      - name: Man pages and shell completions
+        if: runner.os == 'Linux'
+        run: cargo xtask docs-gen
+
       - name: Package (crates.io dry run)
         if: runner.os == 'Linux'
         run: cargo xtask package
