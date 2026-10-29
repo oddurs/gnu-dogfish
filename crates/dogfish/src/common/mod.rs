@@ -30,6 +30,7 @@ pub(crate) mod preserve_root;
 pub(crate) mod printf_format;
 pub(crate) mod prompt;
 pub(crate) mod quote;
+pub(crate) mod sha256;
 pub(crate) mod signals;
 pub(crate) mod strftime;
 pub(crate) mod strtod;

@@ -15,19 +15,21 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::common::arg_order::last_index;
+use crate::common::sha256::Sha256;
 
-/// SHA-256 backed by `ring`, adapted to the RustCrypto [`Digest`] interface the hashing
-/// pipeline is generic over.
+/// SHA-256 ([`Sha256`]: `ring`, or an AVX2 path where that is faster), adapted
+/// to the RustCrypto [`Digest`] interface the hashing pipeline is generic over.
 ///
 /// `ring` carries the OpenSSL/BoringSSL assembly with runtime CPU dispatch (SHA-NI,
-/// AVX2+BMI2, SSSE3, ARMv8 crypto), the same code GNU `sha256sum` reaches through
-/// libcrypto. RustCrypto's `sha2` only accelerates SHA-NI and ARMv8, so it ran ~1.7x
-/// slower than GNU on CPUs without SHA extensions.
-struct RingSha256(ring::digest::Context);
+/// AVX, SSSE3, ARMv8 crypto); GNU `sha256sum` reaches OpenSSL's through libcrypto,
+/// including its AVX2 code, which [`Sha256`] matches. RustCrypto's `sha2` only
+/// accelerates SHA-NI and ARMv8, so it ran ~1.7x slower than GNU on CPUs without
+/// SHA extensions.
+struct RingSha256(Sha256);
 
 impl Default for RingSha256 {
     fn default() -> Self {
-        Self(ring::digest::Context::new(&ring::digest::SHA256))
+        Self(Sha256::new())
     }
 }
 
@@ -45,7 +47,7 @@ impl digest::Update for RingSha256 {
 
 impl digest::FixedOutput for RingSha256 {
     fn finalize_into(self, out: &mut digest::Output<Self>) {
-        out.copy_from_slice(self.0.finish().as_ref());
+        out.copy_from_slice(&self.0.finish());
     }
 }
 
