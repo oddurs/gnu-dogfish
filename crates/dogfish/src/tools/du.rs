@@ -585,7 +585,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     cfg.hash_all = targets.len() > 1 || cfg.follow_all;
 
     // On a terminal, the default view is the Dogfish top-level breakdown.
-    let rich = ctx.stdout_is_tty && !json;
+    let rich = ctx.stdout_is_tty() && !json;
     let rich_overview = rich && !cfg.all && !summarize && max_depth.is_none() && !separate_dirs;
     let max_depth = if summarize {
         0

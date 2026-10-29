@@ -319,7 +319,7 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut all_stdin: Option<Vec<u8>> = None;
     // Check for NDJSON named-field projection (e.g., `dogfish ls -J | dogfish cut -f name,size`)
-    if sources.len() == 1 && matches!(sources[0], InputSource::Stdin) && !ctx.stdin_is_tty {
+    if sources.len() == 1 && matches!(sources[0], InputSource::Stdin) && !ctx.stdin_is_tty() {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;
         if looks_like_json(&all)

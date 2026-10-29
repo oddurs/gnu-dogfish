@@ -231,7 +231,7 @@ pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !from_start
         && !parsed.follow
         && !parsed.verbose
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
     {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;

@@ -272,7 +272,7 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !by_bytes
         && !all_but
         && !parsed.verbose
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
     {
         return head_stdin_adaptive(count, parsed.json, ctx);
     }
