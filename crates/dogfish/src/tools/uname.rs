@@ -1,60 +1,132 @@
 //! uname — With `--json` and visual card mode
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version, usage_error,
+};
+use crate::common::quote::quote_locale;
 use crate::common::uname_info::{UNKNOWN, get_uname_info};
 
-#[derive(Parser)]
-#[command(
-    name = "uname",
-    about = "Print certain system information.  With no OPTION, same as -s.",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
+const UNAME_HELP: &str = "\
+Print certain system information.  With no OPTION, same as -s.
+
+Usage: uname [OPTIONS]
+
+Options:
+  -a, --all                Print all information, in the following order, except omit -p and -i if
+                           unknown
+  -s, --kernel-name        Print the kernel name
+  -n, --nodename           Print the network node hostname
+  -r, --kernel-release     Print the kernel release
+  -v, --kernel-version     Print the kernel version
+  -m, --machine            Print the machine hardware name
+  -p, --processor          Print the processor type (non-portable)
+  -i, --hardware-platform  Print the hardware platform (non-portable)
+  -o, --operating-system   Print the operating system
+  -J, --json               Emit structured JSON
+      --help               Display this help and exit
+";
+
+#[derive(Default)]
 struct UnameArgs {
-    /// Print all information, in the following order, except omit -p and -i if unknown
-    #[arg(short = 'a', long = "all")]
     all: bool,
-    /// Print the kernel name
-    #[arg(short = 's', long = "kernel-name")]
     sysname: bool,
-    /// Print the network node hostname
-    #[arg(short = 'n', long = "nodename")]
     nodename: bool,
-    /// Print the kernel release
-    #[arg(short = 'r', long = "kernel-release")]
     release: bool,
-    /// Print the kernel version
-    #[arg(short = 'v', long = "kernel-version")]
     version: bool,
-    /// Print the machine hardware name
-    #[arg(short = 'm', long = "machine")]
     machine: bool,
-    /// Print the processor type (non-portable)
-    #[arg(short = 'p', long = "processor")]
     processor: bool,
-    /// Print the hardware platform (non-portable)
-    #[arg(short = 'i', long = "hardware-platform")]
     platform: bool,
-    /// Print the operating system
-    #[arg(short = 'o', long = "operating-system")]
     os: bool,
-    /// Emit structured JSON
-    #[arg(short = 'J', long = "json")]
     json: bool,
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
 }
 
-pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
-    let parsed = UnameArgs::try_parse_from(args)?;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnameArgsOpt {
+    All,
+    Sysname,
+    Nodename,
+    Release,
+    KernelVersion,
+    Machine,
+    Processor,
+    Platform,
+    Os,
+    Json,
+    Help,
+    Version,
+}
+
+const SPECS: &[OptSpec<UnameArgsOpt>] = &[
+    OptSpec::both(b'a', "all", HasArg::No, UnameArgsOpt::All),
+    OptSpec::both(b's', "kernel-name", HasArg::No, UnameArgsOpt::Sysname),
+    OptSpec::long("sysname", HasArg::No, UnameArgsOpt::Sysname),
+    OptSpec::both(b'n', "nodename", HasArg::No, UnameArgsOpt::Nodename),
+    OptSpec::both(b'r', "kernel-release", HasArg::No, UnameArgsOpt::Release),
+    OptSpec::long("release", HasArg::No, UnameArgsOpt::Release),
+    OptSpec::both(
+        b'v',
+        "kernel-version",
+        HasArg::No,
+        UnameArgsOpt::KernelVersion,
+    ),
+    OptSpec::both(b'm', "machine", HasArg::No, UnameArgsOpt::Machine),
+    OptSpec::both(b'p', "processor", HasArg::No, UnameArgsOpt::Processor),
+    OptSpec::both(
+        b'i',
+        "hardware-platform",
+        HasArg::No,
+        UnameArgsOpt::Platform,
+    ),
+    OptSpec::both(b'o', "operating-system", HasArg::No, UnameArgsOpt::Os),
+    OptSpec::both(b'J', "json", HasArg::No, UnameArgsOpt::Json),
+    OptSpec::long("help", HasArg::No, UnameArgsOpt::Help),
+    OptSpec::long("version", HasArg::No, UnameArgsOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_uname_args(args: Vec<std::ffi::OsString>) -> std::result::Result<UnameArgs, i32> {
+    let mut parsed = UnameArgs::default();
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
+    while let Some(opt) = opts.next() {
+        let (o, _) = opt.map_err(|e| getopt_error("uname", &e))?;
+        match o {
+            UnameArgsOpt::All => parsed.all = true,
+            UnameArgsOpt::Sysname => parsed.sysname = true,
+            UnameArgsOpt::Nodename => parsed.nodename = true,
+            UnameArgsOpt::Release => parsed.release = true,
+            UnameArgsOpt::KernelVersion => parsed.version = true,
+            UnameArgsOpt::Machine => parsed.machine = true,
+            UnameArgsOpt::Processor => parsed.processor = true,
+            UnameArgsOpt::Platform => parsed.platform = true,
+            UnameArgsOpt::Os => parsed.os = true,
+            UnameArgsOpt::Json => parsed.json = true,
+            UnameArgsOpt::Help => return Err(print_help(UNAME_HELP)),
+            UnameArgsOpt::Version => return Err(print_version("uname")),
+        }
+    }
+    let operands = opts.operands();
+    if let Some(extra) = operands.first() {
+        return Err(usage_error(
+            "uname",
+            format!("extra operand {}", quote_locale(extra)),
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn run_uname(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_uname_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let info = get_uname_info()?;
 
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&info)?);
+        outln!("{}", serde_json::to_string_pretty(&info)?);
         return Ok(0);
     }
 
@@ -91,6 +163,6 @@ pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         .filter(|(wanted, _)| *wanted)
         .map(|(_, v)| v.as_str())
         .collect();
-    println!("{}", parts.join(" "));
+    outln!("{}", parts.join(" "));
     Ok(0)
 }

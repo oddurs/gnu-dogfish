@@ -1,44 +1,84 @@
 //! tac — Concatenate and print files in reverse: GNU `tac.c` record
 //! splitting with `-b`, `-r` and `-s` (SIMD `memrchr` for newlines).
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStringExt;
 
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 use memchr::memrchr;
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version,
+};
 use crate::common::gnu_regex::Regex;
 use crate::common::input::{RawStdout, close_stdin, stdin_file};
 use crate::common::quote::{qa, qf};
 
-#[derive(Parser)]
-#[command(
-    name = "tac",
-    about = "Concatenate and print files in reverse (last line first)"
-)]
+const TAC_HELP: &str = "\
+Usage: tac [OPTION]... [FILE]...
+Write each FILE to standard output, last line first.
+
+With no FILE, or when FILE is -, read standard input.
+
+Mandatory arguments to long options are mandatory for short options too.
+  -b, --before             attach the separator before instead of after
+  -r, --regex              interpret the separator as a regular expression
+  -s, --separator=STRING   use STRING as the separator instead of newline
+      --help        display this help and exit
+      --version     output version information and exit
+";
+
+/// What `tac` was asked to do.
+#[derive(Default)]
 struct TacArgs {
-    /// Attach the separator before instead of after
-    #[arg(short = 'b', long = "before")]
     before: bool,
-
-    /// Interpret the separator as a regular expression
-    #[arg(short = 'r', long = "regex")]
     regex: bool,
-
-    /// Use STRING as the separator instead of newline
-    #[arg(
-        short = 's',
-        long = "separator",
-        value_name = "STRING",
-        allow_hyphen_values = true
-    )]
-    separator: Option<String>,
-
+    /// The separator as given (bytes: it need not be UTF-8).
+    separator: Option<Vec<u8>>,
     files: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TacOpt {
+    Before,
+    Regex,
+    Separator,
+    Help,
+    Version,
+}
+
+/// GNU's `longopts` and `"brs:"`.
+const SPECS: &[OptSpec<TacOpt>] = &[
+    OptSpec::both(b'b', "before", HasArg::No, TacOpt::Before),
+    OptSpec::both(b'r', "regex", HasArg::No, TacOpt::Regex),
+    OptSpec::both(b's', "separator", HasArg::Required, TacOpt::Separator),
+    OptSpec::long("help", HasArg::No, TacOpt::Help),
+    OptSpec::long("version", HasArg::No, TacOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_tac_args(args: Vec<OsString>) -> std::result::Result<TacArgs, i32> {
+    let mut parsed = TacArgs::default();
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("tac", &e))?;
+        match o {
+            TacOpt::Before => parsed.before = true,
+            TacOpt::Regex => parsed.regex = true,
+            TacOpt::Separator => parsed.separator = v.map(OsString::into_vec),
+            TacOpt::Help => return Err(print_help(TAC_HELP)),
+            TacOpt::Version => return Err(print_version("tac")),
+        }
+    }
+    parsed.files = lossy_all(opts.operands());
+    Ok(parsed)
 }
 
 /// How records are separated.
@@ -129,14 +169,17 @@ fn read_input(src: &InputSource) -> std::result::Result<Vec<u8>, (bool, io::Erro
     }
 }
 
-pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TacArgs::try_parse_from(args)?;
+pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_tac_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let sep = match (&parsed.separator, parsed.regex) {
         (Some(s), true) if s.is_empty() => {
             eprintln!("tac: separator cannot be empty");
             return Ok(1);
         }
-        (Some(s), true) => match Regex::new(s.as_bytes()) {
+        (Some(s), true) => match Regex::new(s) {
             Ok(re) => Separator::Regex(re),
             Err(msg) => {
                 eprintln!("tac: {msg}");
@@ -152,7 +195,7 @@ pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         },
         // `-s ''` separates records with NUL bytes.
         (Some(s), false) if s.is_empty() => Separator::Literal(vec![0]),
-        (Some(s), false) => Separator::Literal(s.as_bytes().to_vec()),
+        (Some(s), false) => Separator::Literal(s.clone()),
         (None, false) => Separator::Literal(vec![b'\n']),
     };
     let sources = InputSource::from_args(&parsed.files);
@@ -192,6 +235,7 @@ pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         match tac_buffer(&data, &sep, parsed.before, &mut out) {
             Ok(()) => ctx.telemetry.add_written(data.len() as u64),
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(i32::from(!ok)),
+            Err(e) if stdout::is_write_error(&e) => return Err(e.into()),
             Err(e) => return Err(e.into()),
         }
     }

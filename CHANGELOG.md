@@ -18,11 +18,16 @@ This release makes Dogfish safe to use on real data and a drop-in for GNU coreut
 - `touch` no longer truncates existing files.
 - `mv s f` and `cp -a`/`cp -d s f`, where `s` is a symlink to `f`, replaced `f` with a symlink to itself. cp and mv now share a port of GNU's `same_file_ok`: they refuse whatever would lose the file, and allow what a backup or another hard link keeps safe (`mv -b h1 h2`, `cp -b f s`, `cp -sf f s`).
 - `cp -a --attributes-only` truncated a destination that had other hard links.
+- `rm --safe` (and undo) hung on a FIFO when the trash was on another file system: the copy fallback read it. Special files are now recreated, never read.
 - `seq` no longer loops forever (release builds) or panics (debug builds) near `i64::MAX`, and keeps full precision above 2^53.
 - A file truncated while being read (SIGBUS on mmapped input) now produces a clean error instead of a crash.
 
 ### Fixed — GNU compatibility
 - `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds, because `-h` clashed with clap's help flag.
+- Every tool now parses options with one port of glibc's `getopt_long` instead of clap: GNU's permutation and `POSIXLY_CORRECT`, clustering, unique abbreviations, `option '--s' is ambiguous; possibilities: ...`, last-wins repeats, `--help`/`--version` anywhere, and GNU's usage exit status per tool. Arguments need not be UTF-8.
+- `--stats`, `--color` and `--no-color` were removed from every tool's arguments before it saw them, so `echo --color x`, `printf '%s' --stats` or `env cmd --stats` lost them. Each tool now parses them as its own (full spelling only), and `echo`, `printf`, `true`, `false` and `yes` behave exactly as GNU's. Dogfish's own long options no longer change GNU's abbreviations or ambiguity messages.
+- `cp`, `mv`, `ln`, `mkdir` and `mktemp` accept file names that are not valid UTF-8, byte for byte as GNU does, and the undo journal records them losslessly (as `{"path_bytes": BASE64}`; journals with plain string paths still read).
+- Output goes through one standard-output writer with GNU's `close_stdout` semantics: a failed write (`>/dev/full`, a closed stdout) is reported once, as `TOOL: write error: ...`, and fails the tool.
 - `ls`, `du`, `df` and `stat` printed decorated tables even when piped. They now produce GNU output when not on a terminal:
   - **`ls`**: every sort and layout mode, `-l` with every `--time-style`, all quoting styles, `-R`, and `--color` with GNU's built-in table and `LS_COLORS`.
   - **`du`**: block-based sizes with hard links counted once, every unit and depth option, GNU's traversal order.

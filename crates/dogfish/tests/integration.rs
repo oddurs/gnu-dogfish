@@ -910,11 +910,24 @@ fn test_error_handling_and_exit_codes() {
 #[test]
 fn test_global_stats_and_color_flags_on_every_category() {
     // `--stats` should emit `[⚡ gnu/dogfish ...]` on stderr without polluting stdout
-    let out = run(&["echo", "--stats", "--no-color", "clean_stdout"]);
+    let out = run_stdin(&["cat", "--stats", "--no-color"], b"clean_stdout\n");
     assert!(out.status.success());
     assert_eq!(stdout_str(&out), "clean_stdout\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("gnu/dogfish echo"));
+    assert!(stderr.contains("gnu/dogfish cat"), "{stderr}");
+
+    // `echo` takes no options but GNU's, so its switches come from the
+    // environment.
+    let out = run(&["echo", "--stats", "--no-color", "x"]);
+    assert_eq!(stdout_str(&out), "--stats --no-color x\n");
+    assert!(out.stderr.is_empty());
+    let out = Command::new(bin())
+        .args(["echo", "clean_stdout"])
+        .env("DOGFISH_STATS", "1")
+        .output()
+        .expect("failed to execute dogfish");
+    assert_eq!(stdout_str(&out), "clean_stdout\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gnu/dogfish echo"));
 }
 
 #[test]

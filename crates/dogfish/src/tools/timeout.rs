@@ -1,5 +1,6 @@
 //! timeout — run a command with a time limit (`timeout -k 5 -s INT 1m cmd`)
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Command;
@@ -9,8 +10,12 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote};
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version, try_help,
+    usage_error,
+};
 use crate::common::interval::{duration_from_secs, parse_interval};
+use crate::common::quote::quote_locale;
 use crate::common::signals::parse_signal;
 use crate::common::signals::sig_name_into;
 
@@ -56,19 +61,15 @@ Exit status:
   -    the exit status of COMMAND otherwise
 ";
 
-static TIMEOUT_OPTS: [OptSpec; 7] = [
-    opt(
-        Some('k'),
-        Some("kill-after"),
-        HasArg::Required,
-        "kill-after",
-    ),
-    opt(Some('s'), Some("signal"), HasArg::Required, "signal"),
-    opt(Some('v'), Some("verbose"), HasArg::No, "verbose"),
-    opt(None, Some("foreground"), HasArg::No, "foreground"),
-    opt(None, Some("preserve-status"), HasArg::No, "preserve-status"),
-    opt(None, Some("help"), HasArg::No, "help"),
-    opt(None, Some("version"), HasArg::No, "version"),
+/// GNU's `long_options` and `"+k:s:v"`: options end at DURATION.
+const TIMEOUT_OPTS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'k', "kill-after", HasArg::Required, "kill-after"),
+    OptSpec::both(b's', "signal", HasArg::Required, "signal"),
+    OptSpec::both(b'v', "verbose", HasArg::No, "verbose"),
+    OptSpec::long("foreground", HasArg::No, "foreground"),
+    OptSpec::long("preserve-status", HasArg::No, "preserve-status"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
 ];
 
 /// State shared with the async-signal handler, which may only touch atomics
@@ -151,20 +152,24 @@ extern "C" fn timeout_on_signal(sig: libc::c_int) {
     }
 }
 
-pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let usage = |msg: String| Ok(usage_error("timeout", msg, EXIT_CANCELED));
-    let mut opts = GetOpt::new(args.into_iter().skip(1).collect(), &TIMEOUT_OPTS, false);
+pub fn run_timeout(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let usage = |msg: String| Ok(usage_error("timeout", msg));
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        TIMEOUT_OPTS,
+        Order::StopAtOperand,
+    );
     let mut kill_after = 0f64;
     let mut term_signal = libc::SIGTERM;
     let mut verbose = false;
     let mut foreground = false;
     let mut preserve_status = false;
-    while let Some(item) = opts.next_opt() {
+    while let Some(item) = opts.next() {
         let (key, value) = match item {
             Ok(kv) => kv,
-            Err(msg) => return usage(msg),
+            Err(e) => return Ok(getopt_error("timeout", &e)),
         };
-        let value = value.unwrap_or_default();
+        let value = value.as_deref().map(lossy).unwrap_or_default();
         match key {
             "kill-after" => match parse_interval(&value) {
                 Some(secs) => kill_after = secs,
@@ -177,19 +182,19 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "verbose" => verbose = true,
             "foreground" => foreground = true,
             "preserve-status" => preserve_status = true,
-            "help" => return print_help(TIMEOUT_HELP),
-            _ => {
-                println!("timeout (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
-                return Ok(0);
-            }
+            "help" => return Ok(print_help(TIMEOUT_HELP)),
+            _ => return Ok(print_version("timeout")),
         }
     }
-    let operands = opts.into_operands();
+    let operands = opts.operands();
     if operands.len() < 2 {
-        return Ok(try_help("timeout", EXIT_CANCELED));
+        return Ok(try_help("timeout"));
     }
-    let Some(limit) = parse_interval(&operands[0]) else {
-        return usage(format!("invalid time interval {}", gnu_quote(&operands[0])));
+    let Some(limit) = parse_interval(&lossy(&operands[0])) else {
+        return usage(format!(
+            "invalid time interval {}",
+            quote_locale(&operands[0])
+        ));
     };
     let command = &operands[1..];
     ctx.telemetry
@@ -201,7 +206,7 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     if verbose {
         let _ = TIMEOUT_VERBOSE.set((
             b"timeout: sending signal ".to_vec(),
-            format!(" to command {}\n", gnu_quote(&command[0])).into_bytes(),
+            format!(" to command {}\n", quote_locale(&command[0])).into_bytes(),
         ));
     }
     // SAFETY: process-wide signal setup before any child exists; the handler
@@ -251,7 +256,7 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             };
             eprintln!(
                 "timeout: failed to run command {}: {}",
-                gnu_quote(&command[0]),
+                quote_locale(&command[0]),
                 gnu_io_error(&e)
             );
             return Ok(status);

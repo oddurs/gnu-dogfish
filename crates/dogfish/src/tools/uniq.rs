@@ -2,6 +2,7 @@
 //! obsolete `-N` / `+N` syntax, + NDJSON deduplication (`--by <field>`).
 
 use std::cmp::Ordering;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
@@ -12,8 +13,10 @@ use dogfish_core::{
 };
 use serde_json::Value;
 
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, argmatch, opt, print_help, usage_error};
-use crate::common::gnu_getopt::print_tool_version;
+use crate::common::getopt::{
+    Arg, Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
+    try_help,
+};
 use crate::common::input::RawStdout;
 use crate::common::lines::{is_blank, looks_like_json, lossy_lines};
 use crate::common::posixver::posix2_version;
@@ -54,52 +57,58 @@ Note: 'uniq' does not detect repeated lines unless they are adjacent.
 You may want to sort the input first, or use 'sort -u' without 'uniq'.
 ";
 
-static UNIQ_OPTS: [OptSpec; 25] = [
-    opt(Some('0'), None, HasArg::No, "0"),
-    opt(Some('1'), None, HasArg::No, "1"),
-    opt(Some('2'), None, HasArg::No, "2"),
-    opt(Some('3'), None, HasArg::No, "3"),
-    opt(Some('4'), None, HasArg::No, "4"),
-    opt(Some('5'), None, HasArg::No, "5"),
-    opt(Some('6'), None, HasArg::No, "6"),
-    opt(Some('7'), None, HasArg::No, "7"),
-    opt(Some('8'), None, HasArg::No, "8"),
-    opt(Some('9'), None, HasArg::No, "9"),
-    opt(Some('c'), Some("count"), HasArg::No, "count"),
-    opt(Some('d'), Some("repeated"), HasArg::No, "repeated"),
-    opt(Some('D'), None, HasArg::No, "all-repeated"),
-    opt(None, Some("all-repeated"), HasArg::Optional, "all-repeated"),
-    opt(None, Some("group"), HasArg::Optional, "group"),
-    opt(
-        Some('f'),
-        Some("skip-fields"),
-        HasArg::Required,
-        "skip-fields",
-    ),
-    opt(Some('i'), Some("ignore-case"), HasArg::No, "ignore-case"),
-    opt(
-        Some('s'),
-        Some("skip-chars"),
-        HasArg::Required,
-        "skip-chars",
-    ),
-    opt(Some('u'), Some("unique"), HasArg::No, "unique"),
-    opt(
-        Some('w'),
-        Some("check-chars"),
-        HasArg::Required,
-        "check-chars",
-    ),
-    opt(
-        Some('z'),
-        Some("zero-terminated"),
-        HasArg::No,
-        "zero-terminated",
-    ),
-    opt(None, Some("by"), HasArg::Required, "by"),
-    opt(Some('J'), Some("json"), HasArg::No, "json"),
-    opt(None, Some("help"), HasArg::No, "help"),
-    opt(None, Some("version"), HasArg::No, "version"),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UniqOpt {
+    Count,
+    Repeated,
+    AllRepeated,
+    Group,
+    IgnoreCase,
+    Unique,
+    SkipFields,
+    SkipChars,
+    CheckChars,
+    ZeroTerminated,
+    By,
+    Json,
+    /// GNU's obsolete `-N`: skip N fields.
+    Digit(u8),
+    Help,
+    Version,
+}
+
+const fn digit(c: u8) -> OptSpec<UniqOpt> {
+    OptSpec::short(c, HasArg::No, UniqOpt::Digit(c))
+}
+
+/// GNU's `longopts` and `"-0123456789Dcdf:is:uw:z"`, plus the Dogfish `--by`
+/// and `-J, --json`.
+const SPECS: &[OptSpec<UniqOpt>] = &[
+    OptSpec::both(b'c', "count", HasArg::No, UniqOpt::Count),
+    OptSpec::both(b'd', "repeated", HasArg::No, UniqOpt::Repeated),
+    OptSpec::long("all-repeated", HasArg::Optional, UniqOpt::AllRepeated),
+    OptSpec::long("group", HasArg::Optional, UniqOpt::Group),
+    OptSpec::both(b'i', "ignore-case", HasArg::No, UniqOpt::IgnoreCase),
+    OptSpec::both(b'u', "unique", HasArg::No, UniqOpt::Unique),
+    OptSpec::both(b'f', "skip-fields", HasArg::Required, UniqOpt::SkipFields),
+    OptSpec::both(b's', "skip-chars", HasArg::Required, UniqOpt::SkipChars),
+    OptSpec::both(b'w', "check-chars", HasArg::Required, UniqOpt::CheckChars),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, UniqOpt::ZeroTerminated),
+    OptSpec::long("help", HasArg::No, UniqOpt::Help),
+    OptSpec::long("version", HasArg::No, UniqOpt::Version),
+    OptSpec::long("by", HasArg::Required, UniqOpt::By).exact(),
+    OptSpec::both(b'J', "json", HasArg::No, UniqOpt::Json).exact(),
+    digit(b'0'),
+    digit(b'1'),
+    digit(b'2'),
+    digit(b'3'),
+    digit(b'4'),
+    digit(b'5'),
+    digit(b'6'),
+    digit(b'7'),
+    digit(b'8'),
+    digit(b'9'),
+    OptSpec::short(b'D', HasArg::No, UniqOpt::AllRepeated),
 ];
 
 /// `--all-repeated=METHOD`: where blank lines separate groups of duplicates.
@@ -155,7 +164,7 @@ fn size_opt(arg: &str, what: &str) -> std::result::Result<u64, i32> {
 /// `"-0123456789Dcdf:is:uw:z"`: operands are seen in order, so `+N` (skip
 /// N characters) and digit options (`-3`, obsolete `-f 3`) work as in GNU.
 /// `Err` is the exit status after a diagnostic (or `--help`).
-fn parse_args(args: Vec<String>) -> std::result::Result<UniqConfig, i32> {
+fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
     let posixly_correct = std::env::var_os("POSIXLY_CORRECT").is_some();
     let strict_posix2 = (200112..200809).contains(&posix2_version());
     let mut cfg = UniqConfig {
@@ -178,138 +187,125 @@ fn parse_args(args: Vec<String>) -> std::result::Result<UniqConfig, i32> {
     let mut files: Vec<String> = Vec::new();
     let mut fields_from_digits = false;
     let mut output_option_used = false;
-    let mut rest: Vec<String> = args.into_iter().skip(1).collect();
     let add_file = |files: &mut Vec<String>, arg: String| {
         if files.len() == 2 {
             eprintln!("uniq: extra operand {}", quote_locale(&arg));
-            return Err(usage_try());
+            return Err(try_help("uniq"));
         }
         files.push(arg);
         Ok(())
     };
-    'parse: loop {
-        let mut g = GetOpt::new(std::mem::take(&mut rest), &UNIQ_OPTS, false);
-        loop {
-            if posixly_correct && !files.is_empty() {
-                for arg in g.into_operands() {
-                    add_file(&mut files, arg)?;
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::InPlace);
+    while let Some(item) = opts.next_in_order() {
+        let (key, value) = match item.map_err(|e| getopt_error("uniq", &e))? {
+            Arg::Operand(arg) => {
+                let arg = lossy(&arg);
+                // GNU's "-" optstring: an operand is seen in place, and `+N`
+                // means skip N characters.
+                match xstrtoumax(&arg, "") {
+                    (n, None) if arg.starts_with('+') && !strict_posix2 => cfg.skip_chars = n,
+                    _ => add_file(&mut files, arg)?,
                 }
-                break 'parse;
+                // Under POSIXLY_CORRECT, options end with the first file.
+                if posixly_correct && !files.is_empty() {
+                    while let Some(rest) = opts.take_next() {
+                        add_file(&mut files, lossy(&rest))?;
+                    }
+                    break;
+                }
+                continue;
             }
-            let end_of_options = g.peek() == Some("--");
-            let (key, value) = match g.next_opt() {
-                Some(Ok(kv)) => kv,
-                Some(Err(msg)) => return Err(usage_error("uniq", msg, 1)),
-                None => {
-                    let mut operands = g.into_operands().into_iter();
-                    if end_of_options {
-                        for arg in operands {
-                            add_file(&mut files, arg)?;
-                        }
-                        break 'parse;
-                    }
-                    let Some(arg) = operands.next() else {
-                        break 'parse;
-                    };
-                    rest = operands.collect();
-                    // GNU's "-" optstring: an operand is seen in place, and
-                    // `+N` means skip N characters.
-                    match xstrtoumax(&arg, "") {
-                        (n, None) if arg.starts_with('+') && !strict_posix2 => cfg.skip_chars = n,
-                        _ => add_file(&mut files, arg)?,
-                    }
-                    continue 'parse;
+            Arg::Opt(k, v) => (k, v.as_deref().map(lossy)),
+        };
+        let value_or_empty = || value.clone().unwrap_or_default();
+        match key {
+            UniqOpt::Digit(d) => {
+                if !fields_from_digits {
+                    cfg.skip_fields = 0;
                 }
-            };
-            let value = value.unwrap_or_default();
-            match key {
-                d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
-                    if !fields_from_digits {
-                        cfg.skip_fields = 0;
-                    }
-                    let digit = u64::from(d.as_bytes()[0] - b'0');
-                    cfg.skip_fields = cfg
-                        .skip_fields
-                        .checked_mul(10)
-                        .and_then(|v| v.checked_add(digit))
-                        .unwrap_or(u64::MAX);
-                    fields_from_digits = true;
-                }
-                "count" => {
-                    cfg.count = true;
-                    output_option_used = true;
-                }
-                "repeated" => {
-                    cfg.output_unique = false;
-                    output_option_used = true;
-                }
-                "all-repeated" => {
-                    cfg.output_unique = false;
-                    cfg.output_later_repeated = true;
-                    cfg.delimit = if value.is_empty() {
-                        Delimit::None
-                    } else {
-                        let valid = ["none", "prepend", "separate"];
-                        let i = argmatch("uniq", "--all-repeated", &value, &valid, 1)?;
-                        [Delimit::None, Delimit::Prepend, Delimit::Separate][i]
-                    };
-                    output_option_used = true;
-                }
-                "group" => {
-                    cfg.grouping = if value.is_empty() {
-                        Grouping::Separate
-                    } else {
-                        let valid = ["prepend", "append", "separate", "both"];
-                        let i = argmatch("uniq", "--group", &value, &valid, 1)?;
-                        [
-                            Grouping::Prepend,
-                            Grouping::Append,
-                            Grouping::Separate,
-                            Grouping::Both,
-                        ][i]
-                    };
-                }
-                "skip-fields" => {
-                    fields_from_digits = false;
-                    cfg.skip_fields = size_opt(&value, "invalid number of fields to skip")?;
-                }
-                "ignore-case" => cfg.ignore_case = true,
-                "skip-chars" => {
-                    cfg.skip_chars = size_opt(&value, "invalid number of bytes to skip")?;
-                }
-                "unique" => {
-                    cfg.output_first_repeated = false;
-                    output_option_used = true;
-                }
-                "check-chars" => {
-                    cfg.check_chars = size_opt(&value, "invalid number of bytes to compare")?;
-                }
-                "zero-terminated" => cfg.delimiter = 0,
-                "by" => cfg.by_field = Some(value),
-                "json" => cfg.json = true,
-                "help" => {
-                    let _ = print_help(UNIQ_HELP);
-                    return Err(0);
-                }
-                "version" => {
-                    print_tool_version("uniq");
-                    return Err(0);
-                }
-                _ => {}
+                cfg.skip_fields = cfg
+                    .skip_fields
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(u64::from(d - b'0')))
+                    .unwrap_or(u64::MAX);
+                fields_from_digits = true;
             }
+            UniqOpt::Count => {
+                cfg.count = true;
+                output_option_used = true;
+            }
+            UniqOpt::Repeated => {
+                cfg.output_unique = false;
+                output_option_used = true;
+            }
+            UniqOpt::AllRepeated => {
+                cfg.output_unique = false;
+                cfg.output_later_repeated = true;
+                cfg.delimit = match &value {
+                    None => Delimit::None,
+                    Some(v) => argmatch(
+                        "uniq",
+                        "--all-repeated",
+                        v,
+                        &[
+                            ("none", Delimit::None),
+                            ("prepend", Delimit::Prepend),
+                            ("separate", Delimit::Separate),
+                        ],
+                    )?,
+                };
+                output_option_used = true;
+            }
+            UniqOpt::Group => {
+                cfg.grouping = match &value {
+                    None => Grouping::Separate,
+                    Some(v) => argmatch(
+                        "uniq",
+                        "--group",
+                        v,
+                        &[
+                            ("prepend", Grouping::Prepend),
+                            ("append", Grouping::Append),
+                            ("separate", Grouping::Separate),
+                            ("both", Grouping::Both),
+                        ],
+                    )?,
+                };
+            }
+            UniqOpt::SkipFields => {
+                fields_from_digits = false;
+                cfg.skip_fields = size_opt(&value_or_empty(), "invalid number of fields to skip")?;
+            }
+            UniqOpt::IgnoreCase => cfg.ignore_case = true,
+            UniqOpt::SkipChars => {
+                cfg.skip_chars = size_opt(&value_or_empty(), "invalid number of bytes to skip")?;
+            }
+            UniqOpt::Unique => {
+                cfg.output_first_repeated = false;
+                output_option_used = true;
+            }
+            UniqOpt::CheckChars => {
+                cfg.check_chars =
+                    size_opt(&value_or_empty(), "invalid number of bytes to compare")?;
+            }
+            UniqOpt::ZeroTerminated => cfg.delimiter = 0,
+            UniqOpt::By => cfg.by_field = Some(value_or_empty()),
+            UniqOpt::Json => cfg.json = true,
+            UniqOpt::Help => return Err(print_help(UNIQ_HELP)),
+            UniqOpt::Version => return Err(print_version("uniq")),
         }
     }
     if cfg.grouping != Grouping::None && output_option_used {
         eprintln!("uniq: --group is mutually exclusive with -c/-d/-D/-u");
-        return Err(usage_try());
+        return Err(try_help("uniq"));
     }
     if cfg.grouping != Grouping::None && cfg.count {
         eprintln!("uniq: grouping and printing repeat counts is meaningless");
-        return Err(usage_try());
+        return Err(try_help("uniq"));
     }
     if cfg.count && cfg.output_later_repeated {
         eprintln!("uniq: printing all duplicated lines and repeat counts is meaningless");
-        return Err(usage_try());
+        return Err(try_help("uniq"));
     }
     let mut files = files.into_iter();
     if let Some(f) = files.next() {
@@ -319,10 +315,6 @@ fn parse_args(args: Vec<String>) -> std::result::Result<UniqConfig, i32> {
         cfg.output = f;
     }
     Ok(cfg)
-}
-
-fn usage_try() -> i32 {
-    crate::common::getopt::try_help("uniq", 1)
 }
 
 /// The part of `line` (without its delimiter) that is compared: GNU's
@@ -489,7 +481,7 @@ fn check_file(
     Ok(())
 }
 
-pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let cfg = match parse_args(args) {
         Ok(cfg) => cfg,
         Err(status) => return Ok(status),

@@ -5,64 +5,136 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
-    emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, sparkline_bar,
+    emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, sparkline_bar, stdout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 
 use crate::common::files0::{Files0From, extra_operand_error};
-use crate::common::getopt::argmatch;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
+    print_version, unsupported,
+};
 use crate::common::input::{close_stdin, safe_read, stdin_file};
 use crate::common::locale::utf8_locale;
 use crate::common::quote::{qa, qf};
 
-#[derive(Parser)]
-#[command(
-    name = "wc",
-    about = "Print newline, word, and byte counts for each FILE"
-)]
+const WC_HELP: &str = "\
+Print newline, word, and byte counts for each FILE
+
+Usage: wc [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+  -c, --bytes            Print the byte counts
+  -m, --chars            Print the character counts
+  -l, --lines            Print the newline counts
+  -w, --words            Print the word counts
+  -L, --max-line-length  Print the maximum display width
+      --files0-from=F    Read input from the files specified by NUL-terminated
+                         names in file F; if F is - then read names from
+                         standard input
+      --total=WHEN       When to print a line with total counts;
+                         WHEN can be: auto, always, only, never
+  -J, --json             Emit structured JSON / NDJSON
+  -t, --table            Render a rich visual breakdown table with sparklines
+      --help             Print help
+";
+
+#[derive(Default)]
 struct WcArgs {
-    /// Print the byte counts
-    #[arg(short = 'c', long = "bytes")]
     bytes: bool,
-
-    /// Print the character counts
-    #[arg(short = 'm', long = "chars")]
     chars: bool,
-
-    /// Print the newline counts
-    #[arg(short = 'l', long = "lines")]
     lines: bool,
-
-    /// Print the word counts
-    #[arg(short = 'w', long = "words")]
     words: bool,
-
-    /// Print the maximum display width
-    #[arg(short = 'L', long = "max-line-length")]
     max_line_length: bool,
-
-    /// Emit structured JSON / NDJSON
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
-    /// Render a rich visual breakdown table with sparklines
-    #[arg(short = 't', long = "table")]
     table: bool,
-
-    /// Read input from the files specified by NUL-terminated names in file F
-    #[arg(long = "files0-from", value_name = "F")]
     files0_from: Option<String>,
-
-    /// When to print a line with total counts: auto, always, only, never
-    #[arg(long = "total", value_name = "WHEN")]
-    total: Option<String>,
-
+    total: TotalMode,
     files: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WcArgsOpt {
+    Bytes,
+    Chars,
+    Lines,
+    Words,
+    MaxLineLength,
+    Json,
+    Table,
+    Files0From,
+    Total,
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    Version,
+}
+
+/// GNU's `longopts` and `"clLmw"`, plus the Dogfish `-J, --json` and
+/// `-t, --table`.
+const SPECS: &[OptSpec<WcArgsOpt>] = &[
+    OptSpec::both(b'c', "bytes", HasArg::No, WcArgsOpt::Bytes),
+    OptSpec::both(b'm', "chars", HasArg::No, WcArgsOpt::Chars),
+    OptSpec::both(b'l', "lines", HasArg::No, WcArgsOpt::Lines),
+    OptSpec::both(b'w', "words", HasArg::No, WcArgsOpt::Words),
+    OptSpec::long("debug", HasArg::No, WcArgsOpt::Unsupported),
+    OptSpec::long("files0-from", HasArg::Required, WcArgsOpt::Files0From),
+    OptSpec::both(
+        b'L',
+        "max-line-length",
+        HasArg::No,
+        WcArgsOpt::MaxLineLength,
+    ),
+    OptSpec::long("total", HasArg::Required, WcArgsOpt::Total),
+    OptSpec::both(b'J', "json", HasArg::No, WcArgsOpt::Json),
+    OptSpec::both(b't', "table", HasArg::No, WcArgsOpt::Table),
+    OptSpec::long("help", HasArg::No, WcArgsOpt::Help),
+    OptSpec::long("version", HasArg::No, WcArgsOpt::Version),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i32> {
+    let mut parsed = WcArgs::default();
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("wc", &e))?;
+        match o {
+            WcArgsOpt::Bytes => parsed.bytes = true,
+            WcArgsOpt::Chars => parsed.chars = true,
+            WcArgsOpt::Lines => parsed.lines = true,
+            WcArgsOpt::Words => parsed.words = true,
+            WcArgsOpt::MaxLineLength => parsed.max_line_length = true,
+            WcArgsOpt::Json => parsed.json = true,
+            WcArgsOpt::Table => parsed.table = true,
+            WcArgsOpt::Files0From => parsed.files0_from = v.as_deref().map(lossy),
+            WcArgsOpt::Total => {
+                parsed.total = argmatch(
+                    "wc",
+                    "--total",
+                    v.unwrap_or_default(),
+                    &[
+                        ("auto", TotalMode::Auto),
+                        ("always", TotalMode::Always),
+                        ("only", TotalMode::Only),
+                        ("never", TotalMode::Never),
+                    ],
+                )?;
+            }
+            WcArgsOpt::Unsupported => return Err(unsupported("wc", &opts.last_spelling())),
+            WcArgsOpt::Help => return Err(print_help(WC_HELP)),
+            WcArgsOpt::Version => return Err(print_version("wc")),
+        }
+    }
+    parsed.files = lossy_all(opts.operands());
+    Ok(parsed)
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -253,8 +325,9 @@ impl WcOpts {
 }
 
 /// `--total=WHEN`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum TotalMode {
+    #[default]
     Auto,
     Always,
     Only,
@@ -540,23 +613,12 @@ enum Names {
     Files0(Files0From, Option<Vec<String>>),
 }
 
-pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = WcArgs::try_parse_from(args)?;
-    let total_mode = match parsed.total.as_deref() {
-        None => TotalMode::Auto,
-        Some(when) => {
-            let valid = ["auto", "always", "only", "never"];
-            match argmatch("wc", "--total", when, &valid, 1) {
-                Ok(i) => [
-                    TotalMode::Auto,
-                    TotalMode::Always,
-                    TotalMode::Only,
-                    TotalMode::Never,
-                ][i],
-                Err(status) => return Ok(status),
-            }
-        }
+pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_wc_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
+    let total_mode = parsed.total;
 
     let utf8 = utf8_locale();
     let default_cols =
@@ -637,13 +699,12 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         Names::Files0(_, None) => 1,
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let mut ok = true;
     let mut totals = Totals::default();
     let mut read_stdin = false;
     let show_names = !parsed.files.is_empty() || parsed.files0_from.is_some();
-    let mut emit = |out: &mut io::BufWriter<io::StdoutLock<'_>>,
+    let mut emit = |out: &mut io::BufWriter<stdout::Stdout>,
                     src: &InputSource,
                     res: io::Result<Counted>|
      -> io::Result<bool> {
@@ -804,8 +865,7 @@ fn wc_rich(
             sparkline_bar(ratio, 10, st),
         ]);
     }
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     tbl.render(&mut out, st)?;
     Ok(exit_code)
 }

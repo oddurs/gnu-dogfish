@@ -14,6 +14,18 @@ updates:
         patterns: ["digest", "md-5", "blake2", "sha2"]
       cargo-minor:
         update-types: [minor, patch]
+    ignore:
+      # digest 0.11 / blake2 0.11 / md-5 0.11 need a hand-written port (no
+      # Blake2bVar, no md-5 asm feature, new digest traits for the ring
+      # adapter): cairn item 0015. Remove this when it lands.
+      - dependency-name: "digest"
+        versions: [">=0.11"]
+      - dependency-name: "blake2"
+        versions: [">=0.11"]
+      - dependency-name: "md-5"
+        versions: [">=0.11"]
+      - dependency-name: "sha2"
+        versions: [">=0.11"]
 
   - package-ecosystem: github-actions
     directory: /
@@ -21,3 +33,8 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+    ignore:
+      # The toolchain pins are deliberate: 1.88.0 is the MSRV the MSRV job
+      # tests, and the Clippy pin keeps new lints from failing unrelated PRs.
+      # Bump them by hand.
+      - dependency-name: "dtolnay/rust-toolchain"

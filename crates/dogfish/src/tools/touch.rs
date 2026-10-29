@@ -1,5 +1,6 @@
 //! touch — `-d` understands the common GNU date formats (see `parse_datetime`)
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -10,8 +11,10 @@ use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use dogfish_core::{DogfishContext, gnu_io_error};
 
 use crate::common::file_times::{Stamp, set_file_times};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::quote::{qa, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const TOUCH_HELP: &str = "\
 Usage: touch [OPTION]... FILE...
@@ -51,36 +54,45 @@ enum TouchOpt {
     Reference,
     StampArg,
     Time,
+    Help,
+    Version,
 }
 
-pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// GNU's `longopts` and `"acd:fhmr:t:"`.
+const SPECS: &[OptSpec<TouchOpt>] = &[
+    OptSpec::long("time", HasArg::Required, TouchOpt::Time),
+    OptSpec::both(b'c', "no-create", HasArg::No, TouchOpt::NoCreate),
+    OptSpec::both(b'd', "date", HasArg::Required, TouchOpt::Date),
+    OptSpec::both(b'r', "reference", HasArg::Required, TouchOpt::Reference),
+    OptSpec::both(b'h', "no-dereference", HasArg::No, TouchOpt::NoDeref),
+    OptSpec::long("help", HasArg::No, TouchOpt::Help),
+    OptSpec::long("version", HasArg::No, TouchOpt::Version),
+    OptSpec::short(b'a', HasArg::No, TouchOpt::Access),
+    OptSpec::short(b'f', HasArg::No, TouchOpt::Ignored),
+    OptSpec::short(b'm', HasArg::No, TouchOpt::Modify),
+    OptSpec::short(b't', HasArg::Required, TouchOpt::StampArg),
+];
+
+pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use TouchOpt::*;
-    const SPECS: &[ToolOpt<TouchOpt>] = &[
-        opt("a", "", HasArg::No, Access),
-        opt("c", "no-create", HasArg::No, NoCreate),
-        opt("d", "date", HasArg::Required, Date),
-        opt("f", "", HasArg::No, Ignored),
-        opt("h", "no-dereference", HasArg::No, NoDeref),
-        opt("m", "", HasArg::No, Modify),
-        opt("r", "reference", HasArg::Required, Reference),
-        opt("t", "", HasArg::Required, StampArg),
-        opt("", "time", HasArg::Required, Time),
-    ];
-    let parsed = match parse_tool_args("touch", &args, SPECS, TOUCH_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let (mut atime, mut mtime, mut no_create, mut no_deref) = (false, false, false, false);
     let (mut date, mut reference, mut stamp) = (None, None, None);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("touch", &e)),
+        };
         match o {
+            Help => return Ok(print_help(TOUCH_HELP)),
+            Version => return Ok(print_version("touch")),
             Access => atime = true,
             Modify => mtime = true,
             NoCreate => no_create = true,
             NoDeref => no_deref = true,
-            Date => date = v,
+            Date => date = v.as_deref().map(lossy),
             Reference => reference = v,
-            StampArg => stamp = v,
+            StampArg => stamp = v.as_deref().map(lossy),
             Time => {
                 const WORDS: &[(&str, bool)] = &[
                     ("atime", true),
@@ -89,7 +101,7 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ("mtime", false),
                     ("modify", false),
                 ];
-                match argmatch("touch", "--time", v.as_deref().unwrap_or_default(), WORDS) {
+                match argmatch("touch", "--time", v.unwrap_or_default(), WORDS) {
                     Ok(true) => atime = true,
                     Ok(false) => mtime = true,
                     Err(code) => return Ok(code),
@@ -108,7 +120,8 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         atime = true;
         mtime = true;
     }
-    if parsed.operands.is_empty() {
+    let operands = opts.operands();
+    if operands.is_empty() {
         return Ok(usage_error("touch", "missing file operand"));
     }
 
@@ -175,7 +188,7 @@ pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let mut status = 0;
-    for file in &parsed.operands {
+    for file in &operands {
         let path = Path::new(file);
         let mut open_err = None;
         if !no_create && !no_deref {

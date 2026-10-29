@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use dogfish_core::{
     DogfishContext, emit_objects_or_table, format_mode_rwx, format_relative_time, format_size,
-    gnu_io_error, io::ignore_broken_pipe,
+    gnu_io_error, io::ignore_broken_pipe, outln, stdout,
 };
 use serde::Serialize;
 
@@ -21,24 +21,25 @@ use crate::common::file_info::{
     dev_major, dev_minor, file_type_description, find_mount_point, group_name, meta_atime,
     meta_birth, meta_ctime, meta_mtime, path_bytes, security_context, user_name,
 };
-use crate::common::gnu_getopt::{
-    OptArg, OptSpec, gnu_argmatch, gnu_getopt, gnu_usage_error, print_help_text,
-    print_tool_version, try_help,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy_all, print_help, print_version,
+    usage_error,
 };
 use crate::common::quote::{Quoting, quote_af, quote_bytes, quote_bytes_raw};
 use crate::common::strftime::{Timespec, format_local_time};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
-const STAT_OPTIONS: &[OptSpec] = &[
-    OptSpec::new("dereference", Some('L'), Some("dereference"), OptArg::No),
-    OptSpec::new("file-system", Some('f'), Some("file-system"), OptArg::No),
-    OptSpec::new("cached", None, Some("cached"), OptArg::Required),
-    OptSpec::new("format", Some('c'), Some("format"), OptArg::Required),
-    OptSpec::new("printf", None, Some("printf"), OptArg::Required),
-    OptSpec::new("terse", Some('t'), Some("terse"), OptArg::No),
-    OptSpec::new("json", Some('J'), Some("json"), OptArg::No),
-    OptSpec::new("help", None, Some("help"), OptArg::No),
-    OptSpec::new("version", None, Some("version"), OptArg::No),
+const STAT_OPTIONS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'L', "dereference", HasArg::No, "dereference"),
+    OptSpec::both(b'f', "file-system", HasArg::No, "file-system"),
+    OptSpec::both(b'c', "format", HasArg::Required, "format"),
+    OptSpec::long("printf", HasArg::Required, "printf"),
+    OptSpec::both(b't', "terse", HasArg::No, "terse"),
+    OptSpec::long("cached", HasArg::Required, "cached"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    // Dogfish extensions.
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
 ];
 
 const STAT_HELP: &str = "\
@@ -113,18 +114,19 @@ struct StatRecord {
     symlink_target: Option<String>,
 }
 
-pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = match gnu_getopt(STAT_OPTIONS, &args[1..]) {
-        Ok(p) => p,
-        Err(msg) => return Ok(gnu_usage_error("stat", &msg, 1)),
-    };
+pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut parsed = Getopt::new(args.into_iter().skip(1).collect(), STAT_OPTIONS);
     let mut dereference = false;
     let mut file_system = false;
     let mut terse = false;
     let mut json = false;
     // (FORMAT, interpret backslash escapes and omit the trailing newline)
     let mut format: Option<(String, bool)> = None;
-    for opt in parsed.opts {
+    while let Some(item) = parsed.next_text() {
+        let opt = match item {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("stat", &e)),
+        };
         match opt.key {
             "dereference" => dereference = true,
             "file-system" => file_system = true,
@@ -139,23 +141,21 @@ pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ("always", "always"),
                 ];
                 let value = opt.value.unwrap_or_default();
-                if gnu_argmatch("stat", "--cached", &value, &choices).is_none() {
-                    return Ok(try_help("stat", 1));
+                if let Err(code) = argmatch("stat", "--cached", &value, &choices) {
+                    return Ok(code);
                 }
             }
-            "help" => return print_help_text(STAT_HELP),
-            "version" => {
-                print_tool_version("stat");
-                return Ok(0);
-            }
+            "help" => return Ok(print_help(STAT_HELP)),
+            "version" => return Ok(print_version("stat")),
             _ => unreachable!("unhandled stat option"),
         }
     }
-    if parsed.operands.is_empty() {
-        return Ok(gnu_usage_error("stat", "missing operand", 1));
+    let operands = lossy_all(parsed.operands());
+    if operands.is_empty() {
+        return Ok(usage_error("stat", "missing operand"));
     }
     if json || (ctx.stdout_is_tty && format.is_none() && !terse && !file_system) {
-        return stat_card(&parsed.operands, dereference, json, ctx);
+        return stat_card(&operands, dereference, json, ctx);
     }
 
     let selinux = selinux_enabled();
@@ -174,10 +174,9 @@ pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let mut status = 0;
-    for name in &parsed.operands {
+    for name in &operands {
         // `-` means standard input, as in GNU.
         let path = if name == "-" {
             Path::new("/dev/stdin")
@@ -961,13 +960,13 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
             Some(t) => format!("{} -> {}", st.bold_cyan(&rec.name), st.magenta(t)),
             None => st.bold_cyan(&rec.name),
         };
-        println!(
+        outln!(
             "  {} {}  {}",
             st.dim("File:"),
             header_target,
             st.dim(&format!("({})", rec.file_type))
         );
-        println!(
+        outln!(
             "  {} {} ({} B)   {} {}   {} {}",
             st.dim("Size:"),
             st.bold_green(&rec.size_human),
@@ -977,7 +976,7 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
             st.dim("Inode:"),
             rec.inode
         );
-        println!(
+        outln!(
             "{} {} ({})   {} {}:{} ({}:{})   {} {}",
             st.dim("Access:"),
             st.bold_yellow(&rec.mode_symbolic),
@@ -990,14 +989,14 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
             st.dim("Links:"),
             rec.links
         );
-        println!(
+        outln!(
             "{} {} ({})",
             st.dim("Modify:"),
             rec.modified,
             st.cyan(&rec.modified_relative)
         );
-        println!("{} {}", st.dim("Access:"), rec.accessed);
-        println!("{} {}", st.dim("Change:"), rec.changed);
+        outln!("{} {}", st.dim("Access:"), rec.accessed);
+        outln!("{} {}", st.dim("Change:"), rec.changed);
     }
     Ok(exit_code)
 }

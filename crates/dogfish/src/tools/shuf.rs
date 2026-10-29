@@ -3,18 +3,20 @@
 //! `-r`, `-z`, `-o`, `--random-source`, + NDJSON shuffling on terminals.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, emit_objects_or_table, gnu_io_error, read_ndjson_stdin,
 };
 
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error};
-use crate::common::gnu_getopt::print_tool_version;
-use crate::common::input::RawStdout;
-use crate::common::input::stdin_file;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, try_help,
+};
+use crate::common::input::{RawStdout, stdin_file};
 use crate::common::lines::{lossy_lines, split_records};
 use crate::common::quote::{qf, quote_locale};
 use crate::common::xstrtol::{StrtolError, xstrtoumax};
@@ -40,37 +42,32 @@ Mandatory arguments to long options are mandatory for short options too.
       --version     output version information and exit
 ";
 
-static SHUF_OPTS: [OptSpec; 10] = [
-    opt(Some('e'), Some("echo"), HasArg::No, "echo"),
-    opt(
-        Some('i'),
-        Some("input-range"),
-        HasArg::Required,
-        "input-range",
-    ),
-    opt(
-        Some('n'),
-        Some("head-count"),
-        HasArg::Required,
-        "head-count",
-    ),
-    opt(Some('o'), Some("output"), HasArg::Required, "output"),
-    opt(
-        None,
-        Some("random-source"),
-        HasArg::Required,
-        "random-source",
-    ),
-    opt(Some('r'), Some("repeat"), HasArg::No, "repeat"),
-    opt(
-        Some('z'),
-        Some("zero-terminated"),
-        HasArg::No,
-        "zero-terminated",
-    ),
-    opt(Some('J'), Some("json"), HasArg::No, "json"),
-    opt(None, Some("help"), HasArg::No, "help"),
-    opt(None, Some("version"), HasArg::No, "version"),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShufOpt {
+    Echo,
+    InputRange,
+    HeadCount,
+    Output,
+    RandomSource,
+    Repeat,
+    ZeroTerminated,
+    Json,
+    Help,
+    Version,
+}
+
+/// GNU's `long_opts` and `"ei:n:o:rz"`, plus the Dogfish `-J, --json`.
+const SPECS: &[OptSpec<ShufOpt>] = &[
+    OptSpec::both(b'e', "echo", HasArg::No, ShufOpt::Echo),
+    OptSpec::both(b'i', "input-range", HasArg::Required, ShufOpt::InputRange),
+    OptSpec::both(b'n', "head-count", HasArg::Required, ShufOpt::HeadCount),
+    OptSpec::both(b'o', "output", HasArg::Required, ShufOpt::Output),
+    OptSpec::long("random-source", HasArg::Required, ShufOpt::RandomSource),
+    OptSpec::both(b'r', "repeat", HasArg::No, ShufOpt::Repeat),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, ShufOpt::ZeroTerminated),
+    OptSpec::long("help", HasArg::No, ShufOpt::Help),
+    OptSpec::long("version", HasArg::No, ShufOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, ShufOpt::Json).exact(),
 ];
 
 /// What shuf was asked to do.
@@ -84,7 +81,7 @@ struct ShufConfig {
     repeat: bool,
     eol: u8,
     json: bool,
-    operands: Vec<String>,
+    operands: Vec<OsString>,
 }
 
 /// GNU's `-i` parsing: `LO-HI`, both plain numbers, with at least one line.
@@ -129,7 +126,7 @@ fn parse_range(arg: &str) -> std::result::Result<(u64, u64), String> {
 }
 
 /// GNU's option loop; `Err` is the exit status after a diagnostic.
-fn parse_args(args: Vec<String>) -> std::result::Result<ShufConfig, i32> {
+fn parse_args(args: Vec<OsString>) -> std::result::Result<ShufConfig, i32> {
     let mut cfg = ShufConfig {
         echo: false,
         range: None,
@@ -145,55 +142,48 @@ fn parse_args(args: Vec<String>) -> std::result::Result<ShufConfig, i32> {
         eprintln!("shuf: {msg}");
         1
     };
-    let mut g = GetOpt::new(args.into_iter().skip(1).collect(), &SHUF_OPTS, true);
-    while let Some(next) = g.next_opt() {
-        let (key, value) = next.map_err(|msg| usage_error("shuf", msg, 1))?;
-        let value = value.unwrap_or_default();
+    let mut g = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(next) = g.next() {
+        let (key, value) = next.map_err(|e| getopt_error("shuf", &e))?;
+        let value = value.as_deref().map(lossy).unwrap_or_default();
         match key {
-            "echo" => cfg.echo = true,
-            "input-range" => {
+            ShufOpt::Echo => cfg.echo = true,
+            ShufOpt::InputRange => {
                 if cfg.range.is_some() {
                     return Err(die("multiple -i options specified".to_string()));
                 }
                 cfg.range = Some(parse_range(&value).map_err(die)?);
             }
-            "head-count" => match xstrtoumax(&value, "") {
+            ShufOpt::HeadCount => match xstrtoumax(&value, "") {
                 (n, None) => cfg.head_lines = cfg.head_lines.min(n),
                 (_, Some(StrtolError::Overflow)) => {}
                 _ => {
                     return Err(die(format!("invalid line count: {}", quote_locale(&value))));
                 }
             },
-            "output" => {
+            ShufOpt::Output => {
                 if cfg.outfile.as_ref().is_some_and(|o| *o != value) {
                     return Err(die("multiple output files specified".to_string()));
                 }
                 cfg.outfile = Some(value);
             }
-            "random-source" => {
+            ShufOpt::RandomSource => {
                 if cfg.random_source.as_ref().is_some_and(|r| *r != value) {
                     return Err(die("multiple random sources specified".to_string()));
                 }
                 cfg.random_source = Some(value);
             }
-            "repeat" => cfg.repeat = true,
-            "zero-terminated" => cfg.eol = 0,
-            "json" => cfg.json = true,
-            "help" => {
-                let _ = print_help(SHUF_HELP);
-                return Err(0);
-            }
-            "version" => {
-                print_tool_version("shuf");
-                return Err(0);
-            }
-            _ => {}
+            ShufOpt::Repeat => cfg.repeat = true,
+            ShufOpt::ZeroTerminated => cfg.eol = 0,
+            ShufOpt::Json => cfg.json = true,
+            ShufOpt::Help => return Err(print_help(SHUF_HELP)),
+            ShufOpt::Version => return Err(print_version("shuf")),
         }
     }
-    cfg.operands = g.into_operands();
+    cfg.operands = g.operands();
     if cfg.echo && cfg.range.is_some() {
         eprintln!("shuf: cannot combine -e and -i options");
-        return Err(try_help("shuf", 1));
+        return Err(try_help("shuf"));
     }
     let extra = match (cfg.range.is_some(), cfg.echo) {
         (true, _) => cfg.operands.first(),
@@ -201,8 +191,8 @@ fn parse_args(args: Vec<String>) -> std::result::Result<ShufConfig, i32> {
         _ => None,
     };
     if let Some(extra) = extra {
-        eprintln!("shuf: extra operand {}", quote_locale(extra));
-        return Err(try_help("shuf", 1));
+        eprintln!("shuf: extra operand {}", quote_locale(extra.as_os_str()));
+        return Err(try_help("shuf"));
     }
     Ok(cfg)
 }
@@ -319,7 +309,7 @@ fn read_records(data: &[u8], eol: u8) -> Vec<&[u8]> {
     split_records(data, eol).collect()
 }
 
-pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let cfg = match parse_args(args) {
         Ok(cfg) => cfg,
         Err(status) => return Ok(status),
@@ -330,12 +320,16 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // for -n 0).
     let mut data = Vec::new();
     if cfg.head_lines > 0 && !cfg.echo && cfg.range.is_none() {
-        let res = match cfg.operands.first().map(String::as_str) {
-            None | Some("-") => stdin_file().read_to_end(&mut data),
+        let res = match cfg.operands.first().map(OsString::as_os_str) {
+            None => stdin_file().read_to_end(&mut data),
+            Some(p) if p == "-" => stdin_file().read_to_end(&mut data),
             Some(path) => File::open(path).and_then(|mut f| f.read_to_end(&mut data)),
         };
         if let Err(e) = res {
-            let name = cfg.operands.first().map_or("-", String::as_str);
+            let name = cfg
+                .operands
+                .first()
+                .map_or(OsStr::new("-"), OsString::as_os_str);
             let what = if cfg.operands.is_empty() {
                 "read error".to_string()
             } else {

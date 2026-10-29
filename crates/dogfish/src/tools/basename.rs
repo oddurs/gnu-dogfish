@@ -1,13 +1,17 @@
 //! `basename`
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version, usage_error,
+};
 use crate::common::path::{base_len, last_component};
 use crate::common::quote::quote_locale;
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args_posix, usage_error};
 
 const BASENAME_HELP: &str = "\
 Usage: basename NAME [SUFFIX]
@@ -27,21 +31,32 @@ enum BasenameOpt {
     Multiple,
     Suffix,
     Zero,
+    Help,
+    Version,
 }
 
-pub fn run_basename(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// GNU's `longopts` and `"+as:z"`: options end at the first NAME.
+const SPECS: &[OptSpec<BasenameOpt>] = &[
+    OptSpec::both(b'a', "multiple", HasArg::No, BasenameOpt::Multiple),
+    OptSpec::both(b's', "suffix", HasArg::Required, BasenameOpt::Suffix),
+    OptSpec::both(b'z', "zero", HasArg::No, BasenameOpt::Zero),
+    OptSpec::long("help", HasArg::No, BasenameOpt::Help),
+    OptSpec::long("version", HasArg::No, BasenameOpt::Version),
+];
+
+pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use BasenameOpt::*;
-    const SPECS: &[ToolOpt<BasenameOpt>] = &[
-        opt("a", "multiple", HasArg::No, Multiple),
-        opt("s", "suffix", HasArg::Required, Suffix),
-        opt("z", "zero", HasArg::No, Zero),
-    ];
-    let parsed = match parse_tool_args_posix("basename", &args, SPECS, BASENAME_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        SPECS,
+        Order::StopAtOperand,
+    );
     let (mut multiple, mut suffix, mut zero) = (false, None, false);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("basename", &e)),
+        };
         match o {
             Multiple => multiple = true,
             Suffix => {
@@ -49,9 +64,11 @@ pub fn run_basename(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 suffix = v;
             }
             Zero => zero = true,
+            Help => return Ok(print_help(BASENAME_HELP)),
+            Version => return Ok(print_version("basename")),
         }
     }
-    let names = parsed.operands;
+    let names = opts.operands();
     if names.is_empty() {
         return Ok(usage_error("basename", "missing operand"));
     }
@@ -61,17 +78,16 @@ pub fn run_basename(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         if names.len() > 2 {
             return Ok(usage_error(
                 "basename",
-                &format!("extra operand {}", quote_locale(&names[2])),
+                format!("extra operand {}", quote_locale(&names[2])),
             ));
         }
         (&names[..1], names.get(1).cloned())
     };
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     for name in names {
         out.write_all(&compute_basename(
             name.as_bytes(),
-            suffix.as_deref().map(str::as_bytes),
+            suffix.as_deref().map(|s| s.as_bytes()),
         ))?;
         out.write_all(if zero { b"\0" } else { b"\n" })?;
         ctx.telemetry.add_items(1);

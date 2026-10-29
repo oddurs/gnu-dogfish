@@ -4,75 +4,205 @@ use std::io::{self, Read, Seek, Write};
 use std::thread;
 use std::time::Duration;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::memchr_iter;
 
-use crate::common::head_tail::{
-    digit_option, header_name, last_lines_start, parse_count, to_usize,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, lossy_all, print_help, print_version,
+    unsupported,
 };
+use crate::common::head_tail::{header_name, last_lines_start, parse_count, to_usize};
 use crate::common::input::{RawStdout, stdin_file};
 use crate::common::lines::{line_end, looks_like_json, lossy_lines};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, quote_locale};
 use crate::common::xstrtol::{StrtolError, xstrtoumax};
 
-#[derive(Parser)]
-#[command(
-    name = "tail",
-    about = "Output the last part of files (or NDJSON object streams)"
-)]
+const TAIL_HELP: &str = "\
+Output the last part of files (or NDJSON object streams)
+
+Usage: tail [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+  -n, --lines <[+]NUM>  Output the last NUM lines (default 10); or use -n +NUM to skip NUM-1 lines
+                        at the start
+  -c, --bytes <[+]NUM>  Output the last NUM bytes; or use -c +NUM to output starting with byte NUM
+  -f, --follow          Output appended data as the file grows
+  -q, --quiet           [alias: --silent]
+  -v, --verbose         
+  -z, --zero-terminated Line delimiter is NUL, not newline
+  -J, --json            
+      --help            Print help
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailOpt {
+    Bytes,
+    Follow,
+    FollowWhen,
+    Lines,
+    DisableInotify,
+    PresumeInputPipe,
+    Quiet,
+    Verbose,
+    ZeroTerminated,
+    Json,
+    Digit(u8),
+    /// A GNU option Dogfish does not implement yet.
+    Unsupported,
+    Help,
+    Version,
+}
+
+const fn digit(c: u8) -> OptSpec<TailOpt> {
+    OptSpec::short(c, HasArg::No, TailOpt::Digit(c))
+}
+
+/// GNU's `long_options` and `"c:n:fFqs:vz0123456789"`, plus `-J, --json`.
+/// `---disable-inotify` and `---presume-input-pipe` are GNU's hidden test
+/// options.
+const SPECS: &[OptSpec<TailOpt>] = &[
+    OptSpec::both(b'c', "bytes", HasArg::Required, TailOpt::Bytes),
+    OptSpec::long("follow", HasArg::Optional, TailOpt::FollowWhen),
+    OptSpec::both(b'n', "lines", HasArg::Required, TailOpt::Lines),
+    OptSpec::long(
+        "max-unchanged-stats",
+        HasArg::Required,
+        TailOpt::Unsupported,
+    ),
+    OptSpec::long("-disable-inotify", HasArg::No, TailOpt::DisableInotify),
+    OptSpec::long("pid", HasArg::Required, TailOpt::Unsupported),
+    OptSpec::long("-presume-input-pipe", HasArg::No, TailOpt::PresumeInputPipe),
+    OptSpec::both(b'q', "quiet", HasArg::No, TailOpt::Quiet),
+    OptSpec::long("retry", HasArg::No, TailOpt::Unsupported),
+    OptSpec::long("silent", HasArg::No, TailOpt::Quiet),
+    OptSpec::both(
+        b's',
+        "sleep-interval",
+        HasArg::Required,
+        TailOpt::Unsupported,
+    ),
+    OptSpec::both(b'v', "verbose", HasArg::No, TailOpt::Verbose),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, TailOpt::ZeroTerminated),
+    OptSpec::long("help", HasArg::No, TailOpt::Help),
+    OptSpec::long("version", HasArg::No, TailOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, TailOpt::Json).exact(),
+    OptSpec::short(b'f', HasArg::No, TailOpt::Follow),
+    OptSpec::short(b'F', HasArg::No, TailOpt::Unsupported),
+    digit(b'0'),
+    digit(b'1'),
+    digit(b'2'),
+    digit(b'3'),
+    digit(b'4'),
+    digit(b'5'),
+    digit(b'6'),
+    digit(b'7'),
+    digit(b'8'),
+    digit(b'9'),
+];
+
+/// What `tail` was asked for; as in GNU, the last `-c`/`-n` wins.
 struct TailArgs {
-    /// Output the last NUM lines (default 10); or use -n +NUM to skip NUM-1 lines at the start
-    #[arg(
-        short = 'n',
-        long = "lines",
-        value_name = "[+]NUM",
-        allow_hyphen_values = true
-    )]
-    lines: Option<String>,
-
-    /// Output the last NUM bytes; or use -c +NUM to output starting with byte NUM
-    #[arg(
-        short = 'c',
-        long = "bytes",
-        value_name = "[+]NUM",
-        allow_hyphen_values = true
-    )]
-    bytes: Option<String>,
-
-    /// Output appended data as the file grows
-    #[arg(short = 'f', long = "follow")]
+    by_bytes: bool,
+    from_start: bool,
+    count: u64,
     follow: bool,
-
-    #[arg(short = 'q', long = "quiet", visible_alias = "silent")]
+    /// `---disable-inotify`: follow by polling (all Dogfish does today).
+    disable_inotify: bool,
     quiet: bool,
-
-    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
-
-    /// Line delimiter is NUL, not newline
-    #[arg(short = 'z', long = "zero-terminated")]
     zero_terminated: bool,
-
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     files: Vec<String>,
+}
+
+/// Parses the command line; `Err` is the exit status after a diagnostic.
+fn parse_tail_args(args: Vec<OsString>) -> std::result::Result<TailArgs, i32> {
+    let mut a = TailArgs {
+        by_bytes: false,
+        from_start: false,
+        count: 10,
+        follow: false,
+        disable_inotify: false,
+        quiet: false,
+        verbose: false,
+        zero_terminated: false,
+        json: false,
+        files: Vec::new(),
+    };
+    let mut opts = Getopt::new(expand_obsolete(args)?.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("tail", &e))?;
+        match o {
+            TailOpt::Bytes | TailOpt::Lines => {
+                // Like GNU, each count is checked as it is met.
+                a.by_bytes = o == TailOpt::Bytes;
+                let spec = v.as_deref().map(lossy).unwrap_or_default();
+                let (from_start, num_str) = match spec.strip_prefix('+') {
+                    Some(rest) => (true, rest),
+                    None => (false, spec.strip_prefix('-').unwrap_or(&spec)),
+                };
+                let count = parse_count(num_str, !a.by_bytes).map_err(|msg| {
+                    eprintln!("tail: {msg}");
+                    1
+                })?;
+                (a.from_start, a.count) = (from_start, count);
+            }
+            TailOpt::Follow => a.follow = true,
+            TailOpt::FollowWhen => {
+                if let Some(how) = v {
+                    argmatch("tail", "--follow", how, &[("descriptor", 0), ("name", 1)])?;
+                }
+                a.follow = true;
+            }
+            TailOpt::DisableInotify => a.disable_inotify = true,
+            TailOpt::PresumeInputPipe => {}
+            TailOpt::Quiet => (a.quiet, a.verbose) = (true, false),
+            TailOpt::Verbose => (a.quiet, a.verbose) = (false, true),
+            TailOpt::ZeroTerminated => a.zero_terminated = true,
+            TailOpt::Json => a.json = true,
+            TailOpt::Digit(c) => {
+                eprintln!("tail: option used in invalid context -- {}", char::from(c));
+                return Err(1);
+            }
+            TailOpt::Unsupported => return Err(unsupported("tail", &opts.last_spelling())),
+            TailOpt::Help => return Err(print_help(TAIL_HELP)),
+            TailOpt::Version => return Err(print_version("tail")),
+        }
+    }
+    a.files = lossy_all(opts.operands());
+    Ok(a)
+}
+
+/// Prints GNU's diagnostic for a failed write while copying; false for any
+/// other error.
+fn write_failed(e: &io::Error) -> bool {
+    if !stdout::is_write_error(e) {
+        return false;
+    }
+    stdout::mark_reported();
+    eprintln!("tail: error writing 'standard output': {}", gnu_io_error(e));
+    true
 }
 
 /// GNU's `parse_obsolete_option`: with at most one file operand, a first
 /// argument such as `-5`, `+2c`, `-l`, `-3bf` is the whole option list. It
 /// is rewritten as the equivalent options; `Err` is the exit status after
 /// GNU's `invalid number` diagnostic.
-fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
+fn expand_obsolete(mut args: Vec<OsString>) -> Result<Vec<OsString>, i32> {
+    use std::os::unix::ffi::OsStrExt;
     let argc = args.len();
     let operand_ok = argc == 2
-        || (argc == 3 && !(args[2].starts_with('-') && args[2].len() > 1))
+        || (argc == 3 && !(args[2].as_bytes().starts_with(b"-") && args[2].len() > 1))
         || ((3..=4).contains(&argc) && args[2] == "--");
     if !operand_ok {
         return Ok(args);
@@ -80,7 +210,8 @@ fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
     let posix_ver = posix2_version();
     let obsolete_usage = posix_ver < 200112;
     let traditional_usage = obsolete_usage || 200809 <= posix_ver;
-    let arg = args[1].as_bytes();
+    let first = args[1].clone();
+    let arg = first.as_bytes();
     let from_start = match arg.first() {
         Some(b'+') if traditional_usage => true,
         // "-" alone is standard input and "-c" needs an argument, except in
@@ -129,7 +260,7 @@ fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
             _ => {
                 eprintln!(
                     "tail: invalid number: {}: Numerical result out of range",
-                    quote_locale(&args[1])
+                    quote_locale(&first)
                 );
                 return Err(1);
             }
@@ -137,9 +268,12 @@ fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
     };
     let option = if count_lines { "-n" } else { "-c" };
     let sign = if from_start { "+" } else { "" };
-    let mut replacement = vec![option.to_string(), format!("{sign}{count}")];
+    let mut replacement = vec![
+        OsString::from(option),
+        OsString::from(format!("{sign}{count}")),
+    ];
     if forever {
-        replacement.push("-f".to_string());
+        replacement.push(OsString::from("-f"));
     }
     args.splice(1..2, replacement);
     Ok(args)
@@ -183,41 +317,14 @@ fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64, eol: u
     }
 }
 
-pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let args = match expand_obsolete(args) {
-        Ok(args) => args,
-        Err(status) => return Ok(status),
+pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_tail_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
-    let long_with_arg = [
-        "bytes",
-        "lines",
-        "max-unchanged-stats",
-        "pid",
-        "sleep-interval",
-    ];
-    if let Some(c) = digit_option(&args, b"cns", &long_with_arg) {
-        eprintln!("tail: option used in invalid context -- {c}");
-        return Ok(1);
-    }
-    let parsed = TailArgs::try_parse_from(args)?;
-    let by_bytes = parsed.bytes.is_some();
+    let _ = parsed.disable_inotify;
+    let (by_bytes, from_start, count) = (parsed.by_bytes, parsed.from_start, parsed.count);
     let eol = line_end(parsed.zero_terminated);
-    let spec = parsed
-        .bytes
-        .as_deref()
-        .or(parsed.lines.as_deref())
-        .unwrap_or("10");
-    let (from_start, num_str) = match spec.strip_prefix('+') {
-        Some(rest) => (true, rest),
-        None => (false, spec.strip_prefix('-').unwrap_or(spec)),
-    };
-    let count = match parse_count(num_str, !by_bytes) {
-        Ok(n) => n,
-        Err(msg) => {
-            eprintln!("tail: {msg}");
-            return Ok(1);
-        }
-    };
     // Don't read anything if nothing will be output.
     if count == 0 && !parsed.follow && !from_start {
         return Ok(0);
@@ -295,6 +402,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         match res {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
+            Err(e) if write_failed(&e) => return Ok(1),
             Err(e) => {
                 let _ = out.flush();
                 eprintln!(

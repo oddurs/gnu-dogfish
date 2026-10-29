@@ -2,80 +2,113 @@
 //! body and footer sections), `-b/-h/-f` styles including `pBRE`, `-d`,
 //! `-l`, `-p`, and GNU's number checks.
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-use clap::{CommandFactory, FromArgMatches, Parser};
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, try_help,
+    xdectoimax,
+};
 use crate::common::gnu_regex::Regex;
 use crate::common::input::RawStdout;
 use crate::common::quote::{qf, quote_locale};
-use crate::common::xstrtol::xdectoimax;
 
-#[derive(Parser)]
-#[command(
-    name = "nl",
-    about = "Write each FILE to standard output, with line numbers added",
-    disable_help_flag = true
-)]
-struct NlArgs {
-    /// Print help
-    #[arg(long = "help", action = clap::ArgAction::Help)]
-    help: Option<bool>,
+const NL_HELP: &str = "\
+Usage: nl [OPTION]... [FILE]...
+Write each FILE to standard output, with line numbers added.
 
-    /// Use STYLE for numbering body lines (a: all, t: nonempty, n: none, pBRE)
-    #[arg(short = 'b', long = "body-numbering")]
-    body: Option<String>,
+With no FILE, or when FILE is -, read standard input.
 
-    /// Use STYLE for numbering header lines
-    #[arg(short = 'h', long = "header-numbering")]
-    header: Option<String>,
+Mandatory arguments to long options are mandatory for short options too.
+  -b, --body-numbering=STYLE      use STYLE for numbering body lines
+  -d, --section-delimiter=CC      use CC for logical page delimiters
+  -f, --footer-numbering=STYLE    use STYLE for numbering footer lines
+  -h, --header-numbering=STYLE    use STYLE for numbering header lines
+  -i, --line-increment=NUMBER     line number increment at each line
+  -l, --join-blank-lines=NUMBER   group of NUMBER empty lines counted as one
+  -n, --number-format=FORMAT      insert line numbers according to FORMAT
+  -p, --no-renumber               do not reset line numbers for each section
+  -s, --number-separator=STRING   add STRING after (possible) line number
+  -v, --starting-line-number=NUMBER  first line number for each section
+  -w, --number-width=NUMBER       use NUMBER columns for line numbers
+  -a, --all                       number all lines (as -ba; a Dogfish extension)
+      --help        display this help and exit
+      --version     output version information and exit
 
-    /// Use STYLE for numbering footer lines
-    #[arg(short = 'f', long = "footer-numbering")]
-    footer: Option<String>,
+Default options are: -bt -d'\\:' -fn -hn -i1 -l1 -n'rn' -s<TAB> -v1 -w6
 
-    /// Number all lines (including empty ones; equivalent to -ba)
-    #[arg(short = 'a', long = "all")]
-    all: bool,
+CC are two delimiter characters used to construct logical page delimiters;
+a missing second character implies ':'.  As a GNU extension one can specify
+more than two characters, and also specifying the empty string (-d '')
+disables section matching.
 
-    /// Use CC for logical page delimiters
-    #[arg(short = 'd', long = "section-delimiter", value_name = "CC")]
-    section_delimiter: Option<String>,
+STYLE is one of:
 
-    /// Line number increment at each line
-    #[arg(short = 'i', long = "line-increment", allow_hyphen_values = true)]
-    increment: Option<String>,
+  a      number all lines
+  t      number only nonempty lines
+  n      number no lines
+  pBRE   number only lines that contain a match for the basic regular
+         expression, BRE
 
-    /// Group of NUMBER empty lines counted as one
-    #[arg(short = 'l', long = "join-blank-lines", allow_hyphen_values = true)]
-    join_blank_lines: Option<String>,
+FORMAT is one of:
 
-    /// Insert line numbers according to FORMAT (ln, rn, rz)
-    #[arg(short = 'n', long = "number-format")]
-    format: Option<String>,
+  ln     left justified, no leading zeros
+  rn     right justified, no leading zeros
+  rz     right justified, leading zeros
+";
 
-    /// Do not reset line numbers for each section
-    #[arg(short = 'p', long = "no-renumber")]
-    no_renumber: bool,
-
-    /// Add STRING after (possible) line number
-    #[arg(short = 's', long = "number-separator", default_value = "\t")]
-    separator: String,
-
-    /// First line number for each section
-    #[arg(short = 'v', long = "starting-line-number", allow_hyphen_values = true)]
-    start: Option<String>,
-
-    /// Use NUMBER columns for line numbers
-    #[arg(short = 'w', long = "number-width", allow_hyphen_values = true)]
-    width: Option<String>,
-
-    files: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NlOpt {
+    Header,
+    Body,
+    Footer,
+    Start,
+    Increment,
+    NoRenumber,
+    JoinBlankLines,
+    Separator,
+    Width,
+    Format,
+    SectionDelimiter,
+    All,
+    Help,
+    Version,
 }
+
+/// GNU's `longopts` and `"h:b:f:v:i:pl:s:w:n:d:"`, plus the Dogfish `-a, --all`.
+const SPECS: &[OptSpec<NlOpt>] = &[
+    OptSpec::both(b'h', "header-numbering", HasArg::Required, NlOpt::Header),
+    OptSpec::both(b'b', "body-numbering", HasArg::Required, NlOpt::Body),
+    OptSpec::both(b'f', "footer-numbering", HasArg::Required, NlOpt::Footer),
+    OptSpec::both(b'v', "starting-line-number", HasArg::Required, NlOpt::Start),
+    OptSpec::both(b'i', "line-increment", HasArg::Required, NlOpt::Increment),
+    OptSpec::both(b'p', "no-renumber", HasArg::No, NlOpt::NoRenumber),
+    OptSpec::both(
+        b'l',
+        "join-blank-lines",
+        HasArg::Required,
+        NlOpt::JoinBlankLines,
+    ),
+    OptSpec::both(b's', "number-separator", HasArg::Required, NlOpt::Separator),
+    OptSpec::both(b'w', "number-width", HasArg::Required, NlOpt::Width),
+    OptSpec::both(b'n', "number-format", HasArg::Required, NlOpt::Format),
+    OptSpec::both(
+        b'd',
+        "section-delimiter",
+        HasArg::Required,
+        NlOpt::SectionDelimiter,
+    ),
+    OptSpec::long("help", HasArg::No, NlOpt::Help),
+    OptSpec::long("version", HasArg::No, NlOpt::Version),
+    OptSpec::both(b'a', "all", HasArg::No, NlOpt::All).exact(),
+];
 
 /// How a section's lines are numbered (only the first letter of the
 /// argument counts, as in GNU).
@@ -117,117 +150,140 @@ struct NlConfig {
 }
 
 /// GNU's `build_type_arg`: `Ok(None)` for an unknown style letter.
-fn build_style(arg: &str) -> std::result::Result<Option<Style>, String> {
-    Ok(match arg.as_bytes().first() {
+fn build_style(arg: &[u8]) -> std::result::Result<Option<Style>, String> {
+    Ok(match arg.first() {
         Some(b'a') => Some(Style::All),
         Some(b't') => Some(Style::NonEmpty),
         Some(b'n') => Some(Style::None),
         Some(b'p') => Some(Style::Matching(
-            Regex::new_basic(&arg.as_bytes()[1..]).map_err(str::to_string)?,
+            Regex::new_basic(&arg[1..]).map_err(str::to_string)?,
         )),
         _ => None,
     })
 }
 
-/// Option processing in GNU's terms; `order` is where -h, -b and -f were
-/// given. `Err` is the exit status after the diagnostics.
-fn parse_config(p: &NlArgs, order: [usize; 3]) -> std::result::Result<NlConfig, i32> {
+/// Parses the command line in GNU's order: a bad style or format is
+/// reported and parsing goes on (then the usage hint and exit 1), a bad
+/// number or regex stops at once. Returns the configuration and the files.
+fn parse_nl_args(args: Vec<OsString>) -> std::result::Result<(NlConfig, Vec<String>), i32> {
     let fatal = |msg: String| {
         eprintln!("nl: {msg}");
         1
     };
+    let mut cfg = NlConfig {
+        header: Style::None,
+        body: Style::NonEmpty,
+        footer: Style::None,
+        start: 1,
+        increment: 1,
+        blank_join: 1,
+        reset_numbers: true,
+        separator: b"\t".to_vec(),
+        width: 6,
+        format: Format::Right,
+        section_del: b"\\:".to_vec(),
+    };
     let mut ok = true;
-    let mut style = |arg: &Option<String>, default: Style, what: &str| match arg {
-        None => Ok(default),
-        Some(a) => match build_style(a) {
-            Ok(Some(s)) => Ok(s),
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("nl", &e))?;
+        let raw = v.map(OsString::into_vec).unwrap_or_default();
+        let text = || lossy(OsStr::from_bytes(&raw));
+        let mut style = |what: &str| match build_style(&raw) {
+            Ok(Some(s)) => Ok(Some(s)),
             Ok(None) => {
-                eprintln!("nl: invalid {what} numbering style: {}", quote_locale(a));
+                eprintln!(
+                    "nl: invalid {what} numbering style: {}",
+                    quote_locale(OsStr::from_bytes(&raw))
+                );
                 ok = false;
-                Ok(Style::None)
+                Ok(None)
             }
             Err(msg) => Err(fatal(msg)),
-        },
-    };
-    // Diagnose the styles in command-line order, as GNU does.
-    let mut styles: [Option<Style>; 3] = [None, None, None];
-    let mut keys = [0, 1, 2];
-    keys.sort_by_key(|&k| order[k]);
-    for k in keys {
-        styles[k] = Some(match k {
-            0 => style(&p.header, Style::None, "header")?,
-            1 if p.all => Style::All,
-            1 => style(&p.body, Style::NonEmpty, "body")?,
-            _ => style(&p.footer, Style::None, "footer")?,
-        });
-    }
-    let [Some(header), Some(body), Some(footer)] = styles else {
-        return Err(1);
-    };
-    let number = |arg: &Option<String>, default: i64, min: i64, max: i64, what: &str| match arg {
-        None => Ok(default),
-        Some(a) => xdectoimax(a, min, max, what).map_err(fatal),
-    };
-    let start = number(
-        &p.start,
-        1,
-        i64::MIN,
-        i64::MAX,
-        "invalid starting line number",
-    )?;
-    let increment = number(
-        &p.increment,
-        1,
-        i64::MIN,
-        i64::MAX,
-        "invalid line number increment",
-    )?;
-    let blank_join = number(
-        &p.join_blank_lines,
-        1,
-        1,
-        i64::MAX,
-        "invalid line number of blank lines",
-    )?;
-    let width = number(
-        &p.width,
-        6,
-        1,
-        i64::from(i32::MAX),
-        "invalid line number field width",
-    )?;
-    let format = match p.format.as_deref() {
-        None | Some("rn") => Format::Right,
-        Some("ln") => Format::Left,
-        Some("rz") => Format::RightZero,
-        Some(other) => {
-            eprintln!("nl: invalid line numbering format: {}", quote_locale(other));
-            ok = false;
-            Format::Right
+        };
+        match o {
+            NlOpt::Header => {
+                if let Some(s) = style("header")? {
+                    cfg.header = s;
+                }
+            }
+            NlOpt::Body => {
+                if let Some(s) = style("body")? {
+                    cfg.body = s;
+                }
+            }
+            NlOpt::Footer => {
+                if let Some(s) = style("footer")? {
+                    cfg.footer = s;
+                }
+            }
+            NlOpt::All => cfg.body = Style::All,
+            NlOpt::Start => {
+                cfg.start = xdectoimax(
+                    "nl",
+                    &text(),
+                    i64::MIN,
+                    i64::MAX,
+                    "invalid starting line number",
+                )?;
+            }
+            NlOpt::Increment => {
+                cfg.increment = xdectoimax(
+                    "nl",
+                    &text(),
+                    i64::MIN,
+                    i64::MAX,
+                    "invalid line number increment",
+                )?;
+            }
+            NlOpt::NoRenumber => cfg.reset_numbers = false,
+            NlOpt::JoinBlankLines => {
+                cfg.blank_join = xdectoimax(
+                    "nl",
+                    &text(),
+                    1,
+                    i64::MAX,
+                    "invalid line number of blank lines",
+                )?;
+            }
+            NlOpt::Separator => cfg.separator = raw.clone(),
+            NlOpt::Width => {
+                let w = xdectoimax(
+                    "nl",
+                    &text(),
+                    1,
+                    i64::from(i32::MAX),
+                    "invalid line number field width",
+                )?;
+                cfg.width = usize::try_from(w).unwrap_or(6);
+            }
+            NlOpt::Format => match raw.as_slice() {
+                b"ln" => cfg.format = Format::Left,
+                b"rn" => cfg.format = Format::Right,
+                b"rz" => cfg.format = Format::RightZero,
+                _ => {
+                    eprintln!(
+                        "nl: invalid line numbering format: {}",
+                        quote_locale(OsStr::from_bytes(&raw))
+                    );
+                    ok = false;
+                }
+            },
+            // POSIX: one character replaces the first of the default pair.
+            NlOpt::SectionDelimiter => {
+                cfg.section_del = match raw.len() {
+                    1 => vec![raw[0], b':'],
+                    _ => raw.clone(),
+                };
+            }
+            NlOpt::Help => return Err(print_help(NL_HELP)),
+            NlOpt::Version => return Err(print_version("nl")),
         }
-    };
-    if !ok {
-        return Err(crate::common::getopt::try_help("nl", 1));
     }
-    let section_del = match p.section_delimiter.as_deref() {
-        None => b"\\:".to_vec(),
-        // POSIX: one character replaces the first of the default pair.
-        Some(d) if d.len() == 1 => vec![d.as_bytes()[0], b':'],
-        Some(d) => d.as_bytes().to_vec(),
-    };
-    Ok(NlConfig {
-        header,
-        body,
-        footer,
-        start,
-        increment,
-        blank_join,
-        reset_numbers: !p.no_renumber,
-        separator: p.separator.as_bytes().to_vec(),
-        width: usize::try_from(width).unwrap_or(6),
-        format,
-        section_del,
-    })
+    if !ok {
+        return Err(try_help("nl"));
+    }
+    Ok((cfg, lossy_all(opts.operands())))
 }
 
 /// Numbering state that carries across files.
@@ -360,15 +416,12 @@ impl NlConfig {
     }
 }
 
-pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let matches = NlArgs::command().try_get_matches_from(args)?;
-    let parsed = NlArgs::from_arg_matches(&matches)?;
-    let order = ["header", "body", "footer"].map(|id| matches.index_of(id).unwrap_or(usize::MAX));
-    let cfg = match parse_config(&parsed, order) {
-        Ok(cfg) => cfg,
+pub fn run_nl(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let (cfg, files) = match parse_nl_args(args) {
+        Ok(parsed) => parsed,
         Err(status) => return Ok(status),
     };
-    let sources = InputSource::from_args(&parsed.files);
+    let sources = InputSource::from_args(&files);
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let dim = ctx.style().enabled;
     let mut st = NlState {
@@ -404,6 +457,7 @@ pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Err(NlError::Write(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
                 return Ok(exit_code);
             }
+            Err(NlError::Write(e)) if stdout::is_write_error(&e) => return Err(e.into()),
             Err(NlError::Write(e)) => return Err(e.into()),
         }
     }

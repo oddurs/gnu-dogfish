@@ -3,72 +3,149 @@
 //! rendering on terminals.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
-use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::{memchr_iter, memrchr};
 
-use crate::common::getopt::try_help;
-use crate::common::head_tail::{digit_option, header_name, parse_count, to_usize};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, try_help,
+};
+use crate::common::head_tail::{header_name, parse_count, to_usize};
 use crate::common::input::{RawStdout, close_stdin, full_read, safe_read, stdin_file};
 use crate::common::lines::{line_end, looks_like_json, lossy_lines};
 use crate::common::quote::{qa, qf, quote_locale};
 
-#[derive(Parser)]
-#[command(
-    name = "head",
-    about = "Output the first part of files (or NDJSON object streams)"
-)]
+const HEAD_HELP: &str = "\
+Output the first part of files (or NDJSON object streams)
+
+Usage: head [OPTIONS] [FILES]...
+
+Arguments:
+  [FILES]...  
+
+Options:
+  -n, --lines <[-]NUM>  Print the first NUM lines (default 10); with a leading '-', all but the last
+                        NUM lines
+  -c, --bytes <[-]NUM>  Print the first NUM bytes; with a leading '-', all but the last NUM bytes
+  -q, --quiet           Never print headers giving file names [alias: --silent]
+  -v, --verbose         Always print headers giving file names
+  -z, --zero-terminated Line delimiter is NUL, not newline
+  -J, --json            Force JSON output when processing NDJSON
+      --help            Print help
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadOpt {
+    Bytes,
+    Lines,
+    PresumeInputPipe,
+    Quiet,
+    Verbose,
+    ZeroTerminated,
+    Json,
+    /// A digit after other options (`-c 5 -3`): GNU's "invalid trailing option".
+    Digit(u8),
+    Help,
+    Version,
+}
+
+const fn digit(c: u8) -> OptSpec<HeadOpt> {
+    OptSpec::short(c, HasArg::No, HeadOpt::Digit(c))
+}
+
+/// GNU's `long_options` and `"c:n:qvz0123456789"`, plus the Dogfish
+/// `-J, --json`. `---presume-input-pipe` is GNU's hidden test option.
+const SPECS: &[OptSpec<HeadOpt>] = &[
+    OptSpec::both(b'c', "bytes", HasArg::Required, HeadOpt::Bytes),
+    OptSpec::both(b'n', "lines", HasArg::Required, HeadOpt::Lines),
+    OptSpec::long("-presume-input-pipe", HasArg::No, HeadOpt::PresumeInputPipe),
+    OptSpec::both(b'q', "quiet", HasArg::No, HeadOpt::Quiet),
+    OptSpec::long("silent", HasArg::No, HeadOpt::Quiet),
+    OptSpec::both(b'v', "verbose", HasArg::No, HeadOpt::Verbose),
+    OptSpec::both(b'z', "zero-terminated", HasArg::No, HeadOpt::ZeroTerminated),
+    OptSpec::long("help", HasArg::No, HeadOpt::Help),
+    OptSpec::long("version", HasArg::No, HeadOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, HeadOpt::Json).exact(),
+    digit(b'0'),
+    digit(b'1'),
+    digit(b'2'),
+    digit(b'3'),
+    digit(b'4'),
+    digit(b'5'),
+    digit(b'6'),
+    digit(b'7'),
+    digit(b'8'),
+    digit(b'9'),
+];
+
+/// What `head` was asked for; as in GNU, the last `-c`/`-n` wins.
 struct HeadArgs {
-    /// Print the first NUM lines (default 10); with a leading '-', all but the last NUM lines
-    #[arg(
-        short = 'n',
-        long = "lines",
-        value_name = "[-]NUM",
-        allow_hyphen_values = true,
-        overrides_with = "bytes"
-    )]
-    lines: Option<String>,
-
-    /// Print the first NUM bytes; with a leading '-', all but the last NUM bytes
-    #[arg(
-        short = 'c',
-        long = "bytes",
-        value_name = "[-]NUM",
-        allow_hyphen_values = true,
-        overrides_with = "lines"
-    )]
-    bytes: Option<String>,
-
-    /// Never print headers giving file names
-    #[arg(
-        short = 'q',
-        long = "quiet",
-        visible_alias = "silent",
-        overrides_with = "verbose"
-    )]
+    count: u64,
+    count_lines: bool,
+    elide_from_end: bool,
+    presume_input_pipe: bool,
     quiet: bool,
-
-    /// Always print headers giving file names
-    #[arg(short = 'v', long = "verbose", overrides_with = "quiet")]
     verbose: bool,
-
-    /// Line delimiter is NUL, not newline
-    #[arg(short = 'z', long = "zero-terminated")]
     zero_terminated: bool,
-
-    /// Force JSON output when processing NDJSON
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
     files: Vec<String>,
+}
+
+/// Parses the command line like GNU's `main`; `Err` is the exit status
+/// after a diagnostic, `--help` or `--version`.
+fn parse_head_args(args: Vec<OsString>) -> std::result::Result<HeadArgs, i32> {
+    let mut a = HeadArgs {
+        count: 10,
+        count_lines: true,
+        elide_from_end: false,
+        presume_input_pipe: false,
+        quiet: false,
+        verbose: false,
+        zero_terminated: false,
+        json: false,
+        files: Vec::new(),
+    };
+    let mut opts = Getopt::new(expand_obsolete(args)?.into_iter().skip(1).collect(), SPECS);
+    while let Some(opt) = opts.next() {
+        let (o, v) = opt.map_err(|e| getopt_error("head", &e))?;
+        match o {
+            HeadOpt::Bytes | HeadOpt::Lines => {
+                // Like GNU, each count is checked as it is met.
+                a.count_lines = o == HeadOpt::Lines;
+                let spec = v.as_deref().map(lossy).unwrap_or_default();
+                let (elide, num) = match spec.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, spec.as_str()),
+                };
+                a.elide_from_end = elide;
+                a.count = parse_count(num, a.count_lines).map_err(|msg| {
+                    eprintln!("head: {msg}");
+                    1
+                })?;
+            }
+            HeadOpt::PresumeInputPipe => a.presume_input_pipe = true,
+            HeadOpt::Quiet => (a.quiet, a.verbose) = (true, false),
+            HeadOpt::Verbose => (a.quiet, a.verbose) = (false, true),
+            HeadOpt::ZeroTerminated => a.zero_terminated = true,
+            HeadOpt::Json => a.json = true,
+            HeadOpt::Digit(c) => {
+                eprintln!("head: invalid trailing option -- {}", char::from(c));
+                return Err(try_help("head"));
+            }
+            HeadOpt::Help => return Err(print_help(HEAD_HELP)),
+            HeadOpt::Version => return Err(print_version("head")),
+        }
+    }
+    a.files = lossy_all(opts.operands());
+    Ok(a)
 }
 
 /// GNU's `BUFSIZ`: head reads in units of this, so what it consumes from a
@@ -88,11 +165,12 @@ struct HeadMode {
 /// Rewrites GNU's obsolete first argument (`-5`, `-1c`, `-2b`, `-3lqv`,
 /// `-1z`) as the equivalent options; `Err` is the exit status after GNU's
 /// `invalid trailing option` diagnostic.
-fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
+fn expand_obsolete(mut args: Vec<OsString>) -> Result<Vec<OsString>, i32> {
+    use std::os::unix::ffi::OsStrExt;
     let Some(arg) = args.get(1) else {
         return Ok(args);
     };
-    let bytes = arg.as_bytes();
+    let bytes = arg.as_bytes().to_vec();
     if bytes.len() < 2 || bytes[0] != b'-' || !bytes[1].is_ascii_digit() {
         return Ok(args);
     }
@@ -111,51 +189,31 @@ fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
                 multiplier = Some(c as char);
             }
             b'l' => count_lines = true,
-            b'q' => extra.push("-q".to_string()),
-            b'v' => extra.push("-v".to_string()),
-            b'z' => extra.push("-z".to_string()),
+            b'q' => extra.push(OsString::from("-q")),
+            b'v' => extra.push(OsString::from("-v")),
+            b'z' => extra.push(OsString::from("-z")),
             _ => {
                 eprintln!("head: invalid trailing option -- {}", c as char);
-                return Err(try_help("head", 1));
+                return Err(try_help("head"));
             }
         }
     }
-    let mut count = arg[1..digits_end].to_string();
+    let mut count = String::from_utf8_lossy(&bytes[1..digits_end]).into_owned();
     count.extend(multiplier);
     let option = if count_lines { "-n" } else { "-c" };
-    let mut replacement = vec![option.to_string(), count];
+    let mut replacement = vec![OsString::from(option), OsString::from(count)];
     replacement.extend(extra);
     args.splice(1..2, replacement);
     Ok(args)
 }
 
-pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let args = match expand_obsolete(args) {
-        Ok(args) => args,
-        Err(status) => return Ok(status),
+pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_head_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
-    if let Some(c) = digit_option(&args, b"cn", &["bytes", "lines"]) {
-        eprintln!("head: invalid trailing option -- {c}");
-        return Ok(try_help("head", 1));
-    }
-    let parsed = HeadArgs::try_parse_from(args)?;
-    let count_lines = parsed.bytes.is_none();
-    let spec = parsed
-        .bytes
-        .as_deref()
-        .or(parsed.lines.as_deref())
-        .unwrap_or("10");
-    let (elide_from_end, num_str) = match spec.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, spec),
-    };
-    let count = match parse_count(num_str, count_lines) {
-        Ok(n) => n,
-        Err(msg) => {
-            eprintln!("head: {msg}");
-            return Ok(1);
-        }
-    };
+    let (count, count_lines, elide_from_end) =
+        (parsed.count, parsed.count_lines, parsed.elide_from_end);
     if !count_lines && elide_from_end && count > i64::MAX as u64 {
         eprintln!(
             "head: invalid number of bytes: {}: Value too large for defined data type",
@@ -225,6 +283,7 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             ignore_broken_pipe(writeln!(out, "{sep}==> {} <==", header_name(src)))?;
         }
         let mut head = Head {
+            presume_input_pipe: parsed.presume_input_pipe,
             input,
             name: header_name(src),
             out: &mut out,
@@ -232,6 +291,14 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         match head.run(mode) {
             Ok(file_ok) => ok &= file_ok,
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(i32::from(!ok)),
+            Err(e) if stdout::is_write_error(&e) => {
+                stdout::mark_reported();
+                eprintln!(
+                    "head: error writing 'standard output': {}",
+                    gnu_io_error(&e)
+                );
+                return Ok(1);
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -246,6 +313,8 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 /// One input being copied to standard output. Read problems are diagnosed
 /// here (and make the methods return `Ok(false)`); `Err` is a write error.
 struct Head<'a, W: Write> {
+    /// GNU's hidden `---presume-input-pipe`: never seek.
+    presume_input_pipe: bool,
     input: &'a mut File,
     /// The input's name in messages (`standard input` for `-`).
     name: &'a str,
@@ -270,7 +339,7 @@ impl<W: Write> Head<'_, W> {
         };
         // Like GNU, only regular files have a usable size and offset.
         let mut current_pos = None;
-        if meta.is_file() {
+        if meta.is_file() && !self.presume_input_pipe {
             match self.input.stream_position() {
                 Ok(p) => current_pos = Some(p),
                 Err(e) => {
@@ -670,7 +739,11 @@ mod tests {
     use super::expand_obsolete;
 
     fn expand(args: &[&str]) -> Vec<String> {
-        expand_obsolete(args.iter().map(|s| s.to_string()).collect()).unwrap()
+        expand_obsolete(args.iter().map(std::ffi::OsString::from).collect())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect()
     }
 
     #[test]

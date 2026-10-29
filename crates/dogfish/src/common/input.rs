@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::mem::ManuallyDrop;
 use std::os::fd::{FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Standard input as a `File` that is never closed when dropped, so callers
 /// can `fstat` it, read its offset and seek it as GNU does with fd 0.
@@ -15,20 +16,23 @@ pub(crate) fn stdin_file() -> ManuallyDrop<File> {
     ManuallyDrop::new(unsafe { File::from_raw_fd(0) })
 }
 
-/// Standard output as an unbuffered writer on fd 1, for tools that do
-/// their own (large) buffering: Rust's `Stdout` is line buffered, which
-/// splits every buffer flush at its last newline.
+/// Standard output for tools that do their own (large) buffering: each
+/// buffer goes out whole through the process's one stdout writer
+/// ([`dogfish_core::stdout::write_whole`]), which keeps GNU's write-error
+/// reporting, rather than being split at its last newline.
 pub(crate) struct RawStdout;
 
 impl io::Write for RawStdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Safety: fd 1 is borrowed, never closed (see `stdin_file`).
-        let mut out = ManuallyDrop::new(unsafe { File::from_raw_fd(1) });
-        out.write(buf)
+        dogfish_core::stdout::write_whole(buf).map(|()| buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        dogfish_core::stdout::write_whole(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        dogfish_core::stdout::flush()
     }
 }
 
@@ -41,32 +45,25 @@ pub(crate) fn bytes_available(fd: RawFd) -> Option<usize> {
     (rc == 0).then(|| usize::try_from(n).unwrap_or(0))
 }
 
-/// Undoes the Rust runtime's repair of a closed standard input.
-///
-/// Before `main`, std reopens a closed fd 0 as `/dev/null` (read-write), so
-/// `tac - <&-` would read an empty input where GNU reports `Bad file
-/// descriptor`. A read-write `/dev/null` on fd 0 is taken to be that repair
-/// (a shell's `< /dev/null` is read-only) and fd 0 is closed again.
-pub(crate) fn restore_closed_stdin() {
-    // Safety: fcntl and fstat only read descriptor state.
-    let flags = unsafe { libc::fcntl(0, libc::F_GETFL) };
-    if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
-        return;
-    }
-    let stdin = stdin_file();
-    let (Ok(ours), Ok(null)) = (stdin.metadata(), std::fs::metadata("/dev/null")) else {
-        return;
-    };
-    use std::os::unix::fs::MetadataExt;
-    if ours.dev() == null.dev() && ours.ino() == null.ino() {
-        // Safety: nothing has read fd 0 yet; std's Stdin reports EBADF.
-        unsafe { libc::close(0) };
-    }
+/// Standard input was closed when the process started (`tool <&-`); see
+/// [`stdin_started_closed`].
+static STDIN_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Records that fd 0 was closed at start-up. `main` then holds it with a
+/// write-only `/dev/null` (so no file the tool opens becomes its standard
+/// input and every read fails with EBADF), and [`close_stdin`] fails as
+/// closing a closed descriptor does.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn stdin_started_closed() {
+    STDIN_CLOSED.store(true, Ordering::Relaxed);
 }
 
 /// Closes standard input, as GNU tools do after reading it, so that a closed
 /// descriptor (`tool - <&-`) is reported.
 pub(crate) fn close_stdin() -> io::Result<()> {
+    if STDIN_CLOSED.load(Ordering::Relaxed) {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
     // Safety: closing fd 0 has no memory-safety effect; nothing reads it after.
     if unsafe { libc::close(0) } == 0 {
         Ok(())
