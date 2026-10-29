@@ -1222,6 +1222,26 @@ tree_cases! {
     rm_non_utf8_recursive: "rm" ["-rv", "t@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
 }
 
+/// Whether `dir`'s file system stores names that are not UTF-8. APFS (macOS)
+/// refuses them with EILSEQ, for every program alike, so there is nothing to
+/// test there.
+fn accepts_non_utf8_names(dir: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let probe = dir.join(OsStr::from_bytes(b".probe\xff"));
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("note: skipping — this file system rejects names that are not UTF-8");
+            false
+        }
+        Err(e) => panic!("cannot create {}: {e}", probe.display()),
+    }
+}
+
 /// `mktemp` names are random: check that a template that is not UTF-8 is
 /// used byte for byte, as GNU does.
 #[test]
@@ -1232,6 +1252,9 @@ fn mktemp_non_utf8_template() {
     let dir = scratch_root().join("mktemp-non-utf8");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    if !accepts_non_utf8_names(&dir) {
+        return;
+    }
     for args in [
         &[&b"-p"[..], b".", b"f\xffXXXXXX"][..],
         &[b"-d", b"-p", b".", b"d\xffXXXXXX"],
@@ -1258,6 +1281,9 @@ fn undo_restores_non_utf8_names() {
     let dir = scratch_root().join("undo-non-utf8");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    if !accepts_non_utf8_names(&dir) {
+        return;
+    }
     let home = dir.join(".home");
     let odd = OsStr::from_bytes(b"n\xff");
     let moved = OsStr::from_bytes(b"m\xff");
