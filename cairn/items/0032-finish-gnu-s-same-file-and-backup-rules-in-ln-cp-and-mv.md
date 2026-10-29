@@ -21,8 +21,8 @@ area: safety
 - `ln -f --backup=simple a b` fails with `File exists` when `b~` is already a
   hard link to `b` (the rename is a no-op; GNU's `force_linkat` unlinks and retries);
 - the `backing up 'a' might destroy source; 'a~' not copied` check in cp and mv;
-- whatever `cp/same-file.sh`, `cp/backup-1.sh`, `mv/hard-4.sh` and
-  `mv/part-symlink.sh` still show after 0025 (re-run the suite first).
+- whatever `cp/same-file.sh` and `cp/backup-1.sh` still show after 0025
+  (`mv/hard-4.sh` and `mv/part-symlink.sh` pass since then).
 
 GNU tests that fail on it ([run](https://github.com/oddurs/gnu-dogfish/actions/runs/40885586807)):
 
@@ -32,8 +32,6 @@ GNU tests that fail on it ([run](https://github.com/oddurs/gnu-dogfish/actions/r
 - `tests/mv/backup-is-src.sh`
 - `tests/cp/same-file.sh`
 - `tests/cp/backup-1.sh`
-- `tests/mv/hard-4.sh`
-- `tests/mv/part-symlink.sh`
 
 ## What should happen
 

@@ -28,7 +28,6 @@ GNU tests that fail on it ([run](https://github.com/oddurs/gnu-dogfish/actions/r
 - `tests/mv/no-copy.sh`
 - `tests/mv/mv-special-1.sh`
 - `tests/mv/part-fail.sh`
-- `tests/mv/into-self-2.sh`
 
 ## What should happen
 

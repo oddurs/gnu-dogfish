@@ -58,4 +58,7 @@ or `-d`, as in GNU, where those removals need a data copy. 18 differential
 cases cover it in `gnu_compat_fileops.rs` (`mv_symlink_*`, `mv_*hard_links`,
 `cp_*symlink*`, `cp_backup_hard_links`, `cp_attributes_only_keeps_linked_contents`).
 14 of them fail before the fix; all pass
-after, and the full suite (1,933 tests) passes as root and as non-root.
+after, and the full suite (1,933 tests) passes as root and as non-root. In GNU's
+suite (run 40894914076) six tests went from failing to passing:
+`cp/attr-existing`, `mv/symlink-onto-hardlink`, `mv/symlink-onto-hardlink-to-self`,
+`mv/hard-4`, `mv/part-symlink` and `mv/into-self-2`: 235/374, no regressions.
