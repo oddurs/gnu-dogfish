@@ -15,6 +15,23 @@ pub(crate) fn stdin_file() -> ManuallyDrop<File> {
     ManuallyDrop::new(unsafe { File::from_raw_fd(0) })
 }
 
+/// Standard output as an unbuffered writer on fd 1, for tools that do
+/// their own (large) buffering: Rust's `Stdout` is line buffered, which
+/// splits every buffer flush at its last newline.
+pub(crate) struct RawStdout;
+
+impl io::Write for RawStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Safety: fd 1 is borrowed, never closed (see `stdin_file`).
+        let mut out = ManuallyDrop::new(unsafe { File::from_raw_fd(1) });
+        out.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Bytes that can be read from `fd` without blocking (`FIONREAD`), or `None`
 /// when the descriptor does not support the query.
 pub(crate) fn bytes_available(fd: RawFd) -> Option<usize> {

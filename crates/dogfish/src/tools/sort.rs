@@ -16,6 +16,7 @@ use md5::Md5;
 use rayon::prelude::*;
 
 use crate::common::files0::{Files0From, extra_operand_error};
+use crate::common::input::RawStdout;
 use crate::common::lines::{is_blank, line_end, looks_like_json, lossy_lines, split_records};
 use crate::common::quote::{qa, qf};
 
@@ -386,9 +387,24 @@ impl Sorter {
     }
 
     fn keycompare(&self, a: &[u8], b: &[u8]) -> Ordering {
-        for key in &self.keys {
-            let ka = self.key_slice(a, key);
-            let kb = self.key_slice(b, key);
+        self.keycompare_from(0, a, b)
+    }
+
+    /// Compares by the keys from `first` on.
+    fn keycompare_from(&self, first: usize, a: &[u8], b: &[u8]) -> Ordering {
+        for key in &self.keys[first..] {
+            let ord = self.key_order(key, self.key_slice(a, key), self.key_slice(b, key));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// The order of two extracted keys under `key`'s options (reversal
+    /// included).
+    fn key_order(&self, key: &SortKey, ka: &[u8], kb: &[u8]) -> Ordering {
+        {
             let o = &key.opts;
             let ord = if o.numeric || o.general || o.human || o.month || o.random || o.version {
                 // As in GNU, these orderings see the key after `-d`/`-i`/`-f` rewriting.
@@ -420,11 +436,31 @@ impl Sorter {
             } else {
                 ka.cmp(kb)
             };
-            if ord != Ordering::Equal {
-                return if o.reverse { ord.reverse() } else { ord };
-            }
+            if o.reverse { ord.reverse() } else { ord }
         }
-        Ordering::Equal
+    }
+
+    /// [`Sorter::compare`] for lines whose first key was extracted (and,
+    /// for a plain `-n` key, parsed) once, before sorting.
+    fn compare_keyed(&self, a: &Keyed<'_>, b: &Keyed<'_>) -> Ordering {
+        let first = &self.keys[0];
+        let ord = match (&a.num, &b.num) {
+            (Some(x), Some(y)) => {
+                let ord = num_order(x, y);
+                if first.opts.reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
+            _ => self.key_order(first, a.key, b.key),
+        };
+        let ord = ord.then_with(|| self.keycompare_from(1, a.line, b.line));
+        if ord != Ordering::Equal || self.no_last_resort {
+            return ord;
+        }
+        let ord = a.line.cmp(b.line);
+        if self.reverse { ord.reverse() } else { ord }
     }
 
     /// GNU `compare_random`: order by the seeded MD5 of each key, falling back
@@ -444,6 +480,31 @@ impl Sorter {
         let ord = a.cmp(b);
         if self.reverse { ord.reverse() } else { ord }
     }
+}
+
+/// One input's bytes: mapped, or read into memory.
+enum SortInput {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for SortInput {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SortInput::Mapped(m) => m,
+            SortInput::Owned(v) => v,
+        }
+    }
+}
+
+/// A line with its first key extracted ahead of the sort.
+struct Keyed<'a> {
+    line: &'a [u8],
+    key: &'a [u8],
+    /// The key parsed as a number, for a plain `-n` first key.
+    num: Option<SortNum<'a>>,
 }
 
 struct SortNum<'a> {
@@ -490,7 +551,10 @@ fn parse_sort_num(s: &[u8]) -> SortNum<'_> {
 }
 
 fn numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
-    let (x, y) = (parse_sort_num(a), parse_sort_num(b));
+    num_order(&parse_sort_num(a), &parse_sort_num(b))
+}
+
+fn num_order(x: &SortNum<'_>, y: &SortNum<'_>) -> Ordering {
     let mag = |p: &SortNum, q: &SortNum| {
         p.int
             .len()
@@ -501,8 +565,8 @@ fn numeric_compare(a: &[u8], b: &[u8]) -> Ordering {
     match (x.neg, y.neg) {
         (false, true) => Ordering::Greater,
         (true, false) => Ordering::Less,
-        (false, false) => mag(&x, &y),
-        (true, true) => mag(&y, &x),
+        (false, false) => mag(x, y),
+        (true, true) => mag(y, x),
     }
 }
 
@@ -979,9 +1043,15 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     };
-    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+    // Inputs stay mapped, except with -o, which may truncate one of them.
+    let keep_mapped = parsed.output.is_none();
+    let mut bufs: Vec<SortInput> = Vec::with_capacity(sources.len());
     for src in &sources {
-        match FastReader::open(src).and_then(|r| r.into_bytes()) {
+        let data = FastReader::open(src).and_then(|r| match r {
+            FastReader::Mapped(m) if keep_mapped => Ok(SortInput::Mapped(m)),
+            r => r.into_bytes().map(SortInput::Owned),
+        });
+        match data {
             Ok(b) => {
                 ctx.telemetry.add_read(b.len() as u64);
                 bufs.push(b);
@@ -1059,9 +1129,34 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     } else {
         ctx.telemetry
             .set_strategy("zero-alloc &[u8] slices + rayon stable par_sort_by (GNU keys)");
-        lines.par_sort_by(|a, b| sorter.compare(a, b));
+        // Extract (and for -n parse) the first key once per line rather
+        // than in every comparison.
+        let first = &sorter.keys[0];
+        let numeric = first.opts.numeric && !first.opts.filters();
+        let mut keyed: Vec<Keyed> = lines
+            .par_iter()
+            .map(|&line| {
+                let key = sorter.key_slice(line, first);
+                Keyed {
+                    line,
+                    key,
+                    num: numeric.then(|| parse_sort_num(key)),
+                }
+            })
+            .collect();
+        // With the last-resort comparison only identical lines tie, so an
+        // unstable sort gives the same output, faster.
+        if sorter.no_last_resort {
+            keyed.par_sort_by(|a, b| sorter.compare_keyed(a, b));
+        } else {
+            keyed.par_sort_unstable_by(|a, b| sorter.compare_keyed(a, b));
+        }
+        if parsed.unique {
+            keyed.dedup_by(|cur, prev| sorter.compare_keyed(prev, cur) == Ordering::Equal);
+        }
+        lines = keyed.into_iter().map(|k| k.line).collect();
     }
-    if parsed.unique {
+    if parsed.unique && sorter.keys.is_empty() {
         lines.dedup_by(|cur, prev| sorter.compare(prev, cur) == Ordering::Equal);
     }
 
@@ -1073,7 +1168,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 return Ok(2);
             }
         },
-        _ => Box::new(io::stdout().lock()),
+        _ => Box::new(RawStdout),
     };
     let mut out = io::BufWriter::with_capacity(256 * 1024, sink);
     let mut written = 0u64;
