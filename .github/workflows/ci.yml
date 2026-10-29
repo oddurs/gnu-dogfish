@@ -29,7 +29,7 @@ jobs:
 
       # Pinned so a new stable Clippy lint cannot turn unrelated PRs red; bump deliberately.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
 
@@ -85,7 +85,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Test
         run: cargo xtask test
