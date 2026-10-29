@@ -94,6 +94,8 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
+| `for_stdout` | `mem::zeroed::<libc::stat>()` | `stat` is plain old data; all-zero is a valid value. |
+| `for_stdout` | `fstat` on descriptor 1 | Out-pointer to the local `stat`; a bad descriptor only makes the call fail. |
 | `write_fd` | `write(2)` to descriptor 1 | The pointer and length describe the live `data` slice; a bad descriptor only makes the call fail. |
 
 ### `crates/dogfish-core/src/journal.rs`
@@ -224,6 +226,13 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `blocks` | call of the `#[target_feature(enable = "avx2,bmi1,bmi2")]` `compress` | An `Avx2Sha256` is only made after `is_fastest` detected AVX2, BMI1 and BMI2. |
 | `store` | `_mm256_storeu_si256` | The destination is a 32-byte (8 × `u32`) subslice; the store is unaligned. |
+
+### `crates/dogfish/src/common/signals.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `keep_ignored_sigpipe` | `sigaction` to read SIGPIPE's disposition | A null new action; the old one is written to a zeroed local `sigaction`. |
+| `keep_ignored_sigpipe` | `CommandExt::pre_exec` | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
 
 ### `crates/dogfish/src/common/strftime.rs`
 
@@ -383,7 +392,6 @@ and non-regular files are read with `read(2)` instead.
 | `arm_timer` | `setitimer(ITIMER_REAL)` | Reads a fully initialised `itimerval`; async-signal-safe (also called from the handler). |
 | `timeout_on_signal` | the signal handler's `kill`, `write`, `signal`, `_exit` | Signals: atomics and async-signal-safe calls only; the verbose message is a `OnceLock` set before the handler is installed. |
 | `run_timeout` | `setpgid`, `sigaction`, `signal` setup | Signals: set up before the child exists; zeroed `sigaction` with an `extern "C"` handler. |
-| `run_timeout` | `sigaction` to read SIGPIPE's disposition | A null new action; the old one is written to a zeroed local `sigaction`. |
 | `run_timeout` | `CommandExt::pre_exec` | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
 | `run_timeout` | `getpid`, `getpgrp` | No preconditions. |
 | `run_timeout` | `setrlimit`, `signal`, `sigprocmask`, `raise` to die by the child's signal | Plain calls on this process with initialised arguments. |

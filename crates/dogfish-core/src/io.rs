@@ -317,15 +317,6 @@ pub fn install_sigbus_handler(tool: &str) {
     }
 }
 
-/// Helper to treat `ErrorKind::BrokenPipe` as a clean exit (`Ok(())`).
-pub fn ignore_broken_pipe(res: io::Result<()>) -> io::Result<()> {
-    match res {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod copy_tree_tests {
     use super::*;

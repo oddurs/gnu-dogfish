@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy_all, print_help, print_version,
@@ -232,6 +232,9 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     let exits = matches!(mode, OutputError::Exit | OutputError::ExitNopipe);
     let nopipe = matches!(mode, OutputError::WarnNopipe | OutputError::ExitNopipe);
+    // A broken pipe is diagnosed only in the modes that ask for it; without
+    // --output-error, SIGPIPE ends tee first, unless it was ignored.
+    let warns_epipe = matches!(mode, OutputError::Warn | OutputError::Exit);
     // Whether to notice a broken output pipe while waiting for input; there
     // is no need when the input is always ready.
     let pipe_check = nopipe && input_may_block(libc::STDIN_FILENO);
@@ -239,7 +242,13 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut status = 0;
     let mut outputs = vec![TeeOutput {
         name: "standard output".to_string(),
-        fd: Some(libc::STDOUT_FILENO),
+        // A closed standard output (held by /dev/null) fails every write
+        // with EBADF, as in GNU: descriptor -1 does just that.
+        fd: Some(if stdout::was_closed() {
+            -1
+        } else {
+            libc::STDOUT_FILENO
+        }),
         pollable: pipe_check && is_pipe(libc::STDOUT_FILENO),
         _file: None,
     }];
@@ -267,11 +276,11 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    // GNU's `fail_output`: drops `out` after error `e` (silently for EPIPE in
-    // the -nopipe modes) and returns whether tee must exit now.
+    // GNU's `fail_output`: drops `out` after error `e` (silently for EPIPE
+    // unless `warns_epipe`) and returns whether tee must exit now.
     let fail_output = |out: &mut TeeOutput, e: &io::Error, status: &mut i32| -> bool {
         out.fd = None;
-        if nopipe && e.raw_os_error() == Some(libc::EPIPE) {
+        if !warns_epipe && e.raw_os_error() == Some(libc::EPIPE) {
             return false;
         }
         eprintln!("tee: {}: {}", gnu_quote_file(&out.name), gnu_io_error(e));

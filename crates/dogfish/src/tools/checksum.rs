@@ -10,7 +10,7 @@ use blake2::Blake2bVar;
 use digest::{Digest, Update, VariableOutput};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    gnu_quote, io::ignore_broken_pipe, stdout,
+    gnu_quote, stdout,
 };
 use md5::Md5;
 use rayon::prelude::*;
@@ -421,7 +421,10 @@ fn blake2_length(l: &str) -> std::result::Result<usize, i32> {
     Err(1)
 }
 
+// GNU's digest.c line buffers standard output before parsing options.
+
 pub fn run_b2sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    stdout::gnu_flushes_early();
     match HashMode::parse("b2sum", args, B2SUM_HELP) {
         Ok(mode) => run_sum(Algo::Blake2b(mode.bits), mode, ctx),
         Err(code) => Ok(code),
@@ -429,6 +432,7 @@ pub fn run_b2sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 pub fn run_sha256sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    stdout::gnu_flushes_early();
     match HashMode::parse("sha256sum", args, SHA256SUM_HELP) {
         Ok(mode) => run_sum(Algo::Sha256, mode, ctx),
         Err(code) => Ok(code),
@@ -436,6 +440,7 @@ pub fn run_sha256sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 pub fn run_md5sum(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    stdout::gnu_flushes_early();
     match HashMode::parse("md5sum", args, MD5SUM_HELP) {
         Ok(mode) => run_sum(Algo::Md5, mode, ctx),
         Err(code) => Ok(code),
@@ -471,25 +476,24 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
 
     let mut exit_code = 0;
     let mut records = Vec::with_capacity(results.len());
-    let mut out = io::BufWriter::new(stdout::stdout());
+    // Line buffered, and never checked: as in GNU, every file is done and a
+    // write error is reported at exit.
+    let mut out = stdout::stdout();
     for (src, res) in sources.iter().zip(results) {
         match res {
             Ok(rec) => {
                 if !mode.json {
-                    ignore_broken_pipe(write_digest_line(&mut out, algo, &rec, &mode))?;
+                    let _ = write_digest_line(&mut out, algo, &rec, &mode);
                 }
                 records.push(rec);
             }
             Err(e) => {
-                ignore_broken_pipe(out.flush())?;
                 eprintln!("{tool}: {}: {}", qf(src.name()), gnu_io_error(&e));
                 exit_code = 1;
             }
         }
     }
-    ignore_broken_pipe(out.flush())?;
     if mode.json {
-        drop(out);
         emit_objects_or_table(&records, ctx, true, false)?;
     }
     Ok(exit_code)
@@ -762,7 +766,9 @@ fn verify_checksums(
     ctx: &DogfishContext,
 ) -> Result<i32> {
     let tool = ctx.tool_name.as_str();
-    let mut out = io::BufWriter::new(stdout::stdout());
+    // Unchecked, as in GNU: every line is verified, and a write error is
+    // reported at exit.
+    let mut out = stdout::StdioBuf::new(stdout::stdout());
     let mut json_results = Vec::new();
     let mut all_ok = true;
     let mut style = LineStyle::Unknown;
@@ -775,7 +781,7 @@ fn verify_checksums(
         let mut reader = match src.open() {
             Ok(r) => r.into_bufread(),
             Err(e) => {
-                ignore_broken_pipe(out.flush())?;
+                let _ = out.flush();
                 eprintln!("{tool}: {list_name}: {}", gnu_io_error(&e));
                 all_ok = false;
                 continue;
@@ -807,7 +813,7 @@ fn verify_checksums(
             let Some(entry) = parse_check_line(line, algo, &mut style) else {
                 tally.misformatted += 1;
                 if mode.warn {
-                    ignore_broken_pipe(out.flush())?;
+                    let _ = out.flush();
                     eprintln!(
                         "{tool}: {list_name}: {line_no}: improperly formatted {} checksum line",
                         algo.type_name()
@@ -831,7 +837,7 @@ fn verify_checksums(
                 Err(e) if mode.ignore_missing && e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tally.unreadable += 1;
-                    ignore_broken_pipe(out.flush())?;
+                    let _ = out.flush();
                     eprintln!("{tool}: {}: {}", qf(target.name()), gnu_io_error(&e));
                     if mode.json {
                         json_results.push(serde_json::json!({
@@ -841,7 +847,7 @@ fn verify_checksums(
                         }));
                     } else if !mode.status_only {
                         shown.extend_from_slice(b": FAILED open or read\n");
-                        ignore_broken_pipe(out.write_all(&shown))?;
+                        let _ = out.write_all(&shown);
                     }
                 }
                 Ok(actual) => {
@@ -860,12 +866,12 @@ fn verify_checksums(
                         }));
                     } else if !mode.status_only && (!ok || !mode.quiet) {
                         shown.extend_from_slice(format!(": {verdict}\n").as_bytes());
-                        ignore_broken_pipe(out.write_all(&shown))?;
+                        let _ = out.write_all(&shown);
                     }
                 }
             }
         }
-        ignore_broken_pipe(out.flush())?;
+        let _ = out.flush();
         if read_error {
             eprintln!("{tool}: {list_name}: read error");
             all_ok = false;
@@ -882,7 +888,7 @@ fn verify_checksums(
     if mode.json {
         writeln!(out, "{}", serde_json::to_string_pretty(&json_results)?)?;
     }
-    ignore_broken_pipe(out.flush())?;
+    let _ = out.flush();
     Ok(if all_ok { 0 } else { 1 })
 }
 

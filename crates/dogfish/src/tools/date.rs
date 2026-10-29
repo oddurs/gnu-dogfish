@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote_file, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote_file, stdout};
 
 use crate::common::date_format::{LocalTime, Stamp, format_time, local_time};
 use crate::common::getopt::{
@@ -237,7 +237,11 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         }
         match render_date(stamp, &fmt) {
             Some(line) => {
-                ignore_broken_pipe(out.write_all(&line))?;
+                // GNU's `fprintftime` and `fputc ('\n')`, unchecked: a write
+                // error is reported at exit, after all the input.
+                stdout::gnu_fwrite(line.len() - 1);
+                stdout::gnu_putchars(1);
+                let _ = out.write_all(&line);
                 Ok(true)
             }
             None => {

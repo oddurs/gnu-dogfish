@@ -9,6 +9,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - **File names that are not UTF-8** work in `cp`, `mv`, `ln`, `mkdir`, `mktemp`, `rm`, `stat`, `df`, `realpath`, `basename`, `dirname`, `chmod`, `chown`, `touch`, `env`, `printenv`, `id`, `tail` and the checksum tools (`md5sum`, `sha256sum`, `b2sum`, including `-c` lists). The other tools that read files (`cat`, `head`, `wc`, `ls`, `du`, `sort`, ...) still turn such a name into U+FFFD replacement characters, so they report it as missing.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
+- **A closed standard output** (`>&-`) fails every write with `EBADF` and is diagnosed as GNU does, but Dogfish holds descriptor 1 open on `/dev/null` meanwhile, so no file a tool opens lands there. GNU's tools open their next file on it instead, which shows in a few corner cases: `/dev/stdout` names `/dev/null`, so `tee /dev/stdout >&-` and `sort -o /dev/stdout >&-` write there where GNU cannot open it, and `uniq IN OUT >&-` with an `OUT` that cannot be created reports why rather than GNU's `Bad file descriptor`.
 
 ## File & directory tools
 

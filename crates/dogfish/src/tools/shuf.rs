@@ -431,16 +431,10 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
         out.flush()
     })();
-    match res {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
-        Err(e) => return Err(e.into()),
-    }
+    res?;
     ctx.telemetry.add_items(n_lines.min(cfg.head_lines));
-    match out.flush() {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
-        res => res.map(|()| 0).map_err(Into::into),
-    }
+    out.flush()?;
+    Ok(0)
 }
 
 #[cfg(test)]

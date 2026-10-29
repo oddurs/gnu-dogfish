@@ -533,7 +533,6 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, sink);
     match check_file(&mut input, &mut out, &cfg) {
         Ok(()) => {}
-        Err(UniqError::Write(e)) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
         Err(UniqError::Write(e)) => return Err(e.into()),
         Err(UniqError::Read(e)) => {
             let _ = out.flush();
@@ -545,10 +544,8 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             return Ok(1);
         }
     }
-    match out.flush() {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
-        res => res.map(|()| 0).map_err(Into::into),
-    }
+    out.flush()?;
+    Ok(0)
 }
 
 /// `--by FIELD`: groups adjacent NDJSON objects with equal FIELD.

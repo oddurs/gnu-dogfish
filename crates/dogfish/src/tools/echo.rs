@@ -5,7 +5,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::getopt::{print_help, print_version};
@@ -84,16 +84,28 @@ pub fn run_echo(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     let mut out = stdout::stdout();
 
+    // The stdio calls GNU makes are recorded for the diagnostic of a write
+    // error: with escapes it puts every byte with `putchar`; without, each
+    // argument is one `fputs`, and the blanks and newline are `putchar`s.
     let (rendered, stop) = if interpret_escapes || posixly_correct {
         // `\NNN` is octal as well as `\0NNN` (GNU echo).
-        unescape_echo_bytes(&payload, true)
+        let (rendered, stop) = unescape_echo_bytes(&payload, true);
+        stdout::gnu_putchars(rendered.len());
+        (rendered, stop)
     } else {
+        for (i, arg) in args[idx..].iter().enumerate() {
+            if i > 0 {
+                stdout::gnu_putchars(1);
+            }
+            stdout::gnu_fwrite(arg.len());
+        }
         (payload, false)
     };
-    ignore_broken_pipe(out.write_all(&rendered))?;
+    out.write_all(&rendered)?;
     ctx.telemetry.add_written(rendered.len() as u64);
     if !no_newline && !stop {
-        ignore_broken_pipe(out.write_all(b"\n"))?;
+        stdout::gnu_putchars(1);
+        out.write_all(b"\n")?;
         ctx.telemetry.add_written(1);
     }
     Ok(0)

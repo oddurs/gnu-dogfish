@@ -8,8 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
-    io::ignore_broken_pipe, stdout,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, stdout,
 };
 
 use crate::common::getopt::{
@@ -422,7 +421,7 @@ pub fn run_nl(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         Err(status) => return Ok(status),
     };
     let sources = InputSource::from_args(&files);
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
+    let mut out = stdout::StdioBuf::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let dim = ctx.style().enabled;
     let mut st = NlState {
         line_no: cfg.start,
@@ -454,13 +453,9 @@ pub fn run_nl(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 eprintln!("nl: line number overflow");
                 return Ok(1);
             }
-            Err(NlError::Write(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
-                return Ok(exit_code);
-            }
-            Err(NlError::Write(e)) if stdout::is_write_error(&e) => return Err(e.into()),
             Err(NlError::Write(e)) => return Err(e.into()),
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(exit_code)
 }

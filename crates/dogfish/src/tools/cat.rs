@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, InputSource, gnu_io_error, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, InputSource, gnu_io_error, stdout};
 use memchr::memchr;
 
 use crate::common::getopt::{
@@ -139,15 +139,20 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     let files = lossy_all(getopt.operands());
-    // GNU checks standard output before reading anything.
+    // GNU checks standard output before reading anything; a closed one
+    // fails with EBADF (here it is held by /dev/null).
     // SAFETY: fstat writes into the zeroed buffer it is given.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let fstat_error = if stdout::was_closed() {
+        Some(io::Error::from_raw_os_error(libc::EBADF))
     // SAFETY: fstat on descriptor 1 with a properly sized, writable buffer.
-    if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) } < 0 {
-        eprintln!(
-            "cat: standard output: {}",
-            gnu_io_error(&io::Error::last_os_error())
-        );
+    } else if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) } < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    if let Some(e) = fstat_error {
+        eprintln!("cat: standard output: {}", gnu_io_error(&e));
         return Ok(1);
     }
     let plain =
@@ -197,7 +202,6 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         match res {
             Ok(true) => {}
             Ok(false) => exit_code = 1,
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
             // A failed write ends the run with GNU's `write error`.
             Err(e) if stdout::is_write_error(&e) => return Err(e.into()),
             Err(e) => {
@@ -208,9 +212,9 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     if state.pending_cr {
-        ignore_broken_pipe(out.write_all(b"\r"))?;
+        out.write_all(b"\r")?;
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(exit_code)
 }
 

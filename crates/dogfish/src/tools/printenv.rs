@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version, try_help,
@@ -107,7 +107,7 @@ pub fn run_printenv(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
                 out.write_all(term)?;
             }
         }
-        ignore_broken_pipe(out.flush())?;
+        out.flush()?;
         return Ok(0);
     }
 
@@ -124,6 +124,6 @@ pub fn run_printenv(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
             None => exit_code = 1,
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(exit_code)
 }

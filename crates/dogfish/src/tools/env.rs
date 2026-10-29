@@ -5,9 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-use dogfish_core::{
-    ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, io::ignore_broken_pipe, stdout,
-};
+use dogfish_core::{ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, stdout};
 use serde::Serialize;
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
@@ -613,6 +611,6 @@ fn print_env(
         out.write_all(e)?;
         out.write_all(term)?;
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(0)
 }

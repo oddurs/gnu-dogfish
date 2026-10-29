@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use dogfish_core::{
-    DogfishContext, emit_objects_or_table, format_size, gnu_io_error, io::ignore_broken_pipe,
-    sparkline_bar, stdout,
+    DogfishContext, emit_objects_or_table, format_size, gnu_io_error, sparkline_bar, stdout,
 };
 use serde::Serialize;
 
@@ -809,6 +808,8 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         out.write_all(&[eol])
     };
     let streaming = !rich && !json;
+    // GNU flushes standard output after every line.
+    stdout::gnu_flushes_early();
     let mut walker = DuWalker {
         cfg: &cfg,
         seen: std::collections::HashSet::new(),
@@ -870,14 +871,13 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                 grand_total += size;
                 grand_files += files;
             }
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
             Err(e) => return Err(e.into()),
         }
         rich_groups.push(walker.lines.len());
     }
     if total {
         let res = walker.emit(b"total".to_vec(), grand_total, grand_files);
-        ignore_broken_pipe(res)?;
+        res?;
     }
     let status = walker.status;
     let mut lines = std::mem::take(&mut walker.lines);
@@ -922,9 +922,9 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                 sparkline_bar(l.size as f64 / max as f64, 10, st),
                 st.bold(&String::from_utf8_lossy(&l.path))
             );
-            ignore_broken_pipe(out.write_all(row.as_bytes()))?;
+            out.write_all(row.as_bytes())?;
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(status)
 }

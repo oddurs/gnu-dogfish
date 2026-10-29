@@ -16,8 +16,7 @@ use crate::common::getopt::{
 };
 use crate::common::interval::{duration_from_secs, parse_interval};
 use crate::common::quote::quote_locale;
-use crate::common::signals::parse_signal;
-use crate::common::signals::sig_name_into;
+use crate::common::signals::{keep_ignored_sigpipe, parse_signal, sig_name_into};
 
 const TIMEOUT_HELP: &str = "\
 Usage: timeout [OPTION] DURATION COMMAND [ARG]...
@@ -249,28 +248,17 @@ pub fn run_timeout(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
 
-    // The command inherits an ignored SIGPIPE, as from GNU's timeout (the
-    // standard library resets it to the default in the child).
-    // SAFETY: sigaction(2) with a null new action only reads the current
-    // one into the zeroed local `old`.
-    let pipe_ignored = unsafe {
-        let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0
-            && old.sa_sigaction == libc::SIG_IGN
-    };
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     // SAFETY: the closure runs in the forked child and only calls signal(2).
     unsafe {
-        cmd.pre_exec(move || {
+        cmd.pre_exec(|| {
             libc::signal(libc::SIGTTIN, libc::SIG_DFL);
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
-            if pipe_ignored {
-                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-            }
             Ok(())
         });
     }
+    keep_ignored_sigpipe(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

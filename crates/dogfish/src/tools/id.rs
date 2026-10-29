@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, stdout};
 use serde::Serialize;
 
 use crate::common::getopt::{
@@ -325,7 +325,7 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         let who = match target {
             Ok(who) => who,
             Err(spec) => {
-                ignore_broken_pipe(out.flush())?;
+                out.flush()?;
                 eprintln!("id: {}: no such user", quote_locale(spec));
                 status = 1;
                 continue;
@@ -380,8 +380,8 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         if parsed.zero && parsed.groups && parsed.users.len() > 1 {
             line.push(b'\0');
         }
-        ignore_broken_pipe(out.write_all(&line))?;
+        out.write_all(&line)?;
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(status)
 }

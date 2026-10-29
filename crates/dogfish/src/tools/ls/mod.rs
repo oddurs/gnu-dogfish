@@ -11,9 +11,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{
-    ColorMode, DogfishContext, emit_objects_or_table, io::ignore_broken_pipe, stdout,
-};
+use dogfish_core::{ColorMode, DogfishContext, emit_objects_or_table, stdout};
 
 use crate::common::getopt::lossy_all;
 
@@ -58,7 +56,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 ctx,
             )?;
         }
-        ignore_broken_pipe(out.flush())?;
+        out.flush()?;
         return Ok(0);
     }
 
@@ -82,7 +80,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     opts.check_symlink_mode |= opts.dirs_first;
     let mut lister = Lister {
         opts: &opts,
-        out: io::BufWriter::new(stdout::stdout()),
+        out: stdout::StdioBuf::new(stdout::stdout()),
         status: 0,
         first_header: true,
         rich: rich.then_some(st),
@@ -94,10 +92,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let res = lister
         .run(&targets)
         .and_then(|()| lister.restore_default_color());
-    match res {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(lister.status),
-        res => res?,
-    }
+    res?;
     ctx.telemetry.add_items(lister.json.len() as u64);
     if opts.json {
         ctx.telemetry
@@ -108,6 +103,6 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(0);
     }
     let status = lister.status;
-    ignore_broken_pipe(lister.out.flush())?;
+    lister.out.flush()?;
     Ok(status)
 }

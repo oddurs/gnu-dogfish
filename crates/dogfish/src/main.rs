@@ -4,6 +4,15 @@
 // reopen a closed standard output on /dev/null, hiding `>&-` from the tools.
 #![cfg_attr(not(test), no_main)]
 
+/// Every diagnostic is printed as glibc's `error` prints it: standard output
+/// is flushed first (`stdout::gnu_fflush`), which puts pending output before
+/// the message and decides how GNU would report a write error at exit.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        dogfish_core::gnu_error!($($arg)*)
+    };
+}
+
 mod common;
 mod tools;
 
@@ -430,15 +439,13 @@ fn finish(tool: &str, code: i32) -> u8 {
 }
 
 /// GNU's diagnostic for output lost to a write error: `tool: write error:
-/// No space left on device`. The tools whose output GNU flushes as it goes
-/// find the error before exit, when `errno` no longer says why, and print
-/// just `write error`.
+/// No space left on device`, or just `write error` when GNU met the error
+/// before exit and `errno` no longer says why (see `stdout::errno_lost`).
 fn report_write_error(tool: &str, err: &std::io::Error) {
-    match tool {
-        "wc" | "md5sum" | "sha256sum" | "b2sum" | "du" | "sort" => {
-            eprintln!("{tool}: write error")
-        }
-        _ => eprintln!("{tool}: write error: {}", gnu_io_error(err)),
+    if stdout::errno_lost() {
+        eprintln!("{tool}: write error");
+    } else {
+        eprintln!("{tool}: write error: {}", gnu_io_error(err));
     }
 }
 

@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStringExt;
 use anyhow::Result;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table,
-    eval_json_where, gnu_io_error, io::ignore_broken_pipe, read_ndjson_stdin, stdout,
+    eval_json_where, gnu_io_error, read_ndjson_stdin, stdout,
 };
 use memchr::memchr2;
 use serde_json::{Map, Value};
@@ -582,10 +582,10 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     };
 
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
+    let mut out = stdout::StdioBuf::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let mut exit_code = 0;
     if let Some(all) = all_stdin {
-        ignore_broken_pipe(cut_buffer(&all, &spec, &mut out))?;
+        cut_buffer(&all, &spec, &mut out)?;
     } else {
         for src in &sources {
             let res = FastReader::open(src).and_then(|r| match r {
@@ -594,7 +594,6 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             });
             match res {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(exit_code),
                 Err(e) if stdout::is_write_error(&e) => return Err(e.into()),
                 Err(e) => {
                     let _ = out.flush();
@@ -604,7 +603,7 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(exit_code)
 }
 
