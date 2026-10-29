@@ -4,10 +4,10 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 ## Cross-cutting
 
-- **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`, `printf` character constants) follows the locale's character set as glibc decides it: bytes in the C locale, UTF-8 sequences in a UTF-8 locale; other multibyte character sets are treated as bytes.
-- **Options** are parsed like glibc 2.39's `getopt_long` (permutation, `POSIXLY_CORRECT`, clustering, abbreviations, ambiguity, messages), but a GNU option Dogfish does not implement yet is refused with `TOOL: option 'X' is not supported yet` (exit 1) rather than ignored or emulated, e.g. `sort -m`, `date --resolution`.
-- **File names that are not UTF-8** work in `cp`, `mv`, `ln`, `mkdir`, `mktemp`, `rm`, `stat`, `df`, `realpath`, `basename`, `dirname`, `chmod`, `chown`, `touch`, `env`, `printenv`, `id`, `tail`, `ls`, `du` and the checksum tools (`md5sum`, `sha256sum`, `b2sum`, including `-c` lists). The other tools that read files (`cat`, `head`, `wc`, `sort`, ...) still turn such a name into U+FFFD replacement characters, so they report it as missing.
-- **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
+- **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8` (and `sort --debug` reports "simple byte comparison" there too). Character counting (`wc -m`, `wc -L`, `printf` character constants) follows the locale's character set as glibc decides it: bytes in the C locale, UTF-8 sequences in a UTF-8 locale; other multibyte character sets are treated as bytes.
+- **Options** are parsed like glibc 2.39's `getopt_long` (permutation, `POSIXLY_CORRECT`, clustering, abbreviations, ambiguity, messages), but a GNU option Dogfish does not implement yet is refused with `TOOL: option 'X' is not supported yet` (exit 1) rather than ignored or emulated, e.g. `date --resolution`.
+- **File names that are not UTF-8** work in `cp`, `mv`, `ln`, `mkdir`, `mktemp`, `rm`, `stat`, `df`, `realpath`, `basename`, `dirname`, `chmod`, `chown`, `touch`, `env`, `printenv`, `id`, `tail`, `ls`, `du`, `sort` (except names read with `--files0-from`) and the checksum tools (`md5sum`, `sha256sum`, `b2sum`, including `-c` lists). The other tools that read files (`cat`, `head`, `wc`, ...) still turn such a name into U+FFFD replacement characters, so they report it as missing.
+- **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`. `sort -g` does convert to the x86-64 80-bit `long double` as GNU does there (on other architectures GNU's `long double` differs, Dogfish's does not).
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
 
 ## File & directory tools
@@ -17,7 +17,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
   - `cp -r` refuses to copy a directory into itself before anything is copied, whereas GNU copies part of the tree first (and lists it with `-v`). The message and exit status match.
   - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour). Device files are not kept: undoing a copy over one removes the copy but does not bring the device back.
   - For files on another file system than `$DOGFISH_HOME`, the trash is a private `.dogfish-trash-<uid>-<hash>` directory at the top of that file system (as the freedesktop trash's `.Trash-<uid>`), created when first needed if the top is writable; GNU creates nothing there.
-  - Extended attributes, ACLs and SELinux contexts are not copied (`--preserve=xattr,context` and `-a` accept them). `cp --debug` prints nothing.
+  - Extended attributes, ACLs and SELinux contexts are not copied (`--preserve=xattr,context` and `-a` accept them).
   - `cp -n` behaves as upstream 9.4 (`not replacing 'f'`, exit status 1; `-b -n` is rejected). Ubuntu's 9.4 package carries 9.5's behaviour instead (a warning, then skipping with status 0).
   - GNU 9.4's `mv -b -n` prints its "mutually exclusive" error and still moves the file (a GNU bug); Dogfish errors without moving.
   - `ln -si F F` answered with `y`, and `ln -sf` onto a file that the new symlink would point back to (`ln -sf f d/f` for an existing `d/f`), leave the file alone; GNU replaces it with a symlink to itself, losing its contents. `ln -sf` reports "are the same file", `ln -si` does nothing.
@@ -27,6 +27,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 ## Text tools
 
+- **`sort -S`**: when the input is spilled to temporary files follows GNU's buffer accounting only approximately, so `--compress-program` may run where GNU's would not (or the reverse) for inputs near the buffer size; the output is the same.
 - **`shuf --random-source=FILE`** is deterministic for a given FILE, but uses its bytes differently from GNU's `randint`, so the order differs from GNU's for the same FILE.
 - **`tac -r`** and **`nl -bpBRE`** use a small built-in regex engine with GNU's syntax (Emacs syntax for `tac`, POSIX basic for `nl`), matching bytes in the C locale; for `tac -r`, `^` and `$` also match at the start of the file and at the end of the unread data, where GNU anchors at its read-buffer boundaries.
 

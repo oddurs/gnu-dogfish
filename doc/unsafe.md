@@ -158,8 +158,8 @@ with `read(2)` instead.
 | `clone_file` | `ioctl(FICLONE)` (Linux) | Descriptor only. |
 | `new` | `geteuid` | No preconditions. |
 | `copy_internal` | `mkdir` | C path. |
-| `copy_reg` | `futimens` | Descriptor only, plus an array of two `timespec`s. |
-| `copy_reg` | `close(into_raw_fd())` to see `close` errors | `into_raw_fd` gives up ownership, so the descriptor is closed exactly once. |
+| `copy_reg_data` | `futimens` | Descriptor only, plus an array of two `timespec`s. |
+| `copy_reg_data` | `close(into_raw_fd())` to see `close` errors | `into_raw_fd` gives up ownership, so the descriptor is closed exactly once. |
 | `sparse_copy` | `copy_file_range` (Linux) | Descriptor only; null offset pointers mean "use and advance the file offsets". |
 | `try_clonefile` | `clonefile` (macOS) | C paths. |
 
@@ -346,6 +346,34 @@ with `read(2)` instead.
 | --- | --- | --- |
 | `online_processors` | `sched_getaffinity` (Linux) | Out-pointer of exactly `size_of::<cpu_set_t>()` bytes. |
 | `online_processors` | `sysconf` | No preconditions. |
+
+### `crates/dogfish/src/tools/sort/debug.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `locale_messages` | `setlocale` (to see whether the locale exists), then back to `"C"` | NUL-terminated literals; only the null-ness of the result is used, and nothing else depends on the locale before it is put back. |
+
+### `crates/dogfish/src/tools/sort/merge.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `on_signal` | `unlink` of each temporary file | Signals: async-signal-safe; the paths are live `CString`s in a list taken with `try_lock`, so the handler never blocks on, or reads, a list being changed. |
+| `on_signal` | `signal(SIG_DFL)`, `raise` | Signals: restores the default action and re-raises, as GNU's `sighandler`. |
+| `install_cleanup_handlers` | `sigaction` (query, then install) | Out-pointer (zeroed `sigaction`); the handler is an `extern "C" fn(c_int)` doing only async-signal-safe work. Installed once, before any temporary file exists. |
+| `open_output` | `File::from_raw_fd(1)` in `ManuallyDrop` | Descriptor only: fd 1 is open for the life of the process (`main` ensures it), and `ManuallyDrop` keeps the `File` from closing it. |
+| `advise_sequential` | `posix_fadvise` (Linux) | Descriptor only; a hint whose failure is ignored. |
+| `output_identity` | `File::from_raw_fd(1)` in `ManuallyDrop` | As `open_output`; only `fstat` is called on it. |
+
+### `crates/dogfish/src/tools/sort/mod.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `physmem_total` | `sysconf` | No preconditions. |
+| `specify_nmerge` | `getrlimit(RLIMIT_NOFILE)` | Out-pointer: a local `rlimit` the call fills. |
+| `check_inputs` | `faccessat(AT_EACCESS)` | C path. |
+| `check_output` | `dup2` onto fd 1, `close` | Descriptor only: the descriptor was just taken from the opened `File` (`into_raw_fd`) and is closed exactly once, after being copied to fd 1 (GNU's `move_fd`). |
+| `sort_in_memory` | `File::from_raw_fd(1)` in `ManuallyDrop` | As in `merge.rs`'s `open_output`; only `fstat` is called on it. |
+| `sort_main` | `signal(SIGCHLD, SIG_DFL)` | Signals: restores the default action (GNU's `main` does the same) so the compress program's children can be waited for; no handler is installed. |
 
 ### `crates/dogfish/src/tools/stat.rs`
 

@@ -457,6 +457,48 @@ shell_cases! {
     echo_posixly_correct: ["echo"] "export POSIXLY_CORRECT=1; env echo -n -E 'foo\\n'; env echo -nE foo; env echo -E -n foo; env echo --version";
     mktemp_posixly_correct: ["mktemp"] "POSIXLY_CORRECT=1 mktemp aXXXX --suffix=b; echo $?";
 
+    // --------------------------------------------------------------- sort
+    // -m: a streaming merge, stable across inputs, with -u and keys.
+    sort_merge: ["sort"] "printf '1\\n3\\n5\\n' > a; printf '2\\n4\\n6' > b; sort -m a b";
+    sort_merge_reverse_keys: ["sort"] "printf 'a 2\\nb 1\\n' > a; printf 'a 1\\nb 2\\n' > b; sort -m -s -k1,1 b a; sort -mr -k2n a";
+    sort_merge_unique: ["sort"] "printf 'a\\na\\nb\\n' > a; printf 'a\\nb\\nb\\n' > b; sort -mu a b; sort -m -u -k1,1 a b";
+    sort_merge_stdin: ["sort"] "printf '1\\n3\\n' > a; printf '2\\n4\\n' | sort -m a -";
+    sort_merge_output_is_input: ["sort"] "printf 'a\\nc\\n' > f; printf 'b\\n' > g; sort -m f g -o f; cat f; sort -m g f > g; cat g";
+    sort_merge_batches: ["sort"] "for i in $(seq 40); do echo $i > f$i; done; sort -n -m --batch-size=3 f* | paste -s -d ' '";
+    sort_merge_batches_no_tmpdir: ["sort"] "for i in 1 2 3; do echo $i > f$i; done; sort -m --batch-size=2 -T nonexist f*; echo $?";
+    sort_merge_fd_limit: ["sort"] "for i in $(seq 17); do echo $i > f$i; done; (ulimit -n 12; sort -n -m --batch-size=8 f* | paste -s -d ' ')";
+    sort_merge_missing: ["sort"] "sort -m nonexist; echo $?; mkdir d; sort -m d; echo $?";
+    sort_batch_size_errors: ["sort"] "for a in 0 1 -1 a 10x 99999999999999999999; do sort -m --batch-size=$a /dev/null 2>&1 | sed 's/is [0-9]*$/is N/'; done";
+    // -S: sorted buffers spill to temporary files, then merge.
+    sort_buffer_spill: ["sort"] "seq -w 3000 | sort -r -S 2k | md5sum; seq 3000 | sort -S 1k -u -k1.1,1.1 | paste -s -d ' '";
+    sort_buffer_spill_stable: ["sort"] "seq 3000 | sort -S 2k -s -k1.1,1.1 --batch-size=2 | md5sum";
+    sort_buffer_spill_no_tmpdir: ["sort"] "seq 3000 | sort -S 1k -T nonexist; echo $?; seq 10 | sort -S 1M -T nonexist | wc -l";
+    sort_buffer_size_errors: ["sort"] "for s in 1x -1 1kb 99999999999999999999; do sort -S $s /dev/null; sort --buffer-size=$s /dev/null; done 2>&1; sort -S 10b -S 10% /dev/null; echo $?";
+    sort_compress_program: ["sort"] "printf 'tr 41 14\\ntouch ok\\n' > z; chmod +x z; seq -w 2000 | tac > in; sort -S 1k --compress-program=./z in | md5sum; ls ok";
+    sort_parallel: ["sort"] "printf '2\\n1\\n2\\n' | sort --parallel=1 -u; printf '2\\n1\\n' | sort --parallel=2 -S 10b; sort --parallel=0 /dev/null; sort --parallel=x /dev/null; echo $?";
+    // -c / -C.
+    sort_check_quiet: ["sort"] "printf 'b\\na\\n' | sort -C; echo $?; printf 'a\\na\\n' | sort -cu; echo $?; printf 'a\\0c\\0b\\0' | sort -cz | od -c";
+    sort_check_incompatible: ["sort"] "sort -cC /dev/null; sort -c -o x /dev/null; sort -C -o x /dev/null; sort -c a b; sort --debug -c /dev/null; sort --debug -o x /dev/null; echo $?";
+    // Keys and ordering options.
+    sort_key_errors: ["sort"] "for k in 0 1.0 1,0 1x 1,2x 1. , 1.1,-k0 2.,3 2,; do sort -k$k /dev/null; done 2>&1; echo $?";
+    sort_incompatible_options: ["sort"] "sort -dfgiMnR /dev/null; sort -in /dev/null; sort -k1,1nR /dev/null; sort --sort=random -n /dev/null; echo $?";
+    sort_obsolete_keys: ["sort"] "printf 'a 2\\nb 1\\n' > f; sort +1 -2 f; sort +1x f; _POSIX2_VERSION=200112 sort +1 f; echo $?";
+    sort_general_long_double: ["sort"] "printf '1.189731495357231765e+4932\\n-3.3621031431120935063e-4932\\n0\\n3.3621031431120935063e-4932\\n2.2250738585072014e-308\\n1.0000000000000000001\\n1\\n-nan\\nnan\\nx\\n1e5000\\n' | sort -gs";
+    sort_general_nan_merge: ["sort"] "echo nan > F; sort -g -m F F";
+    sort_output_dash_is_a_file: ["sort"] "printf 'b\\na\\n' > f; sort -o - f; echo; cat ./-";
+    sort_stdin_closed: ["sort"] "sort - <&-; echo $?; sort -m - <&-; echo $?";
+    // --debug: key underlining and warnings.
+    sort_debug_keys: ["sort"] "printf '1\\n\\n44\\n33\\n2\\n' | sort -s -k2n --debug; printf ' 1.2ignore\\n 1.1e4ignore\\n' | sort -s -g --debug; printf 'A\\tchr10\\nB\\tchr1\\n' | sort -s -k2.4b,2.3n --debug";
+    sort_debug_month_human: ["sort"] "printf 'FEB\\nJAZZ\\n\\nJAN\\n' | sort -s -k1M --debug; printf -- '-0\\n1\\n-2\\n--Mi-1\\n-3\\n-0\\n' | sort -s --debug -k1,1h";
+    sort_debug_last_resort: ["sort"] "printf ' 1\\n1\\n' | sort -b --debug; printf 'b a\\na b\\n' | sort -u -k2,2 --debug; printf 'a\\nb\\n' | sort -m --debug";
+    sort_debug_warnings: ["sort"] "sort -s -rRVMhgb -k1,1n --debug /dev/null; sort -gbr -k1,1n -k1,1r --debug /dev/null; sort --debug -rb -k2n +2.2 -1b /dev/null; sort -nk1 -t- --debug /dev/null; sort -gk1 -t+ --debug /dev/null; sort -nk1 -t. --debug /dev/null";
+    sort_debug_locale: ["sort"] "LC_ALL=missing sort --debug /dev/null";
+
+    // ----------------------------------------------------------- cp --debug
+    cp_debug: ["cp"] "echo hi > f; cp --debug f g; cp --debug --reflink=never f h; cp --debug --sparse=always f i; truncate -s 1M s; cp --debug s t";
+    cp_debug_no_data_copy: ["cp"] "touch f; cp --debug --attributes-only f g; echo $?; cp --debug -l f h; cp --debug -s f j";
+    cp_debug_skipped: ["cp"] "touch f g; cp --debug --update=none f g; echo $?; cp --debug -u f g; echo $?";
+
     // --------------------------------------------------------------- shuf
     shuf_is_permutation: ["shuf"] "seq 100 > in; shuf in | sort -n | cmp - in && echo ok";
     shuf_range_is_permutation: ["shuf"] "shuf -i 1-100 | sort -n | md5sum";
