@@ -53,6 +53,11 @@ if [ ! -x "$src/src/ls.gnu" ] && [ ! -x "$src/src/ls" ]; then
 fi
 
 # Swap Dogfish in for every program it implements (keeping GNU's as *.gnu).
+# The links point at a copy made now: newer than every GNU object, so make
+# never considers a swapped program out of date and relinks GNU's over it
+# (`-o` below alone did not stop that after a fresh GNU build).
+bin="$work/dogfish"
+cp "$dogfish" "$bin.tmp" && mv -f "$bin.tmp" "$bin"
 links=$(mktemp -d)
 trap 'rm -rf "$links"' EXIT
 "$dogfish" install-links "$links" >/dev/null
@@ -62,7 +67,7 @@ for link in "$links"/*; do
   tool=$(basename "$link")
   [ -e "$src/src/$tool" ] || [ -e "$src/src/$tool.gnu" ] || continue
   [ -e "$src/src/$tool.gnu" ] || mv "$src/src/$tool" "$src/src/$tool.gnu"
-  ln -sfn "$dogfish" "$src/src/$tool"
+  ln -sfn "$bin" "$src/src/$tool"
   echo "$tool" >>"$tools_file"
 done
 echo "gnu-tests: Dogfish provides $(wc -l <"$tools_file") GNU programs"

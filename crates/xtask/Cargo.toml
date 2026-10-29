@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Project automation: `cargo xtask ci` runs what CI runs"
+
+# Standard library only: it must build quickly, offline and on the MSRV.
+[dependencies]

@@ -12,28 +12,32 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    cd gnu-dogfish
    cargo build --release
    ```
-2. **Run the Test Suite** (both profiles — debug builds enable clap's argument asserts and overflow checks, so CI runs both):
+2. **Before you push, run what CI runs**:
    ```bash
-   cargo test
-   cargo test --release
+   cargo xtask ci
    ```
-   On Linux with GNU coreutils installed, `tests/gnu_compat.rs` also diffs Dogfish against the system tools; on other platforms those cases are skipped.
+   It stops at the first failing step and names it: formatting, Clippy, the MSRV
+   (`rustup toolchain install 1.88`), a macOS type-check from Linux
+   (`rustup target add aarch64-apple-darwin`), `cargo test` in debug (clap's
+   argument asserts and overflow checks are on) and release, every test binary
+   again as `nobody` when you run it as root, docs, and a packaging dry run.
+   `cargo xtask` lists the steps; each runs on its own too (`cargo xtask test`).
+   CI calls the same steps, so the two cannot drift (CI also runs the tests on macOS).
+
+   On Linux with GNU coreutils installed, `tests/gnu_compat*.rs` also diff Dogfish
+   against the system tools; on other platforms those cases are skipped.
+   `cargo xtask gnu` runs GNU's own test suite against Dogfish (slow; as a non-root
+   user) and fails if a test in `util/gnu-baseline.json` stops passing.
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench
    ```
-4. **Lint & Format**:
-   ```bash
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets -- -D warnings
-   ```
-   CI rejects any formatting diff or clippy warning.
 
 ---
 
 ## 🧭 Architecture Overview
 
-The workspace consists of two crates:
+The workspace consists of two crates, plus `crates/xtask` (the `cargo xtask` checks):
 - **`crates/dogfish-core`**: Shared infrastructure used by all utilities:
   - `context.rs`: `DogfishContext`, TTY/color policy, and `--stats` telemetry interceptor.
   - `io.rs`: `FastReader` (`mmap` + `MADV_SEQUENTIAL` + 64 KiB `BufReader` fallback), `copy_file_fast` (macOS APFS `clonefile` & Linux `FICLONE` CoW), and `SIGPIPE`/`BrokenPipe` handlers.
