@@ -5,7 +5,9 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 ## Cross-cutting
 
 - **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`) is UTF-8 aware.
-- **Ambiguous long-option abbreviations** (`cat --s`) report `unrecognized option` instead of GNU's `option '--s' is ambiguous; possibilities: ...`. Unambiguous abbreviations work, except that a lone `--vers` is not taken as `--version` for clap-parsed tools.
+- **Options** are parsed like glibc 2.39's `getopt_long` (permutation, `POSIXLY_CORRECT`, clustering, abbreviations, ambiguity, messages), but a GNU option Dogfish does not implement yet is refused with `TOOL: option 'X' is not supported yet` (exit 1) rather than ignored or emulated, e.g. `tac -b`, `nl -h`, `head -z`, `shuf -o`, `du --time`, `ls --dired`.
+- **`--stats`, `--color[=WHEN]` and `--no-color`** are taken by Dogfish before any tool parses its arguments (up to `--`), so e.g. `echo --color x` prints `x` where GNU prints `--color x`.
+- **Non-UTF-8 arguments.** Options and option arguments may be any bytes. File names that are not valid UTF-8 work for the tools that read files; `cp`, `mv`, `ln`, `mkdir` and `mktemp` refuse them.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
 
@@ -20,7 +22,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
   - `mv . x` / `mv d/.. x` report "subdirectory of itself" rather than GNU's "Device or resource busy". A few trailing-slash-on-symlink edge cases (`mv ld/ d`) word their error differently.
   - GNU 9.4's `mv -b -n` prints its "mutually exclusive" error and still moves the file (a GNU bug); Dogfish errors without moving.
 - **`touch -d`**, **`date -d`**: the common GNU date formats are supported (`@epoch`, ISO 8601 with zones, month names, am/pm, relative items such as `yesterday` and `+1 day`). The full `parse_datetime` grammar is not: no `TZ="..."` prefix inside the string, no military zones, no unusual local zone abbreviations. `date --debug` is not implemented.
-- **`du`**: `--time` and `--files0-from` are not implemented.
+- **`du`**: `--time`, `--time-style` and `--files0-from` are not implemented.
 - **`df`**: which file systems count as pseudo file systems follows gnulib, plus Debian/Ubuntu's patch that hides `devtmpfs` and `squashfs` (snaps); other distributions may show those two. `--sync` / `--no-sync` are accepted and ignored.
 - **`ls -l`** ACL (`+`) and SELinux (`.`) markers are detected from extended attributes.
 

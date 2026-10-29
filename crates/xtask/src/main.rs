@@ -32,10 +32,7 @@ const STEPS: &[(&str, &str)] = &[
         "macos",
         "type-check and lint for aarch64-apple-darwin from another OS",
     ),
-    (
-        "test",
-        "cargo test (debug: overflow checks and clap asserts on)",
-    ),
+    ("test", "cargo test (debug: overflow checks on)"),
     ("test-release", "cargo test --release"),
     (
         "unprivileged",
