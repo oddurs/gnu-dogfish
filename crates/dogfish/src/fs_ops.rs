@@ -647,6 +647,13 @@ struct RmArgs {
     files: Vec<String>,
 }
 
+/// True when `p` names the root directory itself (`/`, `//`, `/.`, `/usr/..`, a bind
+/// of the same inode), as `--preserve-root` checks. A symlink pointing at `/` is not
+/// the root: removing it only unlinks the link.
+fn is_root_dir(p: &Path) -> bool {
+    p.symlink_metadata().is_ok_and(|m| m.is_dir()) && same_file(p, Path::new("/"))
+}
+
 pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = RmArgs::try_parse_from(args)?;
     let journal = if parsed.safe {
@@ -685,12 +692,15 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             exit_code = 1;
             continue;
         }
-        if parsed.recursive
-            && !parsed.no_preserve_root
-            && p.symlink_metadata().is_ok_and(|m| m.is_dir())
-            && fs::canonicalize(p).is_ok_and(|c| c == Path::new("/"))
-        {
-            eprintln!("rm: it is dangerous to operate recursively on '{}'", f);
+        if parsed.recursive && !parsed.no_preserve_root && is_root_dir(p) {
+            if f == "/" {
+                eprintln!("rm: it is dangerous to operate recursively on '/'");
+            } else {
+                eprintln!(
+                    "rm: it is dangerous to operate recursively on '{}' (same as '/')",
+                    f
+                );
+            }
             eprintln!("rm: use --no-preserve-root to override this failsafe");
             exit_code = 1;
             continue;
@@ -2103,4 +2113,28 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         "mktemp: failed to create a unique name from template '{}'",
         tmpl
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `rm`'s preserve-root guard is tested through its predicate alone so that a
+    // regression can never turn the test into an actual `rm -r /`.
+    #[test]
+    fn is_root_dir_matches_every_spelling_of_root() {
+        for p in ["/", "//", "/.", "/./", "/tmp/..", "/usr/../."] {
+            assert!(is_root_dir(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn is_root_dir_rejects_non_root_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("root_link");
+        symlink("/", &link).unwrap();
+        assert!(!is_root_dir(&link), "a symlink to / is just a link");
+        assert!(!is_root_dir(tmp.path()));
+        assert!(!is_root_dir(Path::new("/nonexistent-dogfish-path")));
+    }
 }
