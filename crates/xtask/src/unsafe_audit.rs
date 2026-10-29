@@ -107,7 +107,7 @@ fn tokens(src: &str) -> Vec<(usize, Token)> {
     out
 }
 
-/// Skips a `"..."` literal starting at chars[*i].
+/// Skips a `"..."` literal starting at `chars[*i]`.
 fn skip_string(chars: &[char], i: &mut usize, line: &mut usize) {
     *i += 1;
     while *i < chars.len() {
@@ -130,7 +130,7 @@ fn skip_string(chars: &[char], i: &mut usize, line: &mut usize) {
     }
 }
 
-/// Skips the rest of a raw string (`#*"..."#*`) starting at chars[*i]; a
+/// Skips the rest of a raw string (`#*"..."#*`) starting at `chars[*i]`; a
 /// lone identifier `r` followed by `#` (raw identifiers) is left alone.
 fn skip_raw_string(chars: &[char], i: &mut usize, line: &mut usize) {
     let mut hashes = 0;
