@@ -3,7 +3,10 @@ id: 32
 uid: a7cf6993-0bb0-4c3e-a074-2d15c91b6280
 title: "Finish GNU's same-file and backup rules in ln, cp and mv"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -43,5 +46,9 @@ All listed tests pass; the differential suite covers each case.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+Fixed by porting GNU's copy.c, cp-hash.c, ln.c, force-link.c and backupfile.c into `common/copy.rs` (shared by cp and mv) and ln: ln's `force_linkat`-style unlink-and-retry, the `might destroy source` checks and GNU's remaining same-file decisions. Every listed GNU test passes (util/gnu-test-one.sh) and is in `util/gnu-baseline.json`; 104 new differential cases cover the cp/mv/ln changes, and the undo trash keeps every replaced destination (special files are recreated, never read).

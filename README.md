@@ -154,7 +154,7 @@ When output goes to a pipe or a file, Dogfish behaves like GNU coreutils 9.4 byt
 
 This is checked on every Linux CI run by a differential suite of more than 1,800 cases, which runs each command through both Dogfish and GNU in identical fixture trees and compares the results (`crates/dogfish/tests/gnu_compat*.rs`).
 
-GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's tests against Dogfish (only the tests whose programs under test Dogfish implements all of); CI runs it nightly and fails if a test in [`util/gnu-baseline.json`](./util/gnu-baseline.json) stops passing. **Today 235 of 374 such tests pass (62.8%; 43 more skip).** Every failing test is filed as a cairn item (0025–0056). Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`), `ls --dired`, and a handful of rarely used flags.
+GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's tests against Dogfish (only the tests whose programs under test Dogfish implements all of); CI runs it nightly and fails if a test in [`util/gnu-baseline.json`](./util/gnu-baseline.json) stops passing. **Today 267 of 374 such tests pass (71.4%; 43 more skip).** Every failing test is filed as a cairn item (0025–0056). Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`), `ls --dired`, and a handful of rarely used flags.
 
 ---
 
