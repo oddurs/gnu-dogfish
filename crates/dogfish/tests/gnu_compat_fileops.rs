@@ -208,6 +208,29 @@ fn snapshot(root: &Path, cmp: Compare) -> BTreeMap<String, String> {
     snap
 }
 
+/// Removes `path` even when a case left directories without write or search
+/// permission (`chmod -R u-w`): unprivileged, `remove_dir_all` cannot empty
+/// them, and the next run (the release build reuses these paths) would find
+/// the old tree.
+fn force_remove(path: &Path) {
+    fn open_up(p: &Path) {
+        if let Ok(m) = p.symlink_metadata()
+            && m.is_dir()
+        {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = fs::read_dir(p) {
+                for e in entries.flatten() {
+                    open_up(&e.path());
+                }
+            }
+        }
+    }
+    if fs::remove_dir_all(path).is_err() {
+        open_up(path);
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 fn scratch_root() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -318,6 +341,7 @@ impl TreeCase<'_> {
             self.name,
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        force_remove(&base);
         let (ours_dir, gnu_dir) = (base.join("dogfish"), base.join("gnu"));
         // The second file system's directory for each run (empty unless asked).
         let (ours_other, gnu_other) = if self.cmp.other_fs {
@@ -472,7 +496,7 @@ impl TreeCase<'_> {
                 panic!("resulting trees differ:\n{diff}{ctx}");
             }
         }
-        let _ = fs::remove_dir_all(&base);
+        force_remove(&base);
         if self.cmp.other_fs {
             let _ = fs::remove_dir_all(&ours_other);
             let _ = fs::remove_dir_all(&gnu_other);
@@ -852,6 +876,9 @@ tree_cases! {
     chmod_x_if_any: "chmod" ["-v", "g-x,+X", "exe"];
     chmod_recursive: "chmod" ["-vR", "750", "d"];
     chmod_recursive_changes: "chmod" ["-cR", "o-r", "d"];
+    // Deeper (130 levels) than the recursive tools keep directories open.
+    chmod_recursive_deep: "chmod" ["-vR", "u-w", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    chmod_recursive_operands: "chmod" ["-R", "g+w", "d", "ld", "p", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     chmod_dir_keeps_setgid: "chmod" ["-v", "755", "sg"];
     chmod_dir_clears_setgid: "chmod" ["-v", "00755", "sg"];
     chmod_symlink_operand: "chmod" ["-v", "700", "la"];
@@ -902,6 +929,9 @@ tree_cases! {
     rm_dir_flag_empty: "rm" ["-dv", "e"];
     rm_recursive: "rm" ["-rv", "d"];
     rm_recursive_nested: "rm" ["-rv", "p"];
+    // Deeper (130 levels) than rm keeps directories open.
+    rm_recursive_deep: "rm" ["-rv", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    rm_recursive_quiet: "rm" ["-r", "d", "p", "p2", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     rm_trailing_slash_file: "rm" ["a/"];
     rm_force_trailing_slash_file: "rm" ["-f", "a/"];
     rm_recursive_trailing_slash: "rm" ["-rfv", "d/"];
@@ -1251,6 +1281,36 @@ tree_cases! {
     mkdir_non_utf8_mode: "mkdir" ["-v", "-m", "700", "m@xff@"];
     rm_non_utf8: "rm" ["-v", "n@xff@", "d@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
     rm_non_utf8_recursive: "rm" ["-rv", "t@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    stat_non_utf8: "stat" ["-c", "%n|%N|%s", "n@xff@", "l@xff@", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\" && ln -s \"$(printf 'n\\377')\" \"$(printf 'l\\377')\"");
+    stat_non_utf8_deref_terse: "stat" ["-L", "-c", "%n %s", "l@xff@"] setup("printf X > \"$(printf 'n\\377')\" && ln -s \"$(printf 'n\\377')\" \"$(printf 'l\\377')\"");
+    stat_fs_non_utf8: "stat" ["-f", "-c", "%n", "n@xff@", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    stat_fs_stdin: "stat" ["-f", "-"];
+    df_non_utf8: "df" ["--output=file", "n@xff@", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    df_total_target: "df" ["--output=target", "--total", "a"];
+    df_total_source_target: "df" ["--output=source,target", "--total", "a"] => nostderr;
+    realpath_non_utf8: "realpath" ["--relative-to=.", "n@xff@", "l@xff@", "nope@xff@/x"] setup("printf X > \"$(printf 'n\\377')\" && ln -s \"$(printf 'n\\377')\" \"$(printf 'l\\377')\"");
+    realpath_non_utf8_relative: "realpath" ["--relative-to=d@xff@", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\" && mkdir \"$(printf 'd\\377')\"");
+    basename_non_utf8: "basename" ["-a", "-s", "@xff@", "x/n@xff@", "d@xff@/"];
+    dirname_non_utf8: "dirname" ["d@xff@/n@xff@", "n@xff@"];
+    chmod_non_utf8: "chmod" ["-v", "600", "n@xff@", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    chmod_non_utf8_recursive: "chmod" ["-Rc", "700", "t@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    chmod_non_utf8_mode: "chmod" ["u@xff@", "a"];
+    chown_non_utf8: "chown" ["-v", ":0", "n@xff@", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    chown_non_utf8_user: "chown" ["u@xff@", "a"];
+    chown_non_utf8_spec_only: "chown" ["u@xff@"];
+    touch_non_utf8: "touch" ["-d", "2001-02-03 04:05:06", "n@xff@", "new@xff@"] setup("printf X > \"$(printf 'n\\377')\"") => mtime, atime;
+    touch_non_utf8_date: "touch" ["-d", "x@xff@", "a"];
+    touch_non_utf8_reference: "touch" ["-r", "nope@xff@", "a"];
+    mkdir_non_utf8_bad_mode: "mkdir" ["-m", "u@xff@", "m"];
+    md5sum_non_utf8: "md5sum" ["n@xff@", "b\\s", "nope@xff@"] setup("printf X > \"$(printf 'n\\377')\" && printf Y > 'b\\s'");
+    sha256sum_non_utf8_tag: "sha256sum" ["--tag", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    b2sum_non_utf8_zero: "b2sum" ["-z", "-l", "128", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    md5sum_check_non_utf8: "md5sum" ["-c", "s@xff@"] setup("printf X > \"$(printf 'n\\377')\" && printf Y > \"$(printf 'm\\377')\" && md5sum \"$(printf 'n\\377')\" \"$(printf 'm\\377')\" > \"$(printf 's\\377')\" && echo Z > \"$(printf 'm\\377')\" && printf '00000000000000000000000000000000  x\\377\\n' >> \"$(printf 's\\377')\"");
+    md5sum_check_non_utf8_missing_list: "md5sum" ["-c", "nope@xff@"];
+    id_non_utf8_user: "id" ["-u", "root", "u@xff@"];
+    printenv_non_utf8: "printenv" ["nope@xff@"];
+    env_non_utf8_verbose: "env" ["-v", "-i", "-u", "B@xff@", "A=x@xff@", "printenv", "A"];
+    env_non_utf8_bad_unset: "env" ["-u", "B@xff@=", "true"];
 }
 
 /// Whether `dir`'s file system stores names that are not UTF-8. APFS (macOS)

@@ -72,7 +72,7 @@ impl Quoting {
 
 /// True when the character-type locale is UTF-8, so multibyte characters
 /// count as printable (otherwise every non-ASCII byte is, as in the C locale).
-fn locale_is_utf8() -> bool {
+pub(crate) fn locale_is_utf8() -> bool {
     static UTF8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *UTF8.get_or_init(|| {
         let value = ["LC_ALL", "LC_CTYPE", "LANG"]

@@ -3,7 +3,9 @@ id: 44
 uid: f3dfedbb-b966-487c-b67e-3a92dd527d1f
 title: "df and du: remaining GNU test failures"
 type: bug
-status: backlog
+status: doing
+assignee: claude
+claimed: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -42,3 +44,7 @@ All listed tests pass.
 
 - [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
 - [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## 2026-10-29
+
+df: the total row prints `total` in the target column when no source column is shown (tests/df/df-output.sh passes, in the baseline); cells keep raw bytes, control characters become `?`, invalid UTF-8 cells are left unpadded in UTF-8 locales, as GNU. The du parts remain.

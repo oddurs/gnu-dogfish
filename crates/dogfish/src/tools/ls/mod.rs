@@ -89,6 +89,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         json: Vec::new(),
         active: Vec::new(),
         used_color: std::cell::Cell::new(false),
+        time_cache: std::cell::RefCell::new(None),
     };
     let res = lister
         .run(&targets)

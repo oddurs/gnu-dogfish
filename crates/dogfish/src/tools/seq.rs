@@ -332,6 +332,102 @@ fn decimal_le(a: &[u8], b: &[u8]) -> bool {
     (a.len(), a) <= (b.len(), b)
 }
 
+/// Bytes handed to `write` at a time by [`seq_fast`].
+const FAST_BLOCK: usize = 128 * 1024;
+
+/// The longest separator-and-number line [`seq_fast`] copies with one
+/// fixed-size store; longer ones are copied piece by piece.
+const FAST_LINE: usize = 32;
+
+/// GNU's `seq_fast`: counts from the digit string `cur` to `end` by `inc`
+/// (1 to 200) in decimal text, so numbers of any size are exact. Numbers
+/// that differ only in the last digit form a run: `end` is compared once a
+/// run, and each number is one fixed-size copy of the run's line (separator
+/// and digits) with the last digit patched in. Output goes to the stdout
+/// writer in large blocks. Returns how many numbers were written; a closed pipe
+/// ends the output quietly.
+fn seq_fast(mut cur: Vec<u8>, end: &[u8], inc: u32, sep: &[u8]) -> io::Result<u64> {
+    let mut out = stdout::stdout();
+    let mut buf = vec![0u8; FAST_BLOCK + FAST_LINE];
+    let mut pos = 0;
+    let mut count = 0u64;
+    let mut line = [0u8; FAST_LINE];
+    macro_rules! flush {
+        ($bytes:expr) => {
+            match out.write_all($bytes) {
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(count),
+                r => r?,
+            }
+        };
+    }
+    while decimal_le(&cur, end) {
+        let last = cur.len() - 1;
+        // Bounded by 9, or by the last number's last digit once all other
+        // digits match it.
+        let prefix_below = cur.len() < end.len() || cur[..last] < end[..last];
+        let max_digit = if prefix_below {
+            9
+        } else {
+            u32::from(end[last] - b'0')
+        };
+        let mut digit = u32::from(cur[last] - b'0');
+        let len = sep.len() + cur.len();
+        let fixed = len <= FAST_LINE;
+        if fixed {
+            line[..sep.len()].copy_from_slice(sep);
+            line[sep.len()..len].copy_from_slice(&cur);
+        }
+        while digit <= max_digit {
+            let d = b'0' + digit as u8;
+            // No separator before the first number.
+            if fixed && count > 0 {
+                line[len - 1] = d;
+                buf[pos..pos + FAST_LINE].copy_from_slice(&line);
+                pos += len;
+            } else {
+                cur[last] = d;
+                let sep = if count > 0 { sep } else { &[][..] };
+                if pos + sep.len() + cur.len() > FAST_BLOCK {
+                    flush!(&buf[..pos]);
+                    pos = 0;
+                }
+                if sep.len() + cur.len() > FAST_BLOCK {
+                    flush!(sep);
+                    flush!(&cur);
+                } else {
+                    buf[pos..pos + sep.len()].copy_from_slice(sep);
+                    pos += sep.len();
+                    buf[pos..pos + cur.len()].copy_from_slice(&cur);
+                    pos += cur.len();
+                }
+            }
+            count += 1;
+            digit += inc;
+            if pos >= FAST_BLOCK {
+                // End the write at a line break, so that the line-buffered
+                // writer passes it straight through instead of holding back
+                // (and later writing on its own) a partial line.
+                let cut = memchr::memrchr(b'\n', &buf[..pos]).map_or(pos, |i| i + 1);
+                flush!(&buf[..cut]);
+                buf.copy_within(cut..pos, 0);
+                pos -= cut;
+            }
+        }
+        if !prefix_below {
+            break;
+        }
+        // The next number is this run's with last digit 0, plus `digit`.
+        cur[last] = b'0';
+        decimal_add(&mut cur, digit);
+    }
+    if count > 0 {
+        buf[pos] = b'\n';
+        pos += 1;
+    }
+    flush!(&buf[..pos]);
+    Ok(count)
+}
+
 fn write_or_pipe<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<bool> {
     match out.write_all(bytes) {
         Ok(()) => Ok(true),
@@ -480,42 +576,10 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         n => as_digits(&first, &nums[0]).zip(as_digits(&last, &nums[n - 1])),
     };
     let small_step = step.int.is_some_and(|n| (1..=200).contains(&n));
-    if let (None, false, true, Some((mut cur, end))) = (&user_format, equal_width, small_step, fast)
-    {
+    if let (None, false, true, Some((cur, end))) = (&user_format, equal_width, small_step, fast) {
         let inc = step.value as u32;
-        let mut count = 0u64;
-        // Like GNU's seq_fast: append to a local block and hand whole blocks to the
-        // writer, instead of two small writes per number.
-        let mut block: Vec<u8> = Vec::with_capacity(DEFAULT_BUF_SIZE + 64);
-        while decimal_le(&cur, &end) {
-            if count > 0 {
-                block.extend_from_slice(sep);
-            }
-            block.extend_from_slice(&cur);
-            count += 1;
-            // Most increments touch only the last digit; carry the rest.
-            let last = cur.len() - 1;
-            let digit = u32::from(cur[last] - b'0') + inc;
-            if digit < 10 {
-                cur[last] = b'0' + digit as u8;
-            } else {
-                decimal_add(&mut cur, inc);
-            }
-            if block.len() >= DEFAULT_BUF_SIZE {
-                if !write_or_pipe(&mut out, &block)? {
-                    return Ok(0);
-                }
-                block.clear();
-            }
-        }
+        let count = seq_fast(cur, &end, inc, sep)?;
         ctx.telemetry.add_items(count);
-        if count > 0 {
-            block.push(b'\n');
-        }
-        if !write_or_pipe(&mut out, &block)? {
-            return Ok(0);
-        }
-        ignore_broken_pipe(out.flush())?;
         return Ok(0);
     }
 
