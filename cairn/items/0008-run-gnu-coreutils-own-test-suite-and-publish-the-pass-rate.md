@@ -3,10 +3,11 @@ id: 8
 uid: 44cd79f9-13d0-4ccc-91b9-b85e6eefcfd8
 title: "Run GNU coreutils' own test suite and publish the pass rate"
 type: feature
-status: doing
+status: done
 milestone: "v0.3"
 assignee: claude
 claimed: 2026-10-29
+closed_at: 2026-10-29
 depends_on:
 - 4
 created: 2026-10-29
@@ -44,7 +45,35 @@ and fails if the pass count drops below the committed baseline
 
 ## Acceptance criteria
 
-- [ ] One command reproduces the run locally from a clean checkout.
-- [ ] Results are per test, with the failing ones listed, and the totals are published in the README.
-- [ ] CI fails on a regression against the committed baseline and can update it deliberately.
-- [ ] Every failing test is either fixed or filed as an item (grouped by tool).
+- [x] One command reproduces the run locally from a clean checkout.
+- [x] Results are per test, with the failing ones listed, and the totals are published in the README.
+- [x] CI fails on a regression against the committed baseline and can update it deliberately.
+- [x] Every failing test is either fixed or filed as an item (grouped by tool).
+
+## 2026-10-29
+
+The first CI run reported 379/379: `make check-TESTS` relinked every swapped
+`src/<tool>` from GNU's objects (newer than the Dogfish binary), so GNU was
+tested against itself. Fixed with `make -o src/<tool>` and a check, before
+and after the run, that every swapped program reports `GNU/Dogfish`. A
+perfect score from a new compatibility harness should be treated as a bug.
+
+## 2026-10-29
+
+Triage of the 145 failures found no harness causes, and two data-loss bugs
+(symlink moved or copied onto its referent; `--attributes-only` truncating a
+linked file), fixed at once as 0025. The rest are filed as 0026–0056, with
+the parser-level ones added to 0011 and the date ones to 0019.
+
+## Result
+
+`util/gnu-tests.sh` builds Dogfish and the pinned, checksum-verified GNU 9.4,
+swaps Dogfish in for the 49 programs it implements, and runs the 417 GNU
+tests whose programs under test are all Dogfish's. First result (CI run
+40885586807): **229 of 374 passing (61.2%)**, 43 skipped, now the committed
+baseline in `util/gnu-baseline.json` and in the README. `.github/workflows/gnu-tests.yml`
+runs it on PRs that touch the code, on `main` and nightly; a test leaving the
+baseline fails the job (checked locally with a doctored baseline: exit 1), and
+`--update-baseline` rewrites it deliberately. Every failing test is in an item:
+0011, 0019, 0025–0056. Local runs need a non-root user; this session's
+sandbox could not configure GNU, so the end-to-end run is verified in CI only.

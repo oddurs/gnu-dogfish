@@ -16,6 +16,8 @@ This release makes Dogfish safe to use on real data and a drop-in for GNU coreut
 - `rm` refuses `.`/`..` and recursive removal of `/` (`--no-preserve-root` overrides). `rm --safe` refuses directories without `-r`, like plain `rm`.
 - `mktemp` used a predictable name and a symlink-following create. It now uses OS randomness and exclusive creation, with `0600`/`0700` applied at creation.
 - `touch` no longer truncates existing files.
+- `mv s f` and `cp -a`/`cp -d s f`, where `s` is a symlink to `f`, replaced `f` with a symlink to itself. cp and mv now share a port of GNU's `same_file_ok`: they refuse whatever would lose the file, and allow what a backup or another hard link keeps safe (`mv -b h1 h2`, `cp -b f s`, `cp -sf f s`).
+- `cp -a --attributes-only` truncated a destination that had other hard links.
 - `seq` no longer loops forever (release builds) or panics (debug builds) near `i64::MAX`, and keeps full precision above 2^53.
 - A file truncated while being read (SIGBUS on mmapped input) now produces a clean error instead of a crash.
 

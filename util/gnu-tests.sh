@@ -11,7 +11,7 @@
 # Dogfish does not implement stay GNU, and their tests are not counted.
 #
 # Must not run as root: many GNU tests skip or behave differently as root.
-# Environment: DOGFISH (binary, default target/release/dogfish), WORK
+# Environment: DOGFISH (binary; default: build target/release/dogfish), WORK
 # (scratch dir, default target/gnu), JOBS (default: nproc), TEST_TIMEOUT
 # (seconds per test, default 600), TESTS (override the selected test list).
 
@@ -23,6 +23,8 @@ GNU_SHA256=ea613a4cf44612326e917201bbbcdfbd301de21ffc3b59b6e5c07e040b275e52
 GNU_URL="https://ftp.gnu.org/gnu/coreutils/coreutils-${GNU_VERSION}.tar.xz"
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# Without DOGFISH, test a fresh release build of this checkout.
+[ -n "${DOGFISH:-}" ] || (cd "$repo" && cargo build --release --locked --quiet)
 dogfish=$(realpath "${DOGFISH:-$repo/target/release/dogfish}")
 work=$(mkdir -p "${WORK:-$repo/target/gnu}" && cd "${WORK:-$repo/target/gnu}" && pwd)
 jobs=${JOBS:-$(nproc 2>/dev/null || echo 2)}

@@ -42,3 +42,11 @@ its place (e.g. for `--help` text), otherwise remove it.
 - [ ] Exactly one option parser and one quoting implementation remain.
 - [ ] `cat --s` and `sort --vers` print GNU's ambiguity message; `cat --vers` prints the version.
 - [ ] GNU test-suite pass count does not drop; differential suites unchanged.
+- [ ] The parser-level GNU test failures found by 0008 are gone: unique-prefix
+  long options (`cut --out=`), the last of a repeated option wins (`sort -o`
+  twice, `shuf -n` twice), `--help`/`--version` among other operands
+  (`tests/help/help-version-getopt.sh`, `tests/misc/nl.sh`), and non-UTF-8
+  arguments (`cut -d $'\255'`, `date -d $'\xb0'`; today `std::env::args`
+  aborts with exit 134). Tests: `tests/help/help-version-getopt.sh`, plus the
+  parser cases inside `tests/cut/cut.pl`, `tests/sort/sort.pl`,
+  `tests/shuf/shuf.sh`, `tests/misc/nl.sh`, `tests/date/date.pl`.

@@ -73,4 +73,5 @@ jobs:
             target/gnu/selection.json
             target/gnu/check.log
             target/gnu/coreutils-9.4/tests/**/*.log
+            target/gnu/coreutils-9.4/tests/**/*.trs
           if-no-files-found: warn
