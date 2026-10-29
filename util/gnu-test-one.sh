@@ -148,6 +148,7 @@ cat >"$build/config.h" <<'EOF'
 #undef LINKAT_SYMLINK_NOTSUP
 #define USE_XATTR 1
 #define USE_ACL 1
+#define HAVE_INOTIFY 1
 EOF
 
 # Run as an unprivileged user: GNU's tests behave differently as root.

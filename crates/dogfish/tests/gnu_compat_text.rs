@@ -87,6 +87,28 @@ gnu_cases! {
     tail_zero: "tail" ["-z", "-n", "2", "nul.txt"];
     tail_zero_from_start: "tail" ["-z", "-n", "+3", "nul.txt"];
     tail_zero_count_skips_open: "tail" ["-n", "0", "nonexist"];
+    tail_retry_without_follow: "tail" ["--retry", "-n", "2", "many.txt"];
+    tail_retry_missing_without_follow: "tail" ["--retry", "nonexist"];
+    tail_pid_without_follow: "tail" ["--pid=1", "-n", "1", "many.txt"];
+    tail_follow_dash_by_name: "tail" ["-F", "-"];
+    tail_follow_stdin_by_name: "tail" ["--follow=name"];
+    tail_follow_bad_mode: "tail" ["--follow=sideways", "many.txt"];
+    tail_follow_abbreviated_mode: "tail" ["--follow=n", "-"];
+    tail_bad_sleep: "tail" ["-f", "-s", "x", "many.txt"];
+    tail_negative_sleep: "tail" ["-f", "-s", "-1", "many.txt"];
+    tail_overflowing_sleep: "tail" ["-f", "-s", "1e999", "many.txt"];
+    tail_bad_pid: "tail" ["-f", "--pid=x", "many.txt"];
+    tail_pid_too_large: "tail" ["-f", "--pid=2147483648", "many.txt"];
+    tail_bad_max_unchanged_stats: "tail" ["-f", "--max-unchanged-stats=-1", "many.txt"];
+    tail_follow_missing_by_descriptor: "tail" ["-f", "nonexist"];
+    tail_follow_missing_by_name: "tail" ["--follow=name", "nonexist"];
+    tail_follow_missing_retry_dir: "tail" ["--follow=descriptor", "--retry", "."];
+    tail_follow_directory: "tail" ["-f", "."];
+    tail_follow_piped_stdin: "tail" ["-f", "-c3"] stdin b"foo\n";
+    tail_follow_piped_stdin_and_missing: "tail" ["-f", "-c3", "-", "nonexist"] stdin b"bar\n";
+    tail_follow_dead_pid: "tail" ["-f", "-s.1", "--pid=2147483647", "-n", "2", "many.txt"];
+    tail_follow_dead_pid_polling: "tail" ["---disable-inotify", "-f", "-s.1", "--pid=2147483647", "lines.txt", "many.txt"];
+    tail_follow_dead_pid_n0: "tail" ["-n0", "-F", "-s.1", "--pid=2147483647", "many.txt"];
 
     // ----------------------------------------------------------------- wc
     wc_files0_from: "wc" ["--files0-from=names0.txt"];
@@ -409,6 +431,15 @@ shell_cases! {
     head_elide_lines_small_file: ["head"] "seq 10 > in; (head -n -3 > /dev/null; cat) < in";
     head_elide_bytes_huge_count: ["head"] "head --bytes=-9223372036854775807 < /dev/null; echo $?";
     head_closed_stdin: ["head"] "head <&-; echo $?";
+
+    // --------------------------------------------------------------- tail
+    tail_follow_closed_stdin: ["tail"] "tail -f - <&-; echo $?";
+    tail_follow_closed_stdout: ["tail"] "touch f; tail -f f >&-; echo $?";
+    tail_follow_regular_stdin: ["tail"] "seq 5 > f; timeout .5 tail -n2 -s.1 -f < f; echo $?";
+    tail_follow_regular_stdin_polling: ["tail"] "seq 5 > f; timeout .5 tail ---dis -s.1 -f -n1 - f < f; echo $?";
+    tail_follow_fifo: ["tail"] "mkfifo p; (echo 1; echo 2) > p & timeout 1 tail -s.1 -f p; echo $?";
+    tail_follow_dev_null: ["tail"] "timeout .5 tail -s.1 -f /dev/null; echo $?";
+    tail_follow_reader_gone: ["tail"] "seq 5 > f; (trap '' PIPE; timeout 5 tail -s.1 -n2 -f f; echo $? >&2) | head -n1";
 
     // ----------------------------------------------------------------- wc
     wc_bytes_twice_shares_offset: ["wc"] "printf ab > in; { wc -c; wc -c; } < in";
