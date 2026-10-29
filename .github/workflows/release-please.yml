@@ -1,0 +1,74 @@
+name: Release Please
+
+# Conventional commits landing on main keep a "chore: release X.Y.Z" PR up to date
+# (version bump in Cargo.toml, CHANGELOG.md entry). Merging that PR tags vX.Y.Z,
+# publishes the GitHub Release, and builds the release archives.
+#
+# Optional secret RELEASE_PLEASE_TOKEN (a fine-grained PAT or GitHub App token with
+# contents + pull-requests write): PRs and pushes made with the default GITHUB_TOKEN
+# do not trigger CI, so without it the release PR shows no checks.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      pr_branch: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).headBranchName }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # release-please bumps the version in Cargo.toml but cannot regenerate Cargo.lock,
+  # which CI builds with --locked; refresh the workspace entries on the release branch.
+  sync-lockfile:
+    needs: release-please
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.pr_branch }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Update workspace versions in Cargo.lock
+        run: cargo update --workspace
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update Cargo.lock for release" -- Cargo.lock
+          git push
+
+  build-release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    permissions:
+      contents: write

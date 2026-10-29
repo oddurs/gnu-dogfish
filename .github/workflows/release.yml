@@ -1,9 +1,25 @@
 name: Release Binaries (macOS & Linux)
 
 on:
+  # A tag pushed by a person (or a token that triggers workflows).
   push:
     tags:
       - "v*.*.*"
+  # Called by release-please.yml right after it tags a release: tags created with
+  # GITHUB_TOKEN do not trigger the `push` event above.
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and upload assets for (e.g. v0.2.0)
+        required: true
+        type: string
+  # Rebuild the assets of an existing tag by hand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and upload assets for (e.g. v0.2.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,6 +42,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -33,12 +51,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Test
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --locked --target ${{ matrix.target }}
 
       # Built for the baseline CPU of the target (no `target-cpu=native`) so the
       # binaries run on any machine of that architecture.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package release archive & SHA256SUMS
         run: |
@@ -51,7 +69,9 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             ${{ matrix.archive_name }}
             ${{ matrix.archive_name }}.sha256
-          generate_release_notes: true
+          # release-please writes the notes itself; only generate them for a hand-pushed tag.
+          generate_release_notes: ${{ inputs.tag == '' }}
