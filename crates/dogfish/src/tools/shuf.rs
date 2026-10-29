@@ -284,8 +284,22 @@ impl Rng {
 }
 
 /// The first `k` entries of a random permutation of `0..n` (partial
-/// Fisher-Yates). Entries moved are kept in a map, so `n` may be huge.
+/// Fisher-Yates): over an array when `n` is moderate, else with the moved
+/// entries kept in a map, so `n` may be huge.
 fn partial_permutation(rng: &mut Rng, k: u64, n: u64) -> Vec<u64> {
+    const DENSE_MAX: u64 = 1 << 26;
+    if n <= DENSE_MAX
+        && let Ok(len) = usize::try_from(n)
+    {
+        let mut v: Vec<u64> = (0..n).collect();
+        let k = usize::try_from(k).unwrap_or(len).min(len);
+        for i in 0..k {
+            let j = i + rng.upto((len - 1 - i) as u64) as usize;
+            v.swap(i, j);
+        }
+        v.truncate(k);
+        return v;
+    }
     let mut moved: HashMap<u64, u64> = HashMap::new();
     let mut out = Vec::with_capacity(usize::try_from(k).unwrap_or(0).min(1 << 24));
     for i in 0..k {
