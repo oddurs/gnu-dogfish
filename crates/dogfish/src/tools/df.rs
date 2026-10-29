@@ -608,7 +608,7 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         return Ok(status);
     }
     let mut out = io::BufWriter::new(stdout::stdout());
-    if ctx.stdout_is_tty && !cfg.posix && !cfg.inodes && !cfg.output_mode {
+    if ctx.stdout_is_tty() && !cfg.posix && !cfg.inodes && !cfg.output_mode {
         df_render_rich(&rows, &cfg, &mut out, ctx.style())?;
     } else {
         df_render_gnu(&rows, &cfg, &mut out)?;

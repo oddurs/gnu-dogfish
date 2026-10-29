@@ -3,12 +3,15 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 
 use crate::crash::crash_point;
 
 /// 64 KiB aligned buffer size for high-throughput streaming.
 pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
+
+/// Regular files up to this size are read rather than memory-mapped.
+const MMAP_MIN_LEN: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyMethod {
@@ -77,19 +80,25 @@ impl FastReader {
         }
     }
 
-    /// Wraps an already open file, mapping it when it is a non-empty regular
-    /// file of at most 16 GiB (for callers that inspect the file first).
+    /// Wraps an already open file, mapping it when it is a regular file of
+    /// more than 16 KiB and at most 16 GiB (for callers that inspect the
+    /// file first). A smaller file costs less to read than to map (a mapping
+    /// takes four system calls and a page fault to set up).
     pub fn from_file(file: File) -> io::Result<Self> {
         let meta = file.metadata()?;
-        if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
+        if meta.is_file() && meta.len() > MMAP_MIN_LEN && meta.len() <= (1 << 34) {
+            arm_sigbus_handler();
+            // The length is known: telling memmap2 saves it a stat.
+            let mut options = MmapOptions::new();
+            options.len(meta.len() as usize);
             // SAFETY: a read-only private mapping of a regular file the
             // caller opened. Rust's aliasing rules assume the bytes do not
             // change while mapped; another process can still modify or
             // truncate the file. Modification can only change the data read
             // (as with read(2) racing a writer); truncation raises SIGBUS,
-            // which install_sigbus_handler turns into a clean exit. See
+            // which the handler armed above turns into a clean exit. See
             // doc/unsafe.md.
-            if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+            if let Ok(mmap) = unsafe { options.map(&file) } {
                 // SAFETY: the pointer and length describe the live mapping
                 // just created; madvise is only a hint and never changes its
                 // contents.
@@ -329,15 +338,6 @@ pub(crate) fn remove_any(p: &Path) -> io::Result<()> {
     }
 }
 
-/// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.
-pub fn install_sigpipe_handler() {
-    // SAFETY: restores the default disposition; no handler code runs.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
 /// Message written by the `SIGBUS` handler; set once by [`install_sigbus_handler`].
 static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
@@ -354,23 +354,36 @@ extern "C" fn on_sigbus(_: libc::c_int) {
     unsafe { libc::_exit(1) }
 }
 
-/// Turns `SIGBUS` into a clean `tool: ...` error and exit status 1.
+/// Turns `SIGBUS` into a clean `tool: ...` error and exit status 1, once
+/// `tool` maps a file.
 ///
 /// [`FastReader`] memory-maps regular files; if another process truncates a file
 /// while it is mapped, touching the vanished pages raises `SIGBUS`, which would
-/// otherwise kill the process with no explanation.
+/// otherwise kill the process with no explanation. This only records the
+/// message: the handler itself is installed before the first mapping
+/// (`arm_sigbus_handler`), so a tool that maps nothing makes no system call
+/// for it.
 pub fn install_sigbus_handler(tool: &str) {
     let _ =
         SIGBUS_MSG.set(format!("{tool}: input file was truncated while being read\n").into_bytes());
+}
+
+/// Installs the `SIGBUS` handler, once, if [`install_sigbus_handler`] set
+/// its message (only `main` does; library users keep the default action).
+fn arm_sigbus_handler() {
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    if SIGBUS_MSG.get().is_none() {
+        return;
+    }
     // SAFETY: a zeroed sigaction is a valid "no flags, empty mask" value; the
     // handler is an `extern "C" fn(c_int)` that only calls async-signal-safe
     // functions, and SIGBUS_MSG is set before the handler is installed.
-    unsafe {
+    ARMED.call_once(|| unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigbus as *const () as libc::sighandler_t;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
-    }
+    });
 }
 
 /// Helper to treat `ErrorKind::BrokenPipe` as a clean exit (`Ok(())`).

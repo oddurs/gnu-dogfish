@@ -1564,7 +1564,7 @@ impl<'a> Copier<'a> {
 
         // On a terminal, a regular copy is announced once it is done, with
         // how the data was copied (a Dogfish extra).
-        let rich_verbose = self.ctx.stdout_is_tty
+        let rich_verbose = self.ctx.stdout_is_tty()
             && !self.x.hard_link
             && !self.x.symbolic_link
             && (is_type(src_mode, S_IFREG)

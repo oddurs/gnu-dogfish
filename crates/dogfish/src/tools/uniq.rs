@@ -505,7 +505,7 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     // Rich output: NDJSON objects are deduplicated by field on a terminal
     // (or with -J). Piped output is GNU's, byte for byte.
-    if (ctx.stdout_is_tty || cfg.json) && cfg.delimiter == b'\n' && cfg.output == "-" {
+    if (ctx.stdout_is_tty() || cfg.json) && cfg.delimiter == b'\n' && cfg.output == "-" {
         let peek = input.fill_buf()?;
         if looks_like_json(peek) {
             let mut all = Vec::new();
