@@ -59,6 +59,10 @@ The workspace consists of two crates:
 
 ---
 
+## 🗺️ Roadmap & Issues
+
+Planned work is tracked with [cairn](https://github.com/oddurs/cairn): one Markdown file per item under `cairn/items`, using the schema in `cairn.toml`. Start with `cairn next --view next`. `AGENTS.md` describes the workflow for people and agents alike. `ROADMAP.md` lists the known differences from GNU, and the generated plan is `cairn/ROADMAP.md`.
+
 ## 🔀 Pull Requests & Releases
 
 - **Branches open PRs automatically.** Pushing a branch with new commits opens a *draft* PR against `main` (`.github/workflows/auto-pr.yml`); mark it ready when it is.
