@@ -788,9 +788,11 @@ fn test_unicode_multibyte_cut_wc_and_tr() {
     assert_eq!(wc_j["chars"].as_u64(), Some(10)); // 3 emojis + \n + 5 greek + \n = 10 chars
     assert_eq!(wc_j["bytes"].as_u64(), Some(24)); // 12 + 1 + 10 + 1 = 24 bytes
 
-    // `cut -c 2-3` should slice by Unicode scalar character, not raw byte!
+    // Like GNU coreutils, `cut -c` selects bytes, so it can split a character.
     let cut_c = run_stdin(&["cut", "-c", "2-3"], unicode_text.as_bytes());
-    assert_eq!(stdout_str(&cut_c), "🦀🦬\nβγ\n");
+    assert_eq!(cut_c.stdout, b"\x9f\xa6\n\xb1\xce\n");
+    let cut_c = run_stdin(&["cut", "-c", "5-12"], unicode_text.as_bytes());
+    assert_eq!(stdout_str(&cut_c), "🦀🦬\nγδε\n");
 }
 
 #[test]
