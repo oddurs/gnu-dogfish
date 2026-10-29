@@ -134,9 +134,33 @@ impl FastReader {
     }
 }
 
+/// Returns true when `a` and `b` resolve to the same inode on the same device
+/// (same path, `./` aliases, symlinks, or hard links).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
 /// Copies a file using macOS APFS `clonefile` (zero-copy copy-on-write) when available,
 /// transparently falling back to `std::fs::copy`.
+///
+/// Refuses to copy a file onto itself: every strategy here truncates or unlinks
+/// the destination first, which would destroy the source.
 pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
+    if same_file(src, dst) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' and '{}' are the same file",
+                src.display(),
+                dst.display()
+            ),
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -161,22 +185,65 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink
+        // FICLONE ioctl (0x40049409) for instant Btrfs / XFS / bcachefs Copy-on-Write reflink.
+        // One open of each file serves both the reflink attempt and the fallback.
         const FICLONE: libc::c_ulong = 0x40049409;
-        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
-            let ret =
-                unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
-            if ret == 0 {
-                if let Ok(meta) = src_file.metadata() {
-                    let _ = dst_file.set_permissions(meta.permissions());
-                    return Ok((meta.len(), CopyMethod::FicloneCoW));
-                }
-            }
-        }
+        let src_file = File::open(src)?;
+        let meta = src_file.metadata()?;
+        let dst_file = File::create(dst)?;
+        let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+        let (bytes, method) = if ret == 0 {
+            (meta.len(), CopyMethod::FicloneCoW)
+        } else {
+            // std specializes File-to-File `io::copy` to copy_file_range(2) / sendfile(2).
+            (
+                io::copy(&mut &src_file, &mut &dst_file)?,
+                CopyMethod::StandardCopy,
+            )
+        };
+        dst_file.set_permissions(meta.permissions())?;
+        Ok((bytes, method))
     }
 
-    let bytes = fs::copy(src, dst)?;
-    Ok((bytes, CopyMethod::StandardCopy))
+    #[cfg(not(target_os = "linux"))]
+    {
+        let bytes = fs::copy(src, dst)?;
+        Ok((bytes, CopyMethod::StandardCopy))
+    }
+}
+
+/// Recursively copies `src` to `dst`, recreating symlinks rather than following them.
+pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    let ty = meta.file_type();
+    if ty.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+    } else if ty.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        fs::set_permissions(dst, meta.permissions())
+    } else {
+        copy_file_fast(src, dst).map(|_| ())
+    }
+}
+
+/// Renames `src` to `dst`, falling back to copy + remove when they live on
+/// different filesystems (`EXDEV`).
+pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            copy_tree(src, dst)?;
+            if fs::symlink_metadata(src)?.is_dir() {
+                fs::remove_dir_all(src)
+            } else {
+                fs::remove_file(src)
+            }
+        }
+        res => res,
+    }
 }
 
 /// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.
@@ -184,6 +251,35 @@ pub fn install_sigpipe_handler() {
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Message written by the `SIGBUS` handler; set once by [`install_sigbus_handler`].
+static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+extern "C" fn on_sigbus(_: libc::c_int) {
+    // Async-signal-safe only: write(2) a preformatted message, then _exit(2).
+    if let Some(msg) = SIGBUS_MSG.get() {
+        unsafe {
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        }
+    }
+    unsafe { libc::_exit(1) }
+}
+
+/// Turns `SIGBUS` into a clean `tool: ...` error and exit status 1.
+///
+/// [`FastReader`] memory-maps regular files; if another process truncates a file
+/// while it is mapped, touching the vanished pages raises `SIGBUS`, which would
+/// otherwise kill the process with no explanation.
+pub fn install_sigbus_handler(tool: &str) {
+    let _ =
+        SIGBUS_MSG.set(format!("{tool}: input file was truncated while being read\n").into_bytes());
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigbus as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
     }
 }
 

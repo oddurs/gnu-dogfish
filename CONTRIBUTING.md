@@ -12,10 +12,12 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    cd gnu-dogfish
    cargo build --release
    ```
-2. **Run the Test Suite (39 Suites)**:
+2. **Run the Test Suite** (both profiles — debug builds enable clap's argument asserts and overflow checks, so CI runs both):
    ```bash
+   cargo test
    cargo test --release
    ```
+   On Linux with GNU coreutils installed, `tests/gnu_compat.rs` also diffs Dogfish against the system tools; on other platforms those cases are skipped.
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench
@@ -23,8 +25,9 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
 4. **Lint & Format**:
    ```bash
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets
+   cargo clippy --workspace --all-targets -- -D warnings
    ```
+   CI rejects any formatting diff or clippy warning.
 
 ---
 
@@ -52,7 +55,26 @@ The workspace consists of two crates:
 2. **Use `clap::Parser`** for flags, and support `-J` / `--json` (`emit_objects_or_table`) whenever the utility outputs structured records.
 3. **Record telemetry** via `ctx.telemetry.add_read(...)`, `ctx.telemetry.add_written(...)`, `ctx.telemetry.add_items(...)`, and `ctx.telemetry.set_strategy(...)`.
 4. **Register the utility** in `ALL_TOOLS` and `dispatch()` inside `crates/dogfish/src/main.rs`.
-5. **Add integration tests** in `crates/dogfish/tests/integration.rs` (and update the tool count in `test_all_57_tools_respond_to_help_cleanly`).
+5. **Add tests**: integration tests in `crates/dogfish/tests/integration.rs` (and update the tool count in `test_all_57_tools_respond_to_help_cleanly`), GNU differential cases in `tests/gnu_compat.rs`, and — for anything that writes, moves or deletes files — data-safety regressions in `tests/fs_safety.rs`.
+
+---
+
+## 🔀 Pull Requests & Releases
+
+- **Branches open PRs automatically.** Pushing a branch with new commits opens a *draft* PR against `main` (`.github/workflows/auto-pr.yml`); mark it ready when it is.
+- **PR titles are Conventional Commits** (`feat: ...`, `fix(cp): ...`, `perf: ...`, `docs: ...`, `chore: ...`; add `!` for breaking changes). PRs are squash-merged, so the title becomes the commit on `main`, and the **PR Title** check enforces the format.
+- **Releases are automated** by [release-please](https://github.com/googleapis/release-please): every merge to `main` updates a `chore: release X.Y.Z` PR that bumps the version in `Cargo.toml`, refreshes `Cargo.lock`, and adds a `CHANGELOG.md` entry from the commit titles (`feat` → minor, `fix`/`perf` → patch while we are pre-1.0). Merging it tags `vX.Y.Z`, publishes the GitHub Release, and attaches Linux and macOS archives with SHA-256 sums.
+- **Dependabot** opens weekly dependency and Actions updates; patch and minor ones auto-merge once CI is green, majors wait for a human.
+
+### Repository settings these workflows rely on (maintainers)
+
+| Setting | Where | Why |
+| :--- | :--- | :--- |
+| Allow squash merging (and preferably only squash) | Settings → General → Pull Requests | One Conventional Commit per PR on `main`. |
+| Allow auto-merge | Settings → General → Pull Requests | Dependabot (and maintainers) can queue merges. |
+| Branch protection on `main` requiring the CI checks (Lint, Test, MSRV, PR Title) | Settings → Branches | Auto-merge waits for green CI instead of merging immediately. |
+| Allow GitHub Actions to create and approve pull requests | Settings → Actions → General | The default token can open the release and draft PRs. |
+| Optional secrets `RELEASE_PLEASE_TOKEN`, `AUTO_PR_TOKEN` (fine-grained PAT or GitHub App token: contents + pull-requests write) | Settings → Secrets and variables → Actions | PRs opened with the default `GITHUB_TOKEN` don't trigger CI; with these secrets, release and auto-opened PRs get checks immediately. |
 
 ---
 

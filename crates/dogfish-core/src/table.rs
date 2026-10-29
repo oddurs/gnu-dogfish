@@ -128,12 +128,11 @@ pub fn read_ndjson_stdin(lines: &[String]) -> Option<Vec<Value>> {
 
     // Check if the entire input is a single JSON array
     let joined = non_empty.join("\n");
-    if joined.starts_with('[') {
-        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&joined) {
-            if arr.iter().all(|v| v.is_object()) {
-                return Some(arr);
-            }
-        }
+    if joined.starts_with('[')
+        && let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&joined)
+        && arr.iter().all(|v| v.is_object())
+    {
+        return Some(arr);
     }
 
     // Otherwise check if every line is a JSON object (NDJSON)

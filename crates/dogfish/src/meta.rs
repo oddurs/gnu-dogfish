@@ -94,8 +94,10 @@ pub fn run_history(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 original_path,
                 trash_path: _,
             } => format!("trashed '{}'", original_path),
-            JournalAction::Move { src, dst } => format!("'{}' -> '{}'", src, dst),
-            JournalAction::CopyCreate { src, created_path } => {
+            JournalAction::Move { src, dst, .. } => format!("'{}' -> '{}'", src, dst),
+            JournalAction::CopyCreate {
+                src, created_path, ..
+            } => {
                 format!("copied '{}' -> '{}'", src, created_path)
             }
         };
@@ -283,6 +285,7 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let exe = std::env::current_exe()?;
 
     let tmp_dir = tempfile::tempdir()?;
+    let bench_home = tmp_dir.path().join("dogfish_home");
     let payload_path = tmp_dir.path().join("bench_payload.txt");
     let copy_dogfish_dst = tmp_dir.path().join("copy_df.dat");
     let copy_sys_dst = tmp_dir.path().join("copy_sys.dat");
@@ -317,8 +320,13 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // 1. wc -l (SIMD bytecount vs /usr/bin/wc -l)
     if Path::new("/usr/bin/wc").exists() {
-        let df_dur = time_cmd(&exe, &["wc", "-l", &p_str], parsed.iterations);
-        let sys_dur = time_cmd(Path::new("/usr/bin/wc"), &["-l", &p_str], parsed.iterations);
+        let df_dur = time_cmd(&bench_home, &exe, &["wc", "-l", &p_str], parsed.iterations);
+        let sys_dur = time_cmd(
+            &bench_home,
+            Path::new("/usr/bin/wc"),
+            &["-l", &p_str],
+            parsed.iterations,
+        );
         results.push(make_bench_row(
             &format!("wc -l ({} MiB)", parsed.size_mb),
             df_dur,
@@ -329,8 +337,14 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // 2. cp (macOS APFS clonefile CoW / Linux FICLONE CoW vs /bin/cp)
     if Path::new("/bin/cp").exists() {
-        let df_dur = time_cmd(&exe, &["cp", &p_str, &cp_df_str], parsed.iterations);
+        let df_dur = time_cmd(
+            &bench_home,
+            &exe,
+            &["cp", &p_str, &cp_df_str],
+            parsed.iterations,
+        );
         let sys_dur = time_cmd(
+            &bench_home,
             Path::new("/bin/cp"),
             &[&p_str, &cp_sys_str],
             parsed.iterations,
@@ -350,8 +364,8 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // 3. sort -n (rayon par_sort_by vs /usr/bin/sort -n)
     if Path::new("/usr/bin/sort").exists() {
-        let df_dur = time_cmd(&exe, &["sort", "-r", &p_str], 3);
-        let sys_dur = time_cmd(Path::new("/usr/bin/sort"), &["-r", &p_str], 3);
+        let df_dur = time_cmd(&bench_home, &exe, &["sort", "-r", &p_str], 3);
+        let sys_dur = time_cmd(&bench_home, Path::new("/usr/bin/sort"), &["-r", &p_str], 3);
         results.push(make_bench_row(
             &format!("sort -r ({} MiB)", parsed.size_mb),
             df_dur,
@@ -362,8 +376,13 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     // 4. wc (full lines + words + bytes vs /usr/bin/wc)
     if Path::new("/usr/bin/wc").exists() {
-        let df_dur = time_cmd(&exe, &["wc", &p_str], parsed.iterations);
-        let sys_dur = time_cmd(Path::new("/usr/bin/wc"), &[&p_str], parsed.iterations);
+        let df_dur = time_cmd(&bench_home, &exe, &["wc", &p_str], parsed.iterations);
+        let sys_dur = time_cmd(
+            &bench_home,
+            Path::new("/usr/bin/wc"),
+            &[&p_str],
+            parsed.iterations,
+        );
         results.push(make_bench_row(
             &format!("wc -lwc ({} MiB)", parsed.size_mb),
             df_dur,
@@ -381,8 +400,8 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         None
     };
     if let Some((sys_bin, sys_args)) = sys_md5 {
-        let df_dur = time_cmd(&exe, &["md5sum", &p_str], parsed.iterations);
-        let sys_dur = time_cmd(sys_bin, &sys_args, parsed.iterations);
+        let df_dur = time_cmd(&bench_home, &exe, &["md5sum", &p_str], parsed.iterations);
+        let sys_dur = time_cmd(&bench_home, sys_bin, &sys_args, parsed.iterations);
         results.push(make_bench_row(
             &format!("md5sum ({} MiB)", parsed.size_mb),
             df_dur,
@@ -400,20 +419,26 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         None
     };
     if let Some((sys_bin, sys_args)) = sys_sha {
-        let df_dur = time_cmd(&exe, &["sha256sum", &p_str], parsed.iterations);
-        let sys_dur = time_cmd(sys_bin, &sys_args, parsed.iterations);
+        let df_dur = time_cmd(&bench_home, &exe, &["sha256sum", &p_str], parsed.iterations);
+        let sys_dur = time_cmd(&bench_home, sys_bin, &sys_args, parsed.iterations);
         results.push(make_bench_row(
             &format!("sha256sum ({} MiB)", parsed.size_mb),
             df_dur,
             sys_dur,
-            "mmap + hardware SHA-256",
+            "mmap + ring SHA-256 (OpenSSL asm)",
         ));
     }
 
     // 7. seq 1 1000000 vs /usr/bin/seq 1 1000000
     if Path::new("/usr/bin/seq").exists() {
-        let df_dur = time_cmd(&exe, &["seq", "1", "1000000"], parsed.iterations);
+        let df_dur = time_cmd(
+            &bench_home,
+            &exe,
+            &["seq", "1", "1000000"],
+            parsed.iterations,
+        );
         let sys_dur = time_cmd(
+            &bench_home,
             Path::new("/usr/bin/seq"),
             &["1", "1000000"],
             parsed.iterations,
@@ -465,12 +490,15 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     Ok(0)
 }
 
-fn time_cmd(bin: &Path, args: &[&str], iterations: usize) -> Duration {
+/// Best-of-N wall time. `home` isolates `DOGFISH_HOME` so benchmarking `cp` never
+/// writes to the user's real undo journal or trash.
+fn time_cmd(home: &Path, bin: &Path, args: &[&str], iterations: usize) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..iterations {
         let start = Instant::now();
         let _ = Command::new(bin)
             .args(args)
+            .env("DOGFISH_HOME", home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();

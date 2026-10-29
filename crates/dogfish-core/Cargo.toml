@@ -2,7 +2,14 @@
 name = "dogfish-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["coreutils", "ndjson", "mmap", "undo", "cli"]
+categories = ["command-line-utilities", "filesystem"]
 description = "Core engine for Dogfish coreutils: NDJSON pipelines, zero-copy I/O, telemetry, undo journal, and visual formatting"
 
 [dependencies]
@@ -16,3 +23,6 @@ chrono.workspace = true
 libc.workspace = true
 unicode-width.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

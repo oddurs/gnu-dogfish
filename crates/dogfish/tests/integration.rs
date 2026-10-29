@@ -122,8 +122,9 @@ fn test_whoami_id_uname_hostname_nproc() {
 
 #[test]
 fn test_env_and_printenv() {
+    // Like GNU env, assignments keep the order they were given in.
     let out = run(&["env", "-i", "FOO=bar", "BAZ=qux"]);
-    assert_eq!(stdout_str(&out), "BAZ=qux\nFOO=bar\n");
+    assert_eq!(stdout_str(&out), "FOO=bar\nBAZ=qux\n");
 
     let p_out = Command::new(bin())
         .env("DOGFISH_SECRET_VAR", "4242")
@@ -271,7 +272,7 @@ fn test_cat_flags_and_nl() {
     assert!(s.contains("     2\tsecond^Iitem$"));
 
     let nl_out = run_stdin(&["nl", "-w", "4", "-s", ": "], b"alpha\n\nbeta\n");
-    assert_eq!(stdout_str(&nl_out), "   1: alpha\n\n   2: beta\n");
+    assert_eq!(stdout_str(&nl_out), "   1: alpha\n      \n   2: beta\n");
 }
 
 #[test]
@@ -458,9 +459,9 @@ fn test_mkdir_touch_ln_chmod_stat_realpath_basename_dirname_mktemp() {
         0o640
     );
 
-    // stat -c and -J
+    // stat -c and -J (GNU output: `%a` has no leading zero; an empty file is "regular empty file")
     let st_fmt = run(&["stat", "-c", "%a %F", file_p.to_str().unwrap()]);
-    assert_eq!(stdout_str(&st_fmt).trim(), "0640 regular file");
+    assert_eq!(stdout_str(&st_fmt).trim(), "640 regular empty file");
 
     // realpath resolves symlink to canonical file
     let rp = run(&["realpath", link_p.to_str().unwrap()]);
@@ -788,9 +789,11 @@ fn test_unicode_multibyte_cut_wc_and_tr() {
     assert_eq!(wc_j["chars"].as_u64(), Some(10)); // 3 emojis + \n + 5 greek + \n = 10 chars
     assert_eq!(wc_j["bytes"].as_u64(), Some(24)); // 12 + 1 + 10 + 1 = 24 bytes
 
-    // `cut -c 2-3` should slice by Unicode scalar character, not raw byte!
+    // Like GNU coreutils, `cut -c` selects bytes, so it can split a character.
     let cut_c = run_stdin(&["cut", "-c", "2-3"], unicode_text.as_bytes());
-    assert_eq!(stdout_str(&cut_c), "🦀🦬\nβγ\n");
+    assert_eq!(cut_c.stdout, b"\x9f\xa6\n\xb1\xce\n");
+    let cut_c = run_stdin(&["cut", "-c", "5-12"], unicode_text.as_bytes());
+    assert_eq!(stdout_str(&cut_c), "🦀🦬\nγδε\n");
 }
 
 #[test]

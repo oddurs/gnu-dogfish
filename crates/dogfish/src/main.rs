@@ -1,3 +1,9 @@
+//! `dogfish`: the GNU/Dogfish multicall binary.
+
+// Doc comments on clap structs are the `--help` text, where usage syntax such as
+// `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
+#![allow(rustdoc::broken_intra_doc_links)]
+
 mod fs_ops;
 mod hash;
 mod meta;
@@ -8,7 +14,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, io::install_sigpipe_handler};
+use dogfish_core::{
+    ColumnAlign, DogfishContext, Table, gnu_io_error,
+    io::{install_sigbus_handler, install_sigpipe_handler},
+    strip_os_error_suffix,
+};
 
 pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     // Tier 1: File & Directory
@@ -316,26 +326,123 @@ fn main() -> ExitCode {
         }
     };
 
+    install_sigbus_handler(&tool_name);
     let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
+    // Like every GNU utility (scripts probe `tool --version`), a lone `--version`
+    // prints the version instead of being parsed as an operand or rejected.
+    if filtered_args.len() == 2 && filtered_args[1] == "--version" {
+        println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
+        // GNU `false` fails even when asked for its version.
+        return if tool_name == "false" {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
     let res = dispatch(&tool_name, filtered_args, &ctx);
     ctx.finish();
 
     match res {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
-            // If clap printed --help or --version, exit 0
             if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
-                let _ = clap_err.print();
-                return match clap_err.kind() {
-                    clap::error::ErrorKind::DisplayHelp
-                    | clap::error::ErrorKind::DisplayVersion => ExitCode::SUCCESS,
-                    _ => ExitCode::from(1),
-                };
+                use clap::error::ErrorKind;
+                if matches!(
+                    clap_err.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) {
+                    let _ = clap_err.print();
+                    return ExitCode::SUCCESS;
+                }
+                // Usage errors read like glibc getopt's, then GNU's "Try" hint.
+                match gnu_usage_message(clap_err) {
+                    Some(msg) => eprintln!(
+                        "{tool_name}: {msg}\nTry '{tool_name} --help' for more information."
+                    ),
+                    None => {
+                        let _ = clap_err.print();
+                    }
+                }
+                return ExitCode::from(usage_error_status(&tool_name));
             }
+            // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
+            let msg = match err.downcast_ref::<std::io::Error>() {
+                Some(io_err) => gnu_io_error(io_err),
+                None => strip_os_error_suffix(&err.to_string()),
+            };
+            let prefix = format!("{}: ", tool_name);
+            let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
             let st = ctx.stderr_style();
-            eprintln!("{} {}: {}", st.bold_red("error:"), st.bold(&tool_name), err);
+            eprintln!("{}: {}", st.bold(&tool_name), msg);
             ExitCode::from(1)
         }
+    }
+}
+
+/// Exit status GNU uses for command-line usage errors: most tools exit 1, but
+/// the ones whose own failures are reported with 1 reserve a distinct status.
+fn usage_error_status(tool: &str) -> u8 {
+    match tool {
+        "ls" | "sort" | "printenv" => 2,
+        "env" | "timeout" => 125,
+        _ => 1,
+    }
+}
+
+/// Translates a clap parse error into glibc `getopt_long` wording
+/// (`invalid option -- 'x'`, `unrecognized option '--xyz'`, ...), or `None`
+/// for kinds GNU has no generic message for.
+fn gnu_usage_message(err: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let context = |kind| match err.get(kind) {
+        Some(ContextValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    // clap names an option as it is declared (`--wrap <COLS>`); keep the flag.
+    let declared =
+        || context(ContextKind::InvalidArg).map(|a| a.split([' ', '=']).next().unwrap_or(a));
+    match err.kind() {
+        ErrorKind::UnknownArgument => {
+            let arg = context(ContextKind::InvalidArg)?;
+            Some(if arg.starts_with("--") {
+                // clap drops any `=VALUE`; GNU echoes the argument as typed.
+                let typed = std::env::args()
+                    .find(|a| a.strip_prefix(arg).is_some_and(|v| v.starts_with('=')))
+                    .unwrap_or_else(|| arg.to_string());
+                format!("unrecognized option '{typed}'")
+            } else if let Some(short) = arg.strip_prefix('-').and_then(|s| s.chars().next()) {
+                format!("invalid option -- '{short}'")
+            } else {
+                format!("extra operand '{arg}'")
+            })
+        }
+        ErrorKind::InvalidValue if context(ContextKind::InvalidValue) == Some("") => {
+            // A missing option argument: GNU names the option the way it was typed,
+            // which clap does not record, so look at the last option-like argument.
+            let typed = std::env::args().rev().find(|a| a.starts_with('-'));
+            Some(match typed {
+                Some(t) if !t.starts_with("--") => {
+                    let short = t.chars().last().unwrap_or('?');
+                    format!("option requires an argument -- '{short}'")
+                }
+                _ => format!("option '{}' requires an argument", declared()?),
+            })
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => Some(format!(
+            "invalid argument '{}' for '{}'",
+            context(ContextKind::InvalidValue)?,
+            declared()?
+        )),
+        ErrorKind::TooManyValues => {
+            let arg = declared()?;
+            Some(if arg.starts_with('-') {
+                format!("option '{arg}' doesn't allow an argument")
+            } else {
+                format!("extra operand '{}'", context(ContextKind::InvalidValue)?)
+            })
+        }
+        ErrorKind::MissingRequiredArgument => Some("missing operand".to_string()),
+        _ => None,
     }
 }
 

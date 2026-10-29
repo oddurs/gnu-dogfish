@@ -1,0 +1,59 @@
+name: Auto PR
+
+# Opens a draft PR against main for every pushed branch that has commits main lacks
+# and no open PR yet, with the PR template as its body. Mark it ready for review
+# when it is. The title comes from the branch's first commit; edit it into a
+# Conventional Commit if the PR Title check complains.
+#
+# Optional secret AUTO_PR_TOKEN (fine-grained PAT or GitHub App token with
+# pull-requests write): PRs opened with the default GITHUB_TOKEN do not trigger CI
+# until the next push. With GITHUB_TOKEN, enable "Allow GitHub Actions to create
+# and approve pull requests" in the repository's Actions settings.
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - "release-please--**"
+      - "dependabot/**"
+      - "gh-readonly-queue/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: auto-pr-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Open a draft PR if none exists
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "A PR is already open for $BRANCH"
+            exit 0
+          fi
+          git fetch --quiet origin main
+          commits=$(git log --reverse --format='- %s' origin/main..HEAD)
+          if [ -z "$commits" ]; then
+            echo "$BRANCH has no commits that main lacks"
+            exit 0
+          fi
+          title=$(git log --reverse --format=%s origin/main..HEAD | head -n 1)
+          {
+            cat .github/pull_request_template.md
+            printf '\n## Commits\n%s\n' "$commits"
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --draft --base main --head "$BRANCH" \
+            --title "$title" --body-file "$RUNNER_TEMP/body.md"
