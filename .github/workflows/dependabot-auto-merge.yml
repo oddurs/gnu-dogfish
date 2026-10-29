@@ -1,31 +1,80 @@
 name: Dependabot Auto-Merge
 
-# Queues GitHub auto-merge (squash) on Dependabot PRs for patch and minor updates;
-# GitHub merges them only once the required CI checks pass. Major updates are left
-# for a human. Requires "Allow auto-merge" and a branch protection rule on main that
-# requires the CI checks (otherwise auto-merge has nothing to wait for).
+# Squash-merges Dependabot PRs whose every update is semver-compatible, once the
+# CI run for the PR's exact head commit has passed. Everything else waits for a
+# human.
+#
+# "Compatible" is Cargo's rule, not Dependabot's label: for a 0.x crate a minor
+# bump (0.10 -> 0.11) is breaking, and so is any 0.0.x change. Dependabot calls
+# 0.10 -> 0.11 "semver-minor", which is how four breaking bumps once merged.
+#
+# This waits for CI itself rather than using GitHub auto-merge: without a branch
+# protection rule requiring checks, `gh pr merge --auto` merges immediately.
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize]
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   auto-merge:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - id: meta
         uses: dependabot/fetch-metadata@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for patch and minor updates
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
-        run: gh pr merge --auto --squash "$PR_URL"
+      - name: Decide whether every update is semver-compatible
+        id: decide
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          safe=$(jq -r '
+            length > 0 and all(.[];
+              (.prevVersion // "") as $v
+              | if .updateType == "version-update:semver-patch" then ($v | startswith("0.0.") | not)
+                elif .updateType == "version-update:semver-minor" then ($v | startswith("0.") | not)
+                else false end)' <<<"$DEPS")
+          echo "safe=$safe" >> "$GITHUB_OUTPUT"
+          echo "Updates: $DEPS"
+          echo "Semver-compatible: $safe"
+
+      - name: Wait for CI on the PR's head commit
+        if: steps.decide.outputs.safe == 'true'
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          run=""
+          for _ in $(seq 1 60); do
+            run=$(gh run list -R "$REPO" --workflow ci.yml --commit "$SHA" \
+              --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          if [ -z "$run" ]; then
+            echo "No CI run appeared for $SHA; leaving the PR for a human."
+            exit 1
+          fi
+          gh run watch -R "$REPO" "$run" --exit-status
+
+      - name: Squash-merge
+        if: steps.decide.outputs.safe == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: gh pr merge --squash --match-head-commit "$SHA" "$PR_URL"

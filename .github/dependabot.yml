@@ -4,7 +4,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # PR titles must be Conventional Commits (they become the squashed commit).
+    commit-message:
+      prefix: "chore(deps)"
     groups:
+      # Crates that must move together: digest's traits are implemented by md-5,
+      # blake2 and the ring adapter in hash.rs, so a lone bump never compiles.
+      rustcrypto:
+        patterns: ["digest", "md-5", "blake2", "sha2"]
       cargo-minor:
         update-types: [minor, patch]
 
@@ -12,3 +19,5 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "ci"
