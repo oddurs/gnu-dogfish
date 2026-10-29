@@ -347,7 +347,7 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     // Rich output: NDJSON objects are shuffled as objects on a terminal (or
     // with -J). Piped output is GNU's, byte for byte.
-    if (ctx.stdout_is_tty || cfg.json)
+    if (ctx.stdout_is_tty() || cfg.json)
         && !cfg.echo
         && cfg.range.is_none()
         && !cfg.repeat

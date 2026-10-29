@@ -35,11 +35,23 @@ fn seq_large_integers_keep_full_precision() {
 
 #[test]
 fn sigbus_from_truncated_mmap_is_a_clean_error() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
     // A mapped input truncated by another process raises SIGBUS; deliver one directly
-    // so the test is deterministic.
+    // so the test is deterministic, once `wc` has mapped the file and waits on
+    // standard input.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mapped");
+    // Larger than the 16 KiB below which files are read, not mapped.
+    let data = b"mapped\n".repeat(4096);
+    std::fs::write(&file, &data).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_dogfish"))
-        .args(["sleep", "10"])
-        .stderr(std::process::Stdio::piped())
+        .arg("wc")
+        .arg(&file)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -52,8 +64,22 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "sleep: input file was truncated while being read\n"
+        "wc: input file was truncated while being read\n"
     );
+
+    // A tool that maps nothing keeps the default action, as GNU's do (and
+    // pays no system call for the handler).
+    let child = Command::new(env!("CARGO_BIN_EXE_dogfish"))
+        .args(["sleep", "10"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: as above.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGBUS);
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGBUS));
 }
 
 #[test]

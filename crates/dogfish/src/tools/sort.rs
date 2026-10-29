@@ -1333,7 +1333,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // -J, or when --by/--where ask for it. Piped output is GNU's.
     if !parsed.check
         && !parsed.zero_terminated
-        && (ctx.stdout_is_tty
+        && (ctx.stdout_is_tty()
             || parsed.json
             || parsed.by_field.is_some()
             || parsed.where_expr.is_some())

@@ -23,7 +23,7 @@ use crate::tools::ls::options::{LsFormat, LsIgnore, parse_ls_args};
 use crate::tools::ls::rich::render_tree;
 
 pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
-    let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty) {
+    let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty()) {
         Ok(v) => v,
         Err(status) => return Ok(status),
     };
@@ -62,7 +62,7 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(0);
     }
 
-    let rich = ctx.stdout_is_tty
+    let rich = ctx.stdout_is_tty()
         && !opts.json
         && !opts.dired
         && matches!(
