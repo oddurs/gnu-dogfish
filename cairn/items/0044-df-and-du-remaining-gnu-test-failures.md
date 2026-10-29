@@ -3,7 +3,7 @@ id: 44
 uid: f3dfedbb-b966-487c-b67e-3a92dd527d1f
 title: "df and du: remaining GNU test failures"
 type: bug
-status: doing
+status: done
 assignee: claude
 claimed: 2026-10-29
 milestone: "v1.0"
@@ -11,6 +11,7 @@ depends_on:
 - 8
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p2
 effort: m
 area: compat
@@ -42,8 +43,8 @@ All listed tests pass.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
 
 ## 2026-10-29
 

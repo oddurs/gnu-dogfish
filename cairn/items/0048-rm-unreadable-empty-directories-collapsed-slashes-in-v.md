@@ -3,12 +3,13 @@ id: 48
 uid: 054d61a4-eea6-4446-bcb3-42e34c1637e4
 title: "rm: unreadable empty directories, collapsed slashes in -v"
 type: bug
-status: backlog
+status: done
 milestone: "v1.0"
 depends_on:
 - 8
 created: 2026-10-29
 updated: 2026-10-29
+closed_at: 2026-10-29
 priority: p2
 effort: s
 area: compat
@@ -35,5 +36,5 @@ Both tests pass (as non-root, as the suite runs).
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.

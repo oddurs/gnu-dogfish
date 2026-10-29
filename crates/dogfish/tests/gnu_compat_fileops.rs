@@ -962,6 +962,16 @@ tree_cases! {
     rm_one_file_system: "rm" ["-rv", "--one-file-system", "d"];
     rm_quoting: "rm" ["-v", "spa ce"];
     rm_bad_option: "rm" ["-X", "a"];
+    // fts keeps one of several trailing slashes, in messages too.
+    rm_recursive_collapsed_slashes: "rm" ["-rv", "d///"];
+    rm_dir_flag_collapsed_slashes: "rm" ["-dv", "e//"];
+    rm_directory_collapsed_slashes: "rm" ["d///"];
+    rm_missing_collapsed_slashes: "rm" ["nope///", "a//"];
+    // Deeper than PATH_MAX (140 levels of 40-byte names) and than the
+    // directories rm keeps open.
+    // (Perl: a shell's `cd` may build the full path, which is too long.)
+    rm_recursive_deeper_than_path_max: "rm" ["-rv", "long"] setup("perl -e 'my $n = q(n) x 40; mkdir q(long) and chdir q(long) or die $!; for my $i (1..140) { mkdir $n and chdir $n or die $!; if ($i % 30 == 0) { open(my $f, q(>), qq(f$i)) or die $!; mkdir qq(s$i) or die $! } } open(my $f, q(>), q(f)) or die $!'");
+    rm_recursive_deeper_than_path_max_quiet: "rm" ["-r", "long", "a"] setup("perl -e 'my $n = q(n) x 40; mkdir q(long) and chdir q(long) or die $!; for my $i (1..140) { mkdir $n and chdir $n or die $! } symlink(q(/), q(root)) or die $!; symlink(q(..), q(up)) or die $!'");
 
     // ----------------------------------------------------------------- cp
     cp_verbose: "cp" ["-v", "a", "c"];
