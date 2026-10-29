@@ -183,6 +183,22 @@ gh attestation verify gnu-dogfish-linux-x86_64.tar.gz --repo oddurs/gnu-dogfish
 
 [doc/verify.md](doc/verify.md) covers the details, including rebuilding a release bit for bit.
 
+Each archive holds the `dogfish` binary and a `share/` tree: manual pages (`dogfish.1`, and `dogfish-ls.1` and so on for each utility) and completions for bash, zsh and fish. To install under `~/.local`:
+
+```bash
+mkdir -p ~/.local/bin ~/.local/share && tar xzf gnu-dogfish-linux-x86_64.tar.gz -C /tmp
+install -m 755 /tmp/dogfish ~/.local/bin/
+cp -R /tmp/share/. ~/.local/share/
+man dogfish-ls
+```
+
+- **man** finds `~/.local/share/man` when `~/.local/bin` is on `PATH` (or add it to `MANPATH`).
+- **bash** (with bash-completion) loads `~/.local/share/bash-completion/completions/dogfish` when you complete `dogfish`. For the links `install-links` makes (`ls`, `df-ls`), source that file from `~/.bashrc`: it completes every link that resolves to the dogfish binary.
+- **zsh**: `fpath=(~/.local/share/zsh/site-functions $fpath)` before `compinit`. `df-*` links complete on their own; for links named after the tools, add `compdef _dogfish ls cp mv` (and so on). Aliases from `dogfish init` complete as `dogfish TOOL`.
+- **fish** loads `~/.local/share/fish/vendor_completions.d/dogfish.fish` when you complete `dogfish`; source it from `config.fish` to complete `df-*` links and links that resolve to dogfish from the start.
+
+A source build writes the same tree with `cargo xtask docs-gen` (into `target/docs-gen/share`). The pages and completions are generated from each tool's option table and `--help` text, so they list exactly what the parser accepts.
+
 ### Build from Source
 ```bash
 git clone https://github.com/oddurs/gnu-dogfish.git

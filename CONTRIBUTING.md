@@ -21,7 +21,9 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    (`rustup toolchain install 1.88`), a macOS type-check from Linux
    (`rustup target add aarch64-apple-darwin`), `cargo test` in debug (overflow
    checks are on) and release, every test binary
-   again as `nobody` when you run it as root, docs, and a packaging dry run.
+   again as `nobody` when you run it as root, docs, the man pages and shell
+   completions (`docs-gen`, linted with groff, mandoc, bash, zsh and fish where
+   installed), and a packaging dry run.
    `cargo xtask` lists the steps; each runs on its own too (`cargo xtask test`).
    CI calls the same steps, so the two cannot drift (CI also runs the tests on macOS).
 
@@ -49,6 +51,14 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    Otherwise give the block a `// SAFETY:` comment (Clippy enforces it) and a
    row in [`doc/unsafe.md`](doc/unsafe.md) (`cargo xtask unsafe-audit` enforces
    it).
+5. **Adding or changing an option**: the man pages and completions come from
+   the tool's option table (its `OptSpec`s) and its `--help` text, through the
+   `manual()` function next to the parser (`crates/dogfish/src/manual/`). Put
+   the option in both. If its argument is one of a fixed set of words, list
+   them with `.choices("name", ...)` in `manual()`: `tests/manual.rs` checks
+   the list against the tool's own "Valid arguments are:" diagnostic. Nothing
+   generated is committed; `dogfish --generate man ls` (or `bash`, `zsh`,
+   `fish`) prints one, and `cargo xtask docs-gen` writes them all.
 
 ---
 
