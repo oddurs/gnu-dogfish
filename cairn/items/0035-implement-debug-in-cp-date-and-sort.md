@@ -3,7 +3,9 @@ id: 35
 uid: 33581729-a7b4-45aa-88fe-f2eb63d7d8ff
 title: "Implement --debug in cp, date and sort"
 type: bug
-status: backlog
+status: doing
+assignee: claude
+claimed: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -41,3 +43,7 @@ date's part needs the full date grammar (0019).
 
 - [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
 - [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## 2026-10-29
+
+`date --debug` is done (tests/date/date-debug.sh passes; traces match GNU's). cp and sort `--debug` remain.
