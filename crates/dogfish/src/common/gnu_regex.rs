@@ -1,5 +1,6 @@
 //! A small GNU regex work-alike for the default syntax `re_compile_pattern`
-//! uses (`RE_SYNTAX_EMACS`, i.e. no syntax bits), as `tac -r` needs it.
+//! uses (`RE_SYNTAX_EMACS`, i.e. no syntax bits), as `tac -r` needs it,
+//! and for POSIX basic syntax (`nl -bpBRE`, see [`Regex::new_basic`]).
 //!
 //! Syntax: `.` (any byte but newline), `[...]` / `[^...]` with ranges (no
 //! `[:class:]`, backslash is literal inside), `*` `+` `?` (literal where
@@ -14,6 +15,8 @@
 enum Node {
     Byte(u8),
     Any,
+    /// `.` in POSIX syntax: any byte but NUL (newline included).
+    AnyNotNul,
     Set(Box<[bool; 256]>),
     LineStart,
     LineEnd,
@@ -58,6 +61,9 @@ struct Parser<'a> {
     groups: usize,
     /// Groups whose `\)` has been seen (valid back-reference targets).
     closed: Vec<usize>,
+    /// POSIX basic syntax: `\+ \? \{m,n\}` are operators (`+ ?` are
+    /// literal), `.` matches newline but not NUL, lists take `[:class:]`.
+    basic: bool,
 }
 
 impl Parser<'_> {
@@ -95,8 +101,27 @@ impl Parser<'_> {
                 }
                 break;
             }
+            // POSIX basic: \+ \? \{m,n\} repeat what precedes them.
+            if self.basic
+                && can_repeat
+                && c == b'\\'
+                && matches!(self.p.get(self.i + 1), Some(b'+' | b'?' | b'{'))
+            {
+                let op = self.p[self.i + 1];
+                self.i += 2;
+                let (min, max) = match op {
+                    b'+' => (1, None),
+                    b'?' => (0, Some(1)),
+                    _ => self.interval()?,
+                };
+                if let Some(prev) = seq.pop() {
+                    seq.push(Node::Repeat(Box::new(prev), min, max));
+                }
+                continue;
+            }
             self.i += 1;
             let node = match c {
+                b'+' | b'?' if self.basic => Node::Byte(c),
                 b'*' | b'+' | b'?' if can_repeat => {
                     let Some(prev) = seq.pop() else {
                         continue;
@@ -116,6 +141,7 @@ impl Parser<'_> {
                     continue;
                 }
                 b'$' if self.at_branch_end(self.i) => Node::LineEnd,
+                b'.' if self.basic => Node::AnyNotNul,
                 b'.' => Node::Any,
                 b'[' => self.bracket()?,
                 b'\\' => {
@@ -164,6 +190,43 @@ impl Parser<'_> {
         Ok(seq)
     }
 
+    /// `\{m,n\}`, the `\{` already consumed.
+    fn interval(&mut self) -> Result<(usize, Option<usize>), &'static str> {
+        const BAD: &str = "Invalid content of \\{\\}";
+        let number = |me: &mut Self| {
+            let start = me.i;
+            while me.p.get(me.i).is_some_and(u8::is_ascii_digit) {
+                me.i += 1;
+            }
+            std::str::from_utf8(&me.p[start..me.i])
+                .ok()
+                .and_then(|d| d.parse::<usize>().ok())
+        };
+        let min = number(self);
+        let max = if self.p.get(self.i) == Some(&b',') {
+            self.i += 1;
+            number(self)
+        } else {
+            Some(min.ok_or(BAD)?)
+        };
+        if !self.peek_is(b'\\', Some(b'}')) {
+            return Err(if self.i >= self.p.len() {
+                "Unmatched \\{"
+            } else {
+                BAD
+            });
+        }
+        self.i += 2;
+        let min = min.unwrap_or(0);
+        if max.is_some_and(|m| m < min) {
+            return Err(BAD);
+        }
+        if min > 0x7fff || max.is_some_and(|m| m > 0x7fff) {
+            return Err("Regular expression too big");
+        }
+        Ok((min, max))
+    }
+
     /// `[...]`, the `[` already consumed.
     fn bracket(&mut self) -> Result<Node, &'static str> {
         const UNMATCHED: &str = "Unmatched [, [^, [:, [., or [=";
@@ -183,6 +246,29 @@ impl Parser<'_> {
             }
             first = false;
             self.i += 1;
+            // POSIX lists: [:class:], [=c=], [.c.].
+            if self.basic && c == b'[' && matches!(self.p.get(self.i), Some(b':' | b'=' | b'.')) {
+                let kind = self.p[self.i];
+                let body = self.i + 1;
+                let close = (body..self.p.len().saturating_sub(1))
+                    .find(|&j| self.p[j] == kind && self.p[j + 1] == b']')
+                    .ok_or(UNMATCHED)?;
+                let name = &self.p[body..close];
+                self.i = close + 2;
+                if kind == b':' {
+                    let pred = class_predicate(name).ok_or("Invalid character class name")?;
+                    for b in 0..=255u8 {
+                        if pred(b) {
+                            set[b as usize] = true;
+                        }
+                    }
+                } else if let [one] = name {
+                    set[*one as usize] = true;
+                } else {
+                    return Err("Invalid collation character");
+                }
+                continue;
+            }
             if self.p.get(self.i) == Some(&b'-')
                 && self.p.get(self.i + 1).is_some_and(|&e| e != b']')
             {
@@ -206,14 +292,45 @@ impl Parser<'_> {
     }
 }
 
+/// C-locale `<ctype.h>` classes by name.
+fn class_predicate(name: &[u8]) -> Option<fn(u8) -> bool> {
+    Some(match name {
+        b"alnum" => |c: u8| c.is_ascii_alphanumeric(),
+        b"alpha" => |c: u8| c.is_ascii_alphabetic(),
+        b"blank" => |c: u8| c == b' ' || c == b'\t',
+        b"cntrl" => |c: u8| c < 0x20 || c == 0x7f,
+        b"digit" => |c: u8| c.is_ascii_digit(),
+        b"graph" => |c: u8| c.is_ascii_graphic(),
+        b"lower" => |c: u8| c.is_ascii_lowercase(),
+        b"print" => |c: u8| (0x20..0x7f).contains(&c),
+        b"punct" => |c: u8| c.is_ascii_punctuation(),
+        b"space" => |c: u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'),
+        b"upper" => |c: u8| c.is_ascii_uppercase(),
+        b"xdigit" => |c: u8| c.is_ascii_hexdigit(),
+        _ => return None,
+    })
+}
+
 impl Regex {
-    /// Compiles `pattern`, or returns GNU's message (`Unmatched ( or \(`, ...).
+    /// Compiles `pattern` in GNU's default (Emacs) syntax, or returns GNU's
+    /// message (`Unmatched ( or \(`, ...).
     pub(crate) fn new(pattern: &[u8]) -> Result<Self, &'static str> {
+        Self::compile(pattern, false)
+    }
+
+    /// Compiles `pattern` as a POSIX basic regular expression (GNU's
+    /// `RE_SYNTAX_POSIX_BASIC`, with empty ranges allowed).
+    pub(crate) fn new_basic(pattern: &[u8]) -> Result<Self, &'static str> {
+        Self::compile(pattern, true)
+    }
+
+    fn compile(pattern: &[u8], basic: bool) -> Result<Self, &'static str> {
         let mut parser = Parser {
             p: pattern,
             i: 0,
             groups: 0,
             closed: Vec::new(),
+            basic,
         };
         let alts = parser.alternatives(0)?;
         if parser.i < pattern.len() {
@@ -232,6 +349,11 @@ impl Regex {
         };
         m.alternatives(&self.alts, start, &Cont::Done);
         m.best
+    }
+
+    /// Whether the pattern matches anywhere in `text` (`re_search` forward).
+    pub(crate) fn is_match(&self, text: &[u8]) -> bool {
+        (0..=text.len()).any(|s| self.match_at(text, s).is_some())
     }
 
     /// Searches backward like `re_search (..., start, -start)`: the match
@@ -365,6 +487,7 @@ impl Matcher<'_> {
         match node {
             Node::Byte(c) => ok_byte(at(pos) == Some(*c), self),
             Node::Any => ok_byte(at(pos).is_some_and(|c| c != b'\n'), self),
+            Node::AnyNotNul => ok_byte(at(pos).is_some_and(|c| c != 0), self),
             Node::Set(set) => ok_byte(at(pos).is_some_and(|c| set[c as usize]), self),
             Node::Word(want) => ok_byte(at(pos).is_some_and(|c| is_word(c) == *want), self),
             Node::Space(want) => ok_byte(
@@ -415,6 +538,24 @@ mod tests {
         assert_eq!(longest("a\\{2\\}", "a{2}", 0), Some(4));
         assert_eq!(longest("x$", "x\ny", 0), Some(1));
         assert_eq!(longest("^b", "a\nb", 2), Some(3));
+    }
+
+    #[test]
+    fn basic_syntax() {
+        let m = |p: &str, t: &str| {
+            Regex::new_basic(p.as_bytes())
+                .unwrap()
+                .is_match(t.as_bytes())
+        };
+        assert!(m("a\\{2\\}", "xaa"));
+        assert!(!m("a\\{3\\}", "aa"));
+        assert!(m("a+", "a+"));
+        assert!(!m("a+", "aa"));
+        assert!(m("ab\\+c", "abbc"));
+        assert!(m("[[:digit:]]x", "7x"));
+        assert!(m("^b", "b"));
+        assert!(!m("^b", "ab"));
+        assert_eq!(Regex::new_basic(b"a\\{2").unwrap_err(), "Unmatched \\{");
     }
 
     #[test]

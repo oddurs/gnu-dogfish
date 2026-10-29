@@ -22,11 +22,6 @@ pub(crate) fn split_records(buf: &[u8], eol: u8) -> impl Iterator<Item = &[u8]> 
     body.split(move |&b| b == eol).filter(move |_| !empty)
 }
 
-/// Strips the line terminator (`\n` only — `\r` is data, as in GNU).
-pub(crate) fn chomp(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\n").unwrap_or(line)
-}
-
 pub(crate) fn is_blank(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }

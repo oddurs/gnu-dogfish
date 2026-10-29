@@ -297,6 +297,27 @@ gnu_cases! {
     shuf_extra_operand: "shuf" ["lines.txt", "many.txt"];
     shuf_missing_file: "shuf" ["nonexist"];
     shuf_one_line_no_newline: "shuf" [] stdin b"x";
+    // ----------------------------------------------------------------- nl
+    nl_sections: "nl" ["-ha", "-fa", "sections.txt"];
+    nl_sections_no_renumber: "nl" ["-p", "-ha", "-fa", "sections.txt"];
+    nl_section_delimiter_empty: "nl" ["-d", "", "sections.txt"];
+    nl_section_delimiter_one_char: "nl" ["-d", "x"] stdin b"a\nx:x:\nc\n";
+    nl_section_delimiter_long: "nl" ["-d", "foo"] stdin b"a\nfoofoo\nc\n";
+    nl_regex_style: "nl" ["-bp[ac]", "many.txt"];
+    nl_regex_style_interval: "nl" ["-bp^1\\{2\\}"] stdin b"1\n11\n111\n";
+    nl_regex_error: "nl" ["-bp\\(", "many.txt"];
+    nl_join_blank_lines: "nl" ["-ba", "-l2"] stdin b"a\n\n\n\n\nb\n";
+    nl_start_too_large: "nl" ["-v9223372036854775808", "many.txt"];
+    nl_start_max: "nl" ["-v9223372036854775807"] stdin b"a\n\\:\\:\nb\n";
+    nl_overflow: "nl" ["-p", "-v9223372036854775807"] stdin b"a\n\\:\\:\nb\n";
+    nl_increment_too_small: "nl" ["-i-9223372036854775809", "many.txt"];
+    nl_increment_min: "nl" ["-v9223372036854775807", "-i-9223372036854775808"] stdin b"a\nb\n";
+    nl_bad_style: "nl" ["-bx", "-hy", "many.txt"];
+    nl_bad_format: "nl" ["-nxx", "many.txt"];
+    nl_bad_width: "nl" ["-w0", "many.txt"];
+    nl_bad_join: "nl" ["-l0", "many.txt"];
+    nl_rz_negative: "nl" ["-n", "rz", "-v", "-5"] stdin b"a\nb\n";
+    nl_left: "nl" ["-n", "ln", "-s", "%n"] stdin b"a\nb";
 }
 
 // ------------------------------------------------------- shell pipelines

@@ -147,6 +147,59 @@ pub(crate) fn xdectoumax(
     Err(msg)
 }
 
+/// gnulib `xdectoimax` with no suffixes allowed: a signed decimal number
+/// in `min..=max`, or GNU's message (as for [`xdectoumax`]).
+pub(crate) fn xdectoimax(s: &str, min: i64, max: i64, err: &str) -> Result<i64, String> {
+    let bytes = s.as_bytes();
+    let mut pos = bytes
+        .iter()
+        .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .count();
+    let neg = match bytes.get(pos) {
+        Some(b'-') => {
+            pos += 1;
+            true
+        }
+        Some(b'+') => {
+            pos += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = &bytes[pos..];
+    let n = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut errno_text = None;
+    let valid = n > 0 && n == digits.len();
+    if valid {
+        let mut v: i128 = 0;
+        for &d in &digits[..n] {
+            v = (v * 10 + i128::from(d - b'0')).min(1 << 100);
+        }
+        let v = if neg { -v } else { v };
+        if v < i128::from(i64::MIN) || v > i128::from(i64::MAX) {
+            errno_text = Some("Value too large for defined data type");
+        } else {
+            let v = v as i64;
+            if (min..=max).contains(&v) {
+                return Ok(v);
+            }
+            errno_text = Some(
+                if v > i64::from(i32::MAX / 2) || v < i64::from(i32::MIN / 2) {
+                    "Value too large for defined data type"
+                } else {
+                    "Numerical result out of range"
+                },
+            );
+        }
+    }
+    let mut msg = format!("{err}: {}", quote_locale(s));
+    if let Some(text) = errno_text {
+        msg.push_str(": ");
+        msg.push_str(text);
+    }
+    Err(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
