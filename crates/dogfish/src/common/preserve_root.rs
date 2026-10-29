@@ -1,5 +1,7 @@
 //! The `--preserve-root` failsafe (chmod, chown, rm).
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use dogfish_core::same_file;
@@ -7,8 +9,9 @@ use dogfish_core::same_file;
 use crate::common::quote::qa;
 
 /// The `--preserve-root` failsafe message for recursive `rm`, `chmod` and `chown`.
-pub(crate) fn refuse_root(tool: &str, operand: &str) {
-    if operand == "/" {
+pub(crate) fn refuse_root(tool: &str, operand: impl AsRef<OsStr>) {
+    let operand = operand.as_ref();
+    if operand.as_bytes() == b"/" {
         eprintln!("{tool}: it is dangerous to operate recursively on '/'");
     } else {
         eprintln!(

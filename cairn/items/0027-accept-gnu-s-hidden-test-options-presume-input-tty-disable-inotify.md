@@ -3,7 +3,10 @@ id: 27
 uid: 1a09beed-5130-4ed4-b8ea-1fc03dddcf8f
 title: "Accept GNU's hidden test options (---presume-input-tty, ---disable-inotify)"
 type: bug
-status: planned
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v0.3"
 depends_on:
 - 8
@@ -53,5 +56,9 @@ The tail tests also need follow mode (0033); this item unblocks the rm tests out
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`rm ---presume-input-tty` and `tail ---disable-inotify` are accepted (prefix-matchable, hidden from --help); rm prompts as if stdin were a terminal. GNU tests now passing and added to the baseline: help/help-version-getopt, misc/false-status, misc/close-stdout, misc/yes, misc/write-errors, head/head-write-error, rm/dangling-symlink, rm/dir-no-w, rm/empty-inacc, rm/interactive-once, rm/isatty. About 60 new differential cases (abbreviations, ambiguity, --help anywhere, POSIXLY_CORRECT, /dev/full, per-tool switches, 0xff names) and 25 parser unit tests; `cargo xtask ci` passes (6,453 tests).

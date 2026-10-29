@@ -22,34 +22,114 @@ pub const DEFAULT_BACKUP_LIMIT: u64 = 1 << 30;
 /// from 0.1.0, which never cleaned up) are deleted this long after entering the trash.
 const ORPHAN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// Paths in the journal, losslessly: a JSON string when the path is UTF-8
+/// (as every journal before non-UTF-8 support wrote them), otherwise
+/// `{"path_bytes": "<base64>"}`.
+mod json_path {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr<'a> {
+        Text(std::borrow::Cow<'a, str>),
+        Bytes { path_bytes: String },
+    }
+
+    fn repr(p: &Path) -> Repr<'_> {
+        match p.to_str() {
+            Some(t) => Repr::Text(t.into()),
+            None => Repr::Bytes {
+                path_bytes: STANDARD.encode(p.as_os_str().as_bytes()),
+            },
+        }
+    }
+
+    fn from_repr<E: serde::de::Error>(r: Repr<'_>) -> Result<PathBuf, E> {
+        match r {
+            Repr::Text(t) => Ok(PathBuf::from(t.into_owned())),
+            Repr::Bytes { path_bytes } => STANDARD
+                .decode(path_bytes)
+                .map(|b| PathBuf::from(std::ffi::OsString::from_vec(b)))
+                .map_err(E::custom),
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+        repr(p).serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        from_repr(Repr::deserialize(d).map_err(D::Error::custom)?)
+    }
+
+    pub(super) mod option {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(
+            p: &Option<PathBuf>,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            p.as_deref().map(repr).serialize(s)
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> Result<Option<PathBuf>, D::Error> {
+            Option::<Repr<'_>>::deserialize(d)?
+                .map(from_repr)
+                .transpose()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum JournalAction {
     /// File or directory moved to Dogfish trash (`trash_path` -> original `original_path`).
     TrashRemove {
-        original_path: String,
-        trash_path: String,
+        #[serde(with = "json_path")]
+        original_path: PathBuf,
+        #[serde(with = "json_path")]
+        trash_path: PathBuf,
     },
     /// File or directory moved/renamed (`src` -> `dst`). `backup_path` holds whatever
     /// `dst` contained before it was overwritten, if anything.
     Move {
-        src: String,
-        dst: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        backup_path: Option<String>,
+        #[serde(with = "json_path")]
+        src: PathBuf,
+        #[serde(with = "json_path")]
+        dst: PathBuf,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "json_path::option"
+        )]
+        backup_path: Option<PathBuf>,
     },
     /// File or directory created via `cp` (`created_path`). `backup_path` holds the prior
     /// contents of `created_path` if the copy overwrote or merged into something.
     CopyCreate {
-        src: String,
-        created_path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        backup_path: Option<String>,
+        #[serde(with = "json_path")]
+        src: PathBuf,
+        #[serde(with = "json_path")]
+        created_path: PathBuf,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "json_path::option"
+        )]
+        backup_path: Option<PathBuf>,
     },
 }
 
 impl JournalAction {
-    fn backup_path(&self) -> Option<&str> {
+    fn backup_path(&self) -> Option<&Path> {
         match self {
             Self::TrashRemove { .. } => None,
             Self::Move { backup_path, .. } | Self::CopyCreate { backup_path, .. } => {
@@ -59,14 +139,14 @@ impl JournalAction {
     }
 
     /// Everything this entry keeps in the trash, deleted once the entry is dropped.
-    fn payload_path(&self) -> Option<&str> {
+    fn payload_path(&self) -> Option<&Path> {
         match self {
             Self::TrashRemove { trash_path, .. } => Some(trash_path),
             _ => self.backup_path(),
         }
     }
 
-    fn drop_backup(&mut self) -> Option<String> {
+    fn drop_backup(&mut self) -> Option<PathBuf> {
         match self {
             Self::TrashRemove { .. } => None,
             Self::Move { backup_path, .. } | Self::CopyCreate { backup_path, .. } => {
@@ -118,6 +198,7 @@ struct JournalLock(File);
 
 impl Drop for JournalLock {
     fn drop(&mut self) {
+        // SAFETY: flock takes an open descriptor (owned by self.0) and no pointers.
         unsafe {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
@@ -237,6 +318,7 @@ impl UndoJournal {
             .truncate(false)
             .write(true)
             .open(self.base_dir.join("journal.lock"))?;
+        // SAFETY: flock takes an open descriptor (owned by `f`) and no pointers.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -271,17 +353,14 @@ impl UndoJournal {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let fname = original
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "item".to_string());
-        self.trash_dir().join(format!(
-            "{}_{}_{}_{}",
+        let mut slot = std::ffi::OsString::from(format!(
+            "{}_{}_{}_",
             nanos,
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed),
-            fname
-        ))
+        ));
+        slot.push(original.file_name().unwrap_or("item".as_ref()));
+        self.trash_dir().join(slot)
     }
 
     fn read_journal(&self) -> io::Result<String> {
@@ -348,7 +427,7 @@ impl UndoJournal {
             id: last_id + 1,
             timestamp_unix: now_unix(),
             tool: tool.to_string(),
-            backup_bytes: action.backup_path().map_or(0, |p| path_size(Path::new(p))),
+            backup_bytes: action.backup_path().map_or(0, path_size),
             backup_purged: false,
             action,
         };
@@ -391,7 +470,7 @@ impl UndoJournal {
             let excess = entries.len() - self.max_entries;
             for old in entries.drain(..excess) {
                 if let Some(p) = old.action.payload_path() {
-                    remove_any(Path::new(p))?;
+                    remove_any(p)?;
                 }
             }
             changed = true;
@@ -408,7 +487,7 @@ impl UndoJournal {
                 break;
             }
             if let Some(p) = e.action.drop_backup() {
-                remove_any(Path::new(&p))?;
+                remove_any(&p)?;
                 total -= e.backup_bytes;
                 e.backup_purged = true;
                 changed = true;
@@ -430,7 +509,7 @@ impl UndoJournal {
 
         let referenced: HashSet<PathBuf> = entries
             .iter()
-            .filter_map(|e| e.action.payload_path().map(PathBuf::from))
+            .filter_map(|e| e.action.payload_path().map(Path::to_path_buf))
             .collect();
         for item in fs::read_dir(self.trash_dir())?.flatten() {
             let path = item.path();
@@ -447,7 +526,7 @@ impl UndoJournal {
     /// Preserves whatever currently lives at `target` (if anything) in the trash so an
     /// overwriting `cp`/`mv` can be undone. With `by_copy`, `target` is left in place
     /// (needed when the caller writes into it, e.g. `cp -r` merging into a directory).
-    pub fn backup_existing(&self, target: &Path, by_copy: bool) -> io::Result<Option<String>> {
+    pub fn backup_existing(&self, target: &Path, by_copy: bool) -> io::Result<Option<PathBuf>> {
         if !exists_no_follow(target) {
             return Ok(None);
         }
@@ -457,7 +536,7 @@ impl UndoJournal {
         } else {
             move_path(target, &slot)?;
         }
-        Ok(Some(slot.to_string_lossy().into_owned()))
+        Ok(Some(slot))
     }
 
     /// Stages a file or directory into `~/.dogfish/trash` and records a `TrashRemove` entry.
@@ -471,8 +550,8 @@ impl UndoJournal {
         self.record(
             "rm",
             JournalAction::TrashRemove {
-                original_path: abs.to_string_lossy().into_owned(),
-                trash_path: trash_target.to_string_lossy().into_owned(),
+                original_path: abs,
+                trash_path: trash_target,
             },
         )
     }
@@ -494,25 +573,27 @@ impl UndoJournal {
                 original_path,
                 trash_path,
             } => {
-                let orig = Path::new(original_path);
+                let orig = original_path.as_path();
                 refuse_existing(orig)?;
                 if let Some(parent) = orig.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                move_path(Path::new(trash_path), orig)?;
-                format!("Restored '{}' from trash", original_path)
+                move_path(trash_path, orig)?;
+                format!("Restored '{}' from trash", original_path.display())
             }
             JournalAction::Move {
                 src,
                 dst,
                 backup_path,
             } => {
-                let src_p = Path::new(src);
-                refuse_existing(src_p)?;
-                move_path(Path::new(dst), src_p)?;
+                refuse_existing(src)?;
+                move_path(dst, src)?;
+                if let Some(backup) = backup_path {
+                    move_path(backup, dst)?;
+                }
+                let (src, dst) = (src.display(), dst.display());
                 match backup_path {
-                    Some(backup) => {
-                        move_path(Path::new(backup), Path::new(dst))?;
+                    Some(_) => {
                         format!(
                             "Moved '{}' back to '{}' and restored the original",
                             dst, src
@@ -531,7 +612,8 @@ impl UndoJournal {
                 created_path,
                 backup_path,
             } => {
-                let p = Path::new(created_path);
+                let p = created_path.as_path();
+                let created_path = created_path.display();
                 if entry.backup_purged {
                     // The copy is now the only version left; removing it would lose data.
                     format!(
@@ -547,7 +629,7 @@ impl UndoJournal {
                     }
                     match backup_path {
                         Some(backup) => {
-                            move_path(Path::new(backup), p)?;
+                            move_path(backup, p)?;
                             format!("Restored '{}' to its state before the copy", created_path)
                         }
                         None => format!("Removed copied target '{}'", created_path),
@@ -589,7 +671,7 @@ mod tests {
             tool: "rm".into(),
             action: JournalAction::TrashRemove {
                 original_path: "/x".into(),
-                trash_path: kept.to_string_lossy().into_owned(),
+                trash_path: kept.clone(),
             },
             backup_bytes: 0,
             backup_purged: false,
@@ -603,5 +685,56 @@ mod tests {
         j.sweep_orphans(&entries, now_unix() as i64 + 1).unwrap();
         assert!(!orphan.exists());
         assert!(kept.exists());
+    }
+
+    #[test]
+    fn paths_round_trip_losslessly() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let odd = PathBuf::from(OsStr::from_bytes(b"/tmp/caf\xe9"));
+        let action = JournalAction::Move {
+            src: odd.clone(),
+            dst: "/tmp/plain".into(),
+            backup_path: Some(PathBuf::from(OsStr::from_bytes(b"/tmp/b\xffk"))),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        // UTF-8 paths stay plain strings; others are base64 bytes.
+        assert!(json.contains(r#""dst":"/tmp/plain""#), "{json}");
+        assert!(
+            json.contains(r#""src":{"path_bytes":"L3RtcC9jYWbp"}"#),
+            "{json}"
+        );
+        let back: JournalAction = serde_json::from_str(&json).unwrap();
+        let JournalAction::Move {
+            src,
+            dst,
+            backup_path,
+        } = back
+        else {
+            panic!("{json}");
+        };
+        assert_eq!(src, odd);
+        assert_eq!(dst, Path::new("/tmp/plain"));
+        assert!(backup_path.is_some());
+    }
+
+    #[test]
+    fn journals_written_with_string_paths_still_read() {
+        let line = r#"{"id":3,"timestamp_unix":1,"tool":"cp","action":{"action":"copy_create","src":"/a","created_path":"/b"}}"#;
+        let e: JournalEntry = serde_json::from_str(line).unwrap();
+        let JournalAction::CopyCreate {
+            src,
+            created_path,
+            backup_path,
+        } = e.action
+        else {
+            panic!("{line}");
+        };
+        assert_eq!(
+            (src.as_path(), created_path.as_path()),
+            (Path::new("/a"), Path::new("/b"))
+        );
+        assert_eq!(backup_path, None);
     }
 }

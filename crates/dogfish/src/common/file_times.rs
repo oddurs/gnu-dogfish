@@ -36,6 +36,8 @@ pub(crate) fn set_file_times(
     let times = [spec(atime), spec(mtime)];
     let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
     let c = c_path(path)?;
+    // SAFETY: `c` is a NUL-terminated path and `times` an array of two
+    // timespecs, as utimensat(2) requires; both outlive the call.
     if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) } == 0 {
         Ok(())
     } else {

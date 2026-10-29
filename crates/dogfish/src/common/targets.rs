@@ -1,40 +1,28 @@
 //! Destination resolution and same-file checks that cp and mv share.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use dogfish_core::gnu_io_error;
 
+use crate::common::getopt::usage_error;
 use crate::common::path::{same_inode, same_name};
 use crate::common::quote::qa;
-use crate::common::tool_args::usage_error;
-
-/// What to do when the destination exists (GNU's `interactive` setting).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Clobber {
-    /// Overwrite (the default).
-    Yes,
-    /// Ask first (`-i`).
-    Ask,
-    /// Skip silently (`cp -n`), or with a diagnostic and failure (`mv -n`).
-    No,
-    /// Skip silently and successfully (`--update=none`).
-    Skip,
-}
 
 /// Splits operands into sources and a destination the way GNU `cp` and `mv` do.
 /// `Ok(None)` means each source goes into the returned directory.
 pub(crate) enum Targets {
-    Into(String, Vec<String>),
-    Single(String, String),
+    Into(OsString, Vec<OsString>),
+    Single(OsString, OsString),
 }
 
 pub(crate) fn resolve_targets(
     tool: &str,
-    mut files: Vec<String>,
-    target_dir: Option<String>,
+    mut files: Vec<OsString>,
+    target_dir: Option<OsString>,
     no_target_dir: bool,
 ) -> std::result::Result<Targets, i32> {
     if let Some(dir) = target_dir {
@@ -69,7 +57,7 @@ pub(crate) fn resolve_targets(
         1 => {
             return Err(usage_error(
                 tool,
-                &format!("missing destination file operand after {}", qa(&files[0])),
+                format!("missing destination file operand after {}", qa(&files[0])),
             ));
         }
         _ => {}
@@ -78,7 +66,7 @@ pub(crate) fn resolve_targets(
         if files.len() > 2 {
             return Err(usage_error(
                 tool,
-                &format!("extra operand {}", qa(&files[2])),
+                format!("extra operand {}", qa(&files[2])),
             ));
         }
         let dst = files.pop().unwrap_or_default();
@@ -101,19 +89,6 @@ pub(crate) fn resolve_targets(
             let dst = files.pop().unwrap_or_default();
             Ok(Targets::Single(files.remove(0), dst))
         }
-    }
-}
-
-/// Absolute form of `target` with its parent resolved through symlinks, for
-/// "is this inside that directory?" checks on paths that may not exist yet.
-pub(crate) fn resolve_for_containment(target: &Path) -> PathBuf {
-    let parent = match target.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    match (fs::canonicalize(parent), target.file_name()) {
-        (Ok(p), Some(name)) => p.join(name),
-        _ => std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf()),
     }
 }
 

@@ -13,7 +13,11 @@ pub(crate) const CHMOD_MODE_BITS: u32 = 0o7777;
 
 /// The process umask (reading it requires setting it, so it is restored at once).
 pub(crate) fn process_umask() -> u32 {
+    // SAFETY: umask has no preconditions and cannot fail. Callers read it
+    // before starting any thread that creates files, so the moment with mask 0
+    // is never observed.
     let old = unsafe { libc::umask(0) };
+    // SAFETY: restores the mask read just above.
     unsafe { libc::umask(old) };
     mode_t_to_u32(old)
 }

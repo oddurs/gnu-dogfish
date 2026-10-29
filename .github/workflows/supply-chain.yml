@@ -1,0 +1,100 @@
+name: Supply Chain
+
+# - deny: the dependency policy in deny.toml (RustSec advisories, licenses,
+#   duplicate crates, crates.io only). On every PR, and weekly, so a newly
+#   published advisory fails the run even when nothing here changed.
+# - asan: the test suites under AddressSanitizer. Slower, so on main and weekly.
+# - repro: two release builds from two directories must be bit-identical.
+#   On main and weekly.
+# Each job is a `cargo xtask` step, so it runs the same way locally.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      # A prebuilt binary, checked against the SHA-256 in install-action's
+      # manifest. Keep the version equal to CARGO_DENY_VERSION in crates/xtask.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: cargo deny check
+        run: cargo xtask deny
+
+  asan:
+    name: AddressSanitizer
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Stable runs xtask itself; the pinned nightly (ASAN_TOOLCHAIN in
+      # crates/xtask) builds the instrumented tests. Bump both together.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Install the sanitizer toolchain
+        run: rustup toolchain install nightly-2026-10-20 --profile minimal --component rust-src
+
+      - name: Tests under AddressSanitizer
+        run: cargo xtask asan
+
+  repro:
+    name: Reproducible release build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The release toolchain (RELEASE_TOOLCHAIN in release.yml).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build twice and compare
+        run: cargo xtask repro --target x86_64-unknown-linux-gnu

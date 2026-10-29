@@ -74,8 +74,17 @@ impl FastReader {
                 let file = File::open(path)?;
                 let meta = file.metadata()?;
                 if meta.is_file() && meta.len() > 0 && meta.len() <= (1 << 34) {
-                    // Safety: read-only memory map for fast sequential scan
+                    // SAFETY: a read-only private mapping of a regular file we
+                    // opened. Rust's aliasing rules assume the bytes do not
+                    // change while mapped; another process can still modify or
+                    // truncate the file. Modification can only change the data
+                    // read (as with read(2) racing a writer); truncation raises
+                    // SIGBUS, which install_sigbus_handler turns into a clean
+                    // exit. See doc/unsafe.md.
                     if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                        // SAFETY: the pointer and length describe the live
+                        // mapping just created; madvise is only a hint and
+                        // never changes its contents.
                         #[cfg(unix)]
                         unsafe {
                             libc::madvise(
@@ -174,6 +183,7 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
             if dst.exists() {
                 let _ = fs::remove_file(dst);
             }
+            // SAFETY: both pointers come from CStrings that outlive the call.
             let ret = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
             if ret == 0 {
                 let len = fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
@@ -191,6 +201,8 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
         let src_file = File::open(src)?;
         let meta = src_file.metadata()?;
         let dst_file = File::create(dst)?;
+        // SAFETY: FICLONE takes two open file descriptors and no pointers;
+        // both files stay open for the duration of the call.
         let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
         let (bytes, method) = if ret == 0 {
             (meta.len(), CopyMethod::FicloneCoW)
@@ -213,6 +225,8 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
 }
 
 /// Recursively copies `src` to `dst`, recreating symlinks rather than following them.
+/// FIFOs, sockets and device nodes are recreated, never opened: reading a FIFO
+/// would block forever and a device such as `/dev/zero` never ends.
 pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ty = meta.file_type();
@@ -225,9 +239,28 @@ pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
         fs::set_permissions(dst, meta.permissions())
-    } else {
+    } else if ty.is_file() {
         copy_file_fast(src, dst).map(|_| ())
+    } else {
+        make_node_like(dst, &meta)
     }
+}
+
+/// Creates `dst` as a special file of the same type, mode and device number as
+/// `meta` (`mknod`; device nodes need privileges, FIFOs and sockets do not).
+fn make_node_like(dst: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let path = std::ffi::CString::new(dst.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // mode carries the file type bits (S_IFIFO, S_IFCHR, ...) as well as the permissions.
+    let mode = meta.mode() as libc::mode_t;
+    let rdev = meta.rdev() as libc::dev_t;
+    // SAFETY: `path` is a valid NUL-terminated string for the duration of the call.
+    if unsafe { libc::mknod(path.as_ptr(), mode, rdev) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Renames `src` to `dst`, falling back to copy + remove when they live on
@@ -248,6 +281,7 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Resets SIGPIPE to default OS behavior or ignores BrokenPipe gracefully.
 pub fn install_sigpipe_handler() {
+    // SAFETY: restores the default disposition; no handler code runs.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -260,10 +294,13 @@ static SIGBUS_MSG: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 extern "C" fn on_sigbus(_: libc::c_int) {
     // Async-signal-safe only: write(2) a preformatted message, then _exit(2).
     if let Some(msg) = SIGBUS_MSG.get() {
+        // SAFETY: write(2) is async-signal-safe; `msg` is a Vec that is never
+        // freed or changed once set, so the pointer and length stay valid.
         unsafe {
             libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
         }
     }
+    // SAFETY: _exit(2) is async-signal-safe and never returns.
     unsafe { libc::_exit(1) }
 }
 
@@ -275,6 +312,9 @@ extern "C" fn on_sigbus(_: libc::c_int) {
 pub fn install_sigbus_handler(tool: &str) {
     let _ =
         SIGBUS_MSG.set(format!("{tool}: input file was truncated while being read\n").into_bytes());
+    // SAFETY: a zeroed sigaction is a valid "no flags, empty mask" value; the
+    // handler is an `extern "C" fn(c_int)` that only calls async-signal-safe
+    // functions, and SIGBUS_MSG is set before the handler is installed.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigbus as *const () as libc::sighandler_t;
@@ -289,5 +329,56 @@ pub fn ignore_broken_pipe(res: io::Result<()>) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod copy_tree_tests {
+    use super::*;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    #[test]
+    fn copy_tree_recreates_a_fifo_instead_of_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        let copy = dir.path().join("copy");
+        // Reading the FIFO would block forever: with no writer, this returns
+        // only if copy_tree recreates it instead.
+        copy_tree(&fifo, &copy).unwrap();
+        let meta = fs::symlink_metadata(&copy).unwrap();
+        assert!(meta.file_type().is_fifo());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640 & !umask());
+    }
+
+    #[test]
+    fn copy_tree_recreates_fifos_inside_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("file"), b"data").unwrap();
+        let c = std::ffi::CString::new(tree.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let copy = dir.path().join("copy");
+        copy_tree(&tree, &copy).unwrap();
+        assert_eq!(fs::read(copy.join("file")).unwrap(), b"data");
+        assert!(
+            fs::symlink_metadata(copy.join("fifo"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    fn umask() -> u32 {
+        // SAFETY: umask only swaps the process mask; restore it at once.
+        unsafe {
+            let m = libc::umask(0o022);
+            libc::umask(m);
+            m as u32
+        }
     }
 }

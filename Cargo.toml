@@ -22,7 +22,6 @@ keywords = ["coreutils", "cli", "unix", "ndjson", "simd"]
 categories = ["command-line-utilities", "filesystem", "os::unix-apis"]
 
 [workspace.dependencies]
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 memchr = "2.7"
@@ -50,3 +49,12 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Every crate opts in with `[lints] workspace = true`. Each `unsafe` block
+# carries a `// SAFETY:` comment and is listed in doc/unsafe.md
+# (`cargo xtask unsafe-audit` checks the list).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

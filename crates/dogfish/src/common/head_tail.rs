@@ -1,6 +1,9 @@
 //! Helpers shared by head and tail: `==> NAME <==` headers, GNU counts and
 //! the legacy `-N` syntax.
 
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
 use dogfish_core::InputSource;
 use memchr::memrchr_iter;
 
@@ -42,14 +45,14 @@ pub(crate) fn parse_gnu_count(s: &str) -> Option<u64> {
 }
 
 /// Converts the obsolete `-5` shorthand (first argument only, as in GNU) to `-n 5`.
-pub(crate) fn normalize_legacy_num_arg(mut args: Vec<String>) -> Vec<String> {
-    if let Some(a) = args.get(1)
+pub(crate) fn normalize_legacy_num_arg(mut args: Vec<OsString>) -> Vec<OsString> {
+    if let Some(a) = args.get(1).map(|a| a.as_bytes())
         && a.len() > 1
-        && a.starts_with('-')
-        && a[1..].chars().all(|c| c.is_ascii_digit())
+        && a[0] == b'-'
+        && a[1..].iter().all(u8::is_ascii_digit)
     {
-        let n = a[1..].to_string();
-        args.splice(1..2, ["-n".to_string(), n]);
+        let n = OsString::from_vec(a[1..].to_vec());
+        args.splice(1..2, [OsString::from("-n"), n]);
     }
     args
 }

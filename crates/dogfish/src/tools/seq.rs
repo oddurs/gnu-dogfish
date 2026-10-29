@@ -1,12 +1,16 @@
 //! seq — GNU number scanning, widths, formats and arbitrary-size integers
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
 
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
-use crate::common::output::raw_stdout;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, lossy, lossy_all, print_help, print_version,
+    usage_error,
+};
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 
@@ -41,12 +45,14 @@ it defaults to %.PRECf if FIRST, INCREMENT, and LAST are all fixed point
 decimal numbers with maximum precision PREC, and to %g otherwise.
 ";
 
-static SEQ_OPTS: [OptSpec; 5] = [
-    opt(Some('f'), Some("format"), HasArg::Required, "format"),
-    opt(Some('s'), Some("separator"), HasArg::Required, "separator"),
-    opt(Some('w'), Some("equal-width"), HasArg::No, "equal-width"),
-    opt(Some('J'), Some("json"), HasArg::No, "json"),
-    opt(None, Some("help"), HasArg::No, "help"),
+/// GNU's `long_options` and `"+f:s:w"`, plus the Dogfish `-J, --json`.
+const SEQ_OPTS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'w', "equal-width", HasArg::No, "equal-width"),
+    OptSpec::both(b'f', "format", HasArg::Required, "format"),
+    OptSpec::both(b's', "separator", HasArg::Required, "separator"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
 ];
 
 /// A scanned `seq` operand: its value and the output width and precision
@@ -337,11 +343,11 @@ const FAST_LINE: usize = 32;
 /// (1 to 200) in decimal text, so numbers of any size are exact. Numbers
 /// that differ only in the last digit form a run: `end` is compared once a
 /// run, and each number is one fixed-size copy of the run's line (separator
-/// and digits) with the last digit patched in. Output goes straight to fd 1
-/// in large blocks. Returns how many numbers were written; a closed pipe
+/// and digits) with the last digit patched in. Output goes to the stdout
+/// writer in large blocks. Returns how many numbers were written; a closed pipe
 /// ends the output quietly.
 fn seq_fast(mut cur: Vec<u8>, end: &[u8], inc: u32, sep: &[u8]) -> io::Result<u64> {
-    let mut out = raw_stdout();
+    let mut out = stdout::stdout();
     let mut buf = vec![0u8; FAST_BLOCK + FAST_LINE];
     let mut pos = 0;
     let mut count = 0u64;
@@ -398,8 +404,13 @@ fn seq_fast(mut cur: Vec<u8>, end: &[u8], inc: u32, sep: &[u8]) -> io::Result<u6
             count += 1;
             digit += inc;
             if pos >= FAST_BLOCK {
-                flush!(&buf[..pos]);
-                pos = 0;
+                // End the write at a line break, so that the line-buffered
+                // writer passes it straight through instead of holding back
+                // (and later writing on its own) a partial line.
+                let cut = memchr::memrchr(b'\n', &buf[..pos]).map_or(pos, |i| i + 1);
+                flush!(&buf[..cut]);
+                buf.copy_within(cut..pos, 0);
+                pos -= cut;
             }
         }
         if !prefix_below {
@@ -425,41 +436,48 @@ fn write_or_pipe<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<bool> {
     }
 }
 
-pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let mut opts = GetOpt::new(args.into_iter().skip(1).collect(), &SEQ_OPTS, false);
+pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut opts = Getopt::with_order(
+        args.into_iter().skip(1).collect(),
+        SEQ_OPTS,
+        Order::StopAtOperand,
+    );
     let mut format: Option<String> = None;
     let mut separator = "\n".to_string();
     let mut equal_width = false;
     let mut json = false;
     loop {
         // A negative number is an operand, and ends option processing.
-        if let Some(a) = opts.peek()
+        if let Some(a) = opts.peek().map(OsStrExt::as_bytes)
             && a.len() > 1
-            && a.starts_with('-')
-            && a[1..].starts_with(|c: char| c == '.' || c.is_ascii_digit())
+            && a[0] == b'-'
+            && (a[1] == b'.' || a[1].is_ascii_digit())
         {
             break;
         }
-        let Some(item) = opts.next_opt() else { break };
-        match item {
-            Ok(("format", v)) => format = v,
-            Ok(("separator", v)) => separator = v.unwrap_or_default(),
-            Ok(("equal-width", _)) => equal_width = true,
-            Ok(("json", _)) => json = true,
-            Ok(("help", _)) => return print_help(SEQ_HELP),
-            Ok(_) => unreachable!("every seq option is handled"),
-            Err(msg) => return Ok(usage_error("seq", msg, 1)),
+        let Some(item) = opts.next() else { break };
+        let (key, v) = match item {
+            Ok((key, v)) => (key, v.as_deref().map(lossy)),
+            Err(e) => return Ok(getopt_error("seq", &e)),
+        };
+        match key {
+            "format" => format = v,
+            "separator" => separator = v.unwrap_or_default(),
+            "equal-width" => equal_width = true,
+            "json" => json = true,
+            "help" => return Ok(print_help(SEQ_HELP)),
+            "version" => return Ok(print_version("seq")),
+            _ => unreachable!("every seq option is handled"),
         }
     }
-    let nums = opts.into_operands();
+    let nums = lossy_all(opts.operands());
     match nums.len() {
-        0 => return Ok(usage_error("seq", "missing operand", 1)),
+        0 => return Ok(usage_error("seq", "missing operand")),
         1..=3 => {}
         _ => {
             return Ok(usage_error(
                 "seq",
                 format!("extra operand {}", gnu_quote(&nums[3])),
-                1,
             ));
         }
     }
@@ -467,7 +485,7 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     for n in &nums {
         match scan_seq_operand(n) {
             Ok(s) => scanned.push(s),
-            Err(msg) => return Ok(usage_error("seq", msg, 1)),
+            Err(msg) => return Ok(usage_error("seq", msg)),
         }
     }
     let one = SeqOperand {
@@ -486,14 +504,12 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(usage_error(
             "seq",
             format!("invalid Zero increment value: {}", gnu_quote(&nums[1])),
-            1,
         ));
     }
     if format.is_some() && equal_width {
         return Ok(usage_error(
             "seq",
             "format string may not be specified when printing equal width strings",
-            1,
         ));
     }
     let user_format = match format.as_deref().map(SeqFormat::parse).transpose() {
@@ -504,8 +520,7 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let out_of_range = |x: f64| {
         if step.value < 0.0 {
             x < last.value

@@ -95,7 +95,8 @@ mod avx2 {
         }
 
         fn blocks(&mut self, blocks: &[[u8; 64]]) {
-            // Safety: only constructed when the CPU has AVX2, BMI1 and BMI2.
+            // SAFETY: an `Avx2Sha256` is only made once `is_fastest` found
+            // AVX2, BMI1 and BMI2, all that `compress` enables.
             unsafe { compress(&mut self.state, blocks) }
         }
 
@@ -159,94 +160,178 @@ mod avx2 {
         8 * (t / 4) + t % 4
     }
 
-    /// `W + K` of word `$t` (at offset `$lane`), read from memory: a volatile
-    /// read keeps the compiler from extracting it from the vector register that
-    /// computed it (two ALU micro-ops a round) instead of loading it (a load port).
-    macro_rules! wk {
-        ($wk:ident, $t:expr, $lane:expr) => {
-            // Safety: the index is below 128, the array's length.
-            $wk.as_ptr().add(wk_index($t) + $lane).read_volatile()
-        };
-    }
-
     /// Eight rounds from word `$base`, reading `W + K` from `$wk` at offset `$lane`;
     /// `$bc` carries `b ^ c` from one round to the next.
     macro_rules! rounds8 {
         ($v:ident, $bc:ident, $wk:ident, $lane:expr, $base:expr) => {
             let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = $v;
-            round!(a, b, c, d, e, f, g, h, $bc, wk!($wk, $base, $lane));
-            round!(h, a, b, c, d, e, f, g, $bc, wk!($wk, $base + 1, $lane));
-            round!(g, h, a, b, c, d, e, f, $bc, wk!($wk, $base + 2, $lane));
-            round!(f, g, h, a, b, c, d, e, $bc, wk!($wk, $base + 3, $lane));
-            round!(e, f, g, h, a, b, c, d, $bc, wk!($wk, $base + 4, $lane));
-            round!(d, e, f, g, h, a, b, c, $bc, wk!($wk, $base + 5, $lane));
-            round!(c, d, e, f, g, h, a, b, $bc, wk!($wk, $base + 6, $lane));
-            round!(b, c, d, e, f, g, h, a, $bc, wk!($wk, $base + 7, $lane));
+            round!(a, b, c, d, e, f, g, h, $bc, $wk[wk_index($base) + $lane]);
+            round!(
+                h,
+                a,
+                b,
+                c,
+                d,
+                e,
+                f,
+                g,
+                $bc,
+                $wk[wk_index($base + 1) + $lane]
+            );
+            round!(
+                g,
+                h,
+                a,
+                b,
+                c,
+                d,
+                e,
+                f,
+                $bc,
+                $wk[wk_index($base + 2) + $lane]
+            );
+            round!(
+                f,
+                g,
+                h,
+                a,
+                b,
+                c,
+                d,
+                e,
+                $bc,
+                $wk[wk_index($base + 3) + $lane]
+            );
+            round!(
+                e,
+                f,
+                g,
+                h,
+                a,
+                b,
+                c,
+                d,
+                $bc,
+                $wk[wk_index($base + 4) + $lane]
+            );
+            round!(
+                d,
+                e,
+                f,
+                g,
+                h,
+                a,
+                b,
+                c,
+                $bc,
+                $wk[wk_index($base + 5) + $lane]
+            );
+            round!(
+                c,
+                d,
+                e,
+                f,
+                g,
+                h,
+                a,
+                b,
+                $bc,
+                $wk[wk_index($base + 6) + $lane]
+            );
+            round!(
+                b,
+                c,
+                d,
+                e,
+                f,
+                g,
+                h,
+                a,
+                $bc,
+                $wk[wk_index($base + 7) + $lane]
+            );
             $v = [a, b, c, d, e, f, g, h];
         };
     }
 
     /// Rotates each 32-bit lane right by `N` (`M` = 32 - `N`).
-    #[inline(always)]
-    unsafe fn ror<const N: i32, const M: i32>(x: __m256i) -> __m256i {
-        unsafe { _mm256_or_si256(_mm256_srli_epi32::<N>(x), _mm256_slli_epi32::<M>(x)) }
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn ror<const N: i32, const M: i32>(x: __m256i) -> __m256i {
+        _mm256_or_si256(_mm256_srli_epi32::<N>(x), _mm256_slli_epi32::<M>(x))
     }
 
     /// The next four schedule words of both blocks from the previous sixteen
     /// (`x0` oldest), as in Intel's SSE/AVX SHA-256 code.
-    #[inline(always)]
-    unsafe fn schedule(x0: __m256i, x1: __m256i, x2: __m256i, x3: __m256i) -> __m256i {
-        unsafe {
-            // W[t-15..t-12] and W[t-7..t-4].
-            let w15 = _mm256_alignr_epi8::<4>(x1, x0);
-            let w7 = _mm256_alignr_epi8::<4>(x3, x2);
-            let s0 = _mm256_xor_si256(
-                _mm256_xor_si256(ror::<7, 25>(w15), ror::<18, 14>(w15)),
-                _mm256_srli_epi32::<3>(w15),
-            );
-            let mut t = _mm256_add_epi32(_mm256_add_epi32(x0, s0), w7);
-            let sigma1 = |v: __m256i| {
-                _mm256_xor_si256(
-                    _mm256_xor_si256(ror::<17, 15>(v), ror::<19, 13>(v)),
-                    _mm256_srli_epi32::<10>(v),
-                )
-            };
-            // W[t], W[t+1] need sigma1 of W[t-2], W[t-1] (lanes 2, 3 of x3)...
-            let lo = sigma1(_mm256_shuffle_epi32::<0b11_10_11_10>(x3));
-            t = _mm256_add_epi32(
-                t,
-                _mm256_blend_epi32::<0b1100_1100>(lo, _mm256_setzero_si256()),
-            );
-            // ...and W[t+2], W[t+3] need sigma1 of the W[t], W[t+1] just made.
-            let hi = sigma1(_mm256_shuffle_epi32::<0b01_00_01_00>(t));
-            _mm256_add_epi32(
-                t,
-                _mm256_blend_epi32::<0b1100_1100>(_mm256_setzero_si256(), hi),
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn schedule(x0: __m256i, x1: __m256i, x2: __m256i, x3: __m256i) -> __m256i {
+        // W[t-15..t-12] and W[t-7..t-4].
+        let w15 = _mm256_alignr_epi8::<4>(x1, x0);
+        let w7 = _mm256_alignr_epi8::<4>(x3, x2);
+        let s0 = _mm256_xor_si256(
+            _mm256_xor_si256(ror::<7, 25>(w15), ror::<18, 14>(w15)),
+            _mm256_srli_epi32::<3>(w15),
+        );
+        let mut t = _mm256_add_epi32(_mm256_add_epi32(x0, s0), w7);
+        let sigma1 = |v: __m256i| {
+            _mm256_xor_si256(
+                _mm256_xor_si256(ror::<17, 15>(v), ror::<19, 13>(v)),
+                _mm256_srli_epi32::<10>(v),
             )
-        }
+        };
+        // W[t], W[t+1] need sigma1 of W[t-2], W[t-1] (lanes 2, 3 of x3)...
+        let lo = sigma1(_mm256_shuffle_epi32::<0b11_10_11_10>(x3));
+        t = _mm256_add_epi32(
+            t,
+            _mm256_blend_epi32::<0b1100_1100>(lo, _mm256_setzero_si256()),
+        );
+        // ...and W[t+2], W[t+3] need sigma1 of the W[t], W[t+1] just made.
+        let hi = sigma1(_mm256_shuffle_epi32::<0b01_00_01_00>(t));
+        _mm256_add_epi32(
+            t,
+            _mm256_blend_epi32::<0b1100_1100>(_mm256_setzero_si256(), hi),
+        )
     }
 
-    /// Compresses `blocks` into `state`, two at a time.
-    ///
-    /// # Safety
-    /// The CPU must support AVX2, BMI1 and BMI2.
+    /// Words `4j..4j+3` of blocks `a` (lanes 0-3) and `b` (lanes 4-7).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn load(a: &[u8; 64], b: &[u8; 64], j: usize) -> __m256i {
+        let w = |block: &[u8; 64], k: usize| {
+            let at = 16 * j + 4 * k;
+            i32::from_be_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]])
+        };
+        _mm256_setr_epi32(
+            w(a, 0),
+            w(a, 1),
+            w(a, 2),
+            w(a, 3),
+            w(b, 0),
+            w(b, 1),
+            w(b, 2),
+            w(b, 3),
+        )
+    }
+
+    /// Stores `x` plus the round constants of word group `j` (both blocks) as
+    /// `wk[8j..8j+8]`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn store(wk: &mut [u32; 128], j: usize, x: __m256i) {
+        let k = |i: usize| K[4 * j + i] as i32;
+        let kk = _mm256_setr_epi32(k(0), k(1), k(2), k(3), k(0), k(1), k(2), k(3));
+        let dst = &mut wk[8 * j..8 * j + 8];
+        // SAFETY: `dst` is 8 writable `u32`s (32 bytes); the store is unaligned.
+        unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast(), _mm256_add_epi32(x, kk)) }
+    }
+
+    /// Compresses `blocks` into `state`, two at a time. Callers must have
+    /// checked [`is_fastest`] (AVX2, BMI1 and BMI2).
     #[target_feature(enable = "avx2,bmi1,bmi2")]
     // The last round of a block leaves `b ^ c` for a next round there is not.
     #[allow(unused_assignments)]
-    unsafe fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-        // Byte order: each 32-bit word big-endian.
-        let bswap = _mm256_setr_epi8(
-            3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10,
-            9, 8, 15, 14, 13, 12,
-        );
-        // The four round constants of word group j, for both blocks.
-        let k = |j: usize| -> __m256i {
-            // Safety: K has 64 words and j < 16.
-            unsafe {
-                let q = _mm_loadu_si128(K.as_ptr().add(4 * j).cast());
-                _mm256_set_m128i(q, q)
-            }
-        };
+    fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
         let mut i = 0;
         while i < blocks.len() {
             let a = &blocks[i];
@@ -254,83 +339,68 @@ mod avx2 {
             let b = blocks.get(i + 1).unwrap_or(a);
             // W + K of words 4j..4j+3: block a at 8j..8j+3, block b at 8j+4..8j+7.
             let mut wk = [0u32; 128];
-            // Safety: AVX2 is enabled here; the loads stay within the 64-byte
-            // blocks, the stores within `wk` (j < 16).
-            unsafe {
-                let load = |j: usize| {
-                    let v = _mm256_set_m128i(
-                        _mm_loadu_si128(b.as_ptr().add(16 * j).cast()),
-                        _mm_loadu_si128(a.as_ptr().add(16 * j).cast()),
-                    );
-                    _mm256_shuffle_epi8(v, bswap)
+            let (mut x0, mut x1, mut x2, mut x3) =
+                (load(a, b, 0), load(a, b, 1), load(a, b, 2), load(a, b, 3));
+            store(&mut wk, 0, x0);
+            store(&mut wk, 1, x1);
+            store(&mut wk, 2, x2);
+            store(&mut wk, 3, x3);
+            let mut v = *state;
+            let mut bc = v[1] ^ v[2];
+            // Block a's rounds, with the schedule of both blocks computed
+            // alongside, a group of eight rounds ahead of where it is needed.
+            macro_rules! step {
+                ($x0:ident, $x1:ident, $x2:ident, $x3:ident, $j:expr) => {
+                    $x0 = schedule($x0, $x1, $x2, $x3);
+                    store(&mut wk, $j, $x0);
                 };
-                let (mut x0, mut x1, mut x2, mut x3) = (load(0), load(1), load(2), load(3));
-                macro_rules! store {
-                    ($j:expr, $x:expr) => {
-                        _mm256_storeu_si256(
-                            wk.as_mut_ptr().add(8 * $j).cast(),
-                            _mm256_add_epi32($x, k($j)),
-                        );
-                    };
-                }
-                store!(0, x0);
-                store!(1, x1);
-                store!(2, x2);
-                store!(3, x3);
-                let mut v = *state;
-                let mut bc = v[1] ^ v[2];
-                // Block a's rounds, with the schedule of both blocks computed
-                // alongside, a group of eight rounds ahead of where it is needed.
-                macro_rules! step {
-                    ($x0:ident, $x1:ident, $x2:ident, $x3:ident, $j:expr) => {
-                        $x0 = schedule($x0, $x1, $x2, $x3);
-                        store!($j, $x0);
-                    };
-                }
-                macro_rules! group {
-                    ($base:expr) => {
-                        rounds8!(v, bc, wk, 0, $base);
-                    };
-                }
-                group!(0);
-                step!(x0, x1, x2, x3, 4);
-                step!(x1, x2, x3, x0, 5);
-                group!(8);
-                step!(x2, x3, x0, x1, 6);
-                step!(x3, x0, x1, x2, 7);
-                group!(16);
-                step!(x0, x1, x2, x3, 8);
-                step!(x1, x2, x3, x0, 9);
-                group!(24);
-                step!(x2, x3, x0, x1, 10);
-                step!(x3, x0, x1, x2, 11);
-                group!(32);
-                step!(x0, x1, x2, x3, 12);
-                step!(x1, x2, x3, x0, 13);
-                group!(40);
-                step!(x2, x3, x0, x1, 14);
-                step!(x3, x0, x1, x2, 15);
-                group!(48);
-                group!(56);
-                for (s, w) in state.iter_mut().zip(v) {
-                    *s = s.wrapping_add(w);
-                }
+            }
+            // The rounds read `W + K` back through an opaque reference: the
+            // compiler would otherwise extract each word from the vector
+            // register that computed it (two ALU micro-ops a round) instead
+            // of loading it (a load port).
+            macro_rules! group {
+                ($base:expr) => {
+                    let view: &[u32; 128] = std::hint::black_box(&wk);
+                    rounds8!(v, bc, view, 0, $base);
+                };
+            }
+            group!(0);
+            step!(x0, x1, x2, x3, 4);
+            step!(x1, x2, x3, x0, 5);
+            group!(8);
+            step!(x2, x3, x0, x1, 6);
+            step!(x3, x0, x1, x2, 7);
+            group!(16);
+            step!(x0, x1, x2, x3, 8);
+            step!(x1, x2, x3, x0, 9);
+            group!(24);
+            step!(x2, x3, x0, x1, 10);
+            step!(x3, x0, x1, x2, 11);
+            group!(32);
+            step!(x0, x1, x2, x3, 12);
+            step!(x1, x2, x3, x0, 13);
+            group!(40);
+            step!(x2, x3, x0, x1, 14);
+            step!(x3, x0, x1, x2, 15);
+            group!(48);
+            group!(56);
+            for (s, w) in state.iter_mut().zip(v) {
+                *s = s.wrapping_add(w);
             }
             if i + 1 < blocks.len() {
                 // Block b: its schedule is all in `wk` already.
                 let mut v = *state;
                 let mut bc = v[1] ^ v[2];
-                // Safety: the `wk` reads stay below its length (see `wk!`).
-                unsafe {
-                    rounds8!(v, bc, wk, 4, 0);
-                    rounds8!(v, bc, wk, 4, 8);
-                    rounds8!(v, bc, wk, 4, 16);
-                    rounds8!(v, bc, wk, 4, 24);
-                    rounds8!(v, bc, wk, 4, 32);
-                    rounds8!(v, bc, wk, 4, 40);
-                    rounds8!(v, bc, wk, 4, 48);
-                    rounds8!(v, bc, wk, 4, 56);
-                }
+                let view: &[u32; 128] = std::hint::black_box(&wk);
+                rounds8!(v, bc, view, 4, 0);
+                rounds8!(v, bc, view, 4, 8);
+                rounds8!(v, bc, view, 4, 16);
+                rounds8!(v, bc, view, 4, 24);
+                rounds8!(v, bc, view, 4, 32);
+                rounds8!(v, bc, view, 4, 40);
+                rounds8!(v, bc, view, 4, 48);
+                rounds8!(v, bc, view, 4, 56);
                 for (s, w) in state.iter_mut().zip(v) {
                     *s = s.wrapping_add(w);
                 }

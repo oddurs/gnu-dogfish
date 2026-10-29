@@ -1,20 +1,23 @@
 //! chmod — octal and full symbolic modes, -R, -c/-v/-f, --reference
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error};
+use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
 use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::mode::{
     CHMOD_MODE_BITS, ModeChange, mode_adjust, mode_compile, process_umask, strmode9,
 };
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::quote::{qa, qf, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 
 const CHMOD_HELP: &str = "\
 Usage: chmod [OPTION]... MODE[,MODE]... FILE...
@@ -45,7 +48,53 @@ enum ChmodOpt {
     PreserveRoot,
     Reference,
     Recursive,
+    /// A mode that looks like an option (`-w`, `-rx`, `-0`).
+    Mode,
+    Help,
+    Version,
 }
+
+/// A mode character that GNU's option string accepts as an option with an
+/// optional argument, so that `chmod -w FILE` works.
+const fn mode_char(c: u8) -> OptSpec<ChmodOpt> {
+    OptSpec::short(c, HasArg::Optional, ChmodOpt::Mode)
+}
+
+/// GNU's `long_options` and its option string
+/// `"Rcfvr::w::x::X::s::t::u::g::o::a::,::+::=::0::1::2::3::4::5::6::7::"`.
+const SPECS: &[OptSpec<ChmodOpt>] = &[
+    OptSpec::both(b'c', "changes", HasArg::No, ChmodOpt::Changes),
+    OptSpec::both(b'R', "recursive", HasArg::No, ChmodOpt::Recursive),
+    OptSpec::long("no-preserve-root", HasArg::No, ChmodOpt::NoPreserveRoot),
+    OptSpec::long("preserve-root", HasArg::No, ChmodOpt::PreserveRoot),
+    OptSpec::both(b'f', "quiet", HasArg::No, ChmodOpt::Quiet),
+    OptSpec::long("reference", HasArg::Required, ChmodOpt::Reference),
+    OptSpec::long("silent", HasArg::No, ChmodOpt::Quiet),
+    OptSpec::both(b'v', "verbose", HasArg::No, ChmodOpt::Verbose),
+    OptSpec::long("help", HasArg::No, ChmodOpt::Help),
+    OptSpec::long("version", HasArg::No, ChmodOpt::Version),
+    mode_char(b'r'),
+    mode_char(b'w'),
+    mode_char(b'x'),
+    mode_char(b'X'),
+    mode_char(b's'),
+    mode_char(b't'),
+    mode_char(b'u'),
+    mode_char(b'g'),
+    mode_char(b'o'),
+    mode_char(b'a'),
+    mode_char(b','),
+    mode_char(b'+'),
+    mode_char(b'='),
+    mode_char(b'0'),
+    mode_char(b'1'),
+    mode_char(b'2'),
+    mode_char(b'3'),
+    mode_char(b'4'),
+    mode_char(b'5'),
+    mode_char(b'6'),
+    mode_char(b'7'),
+];
 
 struct ChmodRun {
     changes: Option<Vec<ModeChange>>,
@@ -58,38 +107,9 @@ struct ChmodRun {
     diagnose_surprises: bool,
 }
 
-pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use ChmodOpt::*;
-    const SPECS: &[ToolOpt<ChmodOpt>] = &[
-        opt("c", "changes", HasArg::No, Changes),
-        opt("f", "silent", HasArg::No, Quiet),
-        opt("", "quiet", HasArg::No, Quiet),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
-        opt("", "preserve-root", HasArg::No, PreserveRoot),
-        opt("", "reference", HasArg::Required, Reference),
-        opt("R", "recursive", HasArg::No, Recursive),
-    ];
-    // Like GNU, accept modes that look like options (`chmod -w file`).
-    let mut mode_pieces = Vec::new();
-    let mut rest = vec![args.first().cloned().unwrap_or_default()];
-    let mut ended = false;
-    for a in args.iter().skip(1) {
-        ended |= a == "--";
-        let mode_like = !ended
-            && a.len() > 1
-            && a.starts_with('-')
-            && a[1..2].chars().all(|c| "rwxXstugoa,+=01234567".contains(c));
-        if mode_like {
-            mode_pieces.push(a.clone());
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    let parsed = match parse_tool_args("chmod", &rest, SPECS, CHMOD_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut run = ChmodRun {
         changes: None,
         reference_mode: 0,
@@ -98,10 +118,15 @@ pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         report_changes: false,
         verbose: false,
         quiet: false,
-        diagnose_surprises: !mode_pieces.is_empty(),
+        diagnose_surprises: false,
     };
     let (mut preserve_root, mut reference) = (false, None);
-    for (o, v) in parsed.opts {
+    let mut mode_pieces: Vec<String> = Vec::new();
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("chmod", &e)),
+        };
         match o {
             Changes => run.report_changes = true,
             Quiet => run.quiet = true,
@@ -110,21 +135,29 @@ pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             PreserveRoot => preserve_root = true,
             Reference => reference = v,
             Recursive => run.recursive = true,
+            // Like GNU, the whole argument the mode character came from is
+            // the mode (`-rwx`), joined to earlier ones with a comma.
+            Mode => {
+                mode_pieces.push(opts.last_word().map(lossy).unwrap_or_default());
+                run.diagnose_surprises = true;
+            }
+            Help => return Ok(print_help(CHMOD_HELP)),
+            Version => return Ok(print_version("chmod")),
         }
     }
-    let mut files = parsed.operands;
+    let mut files = opts.operands();
     let mut mode = (!mode_pieces.is_empty()).then(|| mode_pieces.join(","));
     if reference.is_none() && mode.is_none() {
         if files.is_empty() {
             return Ok(usage_error("chmod", "missing operand"));
         }
-        mode = Some(files.remove(0));
+        mode = Some(lossy(&files.remove(0)));
     }
     if files.is_empty() {
         return Ok(match (&mode, &reference) {
             (Some(m), None) => usage_error(
                 "chmod",
-                &format!("missing operand after {}", quote_locale(m)),
+                format!("missing operand after {}", quote_locale(m)),
             ),
             _ => usage_error("chmod", "missing operand"),
         });
@@ -147,7 +180,7 @@ pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             None => {
                 return Ok(usage_error(
                     "chmod",
-                    &format!("invalid mode: {}", quote_locale(m)),
+                    format!("invalid mode: {}", quote_locale(m)),
                 ));
             }
         }
@@ -191,7 +224,7 @@ fn chmod_path(
                 );
             }
             if run.verbose {
-                println!("{} could not be accessed", qa(path.as_path()));
+                outln!("{} could not be accessed", qa(path.as_path()));
             }
             return false;
         }
@@ -200,7 +233,7 @@ fn chmod_path(
         if !top_level {
             // During -R traversal, symbolic links are not followed or changed.
             if run.verbose {
-                println!(
+                outln!(
                     "neither symbolic link {} nor referent has been changed",
                     qa(path.as_path())
                 );
@@ -217,7 +250,7 @@ fn chmod_path(
                     );
                 }
                 if run.verbose {
-                    println!("{} could not be accessed", qa(path.as_path()));
+                    outln!("{} could not be accessed", qa(path.as_path()));
                 }
                 return false;
             }
@@ -256,11 +289,11 @@ fn chmod_path(
         let (o, n) = (strmode9(old), strmode9(new));
         let p = qa(path.as_path());
         if !applied {
-            println!("failed to change mode of {p} from {old:04o} ({o}) to {new:04o} ({n})");
+            outln!("failed to change mode of {p} from {old:04o} ({o}) to {new:04o} ({n})");
         } else if changed {
-            println!("mode of {p} changed from {old:04o} ({o}) to {new:04o} ({n})");
+            outln!("mode of {p} changed from {old:04o} ({o}) to {new:04o} ({n})");
         } else {
-            println!("mode of {p} retained as {new:04o} ({n})");
+            outln!("mode of {p} retained as {new:04o} ({n})");
         }
     }
     if applied

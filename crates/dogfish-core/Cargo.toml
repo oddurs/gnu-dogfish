@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 description = "Core engine for Dogfish coreutils: NDJSON pipelines, zero-copy I/O, telemetry, undo journal, and visual formatting"
 
 [dependencies]
-clap.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 memchr.workspace = true
@@ -26,3 +26,6 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

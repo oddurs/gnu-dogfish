@@ -16,7 +16,9 @@
 mod common;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -113,14 +115,6 @@ fn build_tree(root: &Path) {
     }
 }
 
-/// For the `deep` flag: a directory chain deeper than the recursive tools
-/// keep directories open (130 levels), with a file at the bottom.
-fn build_deep(root: &Path) {
-    let deep = (0..130).fold(root.join("deep"), |p, _| p.join("k"));
-    fs::create_dir_all(&deep).unwrap();
-    fs::write(deep.join("f"), b"bottom\n").unwrap();
-}
-
 fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -153,6 +147,12 @@ struct Compare {
     /// Compare stdout as a set of lines: GNU `cp -r` copies a directory's
     /// entries in inode order, which differs between the two scratch trees.
     unordered: bool,
+    /// Give the case a second directory on another file system (cross-device
+    /// `mv`): `@OTHER@` in the arguments names it, `$OTHER` in the setup. The
+    /// case is skipped when there is no such file system.
+    other_fs: bool,
+    /// Run both tools with `POSIXLY_CORRECT` set.
+    posixly_correct: bool,
 }
 
 fn snapshot(root: &Path, cmp: Compare) -> BTreeMap<String, String> {
@@ -163,7 +163,10 @@ fn snapshot(root: &Path, cmp: Compare) -> BTreeMap<String, String> {
     for rel in entries {
         let path = root.join(&rel);
         let meta = path.symlink_metadata().unwrap();
-        let name = rel.to_string_lossy().into_owned();
+        // Names that are not UTF-8 are compared escaped, never merged.
+        let name = rel
+            .to_str()
+            .map_or_else(|| format!("{rel:?}"), str::to_string);
         if !meta.is_dir() && meta.nlink() > 1 {
             by_inode.entry(meta.ino()).or_default().push(name.clone());
         }
@@ -223,10 +226,56 @@ struct TreeCase<'a> {
     tool: &'a str,
     args: &'a [&'a str],
     stdin: Option<&'a [u8]>,
+    /// A shell command run (with the system's tools) in both trees first.
+    setup: Option<&'a str>,
     tz: &'a str,
-    /// Add the [`build_deep`] chain to the tree.
-    deep: bool,
     cmp: Compare,
+}
+
+/// A writable directory on a different file system than the scratch trees
+/// (as GNU's `other_partition_tmpdir`), if there is one.
+fn other_fs_root() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let here = fs::metadata(scratch_root()).ok()?.dev();
+        let mut candidates: Vec<PathBuf> = ["/dev/shm", "/tmp", "/var/tmp", "/run/user"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        if let Some(t) = std::env::var_os("TMPDIR") {
+            candidates.insert(0, PathBuf::from(t));
+        }
+        candidates.into_iter().find_map(|c| {
+            let m = fs::metadata(&c).ok()?;
+            if !m.is_dir() || m.dev() == here {
+                return None;
+            }
+            // Writable? Probe with a directory of our own.
+            let probe = c.join(format!("dogfish-fileops-probe-{}", std::process::id()));
+            fs::create_dir(&probe).ok()?;
+            fs::remove_dir(&probe).ok()?;
+            Some(c)
+        })
+    })
+    .as_deref()
+}
+
+fn replace_bytes(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 impl TreeCase<'_> {
@@ -245,8 +294,9 @@ impl TreeCase<'_> {
             "nostderr" => self.cmp.no_stderr = true,
             "no_undo" => self.cmp.no_undo = true,
             "unordered" => self.cmp.unordered = true,
+            "other_fs" => self.cmp.other_fs = true,
+            "posixly_correct" => self.cmp.posixly_correct = true,
             "tz_new_york" => self.tz = TZ_NEW_YORK,
-            "deep" => self.deep = true,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -266,26 +316,98 @@ impl TreeCase<'_> {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let (ours_dir, gnu_dir) = (base.join("dogfish"), base.join("gnu"));
-        for dir in [&ours_dir, &gnu_dir] {
+        // The second file system's directory for each run (empty unless asked).
+        let (ours_other, gnu_other) = if self.cmp.other_fs {
+            let Some(root) = other_fs_root() else {
+                eprintln!("note: skipping — no writable directory on another file system");
+                return;
+            };
+            let tag = format!(
+                "dogfish-fileops-{}-{}",
+                std::process::id(),
+                base.file_name().unwrap().to_string_lossy()
+            );
+            (
+                root.join(format!("{tag}-dogfish")),
+                root.join(format!("{tag}-gnu")),
+            )
+        } else {
+            (PathBuf::new(), PathBuf::new())
+        };
+        for (dir, other) in [(&ours_dir, &ours_other), (&gnu_dir, &gnu_other)] {
             fs::create_dir_all(dir).unwrap();
             build_tree(dir);
-            if self.deep {
-                build_deep(dir);
+            if self.cmp.other_fs {
+                let _ = fs::remove_dir_all(other);
+                fs::create_dir_all(other).unwrap();
+            }
+            if let Some(setup) = self.setup {
+                let status = Command::new("sh")
+                    .args(["-c", setup])
+                    .current_dir(dir)
+                    .env("OTHER", other)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "setup failed: {setup}");
             }
         }
+        // `@xff@` in an argument is the byte 0xff: a name that is not UTF-8.
+        let args = |other: &Path| -> Vec<OsString> {
+            self.args
+                .iter()
+                .map(|a| {
+                    let a = a.replace("@OTHER@", &other.to_string_lossy());
+                    OsString::from_vec(replace_bytes(a.as_bytes(), b"@xff@", b"\xff"))
+                })
+                .collect()
+        };
 
-        let mut ours = Command::new(dogfish_bin());
-        ours.arg(self.tool)
-            .args(self.args)
-            .env("DOGFISH_HOME", base.join("dogfish-home"))
+        // POSIXLY_CORRECT goes through a shell, as `exec` clears it.
+        let posix = |program: &Path, args: Vec<OsString>| {
+            let mut c = Command::new("sh");
+            c.arg("-c")
+                .arg("POSIXLY_CORRECT=1 exec \"$0\" \"$@\"")
+                .arg(program)
+                .args(args);
+            c
+        };
+        let mut ours = if self.cmp.posixly_correct {
+            let mut v = vec![OsString::from(self.tool)];
+            v.extend(args(&ours_other));
+            posix(Path::new(dogfish_bin()), v)
+        } else {
+            let mut c = Command::new(dogfish_bin());
+            c.arg(self.tool).args(args(&ours_other));
+            c
+        };
+        ours.env("DOGFISH_HOME", base.join("dogfish-home"))
             .env("TZ", self.tz);
         if self.cmp.no_undo {
             ours.env("DOGFISH_UNDO", "off");
         }
-        let mut theirs = Command::new(&gnu);
-        theirs.arg0(self.tool).args(self.args).env("TZ", self.tz);
-        let a = exec(ours, &ours_dir, self.stdin, "C");
-        let b = exec(theirs, &gnu_dir, self.stdin, "C");
+        let mut theirs = if self.cmp.posixly_correct {
+            // GNU names itself after argv[0], the full path here.
+            posix(&gnu, args(&gnu_other))
+        } else {
+            let mut c = Command::new(&gnu);
+            c.arg0(self.tool).args(args(&gnu_other));
+            c
+        };
+        theirs.env("TZ", self.tz);
+        let mut a = exec(ours, &ours_dir, self.stdin, "C");
+        let mut b = exec(theirs, &gnu_dir, self.stdin, "C");
+        if self.cmp.posixly_correct {
+            let full = format!("{}: ", gnu.display());
+            let short = format!("{}: ", self.tool);
+            b.stderr = replace_bytes(&b.stderr, full.as_bytes(), short.as_bytes());
+        }
+        if self.cmp.other_fs {
+            for (o, other) in [(&mut a, &ours_other), (&mut b, &gnu_other)] {
+                let from = other.to_string_lossy().into_owned();
+                o.stdout = replace_bytes(&o.stdout, from.as_bytes(), b"@OTHER@");
+                o.stderr = replace_bytes(&o.stderr, from.as_bytes(), b"@OTHER@");
+            }
+        }
 
         let show = |o: &Output| {
             format!(
@@ -316,7 +438,16 @@ impl TreeCase<'_> {
             assert_eq!(a.stderr, b.stderr, "stderr differs{ctx}");
         }
         if !self.cmp.no_tree {
-            let (sa, sb) = (snapshot(&ours_dir, self.cmp), snapshot(&gnu_dir, self.cmp));
+            let snap = |dir: &Path, other: &Path| {
+                let mut s = snapshot(dir, self.cmp);
+                if self.cmp.other_fs {
+                    for (k, v) in snapshot(other, self.cmp) {
+                        s.insert(format!("@OTHER@/{k}"), v);
+                    }
+                }
+                s
+            };
+            let (sa, sb) = (snap(&ours_dir, &ours_other), snap(&gnu_dir, &gnu_other));
             if sa != sb {
                 let mut diff = String::new();
                 for key in sa
@@ -335,17 +466,23 @@ impl TreeCase<'_> {
             }
         }
         let _ = fs::remove_dir_all(&base);
+        if self.cmp.other_fs {
+            let _ = fs::remove_dir_all(&ours_other);
+            let _ = fs::remove_dir_all(&gnu_other);
+        }
     }
 }
 
-/// `name: tool [args...] (stdin b"...")? (=> flag, ...)?;` — runs the command in
-/// two fresh scratch trees and compares everything (see the module docs).
-/// Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`, `nostderr`, `unordered`, `deep`,
-/// `tz_new_york`.
+/// `name: tool [args...] (setup("sh command"))? (stdin b"...")? (=> flag, ...)?;`
+/// (`@xff@` in an argument is the byte 0xff)
+/// — runs the command in two fresh scratch trees and compares everything (see
+/// the module docs). Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`,
+/// `nostderr`, `unordered`, `tz_new_york`, `other_fs`, `posixly_correct`.
 macro_rules! tree_cases {
     ($(
         $(#[$meta:meta])*
         $name:ident : $tool:literal [$($arg:expr),* $(,)?]
+            $(setup($setup:expr))?
             $(stdin $input:expr)?
             $(=> $($flag:ident),+)?
         ;
@@ -360,11 +497,12 @@ macro_rules! tree_cases {
                     tool: $tool,
                     args: &[$($arg),*],
                     stdin: None,
+                    setup: None,
                     tz: "UTC0",
-                    deep: false,
                     cmp: Compare::default(),
                 };
                 $( case.stdin = Some($input); )?
+                $( case.setup = Some($setup); )?
                 $( $( case.flag(stringify!($flag)); )+ )?
                 case.run();
             }
@@ -683,8 +821,9 @@ tree_cases! {
     chmod_x_if_any: "chmod" ["-v", "g-x,+X", "exe"];
     chmod_recursive: "chmod" ["-vR", "750", "d"];
     chmod_recursive_changes: "chmod" ["-cR", "o-r", "d"];
-    chmod_recursive_deep: "chmod" ["-vR", "u-w", "deep"] => deep;
-    chmod_recursive_operands: "chmod" ["-R", "g+w", "d", "ld", "p", "deep"] => deep;
+    // Deeper (130 levels) than the recursive tools keep directories open.
+    chmod_recursive_deep: "chmod" ["-vR", "u-w", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    chmod_recursive_operands: "chmod" ["-R", "g+w", "d", "ld", "p", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     chmod_dir_keeps_setgid: "chmod" ["-v", "755", "sg"];
     chmod_dir_clears_setgid: "chmod" ["-v", "00755", "sg"];
     chmod_symlink_operand: "chmod" ["-v", "700", "la"];
@@ -735,8 +874,9 @@ tree_cases! {
     rm_dir_flag_empty: "rm" ["-dv", "e"];
     rm_recursive: "rm" ["-rv", "d"];
     rm_recursive_nested: "rm" ["-rv", "p"];
-    rm_recursive_deep: "rm" ["-rv", "deep"] => deep;
-    rm_recursive_quiet: "rm" ["-r", "d", "p", "p2", "deep"] => deep;
+    // Deeper (130 levels) than rm keeps directories open.
+    rm_recursive_deep: "rm" ["-rv", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
+    rm_recursive_quiet: "rm" ["-r", "d", "p", "p2", "deep"] setup("mkdir -p deep/$(printf 'k/%.0s' $(seq 130)) && echo bottom > deep/$(printf 'k/%.0s' $(seq 130))f");
     rm_trailing_slash_file: "rm" ["a/"];
     rm_force_trailing_slash_file: "rm" ["-f", "a/"];
     rm_recursive_trailing_slash: "rm" ["-rfv", "d/"];
@@ -786,12 +926,10 @@ tree_cases! {
     cp_same_file_dot: "cp" ["a", "./a"];
     cp_same_file_link: "cp" ["a", "la"];
     cp_same_symlink: "cp" ["la", "la"];
-    cp_no_clobber: "cp" ["-nv", "a", "b"];
     cp_interactive_no: "cp" ["-i", "a", "b"] stdin b"n\n";
     cp_interactive_yes: "cp" ["-iv", "a", "b"] stdin b"y\n";
     cp_interactive_new_file: "cp" ["-iv", "a", "x"];
     cp_force_then_interactive: "cp" ["-fi", "a", "b"] stdin b"n\n";
-    cp_no_clobber_then_interactive: "cp" ["-n", "-i", "a", "b"] stdin b"y\n";
     cp_backup: "cp" ["-bv", "a", "b"];
     cp_backup_replaces_old_backup: "cp" ["-bv", "a", "c.txt"];
     cp_backup_numbered: "cp" ["--backup=numbered", "-v", "a", "b"];
@@ -800,7 +938,6 @@ tree_cases! {
     cp_backup_suffix: "cp" ["-S", ".bak", "-bv", "a", "b"];
     cp_backup_none: "cp" ["--backup=none", "-v", "a", "b"];
     cp_backup_bad: "cp" ["--backup=bogus", "a", "b"];
-    cp_backup_and_no_clobber: "cp" ["-b", "-n", "a", "b"];
     cp_update_skips_newer: "cp" ["-uv", "old", "new"];
     cp_update_copies_older: "cp" ["-uv", "new", "old"];
     cp_update_none: "cp" ["--update=none", "-v", "a", "b"];
@@ -913,4 +1050,330 @@ tree_cases! {
     mv_keeps_times: "mv" ["old", "x"] => mtime;
     mv_quoting: "mv" ["-v", "spa ce", "it's"];
     mv_bad_option: "mv" ["--bogus", "a", "b"];
+}
+
+// ------------------------------------- cp, mv and ln: GNU's copy.c and ln.c
+
+tree_cases! {
+    // Same-file and backup rules.
+    cp_backup_would_destroy_source: "cp" ["--backup=simple", "c.txt~", "c.txt"];
+    mv_backup_would_destroy_source: "mv" ["--backup=simple", "c.txt~", "c.txt"];
+    cp_force_backup_onto_itself: "cp" ["--force", "--backup=simple", "--suffix=.b", "a", "a"];
+    cp_force_backup_onto_itself_t: "cp" ["-T", "--force", "--backup=simple", "--suffix=.b", "a", "a"];
+    cp_backup_suffix_orig: "cp" ["--backup=simple", "--suffix=.orig", "-v", "a", "b"];
+    mv_backup_suffix_orig: "mv" ["--backup=simple", "--suffix=.orig", "-v", "a", "b"];
+    ln_backup_suffix_orig: "ln" ["--backup=simple", "--suffix=.orig", "-v", "a", "b"];
+    ln_force_backup_onto_own_backup: "ln" ["-fv", "--backup=simple", "a", "b"] setup("ln b b~");
+    ln_symbolic_force_backup_onto_own_backup: "ln" ["-sfv", "--backup=simple", "a", "b"] setup("ln b b~");
+    cp_backup_symlink_onto_referent: "cp" ["-b", "la", "a"];
+    cp_backup_force_symlink_onto_referent: "cp" ["-bf", "la", "a"];
+    cp_force_hard_link_onto_symlink: "cp" ["-fl", "a", "la"];
+    cp_backup_hard_link_onto_symlink: "cp" ["-bl", "a", "la"];
+    cp_hard_link_symlink_onto_symlink: "cp" ["-dl", "la", "lla"];
+    cp_force_symbolic_onto_hard_link: "cp" ["-sf", "h1", "h2"];
+    cp_no_dereference_hard_linked_symlinks: "cp" ["-d", "ll1", "lh1"] setup("ln lh1 ll1");
+
+    // Option parsing (glibc getopt_long and the order GNU checks things in).
+    cp_keep_directory_symlink_is_9_5: "cp" ["--keep-directory-symlink", "a", "n"];
+    cp_abbreviated_long_options: "cp" ["--verb", "--back=numbered", "a", "b"];
+    cp_ambiguous_option: "cp" ["--re", "a", "n"];
+    cp_multiple_target_directories: "cp" ["-t", "d", "-t", "e", "a"];
+    mv_multiple_target_directories: "mv" ["-t", "d", "--target-directory=e", "a"];
+    ln_multiple_target_directories: "ln" ["-t", "d", "-t", "e", "a"];
+    ln_target_directory_checked_while_parsing: "ln" ["-t", "nodir", "--bogus", "a"];
+    ln_target_directory_not_a_directory: "ln" ["-t", "a", "-Q", "b"];
+    ln_bad_option_before_target_directory: "ln" ["--bogus", "-t", "nodir", "a"];
+    mv_last_update_wins: "mv" ["--update=none", "--update=all", "-v", "a", "b"];
+    cp_last_update_wins: "cp" ["--update=all", "--update=none", "-v", "a", "b"];
+    mv_debug_is_verbose: "mv" ["--debug", "a", "n"];
+    cp_permuted_options: "cp" ["a", "n", "-v"];
+    cp_posixly_correct_stops_at_operand: "cp" ["a", "n", "-v"] => posixly_correct;
+
+    // Destinations created earlier in the same run are never overwritten.
+    cp_will_not_overwrite_just_created: "cp" ["a", "m/a", "e"] setup("mkdir m && echo MA > m/a");
+    cp_numbered_backup_just_created: "cp" ["--backup=numbered", "-v", "a", "m/a", "e"]
+        setup("mkdir m && echo MA > m/a");
+    mv_will_not_overwrite_just_created: "mv" ["a", "m/a", "e"] setup("mkdir m && echo MA > m/a");
+    mv_hard_link_pair_and_other: "mv" ["h1", "m/h2", "h2", "e"] setup("mkdir m && echo M > m/h2");
+    ln_will_not_overwrite_just_created: "ln" ["-f", "a", "m/a", "e"] setup("mkdir m && echo MA > m/a");
+    cp_through_just_created_symlink: "cp" ["-dR", "la", "m/la", "e"] setup("mkdir m && echo M > m/la");
+    cp_through_just_created_symlink_existing: "cp" ["-dR", "la", "m/la", "e"]
+        setup("mkdir m && echo M > m/la && echo EA > e/a");
+    cp_source_file_twice: "cp" ["a", "./a", "e"];
+    cp_source_dir_twice: "cp" ["-a", "./d", "d", "e"] => mtime;
+    cp_source_dir_twice_into_itself: "cp" ["-a", "./e", "e", "e/"] => no_tree;
+    cp_backup_source_twice: "cp" ["--backup", "a", "a", "e"];
+    cp_numbered_backup_source_twice: "cp" ["--backup=numbered", "a", "a", "e"];
+    mv_source_twice: "mv" ["a", "a", "e"];
+    mv_source_twice_dot: "mv" ["./a", "a", "e"];
+    mv_source_dir_twice_into_itself: "mv" ["-v", "./e", "e", "e/"];
+
+    // Moving across file systems: a copy that keeps hard links, special files
+    // and attributes, then removal of the source.
+    mv_xdev_file: "mv" ["-v", "a", "@OTHER@"] => other_fs;
+    mv_xdev_replace: "mv" ["-v", "a", "@OTHER@/b"] setup("echo OB > \"$OTHER/b\"") => other_fs;
+    mv_xdev_backup: "mv" ["-vb", "a", "@OTHER@/b"] setup("echo OB > \"$OTHER/b\"") => other_fs;
+    mv_xdev_no_copy: "mv" ["--no-copy", "a", "d", "@OTHER@"] => other_fs;
+    mv_xdev_tree: "mv" ["-v", "d", "@OTHER@"] => other_fs, unordered;
+    mv_xdev_hard_links: "mv" ["-v", "h1", "h2", "@OTHER@"] => other_fs;
+    mv_xdev_hard_links_in_tree: "mv" ["d", "@OTHER@"] setup("ln d/f d/sub/f2") => other_fs;
+    mv_xdev_symlinks: "mv" ["-v", "la", "dl", "ld", "@OTHER@"] => other_fs;
+    mv_xdev_fifo: "mv" ["-v", "fifo", "@OTHER@"] setup("mkfifo fifo") => other_fs;
+    mv_xdev_onto_empty_dir: "mv" ["-Tv", "d", "@OTHER@/e"] setup("mkdir \"$OTHER/e\"")
+        => other_fs, unordered;
+    mv_xdev_onto_full_dir: "mv" ["-T", "d", "@OTHER@/full"]
+        setup("mkdir \"$OTHER/full\" && touch \"$OTHER/full/x\"") => other_fs;
+    mv_xdev_dir_onto_file: "mv" ["-T", "d", "@OTHER@/b"] setup("echo OB > \"$OTHER/b\"") => other_fs;
+    mv_xdev_file_onto_dir: "mv" ["-T", "a", "@OTHER@/e"] setup("mkdir \"$OTHER/e\"") => other_fs;
+    mv_xdev_keeps_attributes: "mv" ["old", "exe", "ro", "@OTHER@"] => other_fs, mtime;
+    mv_xdev_update_skips_newer: "mv" ["-uv", "old", "@OTHER@/b"] setup("echo OB > \"$OTHER/b\"")
+        => other_fs;
+    mv_xdev_no_clobber: "mv" ["-n", "a", "@OTHER@/b"] setup("echo OB > \"$OTHER/b\"") => other_fs;
+    mv_xdev_interactive_no: "mv" ["-i", "a", "@OTHER@/b"]
+        setup("echo OB > \"$OTHER/b\"") stdin b"n\n" => other_fs;
+    mv_xdev_interactive_yes: "mv" ["-iv", "a", "@OTHER@/b"]
+        setup("echo OB > \"$OTHER/b\"") stdin b"y\n" => other_fs;
+
+    // FIFOs and other special files.
+    cp_recursive_fifo: "cp" ["-Rv", "fifo", "x"] setup("mkfifo fifo");
+    cp_recursive_fifo_onto_file: "cp" ["-Rv", "fifo", "b"] setup("mkfifo fifo");
+    cp_archive_fifo: "cp" ["-a", "fifo", "x"] setup("mkfifo -m 640 fifo");
+    cp_recursive_tree_with_fifo: "cp" ["-R", "m", "x"] setup("mkdir m && mkfifo m/p && echo F > m/f");
+
+    // --link, --preserve=links and dereferencing.
+    cp_link_follow_command_line: "cp" ["--link", "-H", "la", "x"];
+    cp_link_follow_always: "cp" ["--link", "-L", "la", "x"];
+    cp_link_physical: "cp" ["--link", "-P", "la", "x"];
+    cp_link_follow_dangling: "cp" ["--link", "-H", "dl", "x"];
+    cp_link_recursive_dir_symlink: "cp" ["--link", "-RL", "ld", "x"] => unordered;
+    cp_preserve_links_command_line_symlink: "cp" ["--preserve=links", "-R", "-H", "a", "la", "e"];
+    cp_preserve_links_dereference: "cp" ["--preserve=links", "-RL", "m", "x"]
+        setup("mkdir m && echo M > m/a && ln -s a m/b");
+    cp_preserve_links_dereference_hard: "cp" ["--preserve=links", "-RL", "m", "x"]
+        setup("mkdir m && echo M > m/a && ln m/a m/b");
+    cp_no_preserve_links: "cp" ["-dR", "--no-preserve=links", "m", "x"]
+        setup("mkdir m && echo M > m/a && ln m/a m/b");
+    cp_archive_update_keeps_hard_links: "cp" ["-au", "s", "t"]
+        setup("mkdir -p s t/s && echo S > s/f && ln s/f s/l && ln s/f s/n && touch t/s/f && touch -d '+1 hour' t/s/n");
+
+    // --parents.
+    cp_parents_preserve_existing_dirs: "cp" ["-p", "--parents", "d/sub/g", "e"]
+        setup("mkdir -p e/d/sub && chmod 700 e/d e/d/sub") => mtime;
+    cp_parents_new_dirs_mode: "cp" ["-p", "--parents", "d/sub/g", "e"] setup("chmod 751 d")
+        => mtime;
+    cp_parents_no_preserve_mode: "cp" ["--parents", "--no-preserve=mode", "d/sub/g", "e"]
+        setup("chmod 700 d");
+    cp_parents_through_file: "cp" ["--parents", "a/g", "e"];
+    cp_parents_recursive_slash: "cp" ["-Rv", "--parents", "d/sub/", "e"];
+    cp_parents_onto_file: "cp" ["--parents", "d/sub/g", "e"] setup("touch e/d");
+
+    // --reflink and --sparse.
+    cp_reflink_always: "cp" ["--reflink=always", "a", "x"];
+    cp_reflink_never: "cp" ["--reflink=never", "-v", "a", "x"];
+    cp_reflink_auto_sparse_always: "cp" ["--reflink=auto", "--sparse=always", "a", "x"];
+    cp_reflink_sparse_conflict: "cp" ["--reflink", "--sparse=always", "a", "x"];
+    cp_reflink_sparse_never_conflict: "cp" ["--reflink", "--sparse=never", "a", "x"];
+    cp_reflink_bad: "cp" ["--reflink=bogus", "a", "x"];
+    cp_sparse_always: "cp" ["--sparse=always", "sp", "x"] setup("truncate -s 64K sp && printf X >> sp");
+    cp_sparse_never: "cp" ["--sparse=never", "sp", "x"] setup("truncate -s 64K sp && printf X >> sp");
+    cp_sparse_bad: "cp" ["--sparse=bogus", "a", "x"];
+
+    // Writing through symlinks.
+    cp_dangling_destination_posixly_correct: "cp" ["a", "dl"] => posixly_correct;
+    cp_force_dangling_destination: "cp" ["-f", "a", "dl"];
+    cp_force_symlink_loop: "cp" ["-f", "a", "loop"] setup("ln -s loop loop");
+    cp_symlink_loop: "cp" ["a", "loop"] setup("ln -s loop loop");
+
+    // Names.
+    cp_recursive_dotdot: "cp" ["-R", "d/sub/..", "e"] => unordered;
+    cp_target_double_slash: "cp" ["-v", "a", "e//"];
+    cp_trailing_slash_missing: "cp" ["a", "nodir/"];
+    cp_interactive_force_read_only: "cp" ["-fi", "a", "ro"] stdin b"y\n";
+
+    // ln -r resolves only the destination's directory.
+    ln_relative_replace_symlink: "ln" ["-srfv", "here", "lx"] setup("ln -s dir1/dir2/f lx");
+    ln_relative_symlink_chain: "ln" ["-srv", "lla", "e/x"];
+    ln_relative_empty: "ln" ["-sr", "", "x"];
+    ln_symbolic_force_onto_itself_relative: "ln" ["-sf", "../a", "e/a"] setup("touch e/a");
+
+    // mv: backups of directories, the last --update.
+    mv_backup_trailing_slash: "mv" ["-T", "--backup=numbered", "-v", "e", "p/"];
+    mv_backup_into_directory: "mv" ["--backup=simple", "f", "d/"] setup("echo NF > f");
+    mv_update_last_wins: "mv" ["--update=none", "--update=all", "new", "old"];
+    mv_update_last_wins_none: "mv" ["--update=all", "--update=none", "new", "old"];
+    cp_update_last_wins: "cp" ["--update=none", "--update=all", "new", "old"];
+    cp_update_last_wins_none: "cp" ["--update=all", "--update=none", "new", "old"];
+    mv_trailing_slash_new_name: "mv" ["-T", "e", "e3/"];
+    cp_recursive_trailing_slash_new_name: "cp" ["-r", "e", "e3/"];
+
+    // Names that are not UTF-8 (`@xff@` is the byte 0xff; `\377` in setup).
+    cp_non_utf8_names: "cp" ["-v", "n@xff@", "c@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    cp_non_utf8_into_directory: "cp" ["-v", "a", "n@xff@", "d"] setup("printf X > \"$(printf 'n\\377')\"");
+    cp_non_utf8_target_directory: "cp" ["-v", "-t", "d@xff@", "a", "b"] setup("mkdir \"$(printf 'd\\377')\"");
+    cp_non_utf8_tree: "cp" ["-rv", "t@xff@", "u@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    cp_non_utf8_parents: "cp" ["-v", "--parents", "t@xff@/f@xff@", "e"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    cp_non_utf8_missing_source: "cp" ["n@xff@", "z"];
+    cp_non_utf8_backup: "cp" ["-v", "--backup=numbered", "a", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    mv_non_utf8_names: "mv" ["-v", "n@xff@", "m@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    mv_non_utf8_into_directory: "mv" ["-v", "a", "n@xff@", "d@xff@"] setup("printf X > \"$(printf 'n\\377')\" && mkdir \"$(printf 'd\\377')\"");
+    mv_non_utf8_strip_slashes: "mv" ["-v", "--strip-trailing-slashes", "t@xff@/", "e"] setup("mkdir \"$(printf 't\\377')\"");
+    ln_non_utf8_symbolic: "ln" ["-sv", "n@xff@", "l@xff@"];
+    ln_non_utf8_hard: "ln" ["-v", "n@xff@", "h@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    ln_non_utf8_target_directory: "ln" ["-v", "-t", "d@xff@", "a"] setup("mkdir \"$(printf 'd\\377')\"");
+    ln_non_utf8_target_directory_missing: "ln" ["-t", "d@xff@", "a"];
+    mkdir_non_utf8_parents: "mkdir" ["-pv", "x@xff@/y@xff@"];
+    mkdir_non_utf8_exists: "mkdir" ["d@xff@"] setup("mkdir \"$(printf 'd\\377')\"");
+    mkdir_non_utf8_mode: "mkdir" ["-v", "-m", "700", "m@xff@"];
+    rm_non_utf8: "rm" ["-v", "n@xff@", "d@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    rm_non_utf8_recursive: "rm" ["-rv", "t@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+}
+
+/// Whether `dir`'s file system stores names that are not UTF-8. APFS (macOS)
+/// refuses them with EILSEQ, for every program alike, so there is nothing to
+/// test there.
+fn accepts_non_utf8_names(dir: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let probe = dir.join(OsStr::from_bytes(b".probe\xff"));
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("note: skipping — this file system rejects names that are not UTF-8");
+            false
+        }
+        Err(e) => panic!("cannot create {}: {e}", probe.display()),
+    }
+}
+
+/// `mktemp` names are random: check that a template that is not UTF-8 is
+/// used byte for byte, as GNU does.
+#[test]
+fn mktemp_non_utf8_template() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = scratch_root().join("mktemp-non-utf8");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    if !accepts_non_utf8_names(&dir) {
+        return;
+    }
+    for args in [
+        &[&b"-p"[..], b".", b"f\xffXXXXXX"][..],
+        &[b"-d", b"-p", b".", b"d\xffXXXXXX"],
+        &[b"--suffix=\xff", b"s.XXXXXX"],
+    ] {
+        let mut cmd = Command::new(dogfish_bin());
+        cmd.arg("mktemp")
+            .args(args.iter().map(|a| OsStr::from_bytes(a)));
+        let out = exec(cmd, &dir, None, "C");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let name = out.stdout.strip_suffix(b"\n").unwrap();
+        assert!(name.contains(&0xff), "{out:?}");
+        assert!(dir.join(OsStr::from_bytes(name)).exists(), "{out:?}");
+    }
+}
+
+/// The undo journal keeps names that are not UTF-8 losslessly: undoing an
+/// overwrite and a move restores exactly the files that were there.
+#[test]
+fn undo_restores_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = scratch_root().join("undo-non-utf8");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    if !accepts_non_utf8_names(&dir) {
+        return;
+    }
+    let home = dir.join(".home");
+    let odd = OsStr::from_bytes(b"n\xff");
+    let moved = OsStr::from_bytes(b"m\xff");
+    fs::write(dir.join(odd), "old\n").unwrap();
+    fs::write(dir.join("a"), "new\n").unwrap();
+    let run = |args: &[&OsStr]| {
+        let mut cmd = Command::new(dogfish_bin());
+        cmd.args(args).env("DOGFISH_HOME", &home);
+        let out = exec(cmd, &dir, None, "C");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+    };
+    run(&["cp".as_ref(), "a".as_ref(), odd]);
+    assert_eq!(fs::read(dir.join(odd)).unwrap(), b"new\n");
+    run(&["mv".as_ref(), odd, moved]);
+    run(&["undo".as_ref()]);
+    assert!(dir.join(odd).exists() && !dir.join(moved).exists());
+    run(&["undo".as_ref()]);
+    assert_eq!(fs::read(dir.join(odd)).unwrap(), b"old\n");
+}
+
+/// Runs Dogfish alone in a fresh scratch tree: for GNU 9.4 behaviour the
+/// system's tool does not have.
+fn dogfish_only(name: &str, args: &[&str], stdin: Option<&[u8]>) -> (Output, PathBuf) {
+    let dir = scratch_root().join(format!("{name}-only"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    build_tree(&dir);
+    let mut cmd = Command::new(dogfish_bin());
+    cmd.arg(args[0])
+        .args(&args[1..])
+        .env("DOGFISH_HOME", dir.join(".dogfish-home"));
+    (exec(cmd, &dir, stdin, "C"), dir)
+}
+
+// Ubuntu's coreutils 9.4 carries 9.5's `cp -n` (a warning, then skipping with
+// status 0); upstream 9.4, whose tests/cp/cp-i.sh Dogfish passes, refuses
+// with a diagnostic and status 1, and rejects `-b -n`. These pin upstream.
+
+#[test]
+fn cp_no_clobber_upstream() {
+    let (out, dir) = dogfish_only("cp_no_clobber_upstream", &["cp", "-nv", "a", "b"], None);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"");
+    assert_eq!(out.stderr, b"cp: not replacing 'b'\n");
+    assert_eq!(fs::read(dir.join("b")).unwrap(), b"B\n");
+}
+
+#[test]
+fn cp_interactive_then_no_clobber_upstream() {
+    let (out, dir) = dogfish_only(
+        "cp_interactive_then_no_clobber_upstream",
+        &["cp", "-vin", "a", "b"],
+        Some(b"y\n"),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stderr, b"cp: not replacing 'b'\n");
+    assert_eq!(fs::read(dir.join("b")).unwrap(), b"B\n");
+}
+
+#[test]
+fn cp_no_clobber_then_interactive_upstream() {
+    let (out, dir) = dogfish_only(
+        "cp_no_clobber_then_interactive_upstream",
+        &["cp", "-vni", "a", "b"],
+        Some(b"y\n"),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"'a' -> 'b'\n");
+    assert_eq!(out.stderr, b"cp: overwrite 'b'? ");
+    assert_eq!(fs::read(dir.join("b")).unwrap(), b"A\n");
+}
+
+#[test]
+fn cp_backup_and_no_clobber_upstream() {
+    let (out, dir) = dogfish_only(
+        "cp_backup_and_no_clobber_upstream",
+        &["cp", "-bn", "a", "b"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.stderr,
+        b"cp: options --backup and --no-clobber are mutually exclusive\n\
+          Try 'cp --help' for more information.\n"
+    );
+    assert_eq!(fs::read(dir.join("b")).unwrap(), b"B\n");
 }

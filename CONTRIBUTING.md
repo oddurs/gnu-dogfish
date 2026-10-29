@@ -16,10 +16,11 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    ```bash
    cargo xtask ci
    ```
-   It stops at the first failing step and names it: formatting, Clippy, the MSRV
+   It stops at the first failing step and names it: formatting, Clippy, the
+   `unsafe` inventory (`doc/unsafe.md`), the MSRV
    (`rustup toolchain install 1.88`), a macOS type-check from Linux
-   (`rustup target add aarch64-apple-darwin`), `cargo test` in debug (clap's
-   argument asserts and overflow checks are on) and release, every test binary
+   (`rustup target add aarch64-apple-darwin`), `cargo test` in debug (overflow
+   checks are on) and release, every test binary
    again as `nobody` when you run it as root, docs, and a packaging dry run.
    `cargo xtask` lists the steps; each runs on its own too (`cargo xtask test`).
    CI calls the same steps, so the two cannot drift (CI also runs the tests on macOS).
@@ -28,10 +29,26 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    against the system tools; on other platforms those cases are skipped.
    `cargo xtask gnu` runs GNU's own test suite against Dogfish (slow; as a non-root
    user) and fails if a test in `util/gnu-baseline.json` stops passing.
+
+   Outside `ci`, because they need extra tools or take longer (CI runs them in
+   `.github/workflows/supply-chain.yml`):
+   - `cargo xtask deny`: the dependency policy in `deny.toml` (RustSec
+     advisories, licenses, duplicate crates, crates.io only). Needs
+     `cargo install --locked cargo-deny@0.20.2`. A new dependency must pass it;
+     an advisory is only ignored with a written reason in `deny.toml`.
+   - `cargo xtask asan`: the test suites under AddressSanitizer
+     (`rustup toolchain install nightly-2026-10-20 --component rust-src`).
+   - `cargo xtask repro`: builds the release archive twice, from two copies of
+     the tree, and fails unless they are bit-identical. `cargo xtask dist`
+     builds one, as the release workflow does.
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench
    ```
+4. **Adding `unsafe`**: avoid it if `std` or an existing helper can do the job.
+   Otherwise give the block a `// SAFETY:` comment (Clippy enforces it) and a
+   row in [`doc/unsafe.md`](doc/unsafe.md) (`cargo xtask unsafe-audit` enforces
+   it).
 
 ---
 
@@ -55,8 +72,8 @@ The workspace consists of two crates, plus `crates/xtask` (the `cargo xtask` che
 
 ## ➕ How to Add a New Utility
 
-1. **Implement `pub fn run_<tool>(args: Vec<String>, ctx: &DogfishContext) -> Result<i32>`** in the appropriate module (`fs_ops.rs`, `text.rs`, `hash.rs`, or `sys.rs`).
-2. **Use `clap::Parser`** for flags, and support `-J` / `--json` (`emit_objects_or_table`) whenever the utility outputs structured records.
+1. **Implement `pub fn run_<tool>(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32>`** in the appropriate module (`fs_ops.rs`, `text.rs`, `hash.rs`, or `sys.rs`).
+2. **Parse options with `common::getopt`** (a port of glibc's `getopt_long`: list GNU's options in GNU's `long_options` order, `--help`/`--version` included), write output through `dogfish_core::stdout` (`out!`/`outln!`), and support `-J` / `--json` (`emit_objects_or_table`) whenever the utility outputs structured records.
 3. **Record telemetry** via `ctx.telemetry.add_read(...)`, `ctx.telemetry.add_written(...)`, `ctx.telemetry.add_items(...)`, and `ctx.telemetry.set_strategy(...)`.
 4. **Register the utility** in `ALL_TOOLS` and `dispatch()` inside `crates/dogfish/src/main.rs`.
 5. **Add tests**: integration tests in `crates/dogfish/tests/integration.rs` (and update the tool count in `test_all_57_tools_respond_to_help_cleanly`), GNU differential cases in `tests/gnu_compat.rs`, and — for anything that writes, moves or deletes files — data-safety regressions in `tests/fs_safety.rs`.

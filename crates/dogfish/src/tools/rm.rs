@@ -1,21 +1,24 @@
 //! rm — GNU semantics plus `--safe` (or `--trash`) undoable trash staging
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
+use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
 use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
 use crate::common::file_info::{describe_mode, file_type_description};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, print_help, print_version, try_help, usage_error,
+};
 use crate::common::path::last_component;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::prompt::{Interactive, ask};
-use crate::common::quote::{qa, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
+use crate::common::quote::{Quoting, qa, quote_bytes};
 
 const RM_HELP: &str = "\
 Usage: rm [OPTION]... [FILE]...
@@ -53,10 +56,35 @@ enum RmOpt {
     OneFileSystem,
     NoPreserveRoot,
     PreserveRoot,
+    PresumeInputTty,
     Recursive,
     Verbose,
     Safe,
+    Help,
+    Version,
 }
+
+/// GNU's `long_opts` (in its order: it decides ambiguity diagnostics) and
+/// `"dfirvIR"`, plus the Dogfish `--safe`/`--trash`. `---presume-input-tty`
+/// is GNU's hidden test option: prompt as if standard input were a terminal.
+const SPECS: &[OptSpec<RmOpt>] = &[
+    OptSpec::both(b'f', "force", HasArg::No, RmOpt::Force),
+    OptSpec::long("interactive", HasArg::Optional, RmOpt::InteractiveWhen),
+    OptSpec::long("one-file-system", HasArg::No, RmOpt::OneFileSystem),
+    OptSpec::long("no-preserve-root", HasArg::No, RmOpt::NoPreserveRoot),
+    OptSpec::long("preserve-root", HasArg::Optional, RmOpt::PreserveRoot),
+    OptSpec::long("-presume-input-tty", HasArg::No, RmOpt::PresumeInputTty),
+    OptSpec::both(b'r', "recursive", HasArg::No, RmOpt::Recursive),
+    OptSpec::both(b'd', "dir", HasArg::No, RmOpt::Dir),
+    OptSpec::both(b'v', "verbose", HasArg::No, RmOpt::Verbose),
+    OptSpec::long("help", HasArg::No, RmOpt::Help),
+    OptSpec::long("version", HasArg::No, RmOpt::Version),
+    OptSpec::long("safe", HasArg::No, RmOpt::Safe).exact(),
+    OptSpec::long("trash", HasArg::No, RmOpt::Safe).exact(),
+    OptSpec::short(b'i', HasArg::No, RmOpt::EveryFile),
+    OptSpec::short(b'I', HasArg::No, RmOpt::Once),
+    OptSpec::short(b'R', HasArg::No, RmOpt::Recursive),
+];
 
 struct RmRun {
     force: bool,
@@ -78,33 +106,60 @@ enum RmStatus {
     Failed,
 }
 
+/// GNU's `directory_status`: whether a directory has entries, or why it
+/// cannot be read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirStatus {
+    Empty,
+    NonEmpty,
+    /// `errno` of the failed opendir/readdir.
+    Unreadable(i32),
+}
+
+fn dir_status(at: At<'_>) -> DirStatus {
+    let mut names = Names::default();
+    match at.open_dir(false).and_then(|d| d.read_names(&mut names)) {
+        Ok(()) if names.is_empty() => DirStatus::Empty,
+        Ok(()) => DirStatus::NonEmpty,
+        Err(e) => DirStatus::Unreadable(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
+/// [`dir_status`] of a path.
+fn dir_status_of(p: &Path) -> DirStatus {
+    match CString::new(p.as_os_str().as_bytes()) {
+        Ok(c) => dir_status(At::cwd(&c)),
+        Err(_) => DirStatus::Unreadable(libc::EINVAL),
+    }
+}
+
 /// True when the last component of `f` is `.` or `..` (`d/.`, `./`, `..//`).
-fn is_dot_or_dotdot(f: &str) -> bool {
+fn is_dot_or_dotdot(f: &OsStr) -> bool {
     let last = last_component(f.as_bytes());
     let name = &last[..last.iter().position(|&b| b == b'/').unwrap_or(last.len())];
     name == b"." || name == b".."
 }
 
-pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// After a usage error, GNU's hint for removing a file whose name looks like
+/// an option: `Try 'rm ./-f' to remove the file '-f'.`
+fn diagnose_leading_hyphen(args: &[OsString]) {
+    for arg in args {
+        let b = arg.as_bytes();
+        if b.len() > 1 && b[0] == b'-' && Path::new(arg).symlink_metadata().is_ok() {
+            eprintln!(
+                "Try 'rm ./{}' to remove the file {}.",
+                quote_bytes(b, Quoting::ShellEscape),
+                qa(arg)
+            );
+            break;
+        }
+    }
+}
+
+pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use RmOpt::*;
-    const SPECS: &[ToolOpt<RmOpt>] = &[
-        opt("d", "dir", HasArg::No, Dir),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "", HasArg::No, EveryFile),
-        opt("I", "", HasArg::No, Once),
-        opt("", "interactive", HasArg::Optional, InteractiveWhen),
-        opt("", "one-file-system", HasArg::No, OneFileSystem),
-        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
-        opt("", "preserve-root", HasArg::Optional, PreserveRoot),
-        opt("rR", "recursive", HasArg::No, Recursive),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("", "safe", HasArg::No, Safe),
-        opt("", "trash", HasArg::No, Safe),
-    ];
-    let parsed = match parse_tool_args("rm", &args, SPECS, RM_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let args: Vec<OsString> = args.into_iter().skip(1).collect();
+    let mut opts = Getopt::new(args.clone(), SPECS);
     let mut run = RmRun {
         force: false,
         interactive: Interactive::Sometimes,
@@ -116,7 +171,15 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let (mut prompt_once, mut preserve_root, mut preserve_all, mut safe) =
         (false, true, false, false);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => {
+                crate::common::getopt::error_bytes("rm", e.as_bytes());
+                diagnose_leading_hyphen(&args);
+                return Ok(try_help("rm"));
+            }
+        };
         match o {
             Dir => run.dir = true,
             Force => {
@@ -150,7 +213,7 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ("yes", When::Always),
                 ];
                 let when = match v {
-                    Some(w) => match argmatch("rm", "--interactive", &w, WHEN) {
+                    Some(w) => match argmatch("rm", "--interactive", w, WHEN) {
                         Ok(w) => w,
                         Err(code) => return Ok(code),
                     },
@@ -174,27 +237,36 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 }
             }
             OneFileSystem => run.one_file_system = true,
-            NoPreserveRoot => preserve_root = false,
+            NoPreserveRoot => {
+                if opts.last_word() != Some(OsStr::new("--no-preserve-root")) {
+                    eprintln!("rm: you may not abbreviate the --no-preserve-root option");
+                    return Ok(1);
+                }
+                preserve_root = false;
+            }
             PreserveRoot => {
-                match v.as_deref() {
+                match v.as_deref().map(OsStr::as_bytes) {
                     None => {}
-                    Some("all") => preserve_all = true,
+                    Some(b"all") => preserve_all = true,
                     Some(other) => {
                         eprintln!(
                             "rm: unrecognized --preserve-root argument: {}",
-                            quote_locale(other)
+                            qa(OsStr::from_bytes(other))
                         );
                         return Ok(1);
                     }
                 }
                 preserve_root = true;
             }
+            PresumeInputTty => run.stdin_tty = true,
             Recursive => run.recursive = true,
             Verbose => run.verbose = true,
             Safe => safe = true,
+            Help => return Ok(print_help(RM_HELP)),
+            Version => return Ok(print_version("rm")),
         }
     }
-    let files = parsed.operands;
+    let files = opts.operands();
     if files.is_empty() {
         return Ok(if run.force {
             0
@@ -240,18 +312,18 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             }
         };
         // GNU checks, in this order: directory without -r, `.`/`..`, then `/`.
-        if meta.is_dir() && !run.recursive {
-            let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
-            if !run.dir || !empty {
-                let why = if run.dir {
-                    "Directory not empty"
-                } else {
-                    "Is a directory"
-                };
-                eprintln!("rm: cannot remove {}: {why}", qa(f));
-                exit_code = 1;
-                continue;
-            }
+        // Like GNU, `-d` goes on to rmdir(2) unless the directory has entries
+        // (an unreadable one may still be empty).
+        if meta.is_dir() && !run.recursive && (!run.dir || dir_status_of(p) == DirStatus::NonEmpty)
+        {
+            let why = if run.dir {
+                "Directory not empty"
+            } else {
+                "Is a directory"
+            };
+            eprintln!("rm: cannot remove {}: {why}", qa(f));
+            exit_code = 1;
+            continue;
         }
         if is_dot_or_dotdot(f) {
             eprintln!(
@@ -293,7 +365,7 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ctx.telemetry.add_items(1);
                     if run.verbose {
                         let st = ctx.style();
-                        println!(
+                        outln!(
                             "{} {} (undo id #{}: run `{}` to restore)",
                             st.yellow("trashed"),
                             qa(f),
@@ -324,7 +396,7 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             if run.recursive {
                 rm_tree(at, &mut path, Some(&info), 0, meta.dev(), &run, ctx)
             } else {
-                rm_empty_dir(at, path.as_path(), Some(&info), &run, ctx)
+                rm_empty_dir(at, path.as_path(), Some(&info), None, &run, ctx)
             }
         } else {
             rm_file(at, path.as_path(), Some(&info), &run, ctx)
@@ -417,7 +489,7 @@ fn rm_file(
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                println!("removed {}", qa(p));
+                outln!("removed {}", qa(p));
             }
             RmStatus::Removed
         }
@@ -428,30 +500,46 @@ fn rm_file(
     }
 }
 
+/// Removes the directory `at` (printed as `p`). `known` is its
+/// [`DirStatus`] if the caller has it; otherwise it is found only when a
+/// prompt or a failed `rmdir` needs it.
 fn rm_empty_dir(
     at: At<'_>,
     p: &Path,
     info: Option<&Info>,
+    known: Option<DirStatus>,
     run: &RmRun,
     ctx: &DogfishContext,
 ) -> RmStatus {
-    if let Some(protected) = rm_prompt_needed(at, info, run)
-        && !ask(
-            "rm",
-            &format!(
+    let mut known = known;
+    let mut status = || *known.get_or_insert_with(|| dir_status(at));
+    if let Some(protected) = rm_prompt_needed(at, info, run) {
+        let question = match status() {
+            // GNU asks before trying to remove a directory it cannot read
+            // (with -d, when it may be empty); any other error is final.
+            DirStatus::Unreadable(libc::EACCES) if run.dir => {
+                format!("attempt removal of inaccessible directory {}? ", qa(p))
+            }
+            DirStatus::Unreadable(errno) => {
+                let e = io::Error::from_raw_os_error(errno);
+                eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+                return RmStatus::Failed;
+            }
+            _ => format!(
                 "remove {}directory {}? ",
                 protected_prefix(protected),
                 qa(p)
             ),
-        )
-    {
-        return RmStatus::Declined;
+        };
+        if !ask("rm", &question) {
+            return RmStatus::Declined;
+        }
     }
     match at.unlink(true) {
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                println!("removed directory {}", qa(p));
+                outln!("removed directory {}", qa(p));
             }
             RmStatus::Removed
         }
@@ -460,6 +548,15 @@ fn rm_empty_dir(
             RmStatus::Removed
         }
         Err(e) => {
+            // A directory that could not be read and is not empty: GNU names
+            // the read error.
+            let e = match e.raw_os_error() {
+                Some(libc::ENOTEMPTY | libc::EEXIST) => match status() {
+                    DirStatus::Unreadable(errno) => io::Error::from_raw_os_error(errno),
+                    _ => e,
+                },
+                _ => e,
+            };
             eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
             RmStatus::Failed
         }
@@ -483,11 +580,28 @@ fn rm_tree(
     ctx: &DogfishContext,
 ) -> RmStatus {
     let mut names = Names::default();
-    // An unreadable directory is not empty: GNU asks to descend, then fails.
     let dir = at
         .open_dir(true)
         .and_then(|d| d.read_names(&mut names).map(|()| d));
-    if dir.as_ref().is_err() || !names.is_empty() {
+    let dir = match dir {
+        // An unreadable directory cannot be descended into; GNU (`FTS_DNR`)
+        // goes straight to removing it, which works if it is empty.
+        Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(libc::EIO);
+            if rm_prompt_needed(at, info, run).is_some() && !(run.dir && errno == libc::EACCES) {
+                eprintln!(
+                    "rm: cannot remove {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
+                return RmStatus::Failed;
+            }
+            let status = Some(DirStatus::Unreadable(errno));
+            return rm_empty_dir(at, path.as_path(), info, status, run, ctx);
+        }
+        Ok(d) => d,
+    };
+    if !names.is_empty() {
         if let Some(protected) = rm_prompt_needed(at, info, run)
             && !ask(
                 "rm",
@@ -500,17 +614,6 @@ fn rm_tree(
         {
             return RmStatus::Kept;
         }
-        let dir = match dir {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "rm: cannot remove {}: {}",
-                    qa(path.as_path()),
-                    gnu_io_error(&e)
-                );
-                return RmStatus::Failed;
-            }
-        };
         // Deep down, entries are reached by full path, with no directory held open.
         let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
         let need_info = run.may_prompt() || run.one_file_system;
@@ -525,6 +628,7 @@ fn rm_tree(
                     full = path.c_path().map(CStr::to_owned);
                     match &full {
                         Some(c) => At::cwd(c),
+                        // A path with a NUL cannot be reached; EBADF says so.
                         None => At { dir: -1, name },
                     }
                 }
@@ -571,5 +675,6 @@ fn rm_tree(
             return RmStatus::Kept;
         }
     }
-    rm_empty_dir(at, path.as_path(), info, run, ctx)
+    let status = names.is_empty().then_some(DirStatus::Empty);
+    rm_empty_dir(at, path.as_path(), info, status, run, ctx)
 }

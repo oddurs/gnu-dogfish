@@ -33,3 +33,10 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+    # Every action is pinned to a full commit SHA with its version in a
+    # comment (`uses: owner/action@<sha> # v1.2.3`); Dependabot updates both.
+    ignore:
+      # dtolnay/rust-toolchain has no releases: it is pinned to a commit of its
+      # master branch, and the toolchains are its `toolchain:` inputs (1.88.0
+      # is the MSRV, the Clippy and release pins are deliberate). Bump by hand.
+      - dependency-name: "dtolnay/rust-toolchain"

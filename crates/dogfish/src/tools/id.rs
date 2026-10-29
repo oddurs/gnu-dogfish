@@ -1,65 +1,105 @@
 //! id — With `--json` and colorized interactive output
 
 use std::ffi::{CStr, CString};
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
-use dogfish_core::{DogfishContext, gnu_quote, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
 use serde::Serialize;
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version,
+};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
-#[derive(Parser)]
-#[command(
-    name = "id",
-    about = "Print user and group information for each specified USER, \
-             or (when USER omitted) for the current process",
-    disable_help_flag = true,
-    infer_long_args = true
-)]
+const ID_HELP: &str = "\
+Print user and group information for each specified USER, or (when USER omitted) for the current
+process
+
+Usage: id [OPTIONS] [USERS]...
+
+Arguments:
+  [USERS]...  
+
+Options:
+  -a             Ignore, for compatibility with other versions
+  -Z, --context  Print only the security context of the process
+  -g, --group    Print only the effective group ID
+  -G, --groups   Print all group IDs
+  -n, --name     Print a name instead of a number, for -u, -g, -G
+  -r, --real     Print the real ID instead of the effective ID, with -u, -g, -G
+  -u, --user     Print only the effective user ID
+  -z, --zero     Delimit entries with NUL characters, not whitespace
+  -J, --json     Emit structured JSON
+      --help     Display this help and exit
+";
+
+#[derive(Default)]
 struct IdArgs {
-    /// Ignore, for compatibility with other versions
-    #[arg(short = 'a')]
-    ignored: bool,
-
-    /// Print only the security context of the process
-    #[arg(short = 'Z', long = "context")]
     context: bool,
-
-    /// Print only the effective group ID
-    #[arg(short = 'g', long = "group")]
     group: bool,
-
-    /// Print all group IDs
-    #[arg(short = 'G', long = "groups")]
     groups: bool,
-
-    /// Print a name instead of a number, for -u, -g, -G
-    #[arg(short = 'n', long = "name")]
     name: bool,
-
-    /// Print the real ID instead of the effective ID, with -u, -g, -G
-    #[arg(short = 'r', long = "real")]
     real: bool,
-
-    /// Print only the effective user ID
-    #[arg(short = 'u', long = "user")]
     user: bool,
-
-    /// Delimit entries with NUL characters, not whitespace
-    #[arg(short = 'z', long = "zero")]
     zero: bool,
-
-    /// Emit structured JSON
-    #[arg(short = 'J', long = "json")]
     json: bool,
-
-    /// Display this help and exit
-    #[arg(long, action = ArgAction::Help)]
-    help: Option<bool>,
-
+    ignored: bool,
     users: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdArgsOpt {
+    Context,
+    Group,
+    Groups,
+    Name,
+    Real,
+    User,
+    Zero,
+    Json,
+    Ignored,
+    Help,
+    Version,
+}
+
+const SPECS: &[OptSpec<IdArgsOpt>] = &[
+    OptSpec::both(b'Z', "context", HasArg::No, IdArgsOpt::Context),
+    OptSpec::both(b'g', "group", HasArg::No, IdArgsOpt::Group),
+    OptSpec::both(b'G', "groups", HasArg::No, IdArgsOpt::Groups),
+    OptSpec::both(b'n', "name", HasArg::No, IdArgsOpt::Name),
+    OptSpec::both(b'r', "real", HasArg::No, IdArgsOpt::Real),
+    OptSpec::both(b'u', "user", HasArg::No, IdArgsOpt::User),
+    OptSpec::both(b'z', "zero", HasArg::No, IdArgsOpt::Zero),
+    OptSpec::both(b'J', "json", HasArg::No, IdArgsOpt::Json),
+    OptSpec::long("help", HasArg::No, IdArgsOpt::Help),
+    OptSpec::long("version", HasArg::No, IdArgsOpt::Version),
+    OptSpec::short(b'a', HasArg::No, IdArgsOpt::Ignored),
+];
+
+/// Parses the command line; `Err` is the exit status after `--help`,
+/// `--version` or a usage diagnostic.
+fn parse_id_args(args: Vec<std::ffi::OsString>) -> std::result::Result<IdArgs, i32> {
+    let mut parsed = IdArgs::default();
+    let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
+    while let Some(opt) = opts.next() {
+        let (o, _) = opt.map_err(|e| getopt_error("id", &e))?;
+        match o {
+            IdArgsOpt::Context => parsed.context = true,
+            IdArgsOpt::Group => parsed.group = true,
+            IdArgsOpt::Groups => parsed.groups = true,
+            IdArgsOpt::Name => parsed.name = true,
+            IdArgsOpt::Real => parsed.real = true,
+            IdArgsOpt::User => parsed.user = true,
+            IdArgsOpt::Zero => parsed.zero = true,
+            IdArgsOpt::Json => parsed.json = true,
+            IdArgsOpt::Ignored => parsed.ignored = true,
+            IdArgsOpt::Help => return Err(print_help(ID_HELP)),
+            IdArgsOpt::Version => return Err(print_version("id")),
+        }
+    }
+    parsed.users = lossy_all(opts.operands());
+    Ok(parsed)
 }
 
 #[derive(Serialize)]
@@ -230,8 +270,11 @@ fn id_full_format(who: &Identity, st: dogfish_core::Style) -> String {
     line
 }
 
-pub fn run_id(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = IdArgs::try_parse_from(args)?;
+pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let parsed = match parse_id_args(args) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let _ = parsed.ignored;
     // There is no SELinux support, so -Z can never be satisfied.
     if parsed.context {
@@ -276,8 +319,7 @@ pub fn run_id(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     let st = ctx.style();
     let term = if parsed.zero { b'\0' } else { b'\n' };
     for who in targets.into_iter().flatten() {

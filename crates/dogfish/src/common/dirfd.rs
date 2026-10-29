@@ -46,9 +46,17 @@ impl<'a> At<'a> {
     pub(crate) fn stat(self, follow: bool) -> io::Result<libc::stat> {
         let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        cvt(unsafe { libc::fstatat(self.dir, self.name.as_ptr(), st.as_mut_ptr(), flags) })?;
-        // Safety: fstatat succeeded, so it filled the buffer.
-        Ok(unsafe { st.assume_init() })
+        // SAFETY: `name` is a NUL-terminated C string and `st` a writable
+        // `stat`; it is read only after fstatat succeeded, which filled it.
+        unsafe {
+            cvt(libc::fstatat(
+                self.dir,
+                self.name.as_ptr(),
+                st.as_mut_ptr(),
+                flags,
+            ))?;
+            Ok(st.assume_init())
+        }
     }
 
     /// Opens a directory to read and to act inside. With `nofollow`, a
@@ -58,25 +66,31 @@ impl<'a> At<'a> {
         if nofollow {
             flags |= libc::O_NOFOLLOW;
         }
-        let fd = cvt(unsafe { libc::openat(self.dir, self.name.as_ptr(), flags) })?;
-        // Safety: openat returned a new descriptor that nothing else owns.
-        Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+        // SAFETY: `name` is a NUL-terminated C string; on success openat
+        // returns a new descriptor that nothing else owns.
+        unsafe {
+            let fd = cvt(libc::openat(self.dir, self.name.as_ptr(), flags))?;
+            Ok(DirFd(OwnedFd::from_raw_fd(fd)))
+        }
     }
 
     /// `unlinkat`: removes a non-directory, or with `dir` an empty directory.
     pub(crate) fn unlink(self, dir: bool) -> io::Result<()> {
         let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: `name` is a NUL-terminated C string.
         cvt(unsafe { libc::unlinkat(self.dir, self.name.as_ptr(), flags) }).map(drop)
     }
 
     /// `fchmodat`, following a final symlink as `chmod` does.
     pub(crate) fn chmod(self, mode: u32) -> io::Result<()> {
+        // SAFETY: `name` is a NUL-terminated C string.
         cvt(unsafe { libc::fchmodat(self.dir, self.name.as_ptr(), mode as libc::mode_t, 0) })
             .map(drop)
     }
 
     /// `access (W_OK)` failing with `EACCES`.
     pub(crate) fn write_protected(self) -> bool {
+        // SAFETY: `name` is a NUL-terminated C string.
         let denied = unsafe { libc::faccessat(self.dir, self.name.as_ptr(), libc::W_OK, 0) } != 0;
         denied && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
     }
@@ -171,9 +185,8 @@ impl Names {
     /// Entry `i`: its name, type and inode number.
     pub(crate) fn get(&self, i: usize) -> (&CStr, EntryType, u64) {
         let (start, kind, ino) = self.entries[i];
-        let end = start + self.buf[start..].iter().position(|&b| b == 0).unwrap_or(0);
-        // Safety: push wrote the name (which has no NUL) followed by a NUL.
-        let name = unsafe { CStr::from_bytes_with_nul_unchecked(&self.buf[start..=end]) };
+        // `push` wrote the name followed by a NUL.
+        let name = CStr::from_bytes_until_nul(&self.buf[start..]).unwrap_or_default();
         (name, kind, ino)
     }
 }
@@ -191,6 +204,7 @@ fn read_entries(fd: RawFd, names: &mut Names) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn getdents(fd: RawFd, buf: &mut [u8], names: &mut Names) -> io::Result<()> {
     loop {
+        // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
         let n = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
@@ -229,17 +243,33 @@ fn getdents(fd: RawFd, buf: &mut [u8], names: &mut Names) -> io::Result<()> {
 /// Elsewhere: `readdir` on a `DIR` stream over a duplicate of the descriptor.
 #[cfg(not(target_os = "linux"))]
 fn read_entries(fd: RawFd, names: &mut Names) -> io::Result<()> {
-    let dup = cvt(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;
-    let dir = unsafe { libc::fdopendir(dup) };
-    if dir.is_null() {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(dup) };
-        return Err(e);
-    }
+    // SAFETY: descriptor only: the duplicate is handed to fdopendir, which
+    // owns it from then on, or closed here once if fdopendir fails.
+    let dir = unsafe {
+        let dup = cvt(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0))?;
+        let dir = libc::fdopendir(dup);
+        if dir.is_null() {
+            let e = io::Error::last_os_error();
+            libc::close(dup);
+            return Err(e);
+        }
+        dir
+    };
     let result = loop {
-        unsafe { *libc::__error() = 0 };
-        let ent = unsafe { libc::readdir(dir) };
-        if ent.is_null() {
+        // SAFETY: `dir` is an open stream; a non-null entry stays valid until
+        // the next readdir, and its NUL-terminated name is copied before that.
+        let done = unsafe {
+            *libc::__error() = 0;
+            let ent = libc::readdir(dir);
+            if ent.is_null() {
+                true
+            } else {
+                let name = CStr::from_ptr((*ent).d_name.as_ptr());
+                names.push(name.to_bytes(), (*ent).d_type, (*ent).d_ino);
+                false
+            }
+        };
+        if done {
             let e = io::Error::last_os_error();
             break if e.raw_os_error() == Some(0) {
                 Ok(())
@@ -247,11 +277,8 @@ fn read_entries(fd: RawFd, names: &mut Names) -> io::Result<()> {
                 Err(e)
             };
         }
-        // Safety: readdir returned a valid entry, live until the next call.
-        let ent = unsafe { &*ent };
-        let name = unsafe { CStr::from_ptr(ent.d_name.as_ptr()) };
-        names.push(name.to_bytes(), ent.d_type, ent.d_ino);
     };
+    // SAFETY: `dir` is open and is closed exactly once.
     unsafe { libc::closedir(dir) };
     result
 }
