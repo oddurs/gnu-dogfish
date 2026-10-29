@@ -333,3 +333,51 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     }
     ok
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    // The --preserve-root walk is tested against a temporary directory standing
+    // in for `/`, never against the real root (AGENTS.md).
+    fn run_with_root(root: Option<DevIno>) -> ChmodRun {
+        ChmodRun {
+            changes: None,
+            reference_mode: 0o700,
+            umask: 0o022,
+            recursive: true,
+            report_changes: false,
+            verbose: false,
+            quiet: true,
+            diagnose_surprises: false,
+            root_dev_ino: root,
+        }
+    }
+
+    #[test]
+    fn preserve_root_refuses_a_followed_command_line_symlink_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_root = tmp.path().join("root");
+        fs::create_dir(&fake_root).unwrap();
+        fs::set_permissions(&fake_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let inner = fake_root.join("f");
+        fs::write(&inner, "x").unwrap();
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&fake_root, &link).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().mode() & 0o7777;
+        let ctx = DogfishContext::new("chmod");
+        let root = Some(DevIno::of(&fs::metadata(&fake_root).unwrap()));
+
+        // Through the link (followed on the command line, like FTS_COMFOLLOW)
+        // and named directly: refused, nothing changed.
+        assert!(!chmod_path(&link, true, &run_with_root(root), &ctx));
+        assert!(!chmod_path(&fake_root, true, &run_with_root(root), &ctx));
+        assert_eq!((mode(&fake_root), mode(&inner)), (0o755, 0o644));
+
+        // Without --preserve-root the same walk goes ahead.
+        assert!(chmod_path(&link, true, &run_with_root(None), &ctx));
+        assert_eq!((mode(&fake_root), mode(&inner)), (0o700, 0o700));
+    }
+}

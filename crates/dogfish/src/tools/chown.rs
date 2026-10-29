@@ -498,3 +498,77 @@ fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext
     }
     ok
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    // The --preserve-root walk is tested against a temporary directory standing
+    // in for `/`, never against the real root (AGENTS.md). The group is "changed"
+    // to the files' own group, which every owner may do.
+    fn run(traverse: Traverse, affect_referent: bool, root: Option<DevIno>, gid: u32) -> ChownRun {
+        ChownRun {
+            spec: OwnerSpec {
+                uid: None,
+                gid: Some(gid),
+                user: None,
+                group: Some(gid.to_string()),
+            },
+            from_uid: None,
+            from_gid: None,
+            recursive: true,
+            traverse,
+            affect_referent,
+            report_changes: false,
+            verbose: false,
+            quiet: true,
+            root_dev_ino: root,
+        }
+    }
+
+    #[test]
+    fn preserve_root_checks_every_directory_the_walk_enters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_root = tmp.path().join("root");
+        fs::create_dir(&fake_root).unwrap();
+        let d = tmp.path().join("d");
+        fs::create_dir(&d).unwrap();
+        symlink(&fake_root, d.join("slink-to-root")).unwrap();
+        let top_link = tmp.path().join("top-link");
+        symlink(&fake_root, &top_link).unwrap();
+        let ctx = DogfishContext::new("chown");
+        let root = Some(DevIno::of(&fs::metadata(&fake_root).unwrap()));
+        let gid = fs::metadata(&d).unwrap().gid();
+        let (all, cmdline, none) = (Traverse::All, Traverse::CommandLine, Traverse::None);
+
+        // -RLh and -RL: the walk follows d/slink-to-root, so it is refused.
+        assert!(!chown_path(&d, true, &run(all, false, root, gid), &ctx));
+        assert!(!chown_path(&d, true, &run(all, true, root, gid), &ctx));
+        // -RHh and -RP: the link below the operand is not followed.
+        assert!(chown_path(&d, true, &run(cmdline, false, root, gid), &ctx));
+        assert!(chown_path(&d, true, &run(none, false, root, gid), &ctx));
+        // -RH on a command-line link to root, with or without -h: refused.
+        assert!(!chown_path(
+            &top_link,
+            true,
+            &run(cmdline, true, root, gid),
+            &ctx
+        ));
+        assert!(!chown_path(
+            &top_link,
+            true,
+            &run(cmdline, false, root, gid),
+            &ctx
+        ));
+        // -RP: a command-line link is just a link.
+        assert!(chown_path(
+            &top_link,
+            true,
+            &run(none, false, root, gid),
+            &ctx
+        ));
+        // Without --preserve-root, -RLh walks through.
+        assert!(chown_path(&d, true, &run(all, false, None, gid), &ctx));
+    }
+}
