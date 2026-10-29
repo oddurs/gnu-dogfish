@@ -1068,8 +1068,14 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     // Check if input is an NDJSON object stream!
+    // Rich output: NDJSON objects are sorted by field on a terminal, with
+    // -J, or when --by/--where ask for it. Piped output is GNU's.
     if !parsed.check
         && !parsed.zero_terminated
+        && (ctx.stdout_is_tty
+            || parsed.json
+            || parsed.by_field.is_some()
+            || parsed.where_expr.is_some())
         && bufs
             .iter()
             .find(|b| !b.is_empty())

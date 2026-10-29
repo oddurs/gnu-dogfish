@@ -4,7 +4,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 ## Cross-cutting
 
-- **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`) is UTF-8 aware.
+- **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`, `printf` character constants) follows the locale's character set as glibc decides it: bytes in the C locale, UTF-8 sequences in a UTF-8 locale; other multibyte character sets are treated as bytes.
 - **Ambiguous long-option abbreviations** (`cat --s`) report `unrecognized option` instead of GNU's `option '--s' is ambiguous; possibilities: ...`. Unambiguous abbreviations work, except that a lone `--vers` is not taken as `--version` for clap-parsed tools.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
@@ -24,6 +24,12 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - **`df`**: which file systems count as pseudo file systems follows gnulib, plus Debian/Ubuntu's patch that hides `devtmpfs` and `squashfs` (snaps); other distributions may show those two. `--sync` / `--no-sync` are accepted and ignored.
 - **`ls -l`** ACL (`+`) and SELinux (`.`) markers are detected from extended attributes.
 
+## Text tools
+
+- **`shuf --random-source=FILE`** is deterministic for a given FILE, but uses its bytes differently from GNU's `randint`, so the order differs from GNU's for the same FILE.
+- **`tac -r`** and **`nl -bpBRE`** use a small built-in regex engine with GNU's syntax (Emacs syntax for `tac`, POSIX basic for `nl`), matching bytes in the C locale; for `tac -r`, `^` and `$` also match at the start of the file and at the end of the unread data, where GNU anchors at its read-buffer boundaries.
+- Arguments that are not valid UTF-8 (`cut -d $'\xff'`) are not accepted yet.
+
 ## System tools
 
 - **`env -v`**: not every debug line is reproduced.
@@ -33,7 +39,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 ## Deliberate extensions (not bugs)
 
-- Rich TTY output for `ls`, `df`, `du`, `stat`, `wc --table`, `env --table`.
+- Rich TTY output for `ls`, `df`, `du`, `stat`, `wc --table`, `env --table`; NDJSON input shown as a table by `head`, `tail`, `sort`, `uniq`, `shuf` and `cut -f NAME` on a terminal (or with `-J`) — piped output stays GNU's.
 - `-J/--json` NDJSON output and `dogfish query`.
 - Human durations such as `500ms` or `1m30s` for `sleep`, `timeout` and `watch` (GNU rejects them).
 - `rm --safe`, `dogfish undo`, `dogfish history`, `--stats`.

@@ -318,6 +318,13 @@ gnu_cases! {
     nl_bad_join: "nl" ["-l0", "many.txt"];
     nl_rz_negative: "nl" ["-n", "rz", "-v", "-5"] stdin b"a\nb\n";
     nl_left: "nl" ["-n", "ln", "-s", "%n"] stdin b"a\nb";
+    // ------------------------------------- JSON lines are text when piped
+    json_lines_sort: "sort" [] stdin b"{\"name\": \"b\"}\n{\"name\":\"a\"}\n";
+    json_lines_head: "head" ["-n", "1"] stdin b"{\"a\":  1}\n{\"b\": 2}\n";
+    json_lines_tail: "tail" ["-n", "1"] stdin b"{\"a\":  1}\n{\"b\": 2}\n";
+    json_lines_uniq: "uniq" [] stdin b"{\"a\":  1}\n{\"a\":  1}\n";
+    json_lines_cut: "cut" ["-c1-5"] stdin b"{\"a\":  1}\n";
+    json_lines_cut_fields: "cut" ["-f1"] stdin b"{\"a\":  1}\n";
 }
 
 // ------------------------------------------------------- shell pipelines
