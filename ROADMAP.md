@@ -12,13 +12,13 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 ## File & directory tools
 
 - **`ls`**: `--dired` (`-D`) is not implemented; `--hyperlink=WHEN` is validated but no hyperlinks are emitted. `--color` follows GNU's built-in table and `LS_COLORS` exactly, except the `ca` (file capabilities) colour, which is never applied: the reference GNU build (Ubuntu) has no libcap and doesn't apply it either.
-- **`cp` / `mv`**
-  - Copying or moving a directory into itself is refused before anything is copied, whereas GNU copies part of the tree first. The message and exit status match.
-  - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour).
-  - `cp -R` does not copy device nodes or sockets (FIFOs work). `--sparse`, `--reflink` and `--debug` are accepted but do nothing special.
-  - Hard-link loops are only detected through the into-itself check.
-  - `mv . x` / `mv d/.. x` report "subdirectory of itself" rather than GNU's "Device or resource busy". A few trailing-slash-on-symlink edge cases (`mv ld/ d`) word their error differently.
+- **`cp` / `mv` / `ln`**
+  - `cp -r` refuses to copy a directory into itself before anything is copied, whereas GNU copies part of the tree first (and lists it with `-v`). The message and exit status match.
+  - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour). FIFOs and device files hold no data and are not kept: undoing a copy over one removes the copy but does not bring the special file back.
+  - Extended attributes, ACLs and SELinux contexts are not copied (`--preserve=xattr,context` and `-a` accept them). `cp --debug` prints nothing.
+  - `cp -n` behaves as upstream 9.4 (`not replacing 'f'`, exit status 1; `-b -n` is rejected). Ubuntu's 9.4 package carries 9.5's behaviour instead (a warning, then skipping with status 0).
   - GNU 9.4's `mv -b -n` prints its "mutually exclusive" error and still moves the file (a GNU bug); Dogfish errors without moving.
+  - `ln -si F F` answered with `y`, and `ln -sf` onto a file that the new symlink would point back to (`ln -sf f d/f` for an existing `d/f`), leave the file alone; GNU replaces it with a symlink to itself, losing its contents. `ln -sf` reports "are the same file", `ln -si` does nothing.
 - **`touch -d`**, **`date -d`**: the common GNU date formats are supported (`@epoch`, ISO 8601 with zones, month names, am/pm, relative items such as `yesterday` and `+1 day`). The full `parse_datetime` grammar is not: no `TZ="..."` prefix inside the string, no military zones, no unusual local zone abbreviations. `date --debug` is not implemented.
 - **`du`**: `--time` and `--files0-from` are not implemented.
 - **`df`**: which file systems count as pseudo file systems follows gnulib, plus Debian/Ubuntu's patch that hides `devtmpfs` and `squashfs` (snaps); other distributions may show those two. `--sync` / `--no-sync` are accepted and ignored.
