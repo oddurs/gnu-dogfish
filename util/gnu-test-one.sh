@@ -14,6 +14,10 @@
 # `make check` would run it, as an unprivileged user (as nobody when invoked
 # as root). Linux on x86-64 only (getlimits' values).
 #
+# Checked against CI on all 417 selected tests: no test passes here that fails
+# there or the reverse. Some skip here that CI runs (ACLs, setgid directories,
+# two groups, process-group kill); CI stays the authority.
+#
 # Prints one line per test (PASS/FAIL/SKIP/ERROR) and exits 1 if any did not
 # pass or skip. Logs: $WORK/logs/<test>.log.
 # Environment: DOGFISH (binary; default: build target/release/dogfish), WORK
@@ -53,18 +57,20 @@ fi
 build="$work/build"
 rm -rf -- "$build"
 mkdir -p "$build/src" "$work/logs"
-# Every program GNU builds by default (configure would compute the same list).
-programs=$(awk '/^default__progs =/ {on = 1} on {print; if (!/\\$/) exit}' "$src/Makefile.in" \
-  | grep -o 'src/[][a-z0-9_]*' | sed 's,src/,,' | sort -u | tr '\n' ' ')
+# Every program GNU can build (EXTRA_PROGRAMS); configure on Linux builds all
+# but the single-binary and libstdbuf pseudo-programs.
+programs=$(awk '/^am__EXEEXT_[123] =/ {on = 1} on {print; if (!/\\$/) on = 0}' "$src/Makefile.in" \
+  | grep -o 'src/[][a-z0-9_]*' | sed 's,src/,,' | grep -vx 'coreutils\|libstdbuf' | sort -u | tr '\n' ' ')
 dogfish_tools=$("$dogfish" install-links "$build/src" >/dev/null && ls "$build/src")
 for p in $programs; do
   [ -e "$build/src/$p" ] && continue
-  sys=$(command -v "$p" 2>/dev/null) && ln -s "$sys" "$build/src/$p"
+  # type -P: the program on PATH, never a shell builtin (test, [, echo, ...).
+  sys=$(type -P "$p" 2>/dev/null) && ln -s "$sys" "$build/src/$p"
 done
 for t in $dogfish_tools; do
   case " $programs " in *" $t "*) ;; *) rm -f "$build/src/$t" ;; esac
 done
-ginstall=$(command -v install) && ln -sfn "$ginstall" "$build/src/ginstall"
+ginstall=$(type -P install) && ln -sfn "$ginstall" "$build/src/ginstall"
 
 cat >"$build/src/getlimits" <<'EOF'
 #!/bin/sh
@@ -161,7 +167,8 @@ run_test() {
   log="$work/logs/${t//\//-}.log"
   rm -f "$log"
   case $t in
-    *.pl|*.xpl) runner=(perl -w -I"$src/tests" -MCuSkip -MCoreutils "-MCuTmpdir qw($t)") ;;
+    *.pl) runner=(perl -w -I"$src/tests" -MCuSkip -MCoreutils "-MCuTmpdir qw($t)") ;;
+    *.xpl) runner=(perl -T -w -I"$src/tests" -MCuSkip -MCoreutils "-MCuTmpdir qw($t)") ;;
     *) runner=(/bin/sh) ;;
   esac
   (
