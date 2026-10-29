@@ -438,3 +438,5 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `run_nonblocking_stdout` | `fcntl(F_GETFL/F_SETFL, O_NONBLOCK)` on a pipe (test) | Descriptor only (owned by the `PipeWriter`). |
 | `timeout_with_sigchld_ignored` | `CommandExt::pre_exec` running `signal(SIGCHLD, SIG_IGN)` (test) | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
+| `run_failing` | `CommandExt::pre_exec` running `signal(SIGPIPE, SIG_IGN)` or `close(1)` (test) | The closure runs in the forked child and only calls `signal` and `close`, which are async-signal-safe. |
+| `commands_inherit_ignored_sigpipe` | `CommandExt::pre_exec` running `signal(SIGPIPE, SIG_IGN)` (test) | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
