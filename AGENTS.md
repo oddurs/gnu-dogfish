@@ -38,5 +38,5 @@ This project tracks its roadmap and issues with `cairn`. Every item is a Markdow
 - `ROADMAP.md` at the repository root is the hand-written list of **known differences from GNU**; keep it accurate when behaviour changes. The planned work lives in `cairn/items`.
 - Decision 0024 records why the v0.3 work is ordered as it is. Work it in that order unless an item says otherwise.
 - When output is not a terminal, every tool must match GNU coreutils 9.4 byte for byte (output, messages, exit status). Rich output is for terminals only.
-- Before pushing: `cargo fmt --check`, Clippy with `-D warnings`, `cargo test` **and** `cargo test --release`, the test suites as a non-root user, and a macOS type-check. Item 0009 turns this into one command.
+- Before pushing: `cargo xtask ci` (formatting, Clippy with `-D warnings`, MSRV, a macOS type-check, `cargo test` **and** `cargo test --release`, the test suites as a non-root user, docs, packaging). It must pass. Behaviour changes also need `cargo xtask gnu` (as a non-root user) or the GNU Test Suite CI job: no test in `util/gnu-baseline.json` may stop passing.
 - Never run destructive commands outside a temporary directory, and never against `/`, even in tests. Test such guards through a pure predicate.

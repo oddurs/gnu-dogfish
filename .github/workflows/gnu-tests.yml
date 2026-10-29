@@ -13,6 +13,7 @@ on:
       - "util/gnu_tests.py"
       - "util/gnu-baseline.json"
       - "Cargo.lock"
+      - ".cargo/config.toml"
       - ".github/workflows/gnu-tests.yml"
   push:
     branches: [main]
@@ -42,11 +43,8 @@ jobs:
           path: target/gnu/coreutils-9.4
           key: gnu-coreutils-9.4-${{ runner.os }}-v1
 
-      - name: Build Dogfish
-        run: cargo build --release --locked
-
       - name: Run GNU's test suite against Dogfish
-        run: util/gnu-tests.sh
+        run: cargo xtask gnu
 
       - name: Print passing tests (for updating the baseline)
         if: always()

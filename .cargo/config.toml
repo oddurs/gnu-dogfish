@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask ci` runs every check CI runs; `cargo xtask` lists the steps.
+xtask = "run --quiet --locked --package xtask --"

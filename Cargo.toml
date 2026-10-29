@@ -3,7 +3,10 @@ resolver = "2"
 members = [
     "crates/dogfish-core",
     "crates/dogfish",
+    "crates/xtask",
 ]
+# Patched in only by `cargo xtask macos`.
+exclude = ["crates/xtask/ring-stub"]
 
 [workspace.package]
 version = "0.1.0"
