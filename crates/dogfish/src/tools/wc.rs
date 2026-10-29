@@ -1,19 +1,26 @@
 //! wc — SIMD `bytecount` + parallel UTF-8 aware scanner + `--json` + table mode
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, FastReader, InputSource, Table, emit_objects_or_table,
-    gnu_io_error, io::ignore_broken_pipe, sparkline_bar, stdout,
+    ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
+    emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, sparkline_bar, stdout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 
+use crate::common::files0::{Files0From, extra_operand_error};
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version, unsupported,
+    Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
+    print_version, unsupported,
 };
+use crate::common::input::{close_stdin, safe_read, stdin_file, stdin_is_closed};
+use crate::common::locale::utf8_locale;
+use crate::common::quote::{qa, qf};
 
 const WC_HELP: &str = "\
 Print newline, word, and byte counts for each FILE
@@ -29,6 +36,11 @@ Options:
   -l, --lines            Print the newline counts
   -w, --words            Print the word counts
   -L, --max-line-length  Print the maximum display width
+      --files0-from=F    Read input from the files specified by NUL-terminated
+                         names in file F; if F is - then read names from
+                         standard input
+      --total=WHEN       When to print a line with total counts;
+                         WHEN can be: auto, always, only, never
   -J, --json             Emit structured JSON / NDJSON
   -t, --table            Render a rich visual breakdown table with sparklines
       --help             Print help
@@ -43,6 +55,8 @@ struct WcArgs {
     max_line_length: bool,
     json: bool,
     table: bool,
+    files0_from: Option<String>,
+    total: TotalMode,
     files: Vec<String>,
 }
 
@@ -55,6 +69,8 @@ enum WcArgsOpt {
     MaxLineLength,
     Json,
     Table,
+    Files0From,
+    Total,
     /// A GNU option Dogfish does not implement yet.
     Unsupported,
     Help,
@@ -69,14 +85,14 @@ const SPECS: &[OptSpec<WcArgsOpt>] = &[
     OptSpec::both(b'l', "lines", HasArg::No, WcArgsOpt::Lines),
     OptSpec::both(b'w', "words", HasArg::No, WcArgsOpt::Words),
     OptSpec::long("debug", HasArg::No, WcArgsOpt::Unsupported),
-    OptSpec::long("files0-from", HasArg::Required, WcArgsOpt::Unsupported),
+    OptSpec::long("files0-from", HasArg::Required, WcArgsOpt::Files0From),
     OptSpec::both(
         b'L',
         "max-line-length",
         HasArg::No,
         WcArgsOpt::MaxLineLength,
     ),
-    OptSpec::long("total", HasArg::Required, WcArgsOpt::Unsupported),
+    OptSpec::long("total", HasArg::Required, WcArgsOpt::Total),
     OptSpec::both(b'J', "json", HasArg::No, WcArgsOpt::Json),
     OptSpec::both(b't', "table", HasArg::No, WcArgsOpt::Table),
     OptSpec::long("help", HasArg::No, WcArgsOpt::Help),
@@ -89,7 +105,7 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
     let mut parsed = WcArgs::default();
     let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
     while let Some(opt) = opts.next() {
-        let (o, _) = opt.map_err(|e| getopt_error("wc", &e))?;
+        let (o, v) = opt.map_err(|e| getopt_error("wc", &e))?;
         match o {
             WcArgsOpt::Bytes => parsed.bytes = true,
             WcArgsOpt::Chars => parsed.chars = true,
@@ -98,6 +114,20 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
             WcArgsOpt::MaxLineLength => parsed.max_line_length = true,
             WcArgsOpt::Json => parsed.json = true,
             WcArgsOpt::Table => parsed.table = true,
+            WcArgsOpt::Files0From => parsed.files0_from = v.as_deref().map(lossy),
+            WcArgsOpt::Total => {
+                parsed.total = argmatch(
+                    "wc",
+                    "--total",
+                    v.unwrap_or_default(),
+                    &[
+                        ("auto", TotalMode::Auto),
+                        ("always", TotalMode::Always),
+                        ("only", TotalMode::Only),
+                        ("never", TotalMode::Never),
+                    ],
+                )?;
+            }
             WcArgsOpt::Unsupported => return Err(unsupported("wc", &opts.last_spelling())),
             WcArgsOpt::Help => return Err(print_help(WC_HELP)),
             WcArgsOpt::Version => return Err(print_version("wc")),
@@ -136,7 +166,7 @@ fn is_unicode_space(c: char) -> bool {
 
 /// Single-pass GNU-compatible (UTF-8 locale) word/char/display-width scanner.
 /// The slice must start at a line boundary.
-fn wc_scan(bytes: &[u8]) -> WcScan {
+fn wc_scan(bytes: &[u8], utf8: bool) -> WcScan {
     let mut s = WcScan::default();
     let mut in_word = false;
     let mut linepos: u64 = 0;
@@ -174,6 +204,13 @@ fn wc_scan(bytes: &[u8]) -> WcScan {
                 }
                 _ => {} // other control characters: neither word nor separator
             }
+            continue;
+        }
+        if !utf8 {
+            // C locale: a byte above 0x7f is a character that is neither
+            // printable nor a separator.
+            i += 1;
+            s.chars += 1;
             continue;
         }
         let seq_len = match b {
@@ -225,17 +262,11 @@ fn line_aligned_chunks(bytes: &[u8], target: usize) -> Vec<&[u8]> {
     chunks
 }
 
-fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
+fn wc_count_bytes(bytes: &[u8], need_scan: bool, utf8: bool) -> WcScan {
     if !need_scan {
-        // Fast path: only `-l` / `-c` requested -> pure SIMD `bytecount::count`
-        let lines = if bytes.len() >= 512 * 1024 {
-            bytes
-                .par_chunks(256 * 1024)
-                .map(|c| bytecount::count(c, b'\n') as u64)
-                .sum()
-        } else {
-            bytecount::count(bytes, b'\n') as u64
-        };
+        // Fast path: only `-l` / `-c` requested -> SIMD `bytecount::count`,
+        // on one thread (more threads cost more CPU than they save).
+        let lines = bytecount::count(bytes, b'\n') as u64;
         return WcScan {
             lines,
             ..Default::default()
@@ -246,7 +277,7 @@ fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
         // so each chunk is independent.
         return line_aligned_chunks(bytes, 256 * 1024)
             .par_iter()
-            .map(|c| wc_scan(c))
+            .map(|c| wc_scan(c, utf8))
             .reduce(WcScan::default, |a, b| WcScan {
                 lines: a.lines + b.lines,
                 words: a.words + b.words,
@@ -254,38 +285,230 @@ fn wc_count_bytes(bytes: &[u8], need_scan: bool) -> WcScan {
                 max_line: a.max_line.max(b.max_line),
             });
     }
-    wc_scan(bytes)
+    wc_scan(bytes, utf8)
 }
 
-fn count_source(src: &InputSource, need_scan: bool, ctx: &DogfishContext) -> io::Result<WcRecord> {
-    let mut reader = FastReader::open(src)?;
-    reader.with_bytes(|bytes| {
-        ctx.telemetry.add_read(bytes.len() as u64);
-        ctx.telemetry.add_items(1);
-        let s = wc_count_bytes(bytes, need_scan);
-        WcRecord {
-            file: src.display_name().to_string(),
-            lines: s.lines,
-            words: s.words,
-            chars: s.chars,
-            bytes: bytes.len() as u64,
-            max_line_length: s.max_line,
+/// What to count and print (GNU's `print_*` flags).
+#[derive(Clone, Copy)]
+struct WcOpts {
+    lines: bool,
+    words: bool,
+    chars: bool,
+    bytes: bool,
+    max_line_length: bool,
+    /// Words, characters or widths are needed: run the full scanner.
+    need_scan: bool,
+    /// The locale's characters are UTF-8 sequences; else `-m` counts bytes.
+    utf8: bool,
+}
+
+impl WcOpts {
+    /// Only `-c` (or `-m` where characters are bytes): a regular file's
+    /// size answers it without reading.
+    fn bytes_only(&self) -> bool {
+        (self.bytes || (self.chars && !self.utf8))
+            && !(self.lines || self.words || (self.chars && self.utf8) || self.max_line_length)
+    }
+
+    fn columns(&self) -> usize {
+        [
+            self.lines,
+            self.words,
+            self.chars,
+            self.bytes,
+            self.max_line_length,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+    }
+}
+
+/// `--total=WHEN`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TotalMode {
+    #[default]
+    Auto,
+    Always,
+    Only,
+    Never,
+}
+
+/// One input's counts; `error` is a read error after which GNU still
+/// prints what was counted.
+struct Counted {
+    rec: WcRecord,
+    error: Option<io::Error>,
+}
+
+/// An input opened for counting.
+enum WcInput {
+    Stdin,
+    File(File),
+}
+
+/// Opens `src`; `Err` is the open error (GNU then prints no counts).
+fn open_input(src: &InputSource) -> io::Result<WcInput> {
+    match src {
+        InputSource::Stdin => Ok(WcInput::Stdin),
+        InputSource::File(path) => File::open(path).map(WcInput::File),
+    }
+}
+
+/// GNU's `-c` shortcut: a regular file (or one positioned inside) counts
+/// its size from the current offset, and the offset moves to the end, as
+/// if it had been read. Sizes that are a multiple of the page size may be
+/// approximate (/proc, /sys), so all but the last block is skipped and the
+/// rest really read.
+fn count_bytes_only(file: &mut File) -> (u64, Option<io::Error>) {
+    let mut bytes = 0u64;
+    let mut skip_read = false;
+    if let Ok(meta) = file.metadata()
+        && meta.is_file()
+    {
+        // SAFETY: no preconditions: sysconf takes no pointers and cannot
+        // fail in a way that matters (a -1 falls back to 4096).
+        let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .unwrap_or(4096)
+            .max(1);
+        let end_pos = meta.len();
+        let current_pos = file.stream_position().ok();
+        if end_pos % page_size != 0 {
+            bytes = end_pos.saturating_sub(current_pos.unwrap_or(0));
+            if bytes > 0 && file.seek(SeekFrom::Current(bytes as i64)).is_ok() {
+                skip_read = true;
+            } else {
+                bytes = 0;
+            }
+        } else {
+            let hi_pos = end_pos - end_pos % (meta.blksize() + 1);
+            if let Some(pos) = current_pos
+                && pos < hi_pos
+                && file.seek(SeekFrom::Current(hi_pos as i64)).is_ok()
+            {
+                bytes = hi_pos - pos;
+            }
         }
-    })
+    }
+    if skip_read {
+        return (bytes, None);
+    }
+    let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
+    loop {
+        match safe_read(file, &mut buf) {
+            Ok(0) => return (bytes, None),
+            Ok(n) => bytes += n as u64,
+            Err(e) => return (bytes, Some(e)),
+        }
+    }
+}
+
+/// Counts one opened input (GNU's `wc`).
+fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) -> Counted {
+    let mut stdin = stdin_file();
+    let mut file = match input {
+        WcInput::Stdin => None,
+        WcInput::File(f) => Some(f),
+    };
+    let handle: &mut File = match &mut file {
+        Some(f) => f,
+        None => &mut stdin,
+    };
+    let record = |bytes: u64, s: WcScan| WcRecord {
+        file: name.to_string(),
+        lines: s.lines,
+        words: s.words,
+        // GNU: where characters are bytes, -m reports the byte count.
+        chars: if opts.utf8 { s.chars } else { bytes },
+        bytes,
+        max_line_length: s.max_line,
+    };
+    if opts.bytes_only() {
+        let (bytes, error) = count_bytes_only(handle);
+        ctx.telemetry.add_items(1);
+        return Counted {
+            rec: record(bytes, WcScan::default()),
+            error,
+        };
+    }
+    if !opts.need_scan {
+        // Lines (and bytes): stream in large reads, as GNU's wc_lines does,
+        // rather than mapping or buffering the whole input.
+        let (mut lines, mut bytes) = (0u64, 0u64);
+        let mut buf = vec![0u8; 64 * 1024];
+        let error = loop {
+            match safe_read(handle, &mut buf) {
+                Ok(0) => break None,
+                Ok(n) => {
+                    lines += bytecount::count(&buf[..n], b'\n') as u64;
+                    bytes += n as u64;
+                }
+                Err(e) => break Some(e),
+            }
+        };
+        ctx.telemetry.add_read(bytes);
+        ctx.telemetry.add_items(1);
+        let scan = WcScan {
+            lines,
+            ..Default::default()
+        };
+        return Counted {
+            rec: record(bytes, scan),
+            error,
+        };
+    }
+    let count = |data: &[u8]| {
+        ctx.telemetry.add_read(data.len() as u64);
+        ctx.telemetry.add_items(1);
+        record(
+            data.len() as u64,
+            wc_count_bytes(data, opts.need_scan, opts.utf8),
+        )
+    };
+    match file {
+        // A file is mapped when possible; it was just opened, at offset 0.
+        Some(f) => match FastReader::from_file(f) {
+            Ok(mut reader) => match reader.with_bytes(count) {
+                Ok(rec) => Counted { rec, error: None },
+                Err(e) => Counted {
+                    rec: count(&[]),
+                    error: Some(e),
+                },
+            },
+            Err(e) => Counted {
+                rec: count(&[]),
+                error: Some(e),
+            },
+        },
+        // Standard input is read from its current offset.
+        None => {
+            let mut data = Vec::new();
+            let error = stdin.read_to_end(&mut data).err();
+            Counted {
+                rec: count(&data),
+                error,
+            }
+        }
+    }
+}
+
+/// Counts `src` (GNU's `wc_file`); `Err` is the open error.
+fn count_source(src: &InputSource, opts: &WcOpts, ctx: &DogfishContext) -> io::Result<Counted> {
+    let name = match src {
+        InputSource::Stdin => "standard input",
+        InputSource::File(p) => p.as_str(),
+    };
+    Ok(count_input(open_input(src)?, name, opts, ctx))
 }
 
 /// (is_regular_file, size) of standard input.
 fn stdin_stat() -> Option<(bool, u64)> {
-    // SAFETY: libc::stat is plain data, for which all-zero bytes are valid.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: fstat on fd 0 with a properly sized, writable stat buffer.
-    if unsafe { libc::fstat(0, &mut st) } != 0 {
+    // GNU's fstat of a closed fd 0 fails; ours sees the /dev/null holding it.
+    if stdin_is_closed() {
         return None;
     }
-    Some((
-        (st.st_mode & libc::S_IFMT) == libc::S_IFREG,
-        st.st_size as u64,
-    ))
+    let meta = stdin_file().metadata().ok()?;
+    Some((meta.is_file(), meta.len()))
 }
 
 /// GNU `compute_number_width`: digits of the summed regular-file sizes,
@@ -312,154 +535,342 @@ fn wc_number_width(sources: &[InputSource]) -> usize {
     width.max(min_width)
 }
 
+/// Writes one line of counts (GNU's `write_counts`); a name containing a
+/// newline is quoted.
+fn write_counts(
+    out: &mut impl Write,
+    opts: &WcOpts,
+    width: usize,
+    r: &WcRecord,
+    name: Option<&str>,
+) -> io::Result<()> {
+    let mut row = String::new();
+    let cols = [
+        (opts.lines, r.lines),
+        (opts.words, r.words),
+        (opts.chars, r.chars),
+        (opts.bytes, r.bytes),
+        (opts.max_line_length, r.max_line_length),
+    ];
+    for (shown, val) in cols {
+        if shown {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(&format!("{val:>width$}"));
+        }
+    }
+    if let Some(n) = name {
+        row.push(' ');
+        if n.contains('\n') {
+            row.push_str(&qf(n));
+        } else {
+            row.push_str(n);
+        }
+    }
+    row.push('\n');
+    out.write_all(row.as_bytes())
+}
+
+/// Running totals with GNU's overflow detection.
+#[derive(Default)]
+struct Totals {
+    rec: WcRecord,
+    overflow: [bool; 4],
+}
+
+impl Totals {
+    fn add(&mut self, r: &WcRecord) {
+        let t = &mut self.rec;
+        for (i, (sum, v)) in [
+            (&mut t.lines, r.lines),
+            (&mut t.words, r.words),
+            (&mut t.chars, r.chars),
+            (&mut t.bytes, r.bytes),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match sum.checked_add(v) {
+                Some(s) => *sum = s,
+                None => {
+                    *sum = u64::MAX;
+                    self.overflow[i] = true;
+                }
+            }
+        }
+        t.max_line_length = t.max_line_length.max(r.max_line_length);
+    }
+}
+
+/// A name from `--files0-from`: `-` is standard input, as an operand is.
+fn name_source(name: &str) -> InputSource {
+    if name == "-" {
+        InputSource::Stdin
+    } else {
+        InputSource::File(name.to_string())
+    }
+}
+
+/// The inputs: operands, or names read from `--files0-from`.
+enum Names {
+    Args(Vec<InputSource>),
+    Files0(Files0From, Option<Vec<String>>),
+}
+
 pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = match parse_wc_args(args) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
-    let sources = InputSource::from_args(&parsed.files);
+    let total_mode = parsed.total;
 
+    let utf8 = utf8_locale();
     let default_cols =
         !parsed.bytes && !parsed.chars && !parsed.lines && !parsed.words && !parsed.max_line_length;
-    let show_lines = default_cols || parsed.lines;
-    let show_words = default_cols || parsed.words;
-    let show_bytes = default_cols || parsed.bytes;
-    let need_scan =
-        show_words || parsed.chars || parsed.max_line_length || parsed.json || parsed.table;
+    let opts = WcOpts {
+        lines: default_cols || parsed.lines,
+        words: default_cols || parsed.words,
+        chars: parsed.chars,
+        bytes: default_cols || parsed.bytes,
+        max_line_length: parsed.max_line_length,
+        need_scan: default_cols
+            || parsed.words
+            || (parsed.chars && utf8)
+            || parsed.max_line_length
+            || parsed.json
+            || parsed.table,
+        utf8,
+    };
 
-    ctx.telemetry.set_strategy(if !need_scan {
+    let mut names = match &parsed.files0_from {
+        None => Names::Args(InputSource::from_args(&parsed.files)),
+        Some(from) => {
+            if let Some(extra) = parsed.files.first() {
+                return Ok(extra_operand_error("wc", extra, 1));
+            }
+            let mut list = match Files0From::open(from) {
+                Ok(list) => list,
+                Err(e) => {
+                    eprintln!(
+                        "wc: cannot open {} for reading: {}",
+                        qa(from),
+                        gnu_io_error(&e)
+                    );
+                    return Ok(1);
+                }
+            };
+            // A small regular list is read up front, as GNU does: its
+            // length then decides the column width.
+            let all = if list.is_small_regular() || parsed.json || parsed.table {
+                match list.read_all() {
+                    Ok(all) => Some(all),
+                    Err(_) => {
+                        eprintln!("wc: cannot read file names from {}", qa(from));
+                        return Ok(1);
+                    }
+                }
+            } else {
+                None
+            };
+            Names::Files0(list, all)
+        }
+    };
+
+    ctx.telemetry.set_strategy(if !opts.need_scan {
         "SIMD bytecount::count (newlines + len only)"
     } else {
         "SIMD bytecount + parallel line-aligned UTF-8 scanner"
     });
 
-    let can_parallel =
-        sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
-    let results: Vec<io::Result<WcRecord>> = if can_parallel {
-        sources
-            .par_iter()
-            .map(|s| count_source(s, need_scan, ctx))
-            .collect()
-    } else {
-        sources
-            .iter()
-            .map(|s| count_source(s, need_scan, ctx))
-            .collect()
-    };
-
-    let mut exit_code = 0;
-    let mut records = Vec::with_capacity(results.len());
-    let report = |src: &InputSource, e: &io::Error| {
-        eprintln!("wc: {}: {}", src.display_name(), gnu_io_error(e));
-    };
-
     if parsed.json || parsed.table {
-        for (src, res) in sources.iter().zip(results) {
-            match res {
-                Ok(r) => records.push(r),
-                Err(e) => {
-                    report(src, &e);
-                    exit_code = 1;
-                }
-            }
-        }
-        if parsed.json {
-            emit_objects_or_table(&records, ctx, true, false)?;
-            return Ok(exit_code);
-        }
-        let max_bytes = records.iter().map(|r| r.bytes).max().unwrap_or(1).max(1);
-        let st = ctx.style();
-        let mut tbl = Table::new(vec![
-            ("FILE", ColumnAlign::Left),
-            ("LINES", ColumnAlign::Right),
-            ("WORDS", ColumnAlign::Right),
-            ("CHARS", ColumnAlign::Right),
-            ("SIZE", ColumnAlign::Right),
-            ("PROPORTION", ColumnAlign::Left),
-        ]);
-        for r in &records {
-            let ratio = r.bytes as f64 / max_bytes as f64;
-            tbl.add_row(vec![
-                st.bold(&r.file),
-                r.lines.to_string(),
-                r.words.to_string(),
-                r.chars.to_string(),
-                st.green(&dogfish_core::format_size(r.bytes, true)),
-                sparkline_bar(ratio, 10, st),
-            ]);
-        }
-        let mut out = stdout::stdout();
-        tbl.render(&mut out, st)?;
-        return Ok(exit_code);
+        let sources = match &names {
+            Names::Args(sources) => sources.clone(),
+            Names::Files0(_, all) => all.iter().flatten().map(|n| name_source(n)).collect(),
+        };
+        return wc_rich(&sources, &opts, parsed.json, ctx);
     }
 
-    let ncols = [
-        show_lines,
-        show_words,
-        parsed.chars,
-        show_bytes,
-        parsed.max_line_length,
-    ]
-    .iter()
-    .filter(|&&b| b)
-    .count();
-    let width = if ncols == 1 && sources.len() == 1 {
-        1
-    } else {
-        wc_number_width(&sources)
+    // Column width: 1 for a single count of a single input, or when the
+    // names are not known in advance; else from the inputs' sizes.
+    let width = match &names {
+        _ if total_mode == TotalMode::Only => 1,
+        Names::Args(sources) if sources.len() == 1 && opts.columns() == 1 => 1,
+        Names::Args(sources) => wc_number_width(sources),
+        Names::Files0(_, Some(all)) if all.len() == 1 && opts.columns() == 1 => 1,
+        Names::Files0(_, Some(all)) => {
+            wc_number_width(&all.iter().map(|n| name_source(n)).collect::<Vec<_>>())
+        }
+        Names::Files0(_, None) => 1,
     };
 
     let mut out = io::BufWriter::new(stdout::stdout());
-    let print_row = |out: &mut io::BufWriter<stdout::Stdout>,
-                     r: &WcRecord,
-                     name: Option<&str>|
-     -> io::Result<()> {
-        let mut row = String::new();
-        let cols = [
-            (show_lines, r.lines),
-            (show_words, r.words),
-            (parsed.chars, r.chars),
-            (show_bytes, r.bytes),
-            (parsed.max_line_length, r.max_line_length),
-        ];
-        for (shown, val) in cols {
-            if shown {
-                if !row.is_empty() {
-                    row.push(' ');
-                }
-                row.push_str(&format!("{:>width$}", val));
-            }
-        }
-        if let Some(n) = name {
-            row.push(' ');
-            row.push_str(n);
-        }
-        row.push('\n');
-        ignore_broken_pipe(out.write_all(row.as_bytes()))
-    };
-
-    let mut total = WcRecord::default();
-    for (src, res) in sources.iter().zip(results) {
+    let mut ok = true;
+    let mut totals = Totals::default();
+    let mut read_stdin = false;
+    let show_names = !parsed.files.is_empty() || parsed.files0_from.is_some();
+    let mut emit = |out: &mut io::BufWriter<stdout::Stdout>,
+                    src: &InputSource,
+                    res: io::Result<Counted>|
+     -> io::Result<bool> {
         match res {
-            Ok(r) => {
-                total.lines += r.lines;
-                total.words += r.words;
-                total.chars += r.chars;
-                total.bytes += r.bytes;
-                total.max_line_length = total.max_line_length.max(r.max_line_length);
-                let name = (!parsed.files.is_empty()).then_some(r.file.as_str());
-                print_row(&mut out, &r, name)?;
+            Ok(c) => {
+                if let Some(e) = &c.error {
+                    out.flush()?;
+                    eprintln!("wc: {}: {}", qf(&c.rec.file), gnu_io_error(e));
+                }
+                if total_mode != TotalMode::Only {
+                    let name = show_names.then_some(src.display_name());
+                    ignore_broken_pipe(write_counts(out, &opts, width, &c.rec, name))?;
+                }
+                totals.add(&c.rec);
+                Ok(c.error.is_none())
             }
             Err(e) => {
                 out.flush()?;
-                report(src, &e);
+                eprintln!("wc: {}: {}", qf(src.display_name()), gnu_io_error(&e));
+                Ok(false)
+            }
+        }
+    };
+
+    let n_args = match &mut names {
+        Names::Args(sources) => {
+            read_stdin = sources.iter().any(|s| matches!(s, InputSource::Stdin));
+            let can_parallel =
+                sources.len() > 1 && sources.iter().all(|s| matches!(s, InputSource::File(_)));
+            let results: Vec<io::Result<Counted>> = if can_parallel {
+                sources
+                    .par_iter()
+                    .map(|s| count_source(s, &opts, ctx))
+                    .collect()
+            } else {
+                sources
+                    .iter()
+                    .map(|s| count_source(s, &opts, ctx))
+                    .collect()
+            };
+            for (src, res) in sources.iter().zip(results) {
+                ok &= emit(&mut out, src, res)?;
+            }
+            if parsed.files.is_empty() {
+                0
+            } else {
+                sources.len() as u64
+            }
+        }
+        Names::Files0(list, all) => {
+            let mut index = 0u64;
+            let mut queued = all.take().map(|v| v.into_iter());
+            loop {
+                let name = match &mut queued {
+                    Some(it) => match it.next() {
+                        Some(n) => n,
+                        None => break,
+                    },
+                    None => match list.next_name() {
+                        Ok(Some(n)) => n,
+                        Ok(None) => break,
+                        Err(e) => {
+                            out.flush()?;
+                            eprintln!("wc: {}: read error: {}", qf(&list.name), gnu_io_error(&e));
+                            ok = false;
+                            break;
+                        }
+                    },
+                };
+                index += 1;
+                if let Some(msg) = list.check_name(&name, index, true) {
+                    out.flush()?;
+                    eprintln!("wc: {msg}");
+                    ok = false;
+                    continue;
+                }
+                let src = name_source(&name);
+                read_stdin |= matches!(src, InputSource::Stdin);
+                let res = count_source(&src, &opts, ctx);
+                ok &= emit(&mut out, &src, res)?;
+            }
+            index
+        }
+    };
+
+    if total_mode != TotalMode::Never && (total_mode != TotalMode::Auto || n_args > 1) {
+        for (overflowed, what) in totals.overflow.iter().zip([
+            "total lines",
+            "total words",
+            "total characters",
+            "total bytes",
+        ]) {
+            if *overflowed {
+                out.flush()?;
+                eprintln!("wc: {what}: Value too large for defined data type");
+                ok = false;
+            }
+        }
+        let name = (total_mode != TotalMode::Only).then_some("total");
+        ignore_broken_pipe(write_counts(&mut out, &opts, width, &totals.rec, name))?;
+    }
+    ignore_broken_pipe(out.flush())?;
+    if read_stdin && let Err(e) = close_stdin() {
+        eprintln!("wc: -: {}", gnu_io_error(&e));
+        return Ok(1);
+    }
+    Ok(i32::from(!ok))
+}
+
+/// `--json` / `--table`: records for every input, then NDJSON or a table.
+fn wc_rich(
+    sources: &[InputSource],
+    opts: &WcOpts,
+    json: bool,
+    ctx: &DogfishContext,
+) -> Result<i32> {
+    let mut exit_code = 0;
+    let mut records = Vec::with_capacity(sources.len());
+    for src in sources {
+        match count_source(src, opts, ctx) {
+            Ok(c) => {
+                if let Some(e) = &c.error {
+                    eprintln!("wc: {}: {}", qf(&c.rec.file), gnu_io_error(e));
+                    exit_code = 1;
+                }
+                let mut rec = c.rec;
+                rec.file = src.display_name().to_string();
+                records.push(rec);
+            }
+            Err(e) => {
+                eprintln!("wc: {}: {}", qf(src.display_name()), gnu_io_error(&e));
                 exit_code = 1;
             }
         }
     }
-    if sources.len() > 1 {
-        print_row(&mut out, &total, Some("total"))?;
+    if json {
+        emit_objects_or_table(&records, ctx, true, false)?;
+        return Ok(exit_code);
     }
-    ignore_broken_pipe(out.flush())?;
+    let max_bytes = records.iter().map(|r| r.bytes).max().unwrap_or(1).max(1);
+    let st = ctx.style();
+    let mut tbl = Table::new(vec![
+        ("FILE", ColumnAlign::Left),
+        ("LINES", ColumnAlign::Right),
+        ("WORDS", ColumnAlign::Right),
+        ("CHARS", ColumnAlign::Right),
+        ("SIZE", ColumnAlign::Right),
+        ("PROPORTION", ColumnAlign::Left),
+    ]);
+    for r in &records {
+        let ratio = r.bytes as f64 / max_bytes as f64;
+        tbl.add_row(vec![
+            st.bold(&r.file),
+            r.lines.to_string(),
+            r.words.to_string(),
+            r.chars.to_string(),
+            st.green(&dogfish_core::format_size(r.bytes, true)),
+            sparkline_bar(ratio, 10, st),
+        ]);
+    }
+    let mut out = stdout::stdout();
+    tbl.render(&mut out, st)?;
     Ok(exit_code)
 }

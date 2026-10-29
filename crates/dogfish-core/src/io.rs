@@ -73,44 +73,47 @@ impl FastReader {
                 DEFAULT_BUF_SIZE,
                 Box::new(io::stdin()),
             ))),
-            InputSource::File(path) => {
-                let file = File::open(path)?;
-                let meta = file.metadata()?;
-                // A small file costs less to read than to map (a mapping
-                // takes four system calls and a page fault to set up).
-                if meta.is_file() && meta.len() > MMAP_MIN_LEN && meta.len() <= (1 << 34) {
-                    arm_sigbus_handler();
-                    // The length is known: telling memmap2 saves it a stat.
-                    let mut options = MmapOptions::new();
-                    options.len(meta.len() as usize);
-                    // SAFETY: a read-only private mapping of a regular file we
-                    // opened. Rust's aliasing rules assume the bytes do not
-                    // change while mapped; another process can still modify or
-                    // truncate the file. Modification can only change the data
-                    // read (as with read(2) racing a writer); truncation raises
-                    // SIGBUS, which the handler armed above turns into a clean
-                    // exit. See doc/unsafe.md.
-                    if let Ok(mmap) = unsafe { options.map(&file) } {
-                        // SAFETY: the pointer and length describe the live
-                        // mapping just created; madvise is only a hint and
-                        // never changes its contents.
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::madvise(
-                                mmap.as_ptr() as *mut libc::c_void,
-                                mmap.len(),
-                                libc::MADV_SEQUENTIAL,
-                            );
-                        }
-                        return Ok(Self::Mapped(mmap));
-                    }
+            InputSource::File(path) => Self::from_file(File::open(path)?),
+        }
+    }
+
+    /// Wraps an already open file, mapping it when it is a regular file of
+    /// more than 16 KiB and at most 16 GiB (for callers that inspect the
+    /// file first). A smaller file costs less to read than to map (a mapping
+    /// takes four system calls and a page fault to set up).
+    pub fn from_file(file: File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        if meta.is_file() && meta.len() > MMAP_MIN_LEN && meta.len() <= (1 << 34) {
+            arm_sigbus_handler();
+            // The length is known: telling memmap2 saves it a stat.
+            let mut options = MmapOptions::new();
+            options.len(meta.len() as usize);
+            // SAFETY: a read-only private mapping of a regular file the
+            // caller opened. Rust's aliasing rules assume the bytes do not
+            // change while mapped; another process can still modify or
+            // truncate the file. Modification can only change the data read
+            // (as with read(2) racing a writer); truncation raises SIGBUS,
+            // which the handler armed above turns into a clean exit. See
+            // doc/unsafe.md.
+            if let Ok(mmap) = unsafe { options.map(&file) } {
+                // SAFETY: the pointer and length describe the live mapping
+                // just created; madvise is only a hint and never changes its
+                // contents.
+                #[cfg(unix)]
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr() as *mut libc::c_void,
+                        mmap.len(),
+                        libc::MADV_SEQUENTIAL,
+                    );
                 }
-                Ok(Self::Buffered(BufReader::with_capacity(
-                    DEFAULT_BUF_SIZE,
-                    Box::new(file),
-                )))
+                return Ok(Self::Mapped(mmap));
             }
         }
+        Ok(Self::Buffered(BufReader::with_capacity(
+            DEFAULT_BUF_SIZE,
+            Box::new(file),
+        )))
     }
 
     /// Reads the entire input as a byte slice (zero-copy if `mmap` succeeded).

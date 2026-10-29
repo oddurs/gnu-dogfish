@@ -3,7 +3,10 @@ id: 50
 uid: 44184790-6ed5-493d-b8c2-ae557683924e
 title: "nl: section delimiters, -p, -d and number range checks"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -34,5 +37,9 @@ The test passes.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`-h`, `-f`, `-d/--section-delimiter`, `-l`, `-p/--no-renumber`, `\:` sections and GNU's range checks; misc/nl.sh passes.

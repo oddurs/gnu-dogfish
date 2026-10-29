@@ -3,7 +3,10 @@ id: 31
 uid: 88e91031-5221-4544-b0fe-dccb48b5e493
 title: "Honour POSIXLY_CORRECT in echo, mktemp and cp"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -36,5 +39,9 @@ The three behaviours match GNU with and without `POSIXLY_CORRECT`.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+echo and mktemp honour POSIXLY_CORRECT (this branch), cp writes through a dangling symlink under it (#22); echo.sh, mktemp.pl and cp/thru-dangling.sh pass.

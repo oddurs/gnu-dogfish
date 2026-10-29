@@ -3,7 +3,10 @@ id: 53
 uid: 5e4b51a0-002a-4f90-b60b-087731668fa3
 title: "shuf: -r, large -i ranges, last -n wins"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -34,5 +37,9 @@ The test passes.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+`-r/--repeat`, `-o`, `--random-source`, `-z`, large `-i` ranges, `-n0` without opening input, last `-n` wins; shuf.sh passes. Known gap: `--random-source` gives a different order from GNU's for the same file.
