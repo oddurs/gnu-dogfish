@@ -20,6 +20,7 @@ pub(crate) mod files0;
 pub(crate) mod fnmatch;
 pub(crate) mod getopt;
 pub(crate) mod gnu_getopt;
+pub(crate) mod gnu_regex;
 pub(crate) mod head_tail;
 pub(crate) mod human;
 pub(crate) mod input;

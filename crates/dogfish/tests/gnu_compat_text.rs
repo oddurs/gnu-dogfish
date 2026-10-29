@@ -190,6 +190,28 @@ gnu_cases! {
     tr_missing_operand_after: "tr" ["-ds", "a"] stdin b"";
     tr_extra_operand: "tr" ["-d", "a", "b"] stdin b"";
     tr_empty_set2: "tr" ["a", ""] stdin b"";
+
+    // ---------------------------------------------------------------- tac
+    tac_before: "tac" ["-b"] stdin b"\na\nb\nc";
+    tac_separator: "tac" ["-s:"] stdin b"a:b:c:";
+    tac_separator_before: "tac" ["-s", ":", "-b"] stdin b":a:b:c";
+    tac_multichar_separator: "tac" ["-s", "::"] stdin b"1::2:::3::";
+    tac_nul_separator: "tac" ["-s", ""] stdin b"a\0b\0c";
+    tac_regex: "tac" ["-r", "-s", "\\._+"] stdin b"a.___b.__1._2.__3.___4._";
+    tac_regex_before: "tac" ["-b", "-r", "-s", "\\._+"] stdin b".__x.___y.____z._1._2.__3.___4";
+    tac_regex_alternation: "tac" ["-r", "-s", "x\\|yy"] stdin b"1x2yy3x";
+    tac_regex_group_star: "tac" ["-r", "-s", "\\(ab\\)*c"] stdin b"1c2ababc3abc";
+    tac_regex_bracket: "tac" ["-r", "-s", "[0-9]+"] stdin b"a1b22c333";
+    tac_regex_literal_star: "tac" ["-r", "-s", "*a"] stdin b"1*a2*a3";
+    tac_regex_empty: "tac" ["-r", "-s", ""] stdin b"a";
+    tac_regex_unmatched_open: "tac" ["-r", "-s", "\\("] stdin b"a";
+    tac_regex_unmatched_close: "tac" ["-r", "-s", "a\\)"] stdin b"a";
+    tac_regex_unmatched_bracket: "tac" ["-r", "-s", "[a"] stdin b"a";
+    tac_regex_trailing_backslash: "tac" ["-r", "-s", "a\\"] stdin b"a";
+    tac_regex_bad_backref: "tac" ["-r", "-s", "\\1"] stdin b"a";
+    tac_regex_default_separator: "tac" ["-r"] stdin b"a\nb\n";
+    tac_two_files: "tac" ["lines.txt", "notrail.txt"];
+    tac_missing_file: "tac" ["nonexist", "lines.txt"];
 }
 
 // ------------------------------------------------------- shell pipelines
@@ -282,4 +304,8 @@ shell_cases! {
     wc_bytes_sparse_not_read: ["wc"] "truncate -s 1T big 2>/dev/null || exit 0; wc -c big";
     wc_newline_in_name: ["wc"] "touch 'a\nb'; printf 'a\\nb\\0' | wc --files0-from=-";
     wc_closed_stdin: ["wc"] "wc <&-; echo $?";
+
+    // ---------------------------------------------------------------- tac
+    tac_closed_stdin: ["tac"] "tac - - <&-; echo $?";
+    tac_pipe_twice: ["tac"] "printf 'x\\ny\\n' | tac - -";
 }
