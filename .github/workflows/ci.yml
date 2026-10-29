@@ -11,6 +11,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Actions are pinned to full commit SHAs (Dependabot updates them with the
+# version comment). The token can only read the repository.
+permissions:
+  contents: read
+
+# A new push to a PR supersedes its running checks; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Lint (${{ matrix.os }})
@@ -25,12 +35,15 @@ jobs:
           - macos-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Pinned so a new stable Clippy lint cannot turn unrelated PRs red; bump deliberately.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.99.0
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -39,6 +52,10 @@ jobs:
 
       - name: Clippy
         run: cargo xtask clippy
+
+      - name: Unsafe inventory (doc/unsafe.md)
+        if: runner.os == 'Linux'
+        run: cargo xtask unsafe-audit
 
       - name: Docs
         if: runner.os == 'Linux'
@@ -60,10 +77,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
       # Debug builds keep clap's argument-definition asserts and overflow checks on,
       # which catch bugs that release builds silently ignore.
@@ -82,10 +103,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.88.0
 
       - name: Test
         run: cargo xtask test

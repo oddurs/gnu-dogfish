@@ -659,6 +659,8 @@ impl FsStats {
         let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
         // SAFETY: statfs fills the zeroed struct for a valid C path.
         let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c_path` is a NUL-terminated path and `s` a writable statfs;
+        // both outlive the call.
         if unsafe { libc::statfs(c_path.as_ptr(), &mut s) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -689,6 +691,8 @@ impl FsStats {
         let c_path = CString::new(path_bytes(path)).map_err(io::Error::other)?;
         // SAFETY: statvfs fills the zeroed struct for a valid C path.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c_path` is a NUL-terminated path and `s` a writable statvfs;
+        // both outlive the call.
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut s) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -735,6 +739,8 @@ impl FsStats {
 fn statfs_type_name(c_path: &CString) -> Option<String> {
     // SAFETY: statfs fills the zeroed struct for a valid C path.
     let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated path and `s` a writable statfs;
+    // both outlive the call.
     if unsafe { libc::statfs(c_path.as_ptr(), &mut s) } != 0 {
         return None;
     }

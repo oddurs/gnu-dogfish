@@ -300,6 +300,8 @@ pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_cha
             // SAFETY: the C runtime passes `argc` valid NUL-terminated strings.
             let arg = unsafe { *argv.add(i) };
             (!arg.is_null()).then(|| {
+                // SAFETY: a non-null argv entry is a NUL-terminated string
+                // that lives for the whole process.
                 OsString::from_vec(unsafe { std::ffi::CStr::from_ptr(arg) }.to_bytes().to_vec())
             })
         })

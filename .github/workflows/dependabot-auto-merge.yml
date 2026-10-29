@@ -15,10 +15,9 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize]
 
-permissions:
-  actions: read
-  contents: write
-  pull-requests: write
+# Never checks out or runs PR code: it reads metadata through the API and
+# merges. The write permissions belong to the one job that needs them.
+permissions: {}
 
 concurrency:
   group: dependabot-auto-merge-${{ github.event.pull_request.number }}
@@ -29,9 +28,13 @@ jobs:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
     steps:
       - id: meta
-        uses: dependabot/fetch-metadata@v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 

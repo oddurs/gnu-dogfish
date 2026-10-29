@@ -1,0 +1,70 @@
+# Dependency policy, checked by `cargo xtask deny` (cargo-deny) on every PR,
+# on main, and weekly for newly published advisories.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Dogfish builds for Linux and macOS only, so Windows-only crates (windows-sys
+# and friends) never reach a binary and are left out of every check.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# RustSec (https://github.com/rustsec/advisory-db). Vulnerabilities, unsound
+# and unmaintained crates are errors. An ignored advisory needs a written reason
+# here, and a cairn item to remove the ignore.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every license here can be combined into a binary distributed under
+# GPL-3.0-or-later OR MIT. All are permissive and GPLv3-compatible (Apache-2.0
+# is compatible with GPLv3, not GPLv2, which Dogfish does not use). Weak or
+# strong copyleft (MPL, LGPL, GPL) is not on the list: no dependency needs it,
+# and every current dependency that offers it also offers MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+# No `[[licenses.clarify]]` entries. ring used to need one (before 0.17.10 its
+# manifest had no SPDX expression); ring 0.17.14 declares
+# `license = "Apache-2.0 AND ISC"`, which cargo-deny uses as is. Checked by
+# hand against its license files: LICENSE-other-bits is ISC (ring's own code),
+# LICENSE-BoringSSL and third_party/fiat/LICENSE are Apache-2.0, and
+# src/polyfill/once_cell is MIT OR Apache-2.0. Re-check if a ring release
+# changes its `license` field.
+
+[licenses.private]
+# The workspace crates (dogfish, dogfish-core, xtask) are checked like any other.
+ignore = false
+
+[bans]
+# Two major versions of one crate means twice the code to audit and build.
+# Each skip below names who pulls the older copy; drop it when they converge.
+multiple-versions = "deny"
+wildcards = "deny"
+# Path dependencies between workspace crates are not wildcards.
+allow-wildcard-paths = true
+highlight = "all"
+skip = [
+    # ring 0.17 is still on getrandom 0.2; tempfile has moved to 0.4.
+    { crate = "getrandom@0.2", reason = "ring 0.17 depends on getrandom 0.2" },
+]
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

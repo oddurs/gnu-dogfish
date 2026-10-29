@@ -9,3 +9,6 @@ description = "Project automation: `cargo xtask ci` runs what CI runs"
 
 # Standard library only: it must build quickly, offline and on the MSRV.
 [dependencies]
+
+[lints]
+workspace = true

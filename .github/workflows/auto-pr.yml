@@ -18,9 +18,7 @@ on:
       - "dependabot/**"
       - "gh-readonly-queue/**"
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: auto-pr-${{ github.ref_name }}
@@ -29,10 +27,16 @@ concurrency:
 jobs:
   open-pr:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v7
+      # The repository is public, so `git fetch` needs no stored credentials;
+      # `gh` gets its token from GH_TOKEN.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Open a draft PR if none exists
         env:
