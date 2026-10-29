@@ -575,6 +575,8 @@ gnu_cases! {
     stat_default_modes: "stat" ["setuid", "setgid", "noperm", "private"];
     stat_terse: "stat" ["-t", "a.txt", "link_file", "fifo", "sparse.img"];
     stat_terse_deref: "stat" ["--terse", "--dereference", "link_file"];
+    stat_fs_dash: "stat" ["-f", "-"];
+    stat_fs_dash_terse: "stat" ["-f", "-t", "-", "a.txt"];
     stat_format_all: "stat" ["-c", "%n|%s|%b|%B|%f|%F|%a|%A|%u|%U|%g|%G|%h|%i|%o|%d|%D|%t|%T|%Hd|%Ld", "a.txt", "dir", "link_file", "fifo", "empty"];
     stat_format_quoted_names: "stat" ["-c", "%N", "link_file", "link_dangling", "dir/to_a", "a.txt"];
     stat_format_quoted_weird_names: "stat" ["-c", "%N", "names/with space", "names/it's", "names/tab\tin", "names/new\nline", "names/dq\"x", "names/$dollar", "names/\u{fc}n\u{ef}", "names/back\\slash", "names/{", "names/~tilde"];

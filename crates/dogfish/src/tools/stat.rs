@@ -190,6 +190,14 @@ pub fn run_stat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         };
         let mut buf = Vec::new();
         let expanded = if file_system {
+            if name == "-" {
+                eprintln!(
+                    "stat: using {} to denote standard input does not work in file system mode",
+                    quote_af(name)
+                );
+                status = 1;
+                continue;
+            }
             let info = match FsStats::query(path) {
                 Ok(info) => info,
                 Err(e) => {

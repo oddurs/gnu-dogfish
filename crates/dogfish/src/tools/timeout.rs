@@ -132,7 +132,12 @@ extern "C" fn timeout_on_signal(sig: libc::c_int) {
         }
         if let Some((head, tail)) = TIMEOUT_VERBOSE.get() {
             let mut buf = [0u8; 16];
-            let name = sig_name_into(sig, &mut buf);
+            // gnulib's sig2str names signal 0 "EXIT".
+            let name = if sig == 0 {
+                b"EXIT".as_slice()
+            } else {
+                sig_name_into(sig, &mut buf)
+            };
             for part in [head.as_slice(), name, tail.as_slice()] {
                 libc::write(libc::STDERR_FILENO, part.as_ptr().cast(), part.len());
             }
@@ -226,6 +231,14 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 libc::sigaction(sig, &action, std::ptr::null_mut());
             }
         }
+        // An inherited `trap '' CHLD` would make the kernel reap the command
+        // before we can wait for it; GNU likewise installs its own SIGCHLD
+        // disposition and unblocks the signal.
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        let mut chld: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut chld);
+        libc::sigaddset(&mut chld, libc::SIGCHLD);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &chld, std::ptr::null_mut());
         // Allow running in the background while the command reads the TTY.
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);

@@ -386,6 +386,14 @@ struct EnvRecord {
     value: String,
 }
 
+/// GNU's hint after an error that suggests a shebang line without -S.
+const SHEBANG_HINT: &str = "use -[v]S to pass options in shebang lines";
+
+/// C's `isspace` in the C locale (which, unlike Rust's, includes `\v`).
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
 pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let usage = |msg: String| Ok(usage_error("env", msg, EXIT_CANCELED));
     let mut opts = GetOpt::new(args.into_iter().skip(1).collect(), &ENV_OPTS, false);
@@ -401,7 +409,20 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     while let Some(item) = opts.next_opt() {
         let (key, value) = match item {
             Ok(kv) => kv,
-            Err(msg) => return usage(msg),
+            Err(msg) => {
+                // A space in the first argument means a shebang line like
+                // `#!/usr/bin/env -i command`, which needs -S (GNU's hint).
+                if let Some(c) = msg
+                    .strip_prefix("invalid option -- '")
+                    .and_then(|r| r.chars().next())
+                    && c.is_ascii()
+                    && is_c_space(c as u8)
+                {
+                    eprintln!("env: {msg}");
+                    return usage(SHEBANG_HINT.to_string());
+                }
+                return usage(msg);
+            }
         };
         match key {
             "ignore-environment" => ignore_env = true,
@@ -536,6 +557,9 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         EXIT_CANNOT_INVOKE
     };
     eprintln!("env: {}: {}", gnu_quote(&command[0]), gnu_io_error(&err));
+    if status == EXIT_ENOENT && command[0].bytes().any(is_c_space) {
+        eprintln!("env: {SHEBANG_HINT}");
+    }
     Ok(status)
 }
 
