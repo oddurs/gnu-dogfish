@@ -12,7 +12,7 @@ use dogfish_core::{
 };
 use memchr::memchr;
 
-use crate::common::input::{close_stdin, stdin_file};
+use crate::common::input::{RawStdout, close_stdin, stdin_file};
 use crate::common::lines::line_end;
 use crate::common::quote::{Quoting, qf, quote_bytes_raw};
 
@@ -209,8 +209,7 @@ pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let read_stdin = names.iter().any(|n| n == "-");
     ctx.telemetry.set_strategy("byte-exact streaming paste");
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let mut ok = true;
     let result = if parsed.serial {
         let mut res = Ok(());

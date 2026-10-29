@@ -1,6 +1,6 @@
 //! tail — SIMD reverse newline scan (`memrchr`), `+N`, `-f` follow + NDJSON support
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use memchr::memchr_iter;
 use crate::common::head_tail::{
     digit_option, header_name, last_lines_start, parse_count, to_usize,
 };
+use crate::common::input::{RawStdout, stdin_file};
 use crate::common::lines::{line_end, looks_like_json, lossy_lines};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, quote_locale};
@@ -144,6 +145,24 @@ fn expand_obsolete(mut args: Vec<String>) -> Result<Vec<String>, i32> {
     Ok(args)
 }
 
+/// Opens an input; standard input that is a regular file at offset 0 is
+/// mapped rather than read, as GNU seeks to its end instead of reading it.
+fn open_tail_input(src: &InputSource) -> io::Result<FastReader> {
+    if let InputSource::Stdin = src {
+        let mut stdin = stdin_file();
+        if stdin.metadata().is_ok_and(|m| m.is_file() && m.len() > 0)
+            && stdin.stream_position().is_ok_and(|p| p == 0)
+        {
+            // Safety: read-only mapping of a regular file, as FastReader does.
+            if let Ok(map) = unsafe { memmap2::Mmap::map(&*stdin) } {
+                let _ = stdin.seek(io::SeekFrom::End(0));
+                return Ok(FastReader::Mapped(map));
+            }
+        }
+    }
+    FastReader::open(src)
+}
+
 /// Offset at which tail output starts.
 fn tail_start(bytes: &[u8], by_bytes: bool, from_start: bool, count: u64, eol: u8) -> usize {
     let len = bytes.len();
@@ -205,8 +224,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     let sources = InputSource::from_args(&parsed.files);
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
 
     if sources.len() == 1
         && matches!(sources[0], InputSource::Stdin)
@@ -245,7 +263,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut exit_code = 0;
 
     for src in &sources {
-        let mut reader = match FastReader::open(src) {
+        let mut reader = match open_tail_input(src) {
             Ok(r) => r,
             Err(e) => {
                 let _ = out.flush();

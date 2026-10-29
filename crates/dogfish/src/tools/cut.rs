@@ -12,6 +12,7 @@ use dogfish_core::{
 use memchr::memchr2;
 use serde_json::{Map, Value};
 
+use crate::common::input::RawStdout;
 use crate::common::lines::{line_end, looks_like_json, lossy_lines, split_records};
 use crate::common::quote::{qf, quote_locale};
 
@@ -454,8 +455,7 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let mut exit_code = 0;
     if let Some(all) = all_stdin {
         ignore_broken_pipe(cut_buffer(&all, &spec, &mut out))?;

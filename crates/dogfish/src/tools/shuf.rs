@@ -13,6 +13,7 @@ use dogfish_core::{
 
 use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error};
 use crate::common::gnu_getopt::print_tool_version;
+use crate::common::input::RawStdout;
 use crate::common::input::stdin_file;
 use crate::common::lines::{lossy_lines, split_records};
 use crate::common::quote::{qf, quote_locale};
@@ -384,7 +385,7 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 return Ok(1);
             }
         },
-        None => Box::new(io::stdout().lock()),
+        None => Box::new(RawStdout),
     };
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, sink);
     let mut itoa_buf = itoa::Buffer::new();

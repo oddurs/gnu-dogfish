@@ -12,7 +12,7 @@ use dogfish_core::{
 use memchr::memrchr;
 
 use crate::common::gnu_regex::Regex;
-use crate::common::input::{close_stdin, stdin_file};
+use crate::common::input::{RawStdout, close_stdin, stdin_file};
 use crate::common::quote::{qa, qf};
 
 #[derive(Parser)]
@@ -159,8 +159,7 @@ pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("mmap + memrchr reverse SIMD line scan");
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let mut ok = true;
     let mut read_stdin = false;
 

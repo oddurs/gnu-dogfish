@@ -17,7 +17,7 @@ use memchr::{memchr_iter, memrchr};
 
 use crate::common::getopt::try_help;
 use crate::common::head_tail::{digit_option, header_name, parse_count, to_usize};
-use crate::common::input::{close_stdin, full_read, safe_read, stdin_file};
+use crate::common::input::{RawStdout, close_stdin, full_read, safe_read, stdin_file};
 use crate::common::lines::{line_end, looks_like_json, lossy_lines};
 use crate::common::quote::{qa, qf, quote_locale};
 
@@ -188,8 +188,7 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("GNU head: BUFSIZ reads, seek back");
     let show_headers = parsed.verbose || (!parsed.quiet && sources.len() > 1);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let mut first_header = true;
     let mut ok = true;
     let mut read_stdin = false;

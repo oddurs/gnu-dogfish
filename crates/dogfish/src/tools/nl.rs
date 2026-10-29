@@ -11,6 +11,7 @@ use dogfish_core::{
 };
 
 use crate::common::gnu_regex::Regex;
+use crate::common::input::RawStdout;
 use crate::common::quote::{qf, quote_locale};
 use crate::common::xstrtol::xdectoimax;
 
@@ -368,8 +369,7 @@ pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         Err(status) => return Ok(status),
     };
     let sources = InputSource::from_args(&parsed.files);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
     let dim = ctx.style().enabled;
     let mut st = NlState {
         line_no: cfg.start,

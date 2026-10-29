@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::common::getopt::{GetOpt, HasArg, OptSpec, argmatch, opt, print_help, usage_error};
 use crate::common::gnu_getopt::print_tool_version;
+use crate::common::input::RawStdout;
 use crate::common::lines::{is_blank, looks_like_json, lossy_lines};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, qf, quote_locale};
@@ -523,7 +524,7 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("O(1) memory streaming deduplicator");
     let sink: Box<dyn Write> = if cfg.output == "-" {
-        Box::new(io::stdout().lock())
+        Box::new(RawStdout)
     } else {
         match File::create(&cfg.output) {
             Ok(f) => Box::new(f),
