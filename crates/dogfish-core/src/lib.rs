@@ -12,6 +12,7 @@ pub mod context;
 pub mod format;
 pub mod io;
 pub mod journal;
+pub mod stdout;
 pub mod table;
 
 pub use context::{ColorMode, DogfishContext, Telemetry};

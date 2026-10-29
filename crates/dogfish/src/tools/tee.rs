@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser};
 use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file};
 
-use crate::common::getopt::argmatch;
+use crate::common::legacy_getopt::argmatch;
 
 #[derive(Parser)]
 #[command(

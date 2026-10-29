@@ -22,6 +22,7 @@ pub(crate) mod gnu_getopt;
 pub(crate) mod head_tail;
 pub(crate) mod human;
 pub(crate) mod interval;
+pub(crate) mod legacy_getopt;
 pub(crate) mod lines;
 pub(crate) mod mode;
 pub(crate) mod path;

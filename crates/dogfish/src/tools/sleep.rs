@@ -6,8 +6,8 @@ use anyhow::Result;
 use clap::{ArgAction, Parser};
 use dogfish_core::{DogfishContext, gnu_quote};
 
-use crate::common::getopt::try_help;
 use crate::common::interval::{duration_from_secs, parse_interval};
+use crate::common::legacy_getopt::try_help;
 
 #[derive(Parser)]
 #[command(

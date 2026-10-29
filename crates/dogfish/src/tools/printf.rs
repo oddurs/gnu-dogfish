@@ -6,7 +6,7 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe};
 
 use crate::common::escapes::unescape_echo_bytes;
-use crate::common::getopt::print_help;
+use crate::common::legacy_getopt::print_help;
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 

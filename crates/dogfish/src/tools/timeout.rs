@@ -9,8 +9,10 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote};
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error};
 use crate::common::interval::{duration_from_secs, parse_interval};
+use crate::common::legacy_getopt::{
+    GetOpt, HasArg, OptSpec, opt, print_help, try_help, usage_error,
+};
 use crate::common::signals::parse_signal;
 use crate::common::signals::sig_name_into;
 

@@ -6,7 +6,7 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
 
 use crate::common::escapes::unescape_echo_bytes;
-use crate::common::getopt::print_help;
+use crate::common::legacy_getopt::print_help;
 
 const ECHO_HELP: &str = "\
 Usage: echo [SHORT-OPTION]... [STRING]...

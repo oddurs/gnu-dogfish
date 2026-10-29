@@ -11,7 +11,7 @@ use dogfish_core::{
 use serde::Serialize;
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
+use crate::common::legacy_getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
 use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
 
 /// Largest signal number worth probing (GNU's SIGNUM_BOUND).

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use dogfish_core::DogfishContext;
 
-use crate::common::getopt::print_help;
+use crate::common::legacy_getopt::print_help;
 
 const TRUE_HELP: &str = "\
 Usage: true [ignored command line arguments]

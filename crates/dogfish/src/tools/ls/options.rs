@@ -780,7 +780,10 @@ pub(crate) fn ls_args(ctx: &DogfishContext, filtered: Vec<String>) -> Vec<String
     }
     let mut args = Vec::with_capacity(ctx.raw_args.len());
     let mut operands_only = false;
-    for (i, arg) in ctx.raw_args.iter().enumerate() {
+    for (i, arg) in crate::common::getopt::lossy_all(ctx.raw_args.clone())
+        .iter()
+        .enumerate()
+    {
         if i == 0 || operands_only {
             args.push(arg.clone());
             continue;

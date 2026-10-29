@@ -7,6 +7,7 @@
 mod common;
 mod tools;
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -14,8 +15,10 @@ use anyhow::Result;
 use dogfish_core::{
     ColumnAlign, DogfishContext, Table, gnu_io_error,
     io::{install_sigbus_handler, install_sigpipe_handler},
-    strip_os_error_suffix,
+    out, outln, stdout, strip_os_error_suffix,
 };
+
+use crate::common::getopt::exit_failure;
 
 pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     // Tier 1: File & Directory
@@ -272,7 +275,7 @@ pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
 
 fn main() -> ExitCode {
     install_sigpipe_handler();
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
 
     // Determine if invoked via symlink (e.g. `ls`, `df-ls`) or as `dogfish <subcommand>`
     let argv0_name = raw_args
@@ -291,32 +294,33 @@ fn main() -> ExitCode {
     {
         let mut a = raw_args;
         if !a.is_empty() {
-            a[0] = stripped_argv0.clone();
+            a[0] = OsString::from(&stripped_argv0);
         }
         (stripped_argv0, a)
     } else {
-        match raw_args.get(1).map(|s| s.as_str()) {
+        let sub = raw_args.get(1).map(|s| s.to_string_lossy().into_owned());
+        match sub.as_deref() {
             None | Some("-h") | Some("--help") | Some("help") => {
                 print_banner_and_help();
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some("-V") | Some("--version") | Some("version") => {
-                println!(
+                outln!(
                     "GNU/Dogfish (gnu-dogfish) {} — Libre, Object-Aware Coreutils",
                     env!("CARGO_PKG_VERSION")
                 );
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some("--list") | Some("list") => {
                 for (name, _, _) in ALL_TOOLS {
-                    println!("{}", name);
+                    outln!("{}", name);
                 }
-                return ExitCode::SUCCESS;
+                return finish("dogfish", 0);
             }
             Some(sub) => {
                 let sub_clean = sub.strip_prefix("df-").unwrap_or(sub).to_string();
                 let mut a = Vec::with_capacity(raw_args.len() - 1);
-                a.push(sub_clean.clone());
+                a.push(OsString::from(&sub_clean));
                 a.extend_from_slice(&raw_args[2..]);
                 (sub_clean, a)
             }
@@ -328,19 +332,15 @@ fn main() -> ExitCode {
     // Like every GNU utility (scripts probe `tool --version`), a lone `--version`
     // prints the version instead of being parsed as an operand or rejected.
     if filtered_args.len() == 2 && filtered_args[1] == "--version" {
-        println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
+        outln!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
         // GNU `false` fails even when asked for its version.
-        return if tool_name == "false" {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
+        return finish(&tool_name, i32::from(tool_name == "false"));
     }
     let res = dispatch(&tool_name, filtered_args, &ctx);
     ctx.finish();
 
-    match res {
-        Ok(code) => ExitCode::from(code as u8),
+    let code = match res {
+        Ok(code) => code,
         Err(err) => {
             if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
                 use clap::error::ErrorKind;
@@ -348,8 +348,8 @@ fn main() -> ExitCode {
                     clap_err.kind(),
                     ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
                 ) {
-                    let _ = clap_err.print();
-                    return ExitCode::SUCCESS;
+                    out!("{}", clap_err.render());
+                    return finish(&tool_name, 0);
                 }
                 // Usage errors read like glibc getopt's, then GNU's "Try" hint.
                 match gnu_usage_message(clap_err) {
@@ -360,29 +360,58 @@ fn main() -> ExitCode {
                         let _ = clap_err.print();
                     }
                 }
-                return ExitCode::from(usage_error_status(&tool_name));
+                return finish(&tool_name, exit_failure(&tool_name));
             }
-            // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
-            let msg = match err.downcast_ref::<std::io::Error>() {
-                Some(io_err) => gnu_io_error(io_err),
-                None => strip_os_error_suffix(&err.to_string()),
-            };
-            let prefix = format!("{}: ", tool_name);
-            let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
-            let st = ctx.stderr_style();
-            eprintln!("{}: {}", st.bold(&tool_name), msg);
-            ExitCode::from(1)
+            match err.downcast_ref::<std::io::Error>() {
+                // A failed write to standard output is reported as GNU's
+                // `close_stdout` does, once.
+                Some(io_err) if stdout::is_write_error(io_err) => {
+                    stdout::mark_reported();
+                    report_write_error(&tool_name, io_err);
+                    exit_failure(&tool_name)
+                }
+                _ => {
+                    // GNU style: `tool: message`, with io::Error rendered as bare strerror text.
+                    let msg = match err.downcast_ref::<std::io::Error>() {
+                        Some(io_err) => gnu_io_error(io_err),
+                        None => strip_os_error_suffix(&err.to_string()),
+                    };
+                    let prefix = format!("{}: ", tool_name);
+                    let msg = msg.strip_prefix(&prefix).unwrap_or(&msg);
+                    let st = ctx.stderr_style();
+                    eprintln!("{}: {}", st.bold(&tool_name), msg);
+                    1
+                }
+            }
         }
-    }
+    };
+    finish(&tool_name, code)
 }
 
-/// Exit status GNU uses for command-line usage errors: most tools exit 1, but
-/// the ones whose own failures are reported with 1 reserve a distinct status.
-fn usage_error_status(tool: &str) -> u8 {
+/// Flushes standard output and exits with `code`, or, when output was lost to
+/// a write error nobody has reported, reports it and fails (gnulib's
+/// `close_stdout`).
+fn finish(tool: &str, code: i32) -> ExitCode {
+    let code = match stdout::close() {
+        Some(err) => {
+            report_write_error(tool, &err);
+            exit_failure(tool)
+        }
+        None => code,
+    };
+    ExitCode::from(code as u8)
+}
+
+/// GNU's diagnostic for output lost to a write error: `tool: write error:
+/// No space left on device`. The tools whose output GNU flushes as it goes
+/// find the error before exit, when `errno` no longer says why, and print
+/// just `write error`.
+fn report_write_error(tool: &str, err: &std::io::Error) {
     match tool {
-        "ls" | "sort" | "printenv" => 2,
-        "env" | "timeout" => 125,
-        _ => 1,
+        "wc" | "md5sum" | "sha256sum" | "b2sum" | "du" | "sort" => {
+            eprintln!("{tool}: write error")
+        }
+        _ => eprintln!("{tool}: write error: {}", gnu_io_error(err)),
     }
 }
 
@@ -403,7 +432,8 @@ fn gnu_usage_message(err: &clap::Error) -> Option<String> {
             let arg = context(ContextKind::InvalidArg)?;
             Some(if arg.starts_with("--") {
                 // clap drops any `=VALUE`; GNU echoes the argument as typed.
-                let typed = std::env::args()
+                let typed = std::env::args_os()
+                    .map(|a| a.to_string_lossy().into_owned())
                     .find(|a| a.strip_prefix(arg).is_some_and(|v| v.starts_with('=')))
                     .unwrap_or_else(|| arg.to_string());
                 format!("unrecognized option '{typed}'")
@@ -416,7 +446,10 @@ fn gnu_usage_message(err: &clap::Error) -> Option<String> {
         ErrorKind::InvalidValue if context(ContextKind::InvalidValue) == Some("") => {
             // A missing option argument: GNU names the option the way it was typed,
             // which clap does not record, so look at the last option-like argument.
-            let typed = std::env::args().rev().find(|a| a.starts_with('-'));
+            let typed = std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .rev()
+                .find(|a| a.starts_with('-'));
             Some(match typed {
                 Some(t) if !t.starts_with("--") => {
                     let short = t.chars().last().unwrap_or('?');
@@ -447,7 +480,8 @@ fn is_known_tool(name: &str) -> bool {
     ALL_TOOLS.iter().any(|(n, _, _)| *n == name)
 }
 
-fn dispatch(tool: &str, args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let args = crate::common::getopt::lossy_all(args);
     let tool_names: Vec<&str> = ALL_TOOLS.iter().map(|(n, _, _)| *n).collect();
     match tool {
         // Tier 1: File & Directory
@@ -538,38 +572,38 @@ fn print_banner_and_help() {
         `._     `--' /   \_\           /  ##  ## (oo)
            `-.___..-'   / /           / \## __   ./
                        /_/               |//YY \|/"#;
-    println!("{}", st.bold_cyan(logo));
-    println!(
+    outln!("{}", st.bold_cyan(logo));
+    outln!(
         "\n  {} {} — {}",
         st.bold_cyan("🦈 GNU/DOGFISH"),
         st.dim(env!("CARGO_PKG_VERSION")),
         st.bold("Libre, High-Velocity, Object-Aware Coreutils in Rust")
     );
-    println!(
+    outln!(
         "  {}",
         st.yellow(
             "Free Software Foundation Spirit • Four Essential Freedoms • Zero Proprietary Bloat"
         )
     );
-    println!(
+    outln!(
         "  {}\n",
         st.dim("Usage: gnu/dogfish <UTILITY> [ARGS]... [--stats] [--json|-J] [--color=auto|always|never]")
     );
 
-    println!("  {}", st.bold_yellow("Killer Features:"));
-    println!(
+    outln!("  {}", st.bold_yellow("Killer Features:"));
+    outln!(
         "    • {}   `dogfish ls -J | dogfish sort --by size --desc | dogfish head -n 5`",
         st.bold_green("NDJSON Object Piping:")
     );
-    println!(
+    outln!(
         "    • {}       Pass `--stats` to any command for microsecond timing & I/O speed",
         st.bold_green("Global Telemetry:")
     );
-    println!(
+    outln!(
         "    • {}     `dogfish rm --safe <file>`, `mv`, `cp` -> rollback with `dogfish undo`",
         st.bold_green("Reversible File Ops:")
     );
-    println!(
+    outln!(
         "    • {}        Run `dogfish bench` to race Dogfish against system `/bin/*` utilities\n",
         st.bold_green("Live Benchmarks:")
     );
@@ -584,8 +618,6 @@ fn print_banner_and_help() {
         tbl.add_row(vec![st.bold_cyan(name), st.yellow(cat), desc.to_string()]);
     }
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let _ = tbl.render(&mut out, st);
-    println!();
+    let _ = tbl.render(&mut stdout::stdout(), st);
+    outln!();
 }

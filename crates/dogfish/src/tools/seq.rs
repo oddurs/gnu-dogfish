@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use anyhow::Result;
 use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe};
 
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
+use crate::common::legacy_getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,17 +78,17 @@ pub struct DogfishContext {
     /// out (`raw_args[0]` is the tool name). A utility with GNU semantics for
     /// `--color[=WHEN]` (where its position and validity matter, as in `ls`)
     /// parses it from here; empty when the context was built without arguments.
-    pub raw_args: Vec<String>,
+    pub raw_args: Vec<OsString>,
     pub telemetry: Arc<Telemetry>,
 }
 
 impl DogfishContext {
     /// Intercepts global Dogfish flags (`--stats`, `--color=...`) while preserving remaining args
-    /// for the individual utility's `clap` parser.
+    /// for the individual utility's option parser.
     pub fn from_raw_args(
         tool_name: impl Into<String>,
-        raw_args: Vec<String>,
-    ) -> (Self, Vec<String>) {
+        raw_args: Vec<OsString>,
+    ) -> (Self, Vec<OsString>) {
         let stdin_is_tty = io::stdin().is_terminal();
         let stdout_is_tty = io::stdout().is_terminal();
         let stderr_is_tty = io::stderr().is_terminal();
@@ -116,7 +117,7 @@ impl DogfishContext {
                 show_stats = true;
                 continue;
             }
-            if let Some(val) = arg.strip_prefix("--color=") {
+            if let Some(val) = arg.to_str().and_then(|a| a.strip_prefix("--color=")) {
                 color_mode = ColorMode::from_str_opt(Some(val));
                 continue;
             }

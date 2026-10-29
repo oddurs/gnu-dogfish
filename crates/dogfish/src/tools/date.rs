@@ -8,7 +8,9 @@ use dogfish_core::{
 };
 
 use crate::common::date_format::{LocalTime, MONTHS, Stamp, WEEKDAYS, format_time, local_time};
-use crate::common::getopt::{GetOpt, HasArg, OptSpec, argmatch, opt, print_help, usage_error};
+use crate::common::legacy_getopt::{
+    GetOpt, HasArg, OptSpec, argmatch, opt, print_help, usage_error,
+};
 
 unsafe extern "C" {
     /// POSIX `tzset(3)`; the `libc` crate does not bind it on every Unix.
