@@ -84,12 +84,14 @@ pub fn run_history(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             JournalAction::TrashRemove {
                 original_path,
                 trash_path: _,
-            } => format!("trashed '{}'", original_path),
-            JournalAction::Move { src, dst, .. } => format!("'{}' -> '{}'", src, dst),
+            } => format!("trashed '{}'", original_path.display()),
+            JournalAction::Move { src, dst, .. } => {
+                format!("'{}' -> '{}'", src.display(), dst.display())
+            }
             JournalAction::CopyCreate {
                 src, created_path, ..
             } => {
-                format!("copied '{}' -> '{}'", src, created_path)
+                format!("copied '{}' -> '{}'", src.display(), created_path.display())
             }
         };
         tbl.add_row(vec![

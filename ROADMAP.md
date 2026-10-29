@@ -6,7 +6,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 
 - **Locales.** Dogfish compares and sorts bytes as GNU does under `LC_ALL=C`. Collation (`strcoll`) in other locales is not implemented, so `sort`, `ls` and `uniq` order can differ from GNU in e.g. `en_US.UTF-8`. Character counting (`wc -m`, `wc -L`) is UTF-8 aware.
 - **Options** are parsed like glibc 2.39's `getopt_long` (permutation, `POSIXLY_CORRECT`, clustering, abbreviations, ambiguity, messages), but a GNU option Dogfish does not implement yet is refused with `TOOL: option 'X' is not supported yet` (exit 1) rather than ignored or emulated, e.g. `tac -b`, `nl -h`, `head -z`, `shuf -o`, `du --time`, `ls --dired`.
-- **Non-UTF-8 arguments.** Options and option arguments may be any bytes. File names that are not valid UTF-8 work for the tools that read files; `cp`, `mv`, `ln`, `mkdir` and `mktemp` refuse them.
+- **File names that are not UTF-8** work in `cp`, `mv`, `ln`, `mkdir`, `mktemp` and `rm`. The tools that read files (`cat`, `head`, `tail`, `wc`, `ls`, `stat`, `du`, `sort`, ...) still turn such a name into U+FFFD replacement characters, so they report it as missing.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`.
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
 

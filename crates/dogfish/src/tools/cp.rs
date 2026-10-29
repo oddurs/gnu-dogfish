@@ -9,14 +9,13 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
+use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
 
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions, Interactive, Reflink, Sparse};
 use crate::common::file_times::{Stamp, set_file_times};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
-    utf8_operands,
 };
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, process_umask};
 use crate::common::path::{
@@ -262,6 +261,7 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(o) => o,
             Err(e) => return Ok(getopt_error("cp", &e)),
         };
+        let raw = v.clone().unwrap_or_default();
         let v = v.as_deref().map(lossy).unwrap_or_default();
         match opt {
             Help => return Ok(print_help(CP_HELP)),
@@ -353,7 +353,7 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                     eprintln!("cp: multiple target directories specified");
                     return Ok(1);
                 }
-                target_dir = Some(v);
+                target_dir = Some(raw);
             }
             NoTargetDir => no_target_dir = true,
             UpdateOlder => o.update_older = true,
@@ -428,11 +428,7 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         BackupMode::None
     };
     let x = copy_options(&o, backup, backup_suffix(suffix));
-    let operands = match utf8_operands("cp", opts.operands()) {
-        Ok(o) => o,
-        Err(code) => return Ok(code),
-    };
-    let targets = match resolve_targets("cp", operands, target_dir, no_target_dir) {
+    let targets = match resolve_targets("cp", opts.operands(), target_dir, no_target_dir) {
         Ok(t) => t,
         Err(code) => return Ok(code),
     };
@@ -493,7 +489,7 @@ fn copy_options(o: &CpOpts, backup: BackupMode, suffix: String) -> CopyOptions {
 
 /// `cp SOURCE DEST`. As a special case, `cp --force --backup F F` backs up
 /// the regular file F by copying it to its backup name.
-fn copy_single(copier: &mut Copier<'_>, src: &str, dst: &str, no_target_dir: bool) -> bool {
+fn copy_single(copier: &mut Copier<'_>, src: &OsStr, dst: &OsStr, no_target_dir: bool) -> bool {
     // GNU knows DEST is missing (or a dangling symlink) from trying to open it
     // as the target directory, which it does not do with -T.
     let new_dst =
@@ -519,8 +515,8 @@ fn copy_single(copier: &mut Copier<'_>, src: &str, dst: &str, no_target_dir: boo
 /// lead to each SOURCE.
 fn copy_into(
     copier: &mut Copier<'_>,
-    dir: &str,
-    sources: Vec<String>,
+    dir: &OsStr,
+    sources: Vec<OsString>,
     parents: bool,
     strip_slashes: bool,
 ) -> bool {
@@ -686,7 +682,12 @@ fn make_dir_parents(
                     return false;
                 }
                 if x.verbose {
-                    outln!("{} -> {}", src.display(), dir.display());
+                    // GNU prints both names as they are, unquoted.
+                    let mut line = src.as_os_str().as_bytes().to_vec();
+                    line.extend_from_slice(b" -> ");
+                    line.extend_from_slice(dir.as_os_str().as_bytes());
+                    line.push(b'\n');
+                    let _ = io::Write::write_all(&mut dogfish_core::stdout::stdout(), &line);
                 }
                 let made = match fs::symlink_metadata(&dir) {
                     Ok(m) => m.mode(),

@@ -24,8 +24,8 @@ use dogfish_core::{
 use crate::common::backup::{BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
-    Deref, absolute_lossy, c_path, dir_name, dir_names, last_component, rename_noreplace,
-    same_inode, same_name,
+    Deref, absolute, c_path, dir_name, dir_names, last_component, rename_noreplace, same_inode,
+    same_name,
 };
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf, quote_locale};
@@ -190,7 +190,7 @@ struct UndoPlan {
     /// The path the operation created or rewrote.
     created: PathBuf,
     /// Where the journal saved what `created` held before.
-    backup: Option<String>,
+    backup: Option<PathBuf>,
     /// Whether `created` existed before the operation.
     existed: bool,
 }
@@ -785,13 +785,13 @@ impl<'a> Copier<'a> {
         let exists = fs::symlink_metadata(&plan.created).is_ok();
         let action = match moved_from {
             Some(from) if exists && fs::symlink_metadata(from).is_err() => JournalAction::Move {
-                src: absolute_lossy(from),
-                dst: absolute_lossy(&plan.created),
+                src: absolute(from),
+                dst: absolute(&plan.created),
                 backup_path: plan.backup,
             },
             _ if plan.backup.is_some() || (!plan.existed && exists) => JournalAction::CopyCreate {
-                src: absolute_lossy(src),
-                created_path: absolute_lossy(&plan.created),
+                src: absolute(src),
+                created_path: absolute(&plan.created),
                 backup_path: plan.backup,
             },
             _ => return,

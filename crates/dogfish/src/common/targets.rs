@@ -1,5 +1,6 @@
 //! Destination resolution and same-file checks that cp and mv share.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -14,14 +15,14 @@ use crate::common::quote::qa;
 /// Splits operands into sources and a destination the way GNU `cp` and `mv` do.
 /// `Ok(None)` means each source goes into the returned directory.
 pub(crate) enum Targets {
-    Into(String, Vec<String>),
-    Single(String, String),
+    Into(OsString, Vec<OsString>),
+    Single(OsString, OsString),
 }
 
 pub(crate) fn resolve_targets(
     tool: &str,
-    mut files: Vec<String>,
-    target_dir: Option<String>,
+    mut files: Vec<OsString>,
+    target_dir: Option<OsString>,
     no_target_dir: bool,
 ) -> std::result::Result<Targets, i32> {
     if let Some(dir) = target_dir {

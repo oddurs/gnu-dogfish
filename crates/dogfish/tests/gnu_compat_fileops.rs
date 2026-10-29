@@ -16,7 +16,9 @@
 mod common;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -161,7 +163,10 @@ fn snapshot(root: &Path, cmp: Compare) -> BTreeMap<String, String> {
     for rel in entries {
         let path = root.join(&rel);
         let meta = path.symlink_metadata().unwrap();
-        let name = rel.to_string_lossy().into_owned();
+        // Names that are not UTF-8 are compared escaped, never merged.
+        let name = rel
+            .to_str()
+            .map_or_else(|| format!("{rel:?}"), str::to_string);
         if !meta.is_dir() && meta.nlink() > 1 {
             by_inode.entry(meta.ino()).or_default().push(name.clone());
         }
@@ -346,15 +351,19 @@ impl TreeCase<'_> {
                 assert!(status.success(), "setup failed: {setup}");
             }
         }
-        let args = |other: &Path| -> Vec<String> {
+        // `@xff@` in an argument is the byte 0xff: a name that is not UTF-8.
+        let args = |other: &Path| -> Vec<OsString> {
             self.args
                 .iter()
-                .map(|a| a.replace("@OTHER@", &other.to_string_lossy()))
+                .map(|a| {
+                    let a = a.replace("@OTHER@", &other.to_string_lossy());
+                    OsString::from_vec(replace_bytes(a.as_bytes(), b"@xff@", b"\xff"))
+                })
                 .collect()
         };
 
         // POSIXLY_CORRECT goes through a shell, as `exec` clears it.
-        let posix = |program: &Path, args: Vec<String>| {
+        let posix = |program: &Path, args: Vec<OsString>| {
             let mut c = Command::new("sh");
             c.arg("-c")
                 .arg("POSIXLY_CORRECT=1 exec \"$0\" \"$@\"")
@@ -363,7 +372,7 @@ impl TreeCase<'_> {
             c
         };
         let mut ours = if self.cmp.posixly_correct {
-            let mut v = vec![self.tool.to_string()];
+            let mut v = vec![OsString::from(self.tool)];
             v.extend(args(&ours_other));
             posix(Path::new(dogfish_bin()), v)
         } else {
@@ -465,6 +474,7 @@ impl TreeCase<'_> {
 }
 
 /// `name: tool [args...] (setup("sh command"))? (stdin b"...")? (=> flag, ...)?;`
+/// (`@xff@` in an argument is the byte 0xff)
 /// — runs the command in two fresh scratch trees and compares everything (see
 /// the module docs). Flags: `mtime`, `atime`, `dir_mtime`, `no_tree`,
 /// `nostderr`, `unordered`, `tz_new_york`, `other_fs`, `posixly_correct`.
@@ -1189,6 +1199,83 @@ tree_cases! {
     cp_update_last_wins_none: "cp" ["--update=all", "--update=none", "new", "old"];
     mv_trailing_slash_new_name: "mv" ["-T", "e", "e3/"];
     cp_recursive_trailing_slash_new_name: "cp" ["-r", "e", "e3/"];
+
+    // Names that are not UTF-8 (`@xff@` is the byte 0xff; `\377` in setup).
+    cp_non_utf8_names: "cp" ["-v", "n@xff@", "c@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    cp_non_utf8_into_directory: "cp" ["-v", "a", "n@xff@", "d"] setup("printf X > \"$(printf 'n\\377')\"");
+    cp_non_utf8_target_directory: "cp" ["-v", "-t", "d@xff@", "a", "b"] setup("mkdir \"$(printf 'd\\377')\"");
+    cp_non_utf8_tree: "cp" ["-rv", "t@xff@", "u@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    cp_non_utf8_parents: "cp" ["-v", "--parents", "t@xff@/f@xff@", "e"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+    cp_non_utf8_missing_source: "cp" ["n@xff@", "z"];
+    cp_non_utf8_backup: "cp" ["-v", "--backup=numbered", "a", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    mv_non_utf8_names: "mv" ["-v", "n@xff@", "m@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    mv_non_utf8_into_directory: "mv" ["-v", "a", "n@xff@", "d@xff@"] setup("printf X > \"$(printf 'n\\377')\" && mkdir \"$(printf 'd\\377')\"");
+    mv_non_utf8_strip_slashes: "mv" ["-v", "--strip-trailing-slashes", "t@xff@/", "e"] setup("mkdir \"$(printf 't\\377')\"");
+    ln_non_utf8_symbolic: "ln" ["-sv", "n@xff@", "l@xff@"];
+    ln_non_utf8_hard: "ln" ["-v", "n@xff@", "h@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    ln_non_utf8_target_directory: "ln" ["-v", "-t", "d@xff@", "a"] setup("mkdir \"$(printf 'd\\377')\"");
+    ln_non_utf8_target_directory_missing: "ln" ["-t", "d@xff@", "a"];
+    mkdir_non_utf8_parents: "mkdir" ["-pv", "x@xff@/y@xff@"];
+    mkdir_non_utf8_exists: "mkdir" ["d@xff@"] setup("mkdir \"$(printf 'd\\377')\"");
+    mkdir_non_utf8_mode: "mkdir" ["-v", "-m", "700", "m@xff@"];
+    rm_non_utf8: "rm" ["-v", "n@xff@", "d@xff@"] setup("printf X > \"$(printf 'n\\377')\"");
+    rm_non_utf8_recursive: "rm" ["-rv", "t@xff@"] setup("mkdir \"$(printf 't\\377')\" && printf Y > \"$(printf 't\\377/f\\377')\"");
+}
+
+/// `mktemp` names are random: check that a template that is not UTF-8 is
+/// used byte for byte, as GNU does.
+#[test]
+fn mktemp_non_utf8_template() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = scratch_root().join("mktemp-non-utf8");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &[&b"-p"[..], b".", b"f\xffXXXXXX"][..],
+        &[b"-d", b"-p", b".", b"d\xffXXXXXX"],
+        &[b"--suffix=\xff", b"s.XXXXXX"],
+    ] {
+        let mut cmd = Command::new(dogfish_bin());
+        cmd.arg("mktemp")
+            .args(args.iter().map(|a| OsStr::from_bytes(a)));
+        let out = exec(cmd, &dir, None, "C");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let name = out.stdout.strip_suffix(b"\n").unwrap();
+        assert!(name.contains(&0xff), "{out:?}");
+        assert!(dir.join(OsStr::from_bytes(name)).exists(), "{out:?}");
+    }
+}
+
+/// The undo journal keeps names that are not UTF-8 losslessly: undoing an
+/// overwrite and a move restores exactly the files that were there.
+#[test]
+fn undo_restores_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = scratch_root().join("undo-non-utf8");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let home = dir.join(".home");
+    let odd = OsStr::from_bytes(b"n\xff");
+    let moved = OsStr::from_bytes(b"m\xff");
+    fs::write(dir.join(odd), "old\n").unwrap();
+    fs::write(dir.join("a"), "new\n").unwrap();
+    let run = |args: &[&OsStr]| {
+        let mut cmd = Command::new(dogfish_bin());
+        cmd.args(args).env("DOGFISH_HOME", &home);
+        let out = exec(cmd, &dir, None, "C");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+    };
+    run(&["cp".as_ref(), "a".as_ref(), odd]);
+    assert_eq!(fs::read(dir.join(odd)).unwrap(), b"new\n");
+    run(&["mv".as_ref(), odd, moved]);
+    run(&["undo".as_ref()]);
+    assert!(dir.join(odd).exists() && !dir.join(moved).exists());
+    run(&["undo".as_ref()]);
+    assert_eq!(fs::read(dir.join(odd)).unwrap(), b"old\n");
 }
 
 /// Runs Dogfish alone in a fresh scratch tree: for GNU 9.4 behaviour the

@@ -14,7 +14,6 @@ use crate::common::backup::{backup_mode, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
-    utf8_operands,
 };
 use crate::common::mode::process_umask;
 use crate::common::path::{
@@ -102,6 +101,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(o) => o,
             Err(e) => return Ok(getopt_error("mv", &e)),
         };
+        let raw = v.clone();
         let v = v.as_deref().map(lossy);
         match opt {
             Help => return Ok(print_help(MV_HELP)),
@@ -128,7 +128,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                     eprintln!("mv: multiple target directories specified");
                     return Ok(1);
                 }
-                target_dir = v;
+                target_dir = raw;
             }
             NoTargetDir => no_target_dir = true,
             UpdateOlder => x.update = true,
@@ -159,10 +159,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // With two operands GNU first tries the rename itself, and only then
     // looks at whether DEST is a directory. (Not with `-b -n`, which GNU 9.4
     // rejects only after that rename; Dogfish rejects it without moving.)
-    let mut operands = match utf8_operands("mv", opts.operands()) {
-        Ok(o) => o,
-        Err(code) => return Ok(code),
-    };
+    let mut operands = opts.operands();
     let backup_no_clobber =
         want_backup && x.interactive == crate::common::copy::Interactive::AlwaysNo;
     if target_dir.is_none() && !no_target_dir && operands.len() == 2 && !backup_no_clobber {
@@ -182,7 +179,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Err(code) => return Ok(code),
         }
     };
-    let strip = |s: String| {
+    let strip = |s: OsString| {
         if strip_slashes {
             strip_trailing_slashes(&s)
         } else {

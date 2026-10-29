@@ -1,8 +1,9 @@
 //! `mkdir`
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -11,7 +12,6 @@ use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
-    utf8_operands,
 };
 use crate::common::mode::{
     CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, mode_adjust, mode_compile,
@@ -73,10 +73,7 @@ pub fn run_mkdir(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Version => return Ok(print_version("mkdir")),
         }
     }
-    let operands = match utf8_operands("mkdir", opts.operands()) {
-        Ok(o) => o,
-        Err(code) => return Ok(code),
-    };
+    let operands = opts.operands();
     if operands.is_empty() {
         return Ok(usage_error("mkdir", "missing operand"));
     }
@@ -124,7 +121,7 @@ struct MkdirMasks {
 }
 
 /// mkdir(2) under a given umask (restored afterwards).
-fn mkdir_with_umask(path: &str, mode: u32, umask: u32) -> io::Result<()> {
+fn mkdir_with_umask(path: &OsStr, mode: u32, umask: u32) -> io::Result<()> {
     let old = unsafe { libc::umask(u32_to_mode_t(umask)) };
     let res = fs::DirBuilder::new().mode(mode).create(path);
     unsafe { libc::umask(old) };
@@ -132,23 +129,23 @@ fn mkdir_with_umask(path: &str, mode: u32, umask: u32) -> io::Result<()> {
 }
 
 fn mkdir_one(
-    dir: &str,
+    dir: &OsStr,
     parents: bool,
     mode: u32,
     mode_bits: u32,
     masks: MkdirMasks,
     verbose: bool,
 ) -> std::result::Result<(), String> {
-    let announce = |d: &str| {
+    let announce = |d: &OsStr| {
         if verbose {
             outln!("mkdir: created directory {}", qa(d));
         }
     };
     let cannot =
-        |d: &str, why: String| format!("cannot create directory {}: {why}", quote_locale(d));
+        |d: &OsStr, why: String| format!("cannot create directory {}: {why}", quote_locale(d));
     if parents {
-        for end in ancestor_ends(dir) {
-            let prefix = &dir[..end];
+        for end in ancestor_ends(dir.as_bytes()) {
+            let prefix = OsStr::from_bytes(&dir.as_bytes()[..end]);
             match mkdir_with_umask(prefix, S_IRWXUGO, masks.ancestor) {
                 Ok(()) => announce(prefix),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {

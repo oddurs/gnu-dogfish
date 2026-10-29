@@ -762,27 +762,6 @@ pub(crate) fn lossy_all(args: Vec<OsString>) -> Vec<String> {
         .collect()
 }
 
-/// Operands as text for a tool that acts on the files they name and whose
-/// logic works on `str`: a name that is not UTF-8 is refused with a
-/// diagnostic (returning the exit status) rather than changed into another
-/// name, which could be another file.
-pub(crate) fn utf8_operands(tool: &str, args: Vec<OsString>) -> Result<Vec<String>, i32> {
-    let mut out = Vec::with_capacity(args.len());
-    for a in args {
-        match a.into_string() {
-            Ok(s) => out.push(s),
-            Err(a) => {
-                eprintln!(
-                    "{tool}: {}: file names that are not valid UTF-8 are not supported",
-                    crate::common::quote::qf(&a)
-                );
-                return Err(1);
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,6 @@ use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
 use crate::common::copy::{force_linkat, force_symlinkat};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
-    utf8_operands,
 };
 use crate::common::path::{
     base_len, c_path, dir_name, file_name_concat, last_component, same_inode, same_name,
@@ -128,12 +128,13 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         hard_dir_link: false,
     };
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
-    let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None::<String>, false);
+    let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None::<OsString>, false);
     while let Some(opt) = opts.next() {
         let (opt, v) = match opt {
             Ok(o) => o,
             Err(e) => return Ok(getopt_error("ln", &e)),
         };
+        let raw = v.clone();
         let v = v.as_deref().map(lossy);
         match opt {
             Help => return Ok(print_help(LN_HELP)),
@@ -168,7 +169,7 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                     eprintln!("ln: multiple target directories specified");
                     return Ok(1);
                 }
-                let d = v.unwrap_or_default();
+                let d = raw.unwrap_or_default();
                 match fs::metadata(&d) {
                     Err(e) => {
                         eprintln!("ln: failed to access {}: {}", qa(&d), gnu_io_error(&e));
@@ -186,10 +187,7 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Verbose => o.verbose = true,
         }
     }
-    let mut files = match utf8_operands("ln", opts.operands()) {
-        Ok(o) => o,
-        Err(code) => return Ok(code),
-    };
+    let mut files = opts.operands();
     if files.is_empty() {
         return Ok(usage_error("ln", "missing file operand"));
     }
@@ -214,7 +212,7 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             return Ok(usage_error("ln", msg));
         }
     } else if files.len() < 2 && target_dir.is_none() {
-        target_dir = Some(".".to_string());
+        target_dir = Some(".".into());
     } else {
         // With two operands, try the link first: DEST is a directory only if
         // that fails.
