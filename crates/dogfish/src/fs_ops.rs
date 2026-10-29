@@ -57,10 +57,10 @@ pub fn run_mkdir(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         };
         match res {
             Ok(()) => {
-                if let Some(ref m_str) = parsed.mode {
-                    if let Ok(oct) = u32::from_str_radix(m_str.trim_start_matches('0'), 8) {
-                        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(oct));
-                    }
+                if let Some(ref m_str) = parsed.mode
+                    && let Ok(oct) = u32::from_str_radix(m_str.trim_start_matches('0'), 8)
+                {
+                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(oct));
                 }
                 ctx.telemetry.add_items(1);
                 if parsed.verbose {
@@ -249,12 +249,10 @@ pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let parsed = ChmodArgs::try_parse_from(args)?;
     for f in &parsed.files {
         if parsed.recursive {
-            for entry in WalkDir::new(f) {
-                if let Ok(e) = entry {
-                    let p = e.path();
-                    apply_chmod(&p, &parsed.mode, parsed.verbose)?;
-                    ctx.telemetry.add_items(1);
-                }
+            for e in WalkDir::new(f).into_iter().flatten() {
+                let p = e.path();
+                apply_chmod(&p, &parsed.mode, parsed.verbose)?;
+                ctx.telemetry.add_items(1);
             }
         } else {
             apply_chmod(Path::new(f), &parsed.mode, parsed.verbose)?;
@@ -288,7 +286,7 @@ fn parse_chmod_mode(spec: &str, current: u32) -> Result<u32> {
     let mut mode = current;
     for clause in spec.split(',') {
         let op_idx = clause
-            .find(|c| matches!(c, '+' | '-' | '='))
+            .find(['+', '-', '='])
             .ok_or_else(|| anyhow!("invalid mode: '{}'", spec))?;
         let (who_part, rest) = clause.split_at(op_idx);
         let op = rest.chars().next().unwrap();
@@ -315,10 +313,8 @@ fn parse_chmod_mode(spec: &str, current: u32) -> Result<u32> {
                 'r' => perm_bits |= 0o444,
                 'w' => perm_bits |= 0o222,
                 'x' => perm_bits |= 0o111,
-                'X' => {
-                    if current & 0o111 != 0 {
-                        perm_bits |= 0o111;
-                    }
+                'X' if current & 0o111 != 0 => {
+                    perm_bits |= 0o111;
                 }
                 _ => {}
             }
@@ -358,11 +354,9 @@ pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     for f in &parsed.files {
         if parsed.recursive {
-            for entry in WalkDir::new(f) {
-                if let Ok(e) = entry {
-                    chown_path(&e.path(), uid, gid)?;
-                    ctx.telemetry.add_items(1);
-                }
+            for e in WalkDir::new(f).into_iter().flatten() {
+                chown_path(&e.path(), uid, gid)?;
+                ctx.telemetry.add_items(1);
             }
         } else {
             chown_path(Path::new(f), uid, gid)?;
@@ -1441,20 +1435,20 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             let mut subdirs: Vec<PathBuf> = Vec::new();
             let mut root_direct_sz = 0_u64;
             let mut root_direct_cnt = 0_u64;
-            if root.is_dir() {
-                if let Ok(rd) = fs::read_dir(root) {
-                    for e in rd.flatten() {
-                        if let Ok(meta) = e.metadata() {
-                            if meta.is_dir() {
-                                subdirs.push(e.path());
+            if root.is_dir()
+                && let Ok(rd) = fs::read_dir(root)
+            {
+                for e in rd.flatten() {
+                    if let Ok(meta) = e.metadata() {
+                        if meta.is_dir() {
+                            subdirs.push(e.path());
+                        } else {
+                            root_direct_cnt += 1;
+                            root_direct_sz += if parsed.bytes {
+                                meta.len()
                             } else {
-                                root_direct_cnt += 1;
-                                root_direct_sz += if parsed.bytes {
-                                    meta.len()
-                                } else {
-                                    meta.blocks() * 512
-                                };
-                            }
+                                meta.blocks() * 512
+                            };
                         }
                     }
                 }
@@ -1473,7 +1467,7 @@ pub fn run_du(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 .collect();
             let total_sz: u64 = root_direct_sz + sub_recs.iter().map(|r| r.size).sum::<u64>();
             let total_cnt: u64 = root_direct_cnt + sub_recs.iter().map(|r| r.files).sum::<u64>();
-            sub_recs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+            sub_recs.sort_unstable_by_key(|r| std::cmp::Reverse(r.size));
             ctx.telemetry.add_items(total_cnt);
             records.extend(sub_recs);
             records.push(DuRecord {
@@ -1523,16 +1517,15 @@ fn compute_dir_size_parallel(root: &Path, apparent_bytes: bool) -> (u64, u64) {
     let mut total_size = 0_u64;
     let mut file_count = 0_u64;
     for entry in WalkDir::new(root).skip_hidden(false) {
-        if let Ok(e) = entry {
-            if let Ok(meta) = e.metadata() {
-                if !meta.is_dir() {
-                    file_count += 1;
-                    if apparent_bytes {
-                        total_size += meta.len();
-                    } else {
-                        total_size += meta.blocks() * 512;
-                    }
-                }
+        if let Ok(e) = entry
+            && let Ok(meta) = e.metadata()
+            && !meta.is_dir()
+        {
+            file_count += 1;
+            if apparent_bytes {
+                total_size += meta.len();
+            } else {
+                total_size += meta.blocks() * 512;
             }
         }
     }
@@ -1825,6 +1818,7 @@ fn colorize_mode(mode: &str, st: Style) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tree<W: Write>(
     dir: &Path,
     prefix: &str,
@@ -1980,10 +1974,11 @@ fn compute_basename(path: &str, suffix: Option<&str>) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| trimmed.to_string());
-    if let Some(suf) = suffix {
-        if base != suf && base.ends_with(suf) {
-            return base[..base.len() - suf.len()].to_string();
-        }
+    if let Some(suf) = suffix
+        && base != suf
+        && base.ends_with(suf)
+    {
+        return base[..base.len() - suf.len()].to_string();
     }
     base
 }

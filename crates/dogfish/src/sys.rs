@@ -1169,11 +1169,11 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut cmd_start = None;
     for (i, item) in parsed.rest.iter().enumerate() {
-        if let Some((k, v)) = item.split_once('=') {
-            if !k.is_empty() {
-                env_map.insert(k.to_string(), v.to_string());
-                continue;
-            }
+        if let Some((k, v)) = item.split_once('=')
+            && !k.is_empty()
+        {
+            env_map.insert(k.to_string(), v.to_string());
+            continue;
         }
         cmd_start = Some(i);
         break;

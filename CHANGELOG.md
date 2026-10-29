@@ -2,6 +2,32 @@
 
 All notable changes to **GNU/Dogfish** are documented in this file.
 
+## [Unreleased]
+
+### Fixed — data safety
+- `cp` onto the same file (`cp a a`, `cp a ./a`, hard links, symlinks) truncated or deleted the source; it is now refused like GNU. Same for `mv` and `ln -f`.
+- `dogfish undo` of a `cp`/`mv` that overwrote an existing file deleted the original; overwritten targets are now backed up to the trash and restored on undo.
+- `undo` never overwrites a path that has since been recreated, moves undone copies to trash instead of deleting them, and restores trashed symlinks as symlinks.
+- The undo journal is written atomically under `flock`, so concurrent `dogfish` processes no longer lose entries, and a corrupt journal is reported instead of silently discarded.
+- `cp -r`/`mv` refuse to copy or move a directory into itself; `cp -r` copies symlinks as symlinks; `mv` works across filesystems.
+- `rm` refuses `.`/`..` and recursive removal of `/` (`--no-preserve-root` to override); `rm --safe` no longer trashes directories without `-r`.
+- `mktemp` uses OS randomness and exclusive creation with `0600`/`0700` set atomically (previously a predictable name and a symlink-following create).
+- `touch` never truncates an existing file.
+- `seq` no longer loops forever (release) or panics (debug) near `i64::MAX`, and keeps full precision for integers above 2^53.
+
+### Fixed — correctness & compatibility
+- `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds (`-h` clashed with clap's help flag).
+- GNU-compatible behaviour for `cat` (`-A -v -E -T -e -t`), `head`/`tail` (`-n -N`, `-n +N`, `-c` forms), `wc` column widths, `sort` keys and `-n`/`-g`/`-h` semantics, `nl`, `uniq`, `cut`, `tr`, `tac`, `echo -e`, `printf`, `base64`, and GNU-style error messages (no `(os error N)` suffix, no duplicated tool prefix).
+
+### Changed
+- Release binaries target the baseline CPU instead of `target-cpu=native`, so they run on any machine of the architecture; native tuning is opt-in via `RUSTFLAGS`.
+- `LICENSE-GPL` (full GPL-3.0 text) and `LICENSE-MIT` (previously missing its liability clause) are now included.
+- CI runs `cargo fmt --check`, `clippy -D warnings`, and the test suite in both debug and release.
+
+### Added
+- `tests/gnu_compat.rs`: 264 differential cases checked byte-for-byte against GNU coreutils on Linux.
+- `tests/fs_safety.rs` and `tests/edge_cases.rs`: data-safety and numeric boundary regressions.
+
 ## [0.1.0] - 2026-10-24
 
 ### Added
@@ -20,4 +46,4 @@ All notable changes to **GNU/Dogfish** are documented in this file.
   - Zero-allocation `mmap` + `MADV_SEQUENTIAL` + Rayon parallel slice sorting in `sort` (~5x faster than system `sort`).
   - Parallel 256 KiB chunked SIMD scanning in `wc` (~8x faster than system `wc`).
   - Hardware SHA-256 / MD5 assembly intrinsics (`sha2/asm`, `md-5/asm`) and `itoa` integer streaming in `seq` (~13x faster than system `seq`).
-- **39 Automated Test Suites**: Unit, integration, adversarial, Unicode, and differential tests running on Linux and macOS CI.
+- **39 Automated Tests**: Unit and integration tests running on Linux and macOS CI.

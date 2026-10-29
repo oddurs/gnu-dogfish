@@ -190,11 +190,11 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
         if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
             let ret =
                 unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
-            if ret == 0 {
-                if let Ok(meta) = src_file.metadata() {
-                    let _ = dst_file.set_permissions(meta.permissions());
-                    return Ok((meta.len(), CopyMethod::FicloneCoW));
-                }
+            if ret == 0
+                && let Ok(meta) = src_file.metadata()
+            {
+                let _ = dst_file.set_permissions(meta.permissions());
+                return Ok((meta.len(), CopyMethod::FicloneCoW));
             }
         }
     }

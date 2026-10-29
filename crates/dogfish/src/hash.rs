@@ -239,10 +239,10 @@ where
 
 fn parse_checksum_line(line: &str) -> Option<(&str, &str)> {
     // BSD tag style: SHA256 (filename) = digest
-    if let Some((left, right)) = line.split_once(") = ") {
-        if let Some((_, fname)) = left.split_once(" (") {
-            return Some((right.trim(), fname.trim()));
-        }
+    if let Some((left, right)) = line.split_once(") = ")
+        && let Some((_, fname)) = left.split_once(" (")
+    {
+        return Some((right.trim(), fname.trim()));
     }
     // Standard GNU style: digest  filename or digest *filename
     let mut parts = line.splitn(2, char::is_whitespace);
@@ -430,7 +430,7 @@ pub fn run_basenc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 fn decode_base2(bits: &[u8]) -> Result<Vec<u8>> {
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         return Err(anyhow!("base2 input length must be a multiple of 8"));
     }
     let mut out = Vec::with_capacity(bits.len() / 8);

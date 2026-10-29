@@ -94,11 +94,13 @@ fn parse_gnu_count(s: &str) -> Option<u64> {
 
 /// Converts the obsolete `-5` shorthand (first argument only, as in GNU) to `-n 5`.
 fn normalize_legacy_num_arg(mut args: Vec<String>) -> Vec<String> {
-    if let Some(a) = args.get(1) {
-        if a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c.is_ascii_digit()) {
-            let n = a[1..].to_string();
-            args.splice(1..2, ["-n".to_string(), n]);
-        }
+    if let Some(a) = args.get(1)
+        && a.len() > 1
+        && a.starts_with('-')
+        && a[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        let n = a[1..].to_string();
+        args.splice(1..2, ["-n".to_string(), n]);
     }
     args
 }
@@ -828,17 +830,17 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;
-        if looks_like_json(&all) {
-            if let Some(objs) = read_ndjson_stdin(&lossy_lines(&all)) {
-                ctx.telemetry
-                    .set_strategy("NDJSON object stream + auto-table");
-                let start = objs.len().saturating_sub(to_usize(count));
-                let slice = &objs[start..];
-                ctx.telemetry.add_items(slice.len() as u64);
-                drop(out);
-                emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
-                return Ok(0);
-            }
+        if looks_like_json(&all)
+            && let Some(objs) = read_ndjson_stdin(&lossy_lines(&all))
+        {
+            ctx.telemetry
+                .set_strategy("NDJSON object stream + auto-table");
+            let start = objs.len().saturating_sub(to_usize(count));
+            let slice = &objs[start..];
+            ctx.telemetry.add_items(slice.len() as u64);
+            drop(out);
+            emit_objects_or_table(slice, ctx, parsed.json, !parsed.json)?;
+            return Ok(0);
         }
         let start = tail_start(&all, false, false, count);
         ignore_broken_pipe(out.write_all(&all[start..]))?;
@@ -898,27 +900,27 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     ignore_broken_pipe(out.flush())?;
 
-    if parsed.follow {
-        if let Some(InputSource::File(path)) = sources.first() {
-            use std::io::{Seek, SeekFrom};
-            let mut file = std::fs::File::open(path)?;
-            let mut pos = file.seek(SeekFrom::End(0))?;
-            let mut buf = [0u8; 8192];
-            loop {
-                thread::sleep(Duration::from_millis(100));
-                let len = file.metadata()?.len();
-                if len < pos {
-                    // Truncated: start again from the beginning.
-                    pos = 0;
-                }
-                if len > pos {
-                    file.seek(SeekFrom::Start(pos))?;
-                    let n = file.read(&mut buf)?;
-                    if n > 0 {
-                        out.write_all(&buf[..n])?;
-                        out.flush()?;
-                        pos += n as u64;
-                    }
+    if parsed.follow
+        && let Some(InputSource::File(path)) = sources.first()
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let mut pos = file.seek(SeekFrom::End(0))?;
+        let mut buf = [0u8; 8192];
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            let len = file.metadata()?.len();
+            if len < pos {
+                // Truncated: start again from the beginning.
+                pos = 0;
+            }
+            if len > pos {
+                file.seek(SeekFrom::Start(pos))?;
+                let n = file.read(&mut buf)?;
+                if n > 0 {
+                    out.write_all(&buf[..n])?;
+                    out.flush()?;
+                    pos += n as u64;
                 }
             }
         }
@@ -2134,11 +2136,11 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             let field = parsed.by_field.as_deref().unwrap_or("name");
             let mut groups: Vec<(Value, usize)> = Vec::new();
             for obj in objs {
-                if let Some((last, cnt)) = groups.last_mut() {
-                    if compare_json_field(last, &obj, field) == Ordering::Equal {
-                        *cnt += 1;
-                        continue;
-                    }
+                if let Some((last, cnt)) = groups.last_mut()
+                    && compare_json_field(last, &obj, field) == Ordering::Equal
+                {
+                    *cnt += 1;
+                    continue;
                 }
                 groups.push((obj, 1));
             }
@@ -2154,10 +2156,10 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     }
                 })
                 .map(|(mut val, c)| {
-                    if parsed.count {
-                        if let Some(map) = val.as_object_mut() {
-                            map.insert("count".to_string(), serde_json::json!(c));
-                        }
+                    if parsed.count
+                        && let Some(map) = val.as_object_mut()
+                    {
+                        map.insert("count".to_string(), serde_json::json!(c));
                     }
                     val
                 })
@@ -2436,34 +2438,34 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     if sources.len() == 1 && matches!(sources[0], InputSource::Stdin) && !ctx.stdin_is_tty {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;
-        if looks_like_json(&all) {
-            if let Some(mut objs) = read_ndjson_stdin(&lossy_lines(&all)) {
-                if let Some(ref expr) = parsed.where_expr {
-                    objs.retain(|o| eval_json_where(o, expr));
-                }
-                if let Some(ref f_spec) = parsed.fields {
-                    ctx.telemetry.set_strategy("NDJSON field projection");
-                    let requested: Vec<&str> = f_spec.split(',').map(|s| s.trim()).collect();
-                    let projected: Vec<Value> = objs
-                        .into_iter()
-                        .map(|obj| {
-                            let mut m = Map::new();
-                            if let Some(orig) = obj.as_object() {
-                                for &k in &requested {
-                                    if let Some(v) = orig.get(k) {
-                                        m.insert(k.to_string(), v.clone());
-                                    }
+        if looks_like_json(&all)
+            && let Some(mut objs) = read_ndjson_stdin(&lossy_lines(&all))
+        {
+            if let Some(ref expr) = parsed.where_expr {
+                objs.retain(|o| eval_json_where(o, expr));
+            }
+            if let Some(ref f_spec) = parsed.fields {
+                ctx.telemetry.set_strategy("NDJSON field projection");
+                let requested: Vec<&str> = f_spec.split(',').map(|s| s.trim()).collect();
+                let projected: Vec<Value> = objs
+                    .into_iter()
+                    .map(|obj| {
+                        let mut m = Map::new();
+                        if let Some(orig) = obj.as_object() {
+                            for &k in &requested {
+                                if let Some(v) = orig.get(k) {
+                                    m.insert(k.to_string(), v.clone());
                                 }
                             }
-                            Value::Object(m)
-                        })
-                        .collect();
-                    emit_objects_or_table(&projected, ctx, parsed.json, !parsed.json)?;
-                    return Ok(0);
-                } else if parsed.where_expr.is_some() {
-                    emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
-                    return Ok(0);
-                }
+                        }
+                        Value::Object(m)
+                    })
+                    .collect();
+                emit_objects_or_table(&projected, ctx, parsed.json, !parsed.json)?;
+                return Ok(0);
+            } else if parsed.where_expr.is_some() {
+                emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
+                return Ok(0);
             }
         }
         all_stdin = Some(all);
@@ -2637,19 +2639,19 @@ fn parse_tr_set(raw: &str) -> std::result::Result<TrSet, String> {
     while i < s.len() {
         if s[i] == b'[' && i + 1 < s.len() {
             // [:class:]
-            if s[i + 1] == b':' {
-                if let Some(end) = memmem::find(&s[i + 2..], b":]") {
-                    let name = &s[i + 2..i + 2 + end];
-                    let bytes = tr_class(name).ok_or_else(|| {
-                        format!(
-                            "invalid character class '{}'",
-                            String::from_utf8_lossy(name)
-                        )
-                    })?;
-                    out.bytes.extend(bytes);
-                    i += end + 4;
-                    continue;
-                }
+            if s[i + 1] == b':'
+                && let Some(end) = memmem::find(&s[i + 2..], b":]")
+            {
+                let name = &s[i + 2..i + 2 + end];
+                let bytes = tr_class(name).ok_or_else(|| {
+                    format!(
+                        "invalid character class '{}'",
+                        String::from_utf8_lossy(name)
+                    )
+                })?;
+                out.bytes.extend(bytes);
+                i += end + 4;
+                continue;
             }
             // [=c=]
             if s[i + 1] == b'=' {
@@ -3064,20 +3066,21 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         all
     };
 
-    if !parsed.echo && parsed.input_range.is_none() {
-        if let Some(mut objs) = read_ndjson_stdin(&lines) {
-            let len = objs.len();
-            for i in (1..len).rev() {
-                let j = (next_u64() as usize) % (i + 1);
-                objs.swap(i, j);
-            }
-            if let Some(n) = parsed.head_count {
-                objs.truncate(n);
-            }
-            ctx.telemetry.add_items(objs.len() as u64);
-            emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
-            return Ok(0);
+    if !parsed.echo
+        && parsed.input_range.is_none()
+        && let Some(mut objs) = read_ndjson_stdin(&lines)
+    {
+        let len = objs.len();
+        for i in (1..len).rev() {
+            let j = (next_u64() as usize) % (i + 1);
+            objs.swap(i, j);
         }
+        if let Some(n) = parsed.head_count {
+            objs.truncate(n);
+        }
+        ctx.telemetry.add_items(objs.len() as u64);
+        emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
+        return Ok(0);
     }
 
     let len = lines.len();

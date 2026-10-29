@@ -7,6 +7,9 @@
 //! When the system tool is missing or is not GNU coreutils (e.g. BSD tools on
 //! macOS), the case prints a note and passes.
 
+// Case names mirror the flags they test (`cat_A_stdin` vs `cat_e_...`), where case matters.
+#![allow(non_snake_case)]
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::process::CommandExt;

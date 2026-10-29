@@ -216,13 +216,13 @@ pub fn sparkline_bar(ratio: f64, width: usize, style: Style) -> String {
 
 /// Formats POSIX file mode into symbolic `drwxr-xr-x` string.
 pub fn format_mode_rwx(mode: u32) -> String {
-    let file_type = match mode & libc::S_IFMT as u32 {
-        x if x == libc::S_IFDIR as u32 => 'd',
-        x if x == libc::S_IFLNK as u32 => 'l',
-        x if x == libc::S_IFCHR as u32 => 'c',
-        x if x == libc::S_IFBLK as u32 => 'b',
-        x if x == libc::S_IFIFO as u32 => 'p',
-        x if x == libc::S_IFSOCK as u32 => 's',
+    let file_type = match mode & libc::S_IFMT {
+        x if x == libc::S_IFDIR => 'd',
+        x if x == libc::S_IFLNK => 'l',
+        x if x == libc::S_IFCHR => 'c',
+        x if x == libc::S_IFBLK => 'b',
+        x if x == libc::S_IFIFO => 'p',
+        x if x == libc::S_IFSOCK => 's',
         _ => '-',
     };
     let mut s = String::with_capacity(10);
@@ -388,14 +388,14 @@ mod tests {
 
     #[test]
     fn test_format_mode_rwx_permissions_and_special_bits() {
-        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o755), "-rwxr-xr-x");
-        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o700), "drwx------");
-        assert_eq!(format_mode_rwx(libc::S_IFLNK as u32 | 0o777), "lrwxrwxrwx");
+        assert_eq!(format_mode_rwx(libc::S_IFREG | 0o755), "-rwxr-xr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR | 0o700), "drwx------");
+        assert_eq!(format_mode_rwx(libc::S_IFLNK | 0o777), "lrwxrwxrwx");
         // SUID + SGID + Sticky
-        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o4755), "-rwsr-xr-x");
-        assert_eq!(format_mode_rwx(libc::S_IFREG as u32 | 0o2755), "-rwxr-sr-x");
-        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o1777), "drwxrwxrwt");
-        assert_eq!(format_mode_rwx(libc::S_IFDIR as u32 | 0o1776), "drwxrwxrwT");
+        assert_eq!(format_mode_rwx(libc::S_IFREG | 0o4755), "-rwsr-xr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFREG | 0o2755), "-rwxr-sr-x");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR | 0o1777), "drwxrwxrwt");
+        assert_eq!(format_mode_rwx(libc::S_IFDIR | 0o1776), "drwxrwxrwT");
     }
 
     #[test]
