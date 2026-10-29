@@ -762,3 +762,16 @@ mod tests {
         assert!(expand_obsolete(vec!["head".into(), "-1x".into()]).is_err());
     }
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        if let Ok(args) = expand_obsolete(args) {
+            let _ = parse_head_args(args);
+        }
+    }
+}

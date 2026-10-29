@@ -43,6 +43,15 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
    - `cargo xtask repro`: builds the release archive twice, from two copies of
      the tree, and fails unless they are bit-identical. `cargo xtask dist`
      builds one, as the release workflow does.
+   - `cargo xtask fuzz [TARGET] [SECONDS]`: the parser fuzz targets in `fuzz/`
+     (`cargo install --locked cargo-fuzz`, and the nightly above), 60 s each by
+     default; `.github/workflows/fuzz.yml` runs them weekly. A crashing input
+     lands in `fuzz/artifacts/TARGET`: fix it and keep it as a regression test.
+     The parsers are reached through `crates/dogfish/src/fuzz_api.rs` (the
+     `fuzzing` feature).
+   - The undo model tests (`tests/undo_model.rs`) run a few hundred random cases
+     in `cargo test`; `DOGFISH_PROPTEST_CASES=10000 cargo test --test undo_model`
+     runs a long search.
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench

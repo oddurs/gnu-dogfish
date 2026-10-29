@@ -8,7 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
+use dogfish_core::journal::inode;
+use dogfish_core::{DogfishContext, JournalAction, UndoJournal, crash_point, gnu_io_error, outln};
 
 use crate::common::backup::{backup_mode, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions};
@@ -17,7 +18,8 @@ use crate::common::getopt::{
 };
 use crate::common::mode::process_umask;
 use crate::common::path::{
-    base_len, dir_names, file_name_concat, last_component, rename_noreplace, strip_trailing_slashes,
+    base_len, dir_names, file_name_concat, last_component, rename_noreplace, stable_path,
+    strip_trailing_slashes,
 };
 use crate::common::quote::qa;
 use crate::common::targets::{Targets, resolve_targets};
@@ -162,13 +164,34 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut operands = opts.operands();
     let backup_no_clobber =
         want_backup && x.interactive == crate::common::copy::Interactive::AlwaysNo;
+    let journal = UndoJournal::open_for_recording();
+    let mut renamed_entry = None;
     if target_dir.is_none() && !no_target_dir && operands.len() == 2 && !backup_no_clobber {
-        x.rename_errno = Some(
-            match rename_noreplace(Path::new(&operands[0]), Path::new(&operands[1])) {
-                Ok(()) => 0,
-                Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
-            },
-        );
+        let (src, dst) = (Path::new(&operands[0]), Path::new(&operands[1]));
+        // Write-ahead, as for every move (see `Copier::copy`).
+        renamed_entry = journal.as_ref().and_then(|j| {
+            j.begin(
+                "mv",
+                JournalAction::Move {
+                    src: stable_path(src),
+                    dst: stable_path(dst),
+                    backup_path: None,
+                    copied: false,
+                    existed: fs::symlink_metadata(dst).is_ok(),
+                    src_inode: inode(src),
+                },
+            )
+            .ok()
+        });
+        x.rename_errno = Some(match rename_noreplace(src, dst) {
+            Ok(()) => 0,
+            Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
+        });
+        if x.rename_errno != Some(0)
+            && let (Some(j), Some(mut e)) = (&journal, renamed_entry.take())
+        {
+            let _ = j.cancel(&mut e);
+        }
     }
     let targets = if x.rename_errno == Some(0) {
         let dst = operands.pop().unwrap_or_default();
@@ -204,13 +227,8 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     x.suffix = backup_suffix(suffix);
 
-    let mut copier = Copier::new(
-        "mv",
-        x,
-        UndoJournal::open_for_recording(),
-        process_umask(),
-        ctx,
-    );
+    let mut copier = Copier::new("mv", x, journal, process_umask(), ctx);
+    copier.adopt_entry(renamed_entry);
     let mut ok = true;
     match targets {
         Targets::Into(dir, sources) => {
@@ -241,15 +259,25 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 fn do_move(copier: &mut Copier<'_>, src: &Path, dst: &Path, ctx: &DogfishContext) -> bool {
     let out = copier.copy(src, dst, 0);
     let mut ok = out.ok;
+    // Recorded as a move only once the source is renamed or completely copied:
+    // a move that failed (a missing source, say) or left the source alone
+    // (`-n`, `-u`) must not make undo rename whatever is at the destination.
+    // (A rename can succeed in an operation that then fails.)
+    let mut moved = out.renamed;
     if ok {
         if out.copy_into_self {
             ok = false;
         } else if !out.rename_succeeded {
             // Copied: now remove the source, as `rm -r` would.
-            ok = remove_tree(src, copier.x.verbose);
+            copier.mark_copied();
+            let mut removed = false;
+            ok = remove_tree(src, copier.x.verbose, &mut removed);
+            // A source nothing was removed from is intact: undo only has to
+            // remove the copy.
+            moved = ok || removed;
         }
     }
-    copier.commit_top(src, Some(src));
+    copier.commit_top(moved);
     if ok {
         ctx.telemetry.add_items(1);
     }
@@ -258,7 +286,7 @@ fn do_move(copier: &mut Copier<'_>, src: &Path, dst: &Path, ctx: &DogfishContext
 
 /// Removes `p` and everything under it, with `rm -r`'s messages (what GNU mv
 /// runs after copying across file systems).
-fn remove_tree(p: &Path, verbose: bool) -> bool {
+fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
     let fail = |e: &io::Error| {
         eprintln!("mv: cannot remove {}: {}", qa(p), gnu_io_error(e));
         false
@@ -268,9 +296,11 @@ fn remove_tree(p: &Path, verbose: bool) -> bool {
         Err(e) => return fail(&e),
     };
     if !meta.is_dir() {
+        crash_point();
         if let Err(e) = fs::remove_file(p) {
             return fail(&e);
         }
+        *removed = true;
         if verbose {
             outln!("removed {}", qa(p));
         }
@@ -283,14 +313,16 @@ fn remove_tree(p: &Path, verbose: bool) -> bool {
     let mut ok = true;
     for name in names {
         let (child, _) = file_name_concat(p.as_os_str().as_bytes(), name.as_bytes());
-        ok &= remove_tree(&child, verbose);
+        ok &= remove_tree(&child, verbose, removed);
     }
     if !ok {
         return false;
     }
+    crash_point();
     if let Err(e) = fs::remove_dir(p) {
         return fail(&e);
     }
+    *removed = true;
     if verbose {
         outln!("removed directory {}", qa(p));
     }

@@ -476,3 +476,14 @@ mod tests {
         assert_eq!(partial_permutation(&mut rng, 2, u64::MAX).len(), 2);
     }
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_args(args);
+    }
+}

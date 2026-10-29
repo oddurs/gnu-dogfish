@@ -317,3 +317,15 @@ pub(crate) fn manual() -> crate::manual::Manual {
         .choices("iso-8601", ISO_8601_FORMATS.iter().map(|(w, _)| *w))
         .choices("rfc-3339", RFC_3339_FORMATS.iter().map(|(w, _)| *w))
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// Formats `stamp` with `fmt` as `date +FMT` does (`TZ` as set).
+    pub fn render(stamp: Stamp, fmt: &[u8]) {
+        let _ = render_date(stamp, fmt);
+    }
+}

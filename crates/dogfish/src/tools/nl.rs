@@ -474,3 +474,14 @@ pub(crate) fn manual() -> crate::manual::Manual {
         .choices("footer-numbering", ["a", "t", "n"])
         .choices("number-format", ["ln", "rn", "rz"])
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_nl_args(args);
+    }
+}

@@ -1228,3 +1228,14 @@ fn run(t: &mut Tail, files: &mut [FileSpec], n_units: u64) -> R<bool> {
 pub(crate) fn manual() -> crate::manual::Manual {
     crate::manual::Manual::new("tail", TAIL_HELP, SPECS).choices("follow", ["descriptor", "name"])
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    pub fn args(args: Vec<OsString>) {
+        let _ = parse_tail_args(args);
+    }
+}

@@ -376,6 +376,11 @@ gnu_cases! {
     // ------------------------------------------------------ ls time styles
     ls_full_time: "ls" ["--full-time", "dir"];
     ls_time_style_full_iso: "ls" ["-l", "--time-style=full-iso", "dir"];
+    // Found by fuzzing (fuzz/fuzz_targets/strftime.rs): a 20-digit width
+    // overflowed; GNU shows seconds for a stamp over 1000 bytes.
+    ls_time_style_width_overflows: "ls" ["-l", "--time-style=+%99999999999999999999Y", "dir"];
+    ls_time_style_too_long: "ls" ["-l", "--time-style=+%1001Y", "dir"];
+    ls_time_style_longest: "ls" ["-l", "--time-style=+%1000Y", "dir"];
     ls_time_style_long_iso: "ls" ["-l", "--time-style=long-iso", "dir"];
     ls_time_style_iso: "ls" ["-l", "--time-style=iso", "a.txt", "recent.txt", "future.txt"];
     ls_time_style_locale: "ls" ["-l", "--time-style=locale", "dir"];

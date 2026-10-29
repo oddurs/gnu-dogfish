@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::crash::crash_point;
 use crate::format::parse_size_str;
-use crate::io::{copy_tree, move_path};
+use crate::io::{copy_tree, move_path, remove_any};
 
 /// Number of operations kept for `dogfish undo` (override with `DOGFISH_JOURNAL_MAX`).
 pub const DEFAULT_MAX_ENTRIES: usize = 500;
@@ -111,6 +112,18 @@ pub enum JournalAction {
             with = "json_path::option"
         )]
         backup_path: Option<PathBuf>,
+        /// A move across file systems copied `src` completely to `dst`; what
+        /// is still at `src` is a remnant of removing it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        copied: bool,
+        /// `dst` existed before the operation (recorded while it is pending, so
+        /// recovery can tell an untouched original from a partial copy).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        existed: bool,
+        /// Device and inode of `src` when the move began: while it is pending,
+        /// the evidence that a file at `dst` is `src` renamed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        src_inode: Option<(u64, u64)>,
     },
     /// File or directory created via `cp` (`created_path`). `backup_path` holds the prior
     /// contents of `created_path` if the copy overwrote or merged into something.
@@ -125,6 +138,15 @@ pub enum JournalAction {
             with = "json_path::option"
         )]
         backup_path: Option<PathBuf>,
+        /// The copy wrote into `created_path` (a file or a merged directory)
+        /// instead of replacing it: undo writes the backup back into it, so
+        /// its inodes, and the hard links to them, stay as they were.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        in_place: bool,
+        /// `created_path` existed before the operation (recorded while it is
+        /// pending, so recovery leaves an unsaved original alone).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        existed: bool,
     },
 }
 
@@ -154,9 +176,23 @@ impl JournalAction {
             }
         }
     }
+
+    /// Sets where the overwritten destination is saved (no-op for `TrashRemove`).
+    pub fn set_backup(&mut self, path: Option<PathBuf>) {
+        match self {
+            Self::TrashRemove { .. } => {}
+            Self::Move { backup_path, .. } | Self::CopyCreate { backup_path, .. } => {
+                *backup_path = path;
+            }
+        }
+    }
 }
 
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
@@ -173,6 +209,17 @@ pub struct JournalEntry {
     /// can no longer restore what this operation replaced.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup_purged: bool,
+    /// Recorded before the operation touched anything and not yet completed:
+    /// the operation is running, or it was interrupted (undo then recovers
+    /// from whatever state it left).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+    /// The process running a pending operation.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub pid: u32,
+    /// The operation recorded nothing to undo after all; the entry is ignored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 /// Manages `~/.dogfish/trash` and `~/.dogfish/journal.ndjson` for `dogfish undo` and
@@ -182,11 +229,23 @@ pub struct JournalEntry {
 /// regardless of history length. Mutations hold an exclusive `flock` on `journal.lock`;
 /// rewrites (undo, retention) replace the file atomically via a temp file and rename.
 ///
+/// # Write-ahead protocol
+///
+/// `cp`, `mv` and `rm --safe` record an operation as *pending* ([`UndoJournal::begin`])
+/// before it changes anything, name the trash slot an overwritten destination will
+/// go to ([`UndoJournal::take`]) before moving it there, and complete the entry
+/// ([`UndoJournal::commit`] or [`UndoJournal::cancel`]) at the end. A later line with the
+/// same id replaces an earlier one. So whatever is in the trash is referenced by an
+/// entry from the moment it gets there, and when a process is killed part-way, undo
+/// of its pending entry works out from what exists which step it reached:
+/// [`move_path`] makes a destination appear only once complete, and a trash slot is
+/// filled by one rename or by a copy that is renamed into place.
+///
 /// Retention keeps the newest [`DEFAULT_MAX_ENTRIES`] operations (compacting once the
 /// journal exceeds that by a small slack); the trash payloads of
 /// older ones are deleted with them. Overwrite backups are additionally capped at
 /// [`DEFAULT_BACKUP_LIMIT`] bytes in total, oldest discarded first (the newest backup is
-/// always kept).
+/// always kept, and so are those of pending operations).
 pub struct UndoJournal {
     base_dir: PathBuf,
     max_entries: usize,
@@ -209,26 +268,14 @@ fn exists_no_follow(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok()
 }
 
-fn refuse_existing(p: &Path) -> io::Result<()> {
-    if exists_no_follow(p) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "refusing to undo: '{}' already exists and would be overwritten",
-                p.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn remove_any(p: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
-        Ok(_) => fs::remove_file(p),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+fn refuse_existing(p: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to undo: '{}' already exists and would be overwritten",
+            p.display()
+        ),
+    )
 }
 
 /// Apparent size of a file or tree, not following symlinks.
@@ -242,6 +289,72 @@ fn path_size(p: &Path) -> u64 {
     fs::read_dir(p)
         .map(|rd| rd.flatten().map(|e| path_size(&e.path())).sum())
         .unwrap_or(0)
+}
+
+/// Whether `a` and `b` are equal trees: the same file types, permission bits,
+/// file contents and symlink targets (not following symlinks).
+fn same_tree(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let (Ok(ma), Ok(mb)) = (fs::symlink_metadata(a), fs::symlink_metadata(b)) else {
+        return false;
+    };
+    let (ta, tb) = (ma.file_type(), mb.file_type());
+    if ma.permissions().mode() != mb.permissions().mode() {
+        return false;
+    }
+    if ta.is_symlink() && tb.is_symlink() {
+        return fs::read_link(a)
+            .ok()
+            .is_some_and(|l| fs::read_link(b).ok() == Some(l));
+    }
+    if ta.is_file() && tb.is_file() {
+        return ma.len() == mb.len()
+            && fs::read(a)
+                .ok()
+                .is_some_and(|d| fs::read(b).ok() == Some(d));
+    }
+    if ta.is_dir() && tb.is_dir() {
+        let names = |p: &Path| -> Option<Vec<std::ffi::OsString>> {
+            let mut v: Vec<_> = fs::read_dir(p)
+                .ok()?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<io::Result<_>>()
+                .ok()?;
+            v.sort();
+            Some(v)
+        };
+        let (Some(na), Some(nb)) = (names(a), names(b)) else {
+            return false;
+        };
+        return na == nb && na.iter().all(|n| same_tree(&a.join(n), &b.join(n)));
+    }
+    // FIFOs, sockets, devices: the same kind of node is the same.
+    ta == tb
+}
+
+/// Whether `a` and `b` are on different file systems: only then can an
+/// interrupted move leave a complete copy of one beside the other.
+fn on_other_fs(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() != mb.dev(),
+        _ => false,
+    }
+}
+
+/// Device and inode of `p`, not following symlinks.
+pub fn inode(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 only checks the process exists; no pointers.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn corrupt(path: &Path, line: usize, err: impl std::fmt::Display) -> io::Error {
@@ -261,6 +374,55 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The id of a journal line, read from its `{"id":N,` prefix (every line is
+/// written with `id` first); `None` when the line does not start that way.
+fn line_id(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("{\"id\":")?;
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse().ok()
+}
+
+/// How [`UndoJournal::take`] saves a target in the trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Moved there: the caller removes or replaces the target anyway.
+    Move,
+    /// Copied there, the target left in place: the caller writes into it
+    /// (e.g. `cp -r` merging into a directory).
+    Copy,
+    /// Hard-linked there (copied when it can't be), the target left in place:
+    /// the caller replaces it with one `rename`, so the name never goes missing
+    /// in between, as with GNU `mv`.
+    Link,
+}
+
+/// Saves `src` as the new trash slot `slot` without taking it away: a hard link
+/// (same inode, so its other links and timestamps stay as they are), or a copy
+/// for a directory or where linking is refused.
+fn link_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
+    let is_dir = fs::symlink_metadata(src)?.is_dir();
+    if !is_dir {
+        crash_point();
+        if fs::hard_link(src, slot).is_ok() {
+            return Ok(());
+        }
+    }
+    copy_into_slot(src, slot)
+}
+
+/// Copies `src` into the new trash slot `slot`, which appears only once complete.
+fn copy_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
+    let mut part = slot.as_os_str().to_os_string();
+    part.push(".partial");
+    let part = PathBuf::from(part);
+    if let Err(e) = copy_tree(src, &part) {
+        let _ = remove_any(&part);
+        return Err(e);
+    }
+    crash_point();
+    fs::rename(&part, slot)
 }
 
 impl UndoJournal {
@@ -360,7 +522,108 @@ impl UndoJournal {
             COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         slot.push(original.file_name().unwrap_or("item".as_ref()));
-        self.trash_dir().join(slot)
+        self.trash_dir_for(original).join(slot)
+    }
+
+    /// The trash for `original`: the one in `DOGFISH_HOME` when `original` is on
+    /// the same file system, else `.dogfish-trash-<uid>-<home hash>` at the top of
+    /// `original`'s file system, as the freedesktop trash does with
+    /// `$topdir/.Trash-$uid`. Trashing is then one rename, which keeps inodes,
+    /// hard links and timestamps and costs nothing for large trees, instead of a
+    /// copy. Falls back to the home trash when that directory can't be made, or is
+    /// not a private directory of ours (someone else could have planted it).
+    fn trash_dir_for(&self, original: &Path) -> PathBuf {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let home_trash = self.trash_dir();
+        let parent = std::path::absolute(original)
+            .ok()
+            .and_then(|a| a.parent().map(Path::to_path_buf))
+            .and_then(|p| fs::canonicalize(p).ok());
+        let (Some(parent), Ok(home)) = (parent, fs::metadata(&home_trash)) else {
+            return home_trash;
+        };
+        let Ok(dev) = fs::metadata(&parent).map(|m| m.dev()) else {
+            return home_trash;
+        };
+        if dev == home.dev() {
+            return home_trash;
+        }
+        let mut top = parent.as_path();
+        while let Some(up) = top.parent() {
+            if fs::metadata(up).map(|m| m.dev()).ok() != Some(dev) {
+                break;
+            }
+            top = up;
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let dir = top.join(format!(".dogfish-trash-{uid}-{:08x}", self.home_hash()));
+        let usable = |m: &fs::Metadata| {
+            m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o077 == 0 && m.dev() == dev
+        };
+        match fs::symlink_metadata(&dir) {
+            Ok(m) if usable(&m) => dir,
+            Ok(_) => home_trash,
+            Err(_) => {
+                crash_point();
+                if fs::DirBuilder::new().mode(0o700).create(&dir).is_err()
+                    || !fs::symlink_metadata(&dir).is_ok_and(|m| usable(&m))
+                {
+                    return home_trash;
+                }
+                self.register_trash_dir(&dir);
+                dir
+            }
+        }
+    }
+
+    /// FNV-1a of the `DOGFISH_HOME` path: separate homes keep separate trash
+    /// directories on other file systems.
+    fn home_hash(&self) -> u32 {
+        self.base_dir
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0x811c_9dc5_u32, |h, &b| {
+                (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            })
+    }
+
+    /// Remembers a trash directory on another file system, for the orphan sweep.
+    fn register_trash_dir(&self, dir: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        if self.trash_dirs().iter().any(|d| d == dir) {
+            return;
+        }
+        let mut line = dir.as_os_str().as_bytes().to_vec();
+        line.push(b'\n');
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.base_dir.join("trash-dirs"))
+        {
+            let _ = f.write_all(&line);
+        }
+    }
+
+    /// Every trash directory: the home one, then those on other file systems.
+    pub fn trash_dirs(&self) -> Vec<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut dirs = vec![self.trash_dir()];
+        if let Ok(list) = fs::read(self.base_dir.join("trash-dirs")) {
+            dirs.extend(
+                list.split(|&b| b == b'\n')
+                    .filter(|l| !l.is_empty())
+                    .map(|l| PathBuf::from(std::ffi::OsStr::from_bytes(l))),
+            );
+        }
+        dirs
+    }
+
+    /// Moves `p` into a trash slot no entry refers to (swept after
+    /// [`ORPHAN_TTL_SECS`]): what undo displaces is set aside, never deleted.
+    fn set_aside(&self, p: &Path) -> io::Result<()> {
+        move_path(p, &self.trash_slot(p))
     }
 
     fn read_journal(&self) -> io::Result<String> {
@@ -385,14 +648,27 @@ impl UndoJournal {
             .map(|(i, l)| (i + 1, l))
     }
 
+    /// The entries, in the order they were last written: a later line with the same
+    /// id replaces an earlier one, and cancelled entries are left out.
+    ///
+    /// Last-written order is the order undo must reverse: an operation that records
+    /// another one inside it (`cp -b` renames the destination to its backup name
+    /// before copying) completes the inner one first, so the inner one is undone
+    /// last, whatever order they were begun in.
     fn parse_entries(&self, content: &str) -> io::Result<Vec<JournalEntry>> {
         // A corrupt journal is an error, not an empty one: silently defaulting would
         // let the next rewrite discard it and orphan everything in the trash.
-        Self::complete_lines(content)
-            .map(|(n, line)| {
-                serde_json::from_str(line).map_err(|e| corrupt(&self.journal_path(), n, e))
-            })
-            .collect()
+        let mut latest: std::collections::HashMap<u64, (usize, JournalEntry)> =
+            std::collections::HashMap::new();
+        for (n, line) in Self::complete_lines(content) {
+            let e: JournalEntry =
+                serde_json::from_str(line).map_err(|e| corrupt(&self.journal_path(), n, e))?;
+            latest.insert(e.id, (n, e));
+        }
+        let mut entries: Vec<(usize, JournalEntry)> =
+            latest.into_values().filter(|(_, e)| !e.cancelled).collect();
+        entries.sort_by_key(|(n, _)| *n);
+        Ok(entries.into_iter().map(|(_, e)| e).collect())
     }
 
     pub fn load_entries(&self) -> io::Result<Vec<JournalEntry>> {
@@ -408,72 +684,131 @@ impl UndoJournal {
         let tmp = self
             .base_dir
             .join(format!("journal.ndjson.tmp.{}", std::process::id()));
+        crash_point();
         fs::write(&tmp, buf)?;
+        crash_point();
         fs::rename(&tmp, self.journal_path())
     }
 
-    pub fn record(&self, tool: &str, action: JournalAction) -> io::Result<JournalEntry> {
-        let _lock = self.lock()?;
-        let content = self.read_journal()?;
-        let last_id = match Self::complete_lines(&content).last() {
-            Some((n, line)) => {
-                serde_json::from_str::<JournalEntry>(line)
-                    .map_err(|e| corrupt(&self.journal_path(), n, e))?
-                    .id
-            }
-            None => 0,
-        };
-        let entry = JournalEntry {
-            id: last_id + 1,
-            timestamp_unix: now_unix(),
-            tool: tool.to_string(),
-            backup_bytes: action.backup_path().map_or(0, path_size),
-            backup_purged: false,
-            action,
-        };
-
-        let mut line = serde_json::to_vec(&entry)?;
+    /// Appends `entry` as one line, dropping a fragment a crashed append left.
+    /// Caller holds the lock; `content` is the journal as read under it.
+    fn append(&self, content: &str, entry: &JournalEntry) -> io::Result<()> {
+        let mut line = serde_json::to_vec(entry)?;
         line.push(b'\n');
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.journal_path())?;
         if !content.is_empty() && !content.ends_with('\n') {
-            // Drop a fragment left by a crashed append before adding a new line.
             let keep = content.rfind('\n').map_or(0, |i| i + 1);
+            crash_point();
             f.set_len(keep as u64)?;
         }
-        f.write_all(&line)?;
+        crash_point();
+        f.write_all(&line)
+    }
 
-        // Retention needs a full parse, so run it only when a limit can be exceeded:
-        // past the entry cap, after adding a backup, or periodically to sweep orphans.
-        // Over the cap, allow some slack before compacting back to it, so a full journal
-        // is rewritten once every few dozen records instead of on every one.
-        let entry_count = Self::complete_lines(&content).count() + 1;
-        let slack = (self.max_entries / 16).max(1);
-        if entry_count > self.max_entries + slack
-            || entry.backup_bytes > 0
-            || entry.id.is_multiple_of(64)
-        {
-            self.enforce_retention()?;
+    fn add(&self, tool: &str, action: JournalAction, pending: bool) -> io::Result<JournalEntry> {
+        let _lock = self.lock()?;
+        let content = self.read_journal()?;
+        let mut last_id = 0;
+        for (n, line) in Self::complete_lines(&content) {
+            let id = match line_id(line) {
+                Some(id) => id,
+                None => {
+                    serde_json::from_str::<JournalEntry>(line)
+                        .map_err(|e| corrupt(&self.journal_path(), n, e))?
+                        .id
+                }
+            };
+            last_id = last_id.max(id);
         }
+        let entry = JournalEntry {
+            id: last_id + 1,
+            timestamp_unix: now_unix(),
+            tool: tool.to_string(),
+            backup_bytes: action.backup_path().map_or(0, path_size),
+            backup_purged: false,
+            pending,
+            pid: if pending { std::process::id() } else { 0 },
+            cancelled: false,
+            action,
+        };
+        self.append(&content, &entry)?;
+        self.after_append(&content, &entry)?;
         Ok(entry)
     }
 
-    /// Applies the entry-count and backup-size limits, deleting the trash payloads of
-    /// whatever no longer fits. Caller must hold the lock.
-    fn enforce_retention(&self) -> io::Result<()> {
-        let mut entries = self.load_entries()?;
-        let mut changed = false;
+    /// Retention needs a full parse, so run it only when a limit can be exceeded:
+    /// past the entry cap, after adding a backup, or periodically to sweep orphans.
+    /// Over the cap, allow some slack before compacting back to it, so a full journal
+    /// is rewritten once every few dozen records instead of on every one.
+    fn after_append(&self, content: &str, entry: &JournalEntry) -> io::Result<()> {
+        let line_count = Self::complete_lines(content).count() + 1;
+        let slack = (self.max_entries / 16).max(1);
+        if line_count > self.max_entries + slack
+            || (entry.backup_bytes > 0 && !entry.pending)
+            || (entry.id.is_multiple_of(64) && !entry.pending)
+        {
+            self.enforce_retention()?;
+        }
+        Ok(())
+    }
 
-        if entries.len() > self.max_entries {
-            let excess = entries.len() - self.max_entries;
-            for old in entries.drain(..excess) {
+    /// Records a completed operation.
+    pub fn record(&self, tool: &str, action: JournalAction) -> io::Result<JournalEntry> {
+        self.add(tool, action, false)
+    }
+
+    /// Records an operation that is about to start (see the write-ahead protocol on
+    /// [`UndoJournal`]). Finish it with [`UndoJournal::commit`] or
+    /// [`UndoJournal::cancel`].
+    pub fn begin(&self, tool: &str, action: JournalAction) -> io::Result<JournalEntry> {
+        self.add(tool, action, true)
+    }
+
+    /// Replaces the recorded version of `entry` (same id) with `entry`.
+    pub fn update(&self, entry: &mut JournalEntry) -> io::Result<()> {
+        entry.backup_bytes = entry.action.backup_path().map_or(0, path_size);
+        let _lock = self.lock()?;
+        let content = self.read_journal()?;
+        self.append(&content, entry)?;
+        self.after_append(&content, entry)
+    }
+
+    /// Marks a pending `entry` as completed, with its final action.
+    pub fn commit(&self, entry: &mut JournalEntry) -> io::Result<()> {
+        entry.pending = false;
+        entry.pid = 0;
+        self.update(entry)
+    }
+
+    /// Withdraws a pending `entry`: the operation left nothing to undo.
+    pub fn cancel(&self, entry: &mut JournalEntry) -> io::Result<()> {
+        entry.cancelled = true;
+        self.update(entry)
+    }
+
+    /// Applies the entry-count and backup-size limits, deleting the trash payloads of
+    /// whatever no longer fits. Caller must hold the lock. Pending entries (an
+    /// operation in progress) are never dropped or purged.
+    fn enforce_retention(&self) -> io::Result<()> {
+        let all = self.load_entries()?;
+        let raw_lines = Self::complete_lines(&self.read_journal()?).count();
+        let mut changed = all.len() != raw_lines;
+        let mut entries = Vec::with_capacity(all.len());
+        let mut excess = all.len().saturating_sub(self.max_entries);
+        for old in all {
+            if excess > 0 && !old.pending {
+                excess -= 1;
                 if let Some(p) = old.action.payload_path() {
+                    crash_point();
                     remove_any(p)?;
                 }
+                changed = true;
+            } else {
+                entries.push(old);
             }
-            changed = true;
         }
 
         let mut total: u64 = entries
@@ -486,7 +821,11 @@ impl UndoJournal {
             if total <= self.backup_limit {
                 break;
             }
+            if e.pending {
+                continue;
+            }
             if let Some(p) = e.action.drop_backup() {
+                crash_point();
                 remove_any(&p)?;
                 total -= e.backup_bytes;
                 e.backup_purged = true;
@@ -511,32 +850,63 @@ impl UndoJournal {
             .iter()
             .filter_map(|e| e.action.payload_path().map(Path::to_path_buf))
             .collect();
-        for item in fs::read_dir(self.trash_dir())?.flatten() {
-            let path = item.path();
-            if referenced.contains(&path) {
-                continue;
-            }
-            if item.metadata().is_ok_and(|m| m.ctime() < cutoff) {
-                remove_any(&path)?;
+        for (i, dir) in self.trash_dirs().iter().enumerate() {
+            let items = match fs::read_dir(dir) {
+                Ok(rd) => rd,
+                // A trash directory on a file system that is not mounted now.
+                Err(_) if i > 0 => continue,
+                Err(e) => return Err(e),
+            };
+            for item in items.flatten() {
+                let path = item.path();
+                if referenced.contains(&path) {
+                    continue;
+                }
+                if item.metadata().is_ok_and(|m| m.ctime() < cutoff) {
+                    remove_any(&path)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Preserves whatever currently lives at `target` (if anything) in the trash so an
-    /// overwriting `cp`/`mv` can be undone. With `by_copy`, `target` is left in place
-    /// (needed when the caller writes into it, e.g. `cp -r` merging into a directory).
-    pub fn backup_existing(&self, target: &Path, by_copy: bool) -> io::Result<Option<PathBuf>> {
+    /// Saves whatever is at `target` (if anything) in the trash, as the backup of the
+    /// pending `entry`, so an overwriting `cp`/`mv` can be undone. The trash slot is
+    /// recorded in the journal before anything moves; `how` says whether `target`
+    /// moves there or stays in place. Returns the slot, or `None` when there is
+    /// nothing to save.
+    pub fn take(
+        &self,
+        entry: &mut JournalEntry,
+        target: &Path,
+        how: Take,
+    ) -> io::Result<Option<PathBuf>> {
         if !exists_no_follow(target) {
             return Ok(None);
         }
         let slot = self.trash_slot(target);
-        if by_copy {
-            copy_tree(target, &slot)?;
-        } else {
-            move_path(target, &slot)?;
+        entry.action.set_backup(Some(slot.clone()));
+        self.update(entry)?;
+        let res = match how {
+            Take::Move => move_path(target, &slot),
+            Take::Copy => copy_into_slot(target, &slot),
+            Take::Link => link_into_slot(target, &slot),
+        };
+        match res {
+            Ok(()) => {
+                // Now that it is there, record its size for the backup limit.
+                entry.backup_bytes = path_size(&slot);
+                Ok(Some(slot))
+            }
+            // Recorded but not taken: undo of the pending entry knows to leave the
+            // target alone (the slot is empty), so failing to say so is harmless.
+            Err(e) if !exists_no_follow(&slot) => {
+                entry.action.set_backup(None);
+                let _ = self.update(entry);
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
-        Ok(Some(slot))
     }
 
     /// Stages a file or directory into `~/.dogfish/trash` and records a `TrashRemove` entry.
@@ -545,15 +915,23 @@ impl UndoJournal {
         // itself, not something at the location it points to.
         let abs = std::path::absolute(target)?;
         let trash_target = self.trash_slot(target);
-        move_path(target, &trash_target)?;
-
-        self.record(
+        let mut entry = self.begin(
             "rm",
             JournalAction::TrashRemove {
                 original_path: abs,
-                trash_path: trash_target,
+                trash_path: trash_target.clone(),
             },
-        )
+        )?;
+        if let Err(e) = move_path(target, &trash_target) {
+            // A complete copy in the trash beside a partly removed original stays
+            // pending: undo restores the copy.
+            if !exists_no_follow(&trash_target) {
+                let _ = self.cancel(&mut entry);
+            }
+            return Err(e);
+        }
+        self.commit(&mut entry)?;
+        Ok(entry)
     }
 
     /// Pops and reverses the most recent journal entry.
@@ -561,85 +939,272 @@ impl UndoJournal {
     /// Never overwrites: if something now occupies a path the undo would restore to,
     /// the entry is left in the journal and an error is returned. Paths an undo
     /// removes (copies, overwritten targets) go to the trash rather than being deleted.
+    ///
+    /// Undo is idempotent: a pending entry (an operation that was interrupted) and an
+    /// entry whose undo was itself interrupted are reversed from whatever state they
+    /// left, so running `dogfish undo` again always makes progress.
     pub fn undo_last(&self) -> io::Result<Option<(JournalEntry, String)>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
         let Some(entry) = entries.pop() else {
             return Ok(None);
         };
-
+        if entry.pending
+            && entry.pid != 0
+            && entry.pid != std::process::id()
+            && process_alive(entry.pid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "refusing to undo: operation #{} ({}) is still running (pid {})",
+                    entry.id, entry.tool, entry.pid
+                ),
+            ));
+        }
         let summary = match &entry.action {
             JournalAction::TrashRemove {
                 original_path,
                 trash_path,
-            } => {
-                let orig = original_path.as_path();
-                refuse_existing(orig)?;
-                if let Some(parent) = orig.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                move_path(trash_path, orig)?;
-                format!("Restored '{}' from trash", original_path.display())
-            }
+            } => self.undo_trash(&entry, original_path, trash_path)?,
             JournalAction::Move {
                 src,
                 dst,
                 backup_path,
-            } => {
-                refuse_existing(src)?;
-                move_path(dst, src)?;
-                if let Some(backup) = backup_path {
-                    move_path(backup, dst)?;
-                }
-                let (src, dst) = (src.display(), dst.display());
-                match backup_path {
-                    Some(_) => {
-                        format!(
-                            "Moved '{}' back to '{}' and restored the original",
-                            dst, src
-                        )
-                    }
-                    None if entry.backup_purged => format!(
-                        "Moved '{}' back to '{}'; the file it replaced was discarded \
-                         (backup limit) and cannot be restored",
-                        dst, src
-                    ),
-                    None => format!("Moved '{}' back to '{}'", dst, src),
-                }
-            }
+                copied,
+                existed,
+                src_inode,
+            } => self.undo_move(
+                &entry,
+                src,
+                dst,
+                backup_path.as_deref(),
+                (*copied, *existed, *src_inode),
+            )?,
             JournalAction::CopyCreate {
-                src: _,
                 created_path,
                 backup_path,
-            } => {
-                let p = created_path.as_path();
-                let created_path = created_path.display();
-                if entry.backup_purged {
-                    // The copy is now the only version left; removing it would lose data.
-                    format!(
-                        "Left '{}' as is: the contents it replaced were discarded \
-                         (backup limit) and cannot be restored",
-                        created_path
-                    )
-                } else {
-                    // Into the trash rather than deleted, in case it was edited since the
-                    // copy; unreferenced, it is swept after ORPHAN_TTL_SECS.
-                    if exists_no_follow(p) {
-                        move_path(p, &self.trash_slot(p))?;
-                    }
-                    match backup_path {
-                        Some(backup) => {
-                            move_path(backup, p)?;
-                            format!("Restored '{}' to its state before the copy", created_path)
-                        }
-                        None => format!("Removed copied target '{}'", created_path),
-                    }
-                }
-            }
+                in_place,
+                existed,
+                ..
+            } => self.undo_copy(
+                &entry,
+                created_path,
+                backup_path.as_deref(),
+                *in_place,
+                *existed,
+            )?,
         };
 
         self.save_entries(&entries)?;
         Ok(Some((entry, summary)))
+    }
+
+    fn undo_trash(&self, entry: &JournalEntry, orig: &Path, trash: &Path) -> io::Result<String> {
+        let shown = orig.display();
+        match (exists_no_follow(orig), exists_no_follow(trash)) {
+            (true, false) if entry.pending => Ok(format!(
+                "Nothing to restore: '{shown}' was never removed (interrupted)"
+            )),
+            // An earlier undo restored it and was interrupted before saving the journal.
+            (true, false) => Ok(format!("'{shown}' is already restored")),
+            (false, false) => Ok(format!(
+                "Cannot restore '{shown}': its copy in the trash is gone"
+            )),
+            (exists, true) => {
+                if exists {
+                    if entry.pending {
+                        // Interrupted while removing it across file systems: the copy
+                        // in the trash is complete, what is left here is not.
+                        self.set_aside(orig)?;
+                    } else if on_other_fs(orig, trash) && same_tree(orig, trash) {
+                        // An earlier undo copied it back across file systems and was
+                        // interrupted before removing the trash copy.
+                        return Ok(format!("'{shown}' is already restored"));
+                    } else {
+                        return Err(refuse_existing(orig));
+                    }
+                }
+                if let Some(parent) = orig.parent() {
+                    crash_point();
+                    fs::create_dir_all(parent)?;
+                }
+                move_path(trash, orig)?;
+                Ok(format!("Restored '{shown}' from trash"))
+            }
+        }
+    }
+
+    fn undo_move(
+        &self,
+        entry: &JournalEntry,
+        src: &Path,
+        dst: &Path,
+        backup: Option<&Path>,
+        (copied, existed, src_inode): (bool, bool, Option<(u64, u64)>),
+    ) -> io::Result<String> {
+        let (s, t) = (exists_no_follow(src), exists_no_follow(dst));
+        let b = backup.is_some_and(exists_no_follow);
+        if src == dst {
+            // Recorded by an older version for a move that left its source alone.
+            return Ok(format!("Nothing to move back to '{}'", src.display()));
+        }
+        // Work out every step before taking any, so a refusal changes nothing.
+        let (mut set_aside_src, mut move_back, mut set_aside_dst) = (false, false, false);
+        if !s && t {
+            // Interrupted, the move happened only if `dst` is `src` renamed
+            // (or a complete copy of it).
+            move_back =
+                !entry.pending || copied || src_inode.is_some_and(|i| inode(dst) == Some(i));
+        } else if s && t {
+            if copied {
+                set_aside_src = true;
+                move_back = true;
+            } else if entry.pending {
+                // Interrupted before `src` replaced `dst`: what is at `dst` is a
+                // partial copy if the original was saved or there was none, else
+                // the untouched original.
+                set_aside_dst = b || !existed;
+            } else if backup.is_some() && !b {
+                // An earlier undo finished and was interrupted before saving.
+                return Ok(format!("'{}' is already moved back", src.display()));
+            } else if on_other_fs(src, dst) && same_tree(src, dst) {
+                // An earlier undo copied `dst` back across file systems and was
+                // interrupted before removing it.
+                set_aside_dst = true;
+            } else {
+                return Err(refuse_existing(src));
+            }
+        }
+        if set_aside_src {
+            self.set_aside(src)?;
+        }
+        if move_back {
+            if let Some(parent) = src.parent() {
+                crash_point();
+                fs::create_dir_all(parent)?;
+            }
+            move_path(dst, src)?;
+        }
+        if set_aside_dst {
+            self.set_aside(dst)?;
+        }
+        if b && let Some(backup) = backup {
+            if exists_no_follow(dst) {
+                return Err(refuse_existing(dst));
+            }
+            move_path(backup, dst)?;
+        }
+        let (src, dst) = (src.display(), dst.display());
+        Ok(if b {
+            format!("Moved '{dst}' back to '{src}' and restored the original")
+        } else if entry.backup_purged {
+            format!(
+                "Moved '{dst}' back to '{src}'; the file it replaced was discarded \
+                 (backup limit) and cannot be restored"
+            )
+        } else if move_back {
+            format!("Moved '{dst}' back to '{src}'")
+        } else {
+            format!("Nothing to move back to '{src}'")
+        })
+    }
+
+    fn undo_copy(
+        &self,
+        entry: &JournalEntry,
+        created: &Path,
+        backup: Option<&Path>,
+        in_place: bool,
+        existed: bool,
+    ) -> io::Result<String> {
+        let shown = created.display();
+        if entry.backup_purged {
+            // The copy is now the only version left; removing it would lose data.
+            return Ok(format!(
+                "Left '{shown}' as is: the contents it replaced were discarded \
+                 (backup limit) and cannot be restored"
+            ));
+        }
+        let exists = exists_no_follow(created);
+        match backup {
+            Some(b) if exists_no_follow(b) => {
+                if exists && in_place {
+                    self.restore_in_place(b, created)?;
+                    crash_point();
+                    remove_any(b)?;
+                } else {
+                    // Into the trash rather than deleted, in case it was edited since the
+                    // copy; unreferenced, it is swept after ORPHAN_TTL_SECS.
+                    if exists {
+                        self.set_aside(created)?;
+                    }
+                    move_path(b, created)?;
+                }
+                Ok(format!("Restored '{shown}' to its state before the copy"))
+            }
+            // Never saved (interrupted first), or restored by an interrupted undo.
+            Some(_) => Ok(format!("Nothing to restore: '{shown}' is as it was")),
+            None if entry.pending && existed => Ok(format!(
+                "Nothing to undo: '{shown}' was not changed (interrupted)"
+            )),
+            None if exists => {
+                self.set_aside(created)?;
+                Ok(format!("Removed copied target '{shown}'"))
+            }
+            None => Ok(format!("Nothing to remove: '{shown}' is gone")),
+        }
+    }
+
+    /// Makes `target` equal to `backup` while keeping the inodes of what both
+    /// have: files are rewritten in place (so hard links to them see the old
+    /// contents again), directories are reconciled entry by entry. What `target`
+    /// holds that `backup` does not is set aside in the trash, and so is the
+    /// current version of each file rewritten. Copies out of `backup` (it is
+    /// removed by the caller once this succeeds), so it can run again after an
+    /// interruption.
+    fn restore_in_place(&self, backup: &Path, target: &Path) -> io::Result<()> {
+        let (mb, mt) = (fs::symlink_metadata(backup)?, fs::symlink_metadata(target)?);
+        if mb.is_file() && mt.is_file() {
+            if !same_tree(backup, target) {
+                if fs::read(backup)? != fs::read(target)? {
+                    use std::os::unix::fs::PermissionsExt;
+                    copy_into_slot(target, &self.trash_slot(target))?;
+                    let data = fs::read(backup)?;
+                    // Writable for the rewrite even if neither version is.
+                    let mode = mt.permissions().mode();
+                    crash_point();
+                    fs::set_permissions(target, fs::Permissions::from_mode(mode | 0o200))?;
+                    crash_point();
+                    let mut f = OpenOptions::new().write(true).truncate(true).open(target)?;
+                    f.write_all(&data)?;
+                }
+                crash_point();
+                fs::set_permissions(target, mb.permissions())?;
+            }
+        } else if mb.is_dir() && mt.is_dir() {
+            for e in fs::read_dir(target)? {
+                let name = e?.file_name();
+                if !exists_no_follow(&backup.join(&name)) {
+                    self.set_aside(&target.join(&name))?;
+                }
+            }
+            for e in fs::read_dir(backup)? {
+                let name = e?.file_name();
+                let (b, t) = (backup.join(&name), target.join(&name));
+                if exists_no_follow(&t) {
+                    self.restore_in_place(&b, &t)?;
+                } else {
+                    copy_tree(&b, &t)?;
+                }
+            }
+            crash_point();
+            fs::set_permissions(target, mb.permissions())?;
+        } else {
+            self.set_aside(target)?;
+            copy_tree(backup, target)?;
+        }
+        Ok(())
     }
 }
 
@@ -675,6 +1240,9 @@ mod tests {
             },
             backup_bytes: 0,
             backup_purged: false,
+            pending: false,
+            pid: 0,
+            cancelled: false,
         }];
 
         // Too young: nothing is touched.
@@ -697,6 +1265,9 @@ mod tests {
             src: odd.clone(),
             dst: "/tmp/plain".into(),
             backup_path: Some(PathBuf::from(OsStr::from_bytes(b"/tmp/b\xffk"))),
+            copied: false,
+            existed: false,
+            src_inode: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // UTF-8 paths stay plain strings; others are base64 bytes.
@@ -710,6 +1281,7 @@ mod tests {
             src,
             dst,
             backup_path,
+            ..
         } = back
         else {
             panic!("{json}");
@@ -727,6 +1299,7 @@ mod tests {
             src,
             created_path,
             backup_path,
+            ..
         } = e.action
         else {
             panic!("{line}");

@@ -14,6 +14,18 @@
 - Destructive operations refuse same-file copies, directory-into-itself copies/moves, `rm` of `.`/`..` and recursive `rm` of `/`; `mktemp` uses OS randomness and exclusive creation. Regression tests live in `crates/dogfish/tests/fs_safety.rs`.
 - No network connections or external telemetry calls are ever made by any Dogfish utility.
 
+## Undo and the trash
+
+`cp`, `mv` and `rm --safe` keep what they replace or remove in the trash and record each operation in the undo journal (`$DOGFISH_HOME`, default `~/.dogfish`). These invariants are checked by model-based property tests with crash injection (`crates/dogfish/tests/undo_model.rs`) on every CI run:
+
+1. **Undo restores.** After any sequence of `cp`, `mv` and `rm --safe` (with `-f`, `-b`, `-r`, `-a`, `-n`, `-T`, `--remove-destination`, `-l`, `-s`; existing or missing destinations; same-file cases; moves across file systems), undoing every recorded operation restores the tree byte for byte: paths, file types (FIFOs and dangling symlinks included), permission bits, contents, symlink targets and hard links. (A move across file systems copies, so, as with GNU, hard links between what moved and what did not are not kept.)
+2. **No operation loses data.** After each operation, every file's contents are still in the tree or in the trash.
+3. **Undo never clobbers.** Undo refuses to replace anything that has appeared at a path it would restore, and moves whatever it displaces into the trash rather than deleting it.
+4. **Crashes lose nothing.** Each operation is in the journal before it changes anything (write-ahead), and every trash slot is named in the journal before anything moves into it. Killed at any step, an operation leaves every original at its path or in the trash referenced by a journal entry; the journal stays readable (a torn final line is ignored and repaired), and `dogfish undo` recovers an interrupted operation from whatever state it left. Moves across file systems assemble the copy under a temporary name, so a destination that exists is complete.
+5. **The trash is bounded.** `DOGFISH_JOURNAL_MAX` entries and `DOGFISH_BACKUP_LIMIT` bytes of overwrite backups; items no entry refers to are deleted after 7 days. A backup discarded to honour the limit is recorded, and undo then leaves the current file in place.
+
+Debug builds kill themselves at the n-th file-system step when `DOGFISH_CRASH_AT=n` is set (that is how the tests inject crashes); release builds compile the hook out.
+
 ## Supply Chain
 
 - **Dependencies** are checked by [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) on every pull request and weekly ([`deny.toml`](deny.toml)): a crate with a [RustSec](https://rustsec.org/) advisory (vulnerable, unsound, unmaintained or yanked), a license outside the allow-list, a second major version of a crate, or a source other than crates.io fails CI.

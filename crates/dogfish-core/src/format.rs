@@ -106,9 +106,8 @@ pub fn parse_size_str(input: &str) -> Result<u64, String> {
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(s.len());
     let (num_part, unit_part) = s.split_at(split_idx);
-    let num: f64 = num_part
-        .parse()
-        .map_err(|_| format!("invalid size number: {}", input))?;
+    let invalid = || format!("invalid size number: {}", input);
+    let num: f64 = num_part.parse().map_err(|_| invalid())?;
     let mult: u64 = match unit_part.trim().to_ascii_uppercase().as_str() {
         "" | "B" | "C" => 1,
         "W" => 2,
@@ -119,6 +118,14 @@ pub fn parse_size_str(input: &str) -> Result<u64, String> {
         "P" | "PB" | "PIB" => 1024_u64.pow(5),
         other => return Err(format!("unknown size suffix '{}'", other)),
     };
+    // Whole numbers exactly (f64 would round those above 2^53).
+    if num_part.bytes().all(|b| b.is_ascii_digit()) {
+        return num_part
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(mult))
+            .ok_or_else(|| format!("size too large: {}", input));
+    }
     Ok((num * (mult as f64)) as u64)
 }
 
@@ -143,7 +150,7 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
         if secs < 0.0 {
             return Err("negative duration not allowed".into());
         }
-        return Ok(Duration::from_secs_f64(secs));
+        return seconds(secs);
     }
 
     let mut total = Duration::ZERO;
@@ -156,7 +163,7 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
         }
         if ch.is_ascii_digit() || ch == '.' {
             if !current_unit.is_empty() {
-                total += apply_duration_unit(&current_num, &current_unit)?;
+                total = add(total, apply_duration_unit(&current_num, &current_unit)?)?;
                 current_num.clear();
                 current_unit.clear();
             }
@@ -171,11 +178,22 @@ pub fn parse_duration_str(s: &str) -> Result<Duration, String> {
         } else {
             &current_unit
         };
-        total += apply_duration_unit(&current_num, unit)?;
+        total = add(total, apply_duration_unit(&current_num, unit)?)?;
     } else {
         return Err(format!("invalid duration '{}'", s));
     }
     Ok(total)
+}
+
+/// `secs` as a duration: an error, not a panic, for infinite, NaN or
+/// out-of-range values.
+fn seconds(secs: f64) -> Result<Duration, String> {
+    Duration::try_from_secs_f64(secs).map_err(|_| format!("duration out of range: {secs}"))
+}
+
+fn add(a: Duration, b: Duration) -> Result<Duration, String> {
+    a.checked_add(b)
+        .ok_or_else(|| "duration out of range".to_string())
 }
 
 fn apply_duration_unit(num_str: &str, unit: &str) -> Result<Duration, String> {
@@ -188,11 +206,11 @@ fn apply_duration_unit(num_str: &str, unit: &str) -> Result<Duration, String> {
     match unit {
         "ns" => Ok(Duration::from_nanos(val as u64)),
         "us" | "µs" => Ok(Duration::from_micros(val as u64)),
-        "ms" => Ok(Duration::from_secs_f64(val / 1000.0)),
-        "s" | "sec" | "secs" => Ok(Duration::from_secs_f64(val)),
-        "m" | "min" | "mins" => Ok(Duration::from_secs_f64(val * 60.0)),
-        "h" | "hr" | "hrs" => Ok(Duration::from_secs_f64(val * 3600.0)),
-        "d" | "day" | "days" => Ok(Duration::from_secs_f64(val * 86400.0)),
+        "ms" => seconds(val / 1000.0),
+        "s" | "sec" | "secs" => seconds(val),
+        "m" | "min" | "mins" => seconds(val * 60.0),
+        "h" | "hr" | "hrs" => seconds(val * 3600.0),
+        "d" | "day" | "days" => seconds(val * 86400.0),
         _ => Err(format!("unknown duration unit '{}'", unit)),
     }
 }
@@ -495,6 +513,22 @@ mod tests {
             Duration::from_secs(5400)
         );
         assert!(parse_duration_str("-5s").is_err());
+        // Found by the `numbers` fuzz target: rounded through f64.
+        assert_eq!(
+            parse_size_str("7309955097279952232"),
+            Ok(7_309_955_097_279_952_232)
+        );
+        assert!(parse_size_str("18446744073709551615K").is_err());
+        // Found by the `numbers` fuzz target: these panicked.
+        for bad in [
+            "inf",
+            "NaN",
+            "1e400",
+            "1e300d",
+            "18446744073709551615s 18446744073709551615s",
+        ] {
+            assert!(parse_duration_str(bad).is_err(), "{bad}");
+        }
         assert!(parse_duration_str("abc").is_err());
     }
 

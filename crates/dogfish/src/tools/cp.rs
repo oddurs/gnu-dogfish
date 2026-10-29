@@ -507,7 +507,7 @@ fn copy_single(copier: &mut Copier<'_>, src: &OsStr, dst: &OsStr, no_target_dir:
     let ok = copier
         .copy(Path::new(src), &dest, if new_dst { -1 } else { 0 })
         .ok;
-    copier.commit_top(Path::new(src), None);
+    copier.commit_top(false);
     ok
 }
 
@@ -553,7 +553,7 @@ fn copy_into(
         }
         let src = Path::new(&arg);
         ok &= copier.copy(src, &dst, i32::from(new_dst)).ok;
-        copier.commit_top(src, None);
+        copier.commit_top(false);
         if parents {
             ok &= re_protect(copier, &dst, &attrs);
         }

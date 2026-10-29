@@ -496,6 +496,12 @@ impl TreeCase<'_> {
                 panic!("resulting trees differ:\n{diff}{ctx}");
             }
         }
+        // The undo trash Dogfish made on the other file system, if any.
+        if let Ok(list) = fs::read_to_string(base.join("dogfish-home/trash-dirs")) {
+            for dir in list.lines() {
+                force_remove(Path::new(dir));
+            }
+        }
         force_remove(&base);
         if self.cmp.other_fs {
             let _ = fs::remove_dir_all(&ours_other);

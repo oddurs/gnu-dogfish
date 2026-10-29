@@ -666,3 +666,20 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 pub(crate) fn manual() -> crate::manual::Manual {
     crate::manual::Manual::new("seq", SEQ_HELP, SEQ_OPTS)
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (only with the `fuzzing` feature).
+#[cfg(feature = "fuzzing")]
+#[allow(dead_code)]
+pub mod fuzz {
+    use super::*;
+
+    /// A `seq` operand.
+    pub fn operand(arg: &str) {
+        if let Ok(op) = scan_seq_operand(arg)
+            && let Some(i) = op.int
+        {
+            assert_eq!(i as f64, op.value, "{arg:?}");
+        }
+        let _ = strtod_full(arg);
+    }
+}

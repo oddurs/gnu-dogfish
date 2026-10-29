@@ -1,10 +1,10 @@
 //! ls — Colors, grid, `--tree` and `--json` on a TTY; GNU `ls` otherwise
 
-mod colors;
+pub(crate) mod colors;
 mod lister;
 mod options;
 mod rich;
-mod version_sort;
+pub(crate) mod version_sort;
 
 pub(crate) use options::manual;
 
