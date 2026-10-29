@@ -39,12 +39,31 @@ impl Sandbox {
 
     /// Runs dogfish inside the sandbox with an isolated undo journal.
     fn run(&self, args: &[&str]) -> Output {
+        self.run_env(args, &[])
+    }
+
+    fn run_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_dogfish"))
             .current_dir(self.dir.path())
             .env("DOGFISH_HOME", self.path(".dogfish"))
+            .envs(envs.iter().copied())
             .args(args)
             .output()
             .expect("failed to execute dogfish")
+    }
+
+    fn trash_len(&self) -> usize {
+        fs::read_dir(self.path(".dogfish/trash")).unwrap().count()
+    }
+
+    fn history(&self) -> Vec<serde_json::Value> {
+        let out = self.run(&["history", "--json"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
     }
 }
 
@@ -258,19 +277,130 @@ fn mv_refuses_to_replace_non_empty_directory() {
 
 #[test]
 fn corrupt_journal_is_reported_not_overwritten() {
+    for name in ["journal.ndjson", "journal.json"] {
+        let sb = Sandbox::new();
+        fs::create_dir_all(sb.path(".dogfish/trash")).unwrap();
+        let journal = format!(".dogfish/{name}");
+        fs::write(sb.path(&journal), "{not json\n").unwrap();
+        let out = sb.run(&["history"]);
+        assert!(!out.status.success(), "{name}");
+        assert!(
+            stderr(&out).contains("corrupt undo journal"),
+            "{}",
+            stderr(&out)
+        );
+        sb.write("a", "A");
+        sb.run(&["cp", "a", "b"]);
+        assert_eq!(sb.read(&journal), "{not json\n", "{name} was modified");
+    }
+}
+
+#[test]
+fn legacy_json_journal_is_migrated_and_still_undoable() {
     let sb = Sandbox::new();
+    sb.write("moved", "M");
+    let src = sb.path("orig");
+    let dst = sb.path("moved");
     fs::create_dir_all(sb.path(".dogfish/trash")).unwrap();
-    fs::write(sb.path(".dogfish/journal.json"), "{not json").unwrap();
-    let out = sb.run(&["history"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("corrupt undo journal"),
-        "{}",
-        stderr(&out)
-    );
+    let legacy = serde_json::json!([{
+        "id": 7,
+        "timestamp_unix": 1,
+        "tool": "mv",
+        "action": { "action": "move", "src": src, "dst": dst }
+    }]);
+    fs::write(sb.path(".dogfish/journal.json"), legacy.to_string()).unwrap();
+
+    assert_eq!(sb.history()[0]["id"], 7);
+    assert!(sb.exists(".dogfish/journal.json.migrated"));
+    assert!(!sb.exists(".dogfish/journal.json"));
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("orig"), "M");
+}
+
+#[test]
+fn torn_final_line_from_a_crash_is_ignored_and_repaired() {
+    let sb = Sandbox::new();
     sb.write("a", "A");
-    sb.run(&["cp", "a", "b"]);
-    assert_eq!(sb.read(".dogfish/journal.json"), "{not json");
+    assert!(sb.run(&["mv", "a", "b"]).status.success());
+    let journal = sb.path(".dogfish/journal.ndjson");
+    let mut content = fs::read_to_string(&journal).unwrap();
+    content.push_str("{\"id\":2,\"timest");
+    fs::write(&journal, content).unwrap();
+
+    assert_eq!(sb.history().len(), 1);
+    assert!(sb.run(&["mv", "b", "c"]).status.success());
+    let ids: Vec<_> = sb.history().iter().map(|e| e["id"].clone()).collect();
+    assert_eq!(ids, [1, 2]);
+    assert!(sb.run(&["undo", "-n", "2"]).status.success());
+    assert_eq!(sb.read("a"), "A");
+}
+
+#[test]
+fn retention_drops_oldest_entries_and_their_trash() {
+    let sb = Sandbox::new();
+    let limit = [("DOGFISH_JOURNAL_MAX", "3")];
+    for i in 0..5 {
+        sb.write(&format!("f{i}"), "x");
+        assert!(
+            sb.run_env(&["rm", "--safe", &format!("f{i}")], &limit)
+                .status
+                .success()
+        );
+    }
+    let ids: Vec<_> = sb.history().iter().map(|e| e["id"].clone()).collect();
+    assert_eq!(ids, [3, 4, 5]);
+    assert_eq!(sb.trash_len(), 3, "payloads of dropped entries are deleted");
+}
+
+#[test]
+fn backup_limit_discards_oldest_backups_but_never_loses_current_files() {
+    let sb = Sandbox::new();
+    let limit = [("DOGFISH_BACKUP_LIMIT", "10")];
+    sb.write("dst", "original-1");
+    sb.write("v2", "version-2");
+    sb.write("v3", "version-3");
+    assert!(sb.run_env(&["cp", "v2", "dst"], &limit).status.success());
+    // The newest backup is always kept, even alone over the limit.
+    assert_eq!(sb.trash_len(), 1);
+    assert!(sb.run_env(&["cp", "v3", "dst"], &limit).status.success());
+    assert_eq!(
+        sb.trash_len(),
+        1,
+        "older backup discarded to honour the limit"
+    );
+
+    let history = sb.history();
+    // `history --json` lists oldest first.
+    assert_eq!(history[0]["backup_purged"], true);
+    assert!(history[1].get("backup_purged").is_none());
+
+    // Undo #2 restores version-2 from its backup; undo #1 has no backup left, so it
+    // must leave the file alone rather than delete it.
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("dst"), "version-2");
+    let out = sb.run(&["undo"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("cannot be restored"));
+    assert_eq!(sb.read("dst"), "version-2");
+}
+
+#[test]
+fn rm_safe_files_are_exempt_from_the_backup_limit() {
+    let sb = Sandbox::new();
+    let limit = [("DOGFISH_BACKUP_LIMIT", "1")];
+    sb.write("keep", "a fairly large trashed file");
+    assert!(
+        sb.run_env(&["rm", "--safe", "keep"], &limit)
+            .status
+            .success()
+    );
+    sb.write("dst", "old");
+    sb.write("new", "new");
+    assert!(sb.run_env(&["cp", "new", "dst"], &limit).status.success());
+    sb.write("new2", "newer");
+    assert!(sb.run_env(&["cp", "new2", "dst"], &limit).status.success());
+    assert!(sb.run(&["undo", "-n", "3"]).status.success());
+    assert_eq!(sb.read("keep"), "a fairly large trashed file");
 }
 
 #[test]

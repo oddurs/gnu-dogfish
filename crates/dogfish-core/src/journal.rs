@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::format::parse_size_str;
 use crate::io::{copy_tree, move_path};
+
+/// Number of operations kept for `dogfish undo` (override with `DOGFISH_JOURNAL_MAX`).
+pub const DEFAULT_MAX_ENTRIES: usize = 500;
+
+/// Total size of the automatic backups `cp`/`mv` keep of files they overwrite
+/// (override with `DOGFISH_BACKUP_LIMIT`, e.g. `4G`). Files staged with `rm --safe`
+/// never count against it.
+pub const DEFAULT_BACKUP_LIMIT: u64 = 1 << 30;
+
+/// Trash items no journal entry refers to (undone copies, leftovers from crashes or
+/// from 0.1.0, which never cleaned up) are deleted this long after entering the trash.
+const ORPHAN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -35,21 +48,69 @@ pub enum JournalAction {
     },
 }
 
+impl JournalAction {
+    fn backup_path(&self) -> Option<&str> {
+        match self {
+            Self::TrashRemove { .. } => None,
+            Self::Move { backup_path, .. } | Self::CopyCreate { backup_path, .. } => {
+                backup_path.as_deref()
+            }
+        }
+    }
+
+    /// Everything this entry keeps in the trash, deleted once the entry is dropped.
+    fn payload_path(&self) -> Option<&str> {
+        match self {
+            Self::TrashRemove { trash_path, .. } => Some(trash_path),
+            _ => self.backup_path(),
+        }
+    }
+
+    fn drop_backup(&mut self) -> Option<String> {
+        match self {
+            Self::TrashRemove { .. } => None,
+            Self::Move { backup_path, .. } | Self::CopyCreate { backup_path, .. } => {
+                backup_path.take()
+            }
+        }
+    }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub id: u64,
     pub timestamp_unix: u64,
     pub tool: String,
     pub action: JournalAction,
+    /// Size of the overwrite backup held for this entry, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub backup_bytes: u64,
+    /// The overwrite backup was discarded to stay under the backup limit, so undo
+    /// can no longer restore what this operation replaced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_purged: bool,
 }
 
-/// Manages `~/.dogfish/trash` and `~/.dogfish/journal.json` for `dogfish undo` and `dogfish history`.
+/// Manages `~/.dogfish/trash` and `~/.dogfish/journal.ndjson` for `dogfish undo` and
+/// `dogfish history`.
 ///
-/// Mutations hold an exclusive `flock` on `journal.lock` and the journal is replaced
-/// atomically (write to a temp file, then rename), so concurrent `dogfish` processes
-/// cannot interleave or truncate each other's entries.
+/// The journal is append-only NDJSON, so recording an operation costs one small write
+/// regardless of history length. Mutations hold an exclusive `flock` on `journal.lock`;
+/// rewrites (undo, retention) replace the file atomically via a temp file and rename.
+///
+/// Retention keeps the newest [`DEFAULT_MAX_ENTRIES`] operations (compacting once the
+/// journal exceeds that by a small slack); the trash payloads of
+/// older ones are deleted with them. Overwrite backups are additionally capped at
+/// [`DEFAULT_BACKUP_LIMIT`] bytes in total, oldest discarded first (the newest backup is
+/// always kept).
 pub struct UndoJournal {
     base_dir: PathBuf,
+    max_entries: usize,
+    backup_limit: u64,
 }
 
 /// Exclusive advisory lock on the journal, released on drop.
@@ -80,6 +141,47 @@ fn refuse_existing(p: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn remove_any(p: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+        Ok(_) => fs::remove_file(p),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Apparent size of a file or tree, not following symlinks.
+fn path_size(p: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(p)
+        .map(|rd| rd.flatten().map(|e| path_size(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+fn corrupt(path: &Path, line: usize, err: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "corrupt undo journal '{}' (line {}): {}",
+            path.display(),
+            line,
+            err
+        ),
+    )
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl UndoJournal {
     pub fn open() -> io::Result<Self> {
         let home = std::env::var_os("DOGFISH_HOME")
@@ -87,11 +189,26 @@ impl UndoJournal {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".dogfish")))
             .unwrap_or_else(|| PathBuf::from("/tmp/.dogfish"));
         fs::create_dir_all(home.join("trash"))?;
-        Ok(Self { base_dir: home })
+        let max_entries = std::env::var("DOGFISH_JOURNAL_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_ENTRIES)
+            .max(1);
+        let backup_limit = std::env::var("DOGFISH_BACKUP_LIMIT")
+            .ok()
+            .and_then(|v| parse_size_str(&v).ok())
+            .unwrap_or(DEFAULT_BACKUP_LIMIT);
+        let journal = Self {
+            base_dir: home,
+            max_entries,
+            backup_limit,
+        };
+        journal.migrate_legacy()?;
+        Ok(journal)
     }
 
     fn journal_path(&self) -> PathBuf {
-        self.base_dir.join("journal.json")
+        self.base_dir.join("journal.ndjson")
     }
 
     pub fn trash_dir(&self) -> PathBuf {
@@ -108,6 +225,27 @@ impl UndoJournal {
             return Err(io::Error::last_os_error());
         }
         Ok(JournalLock(f))
+    }
+
+    /// Converts a 0.1.0 `journal.json` (a JSON array) to NDJSON, keeping the original
+    /// as `journal.json.migrated`.
+    fn migrate_legacy(&self) -> io::Result<()> {
+        let legacy = self.base_dir.join("journal.json");
+        if !legacy.exists() {
+            return Ok(());
+        }
+        let _lock = self.lock()?;
+        if !legacy.exists() || self.journal_path().exists() {
+            return Ok(());
+        }
+        let content = fs::read_to_string(&legacy)?;
+        let entries: Vec<JournalEntry> = if content.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&content).map_err(|e| corrupt(&legacy, 1, e))?
+        };
+        self.save_entries(&entries)?;
+        fs::rename(&legacy, self.base_dir.join("journal.json.migrated"))
     }
 
     /// Returns a fresh, unique path inside the trash directory for `original`.
@@ -130,56 +268,164 @@ impl UndoJournal {
         ))
     }
 
-    pub fn load_entries(&self) -> io::Result<Vec<JournalEntry>> {
-        let p = self.journal_path();
-        if !p.exists() {
-            return Ok(Vec::new());
+    fn read_journal(&self) -> io::Result<String> {
+        match fs::read_to_string(self.journal_path()) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            res => res,
         }
-        let content = fs::read_to_string(&p)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
+    }
+
+    /// Complete lines of the journal. Every record is written as one `line\n`, so a
+    /// trailing fragment without a newline is an append cut short by a crash; it never
+    /// became a valid entry and is ignored.
+    fn complete_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
+        let complete = match content.rfind('\n') {
+            Some(i) => &content[..=i],
+            None => "",
+        };
+        complete
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+            .map(|(i, l)| (i + 1, l))
+    }
+
+    fn parse_entries(&self, content: &str) -> io::Result<Vec<JournalEntry>> {
         // A corrupt journal is an error, not an empty one: silently defaulting would
-        // let the next `record` overwrite it and orphan everything in the trash.
-        serde_json::from_str(&content).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("corrupt undo journal '{}': {}", p.display(), e),
-            )
-        })
+        // let the next rewrite discard it and orphan everything in the trash.
+        Self::complete_lines(content)
+            .map(|(n, line)| {
+                serde_json::from_str(line).map_err(|e| corrupt(&self.journal_path(), n, e))
+            })
+            .collect()
+    }
+
+    pub fn load_entries(&self) -> io::Result<Vec<JournalEntry>> {
+        self.parse_entries(&self.read_journal()?)
     }
 
     fn save_entries(&self, entries: &[JournalEntry]) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(entries)?;
+        let mut buf = Vec::new();
+        for e in entries {
+            serde_json::to_writer(&mut buf, e)?;
+            buf.push(b'\n');
+        }
         let tmp = self
             .base_dir
-            .join(format!("journal.json.tmp.{}", std::process::id()));
-        fs::write(&tmp, json)?;
+            .join(format!("journal.ndjson.tmp.{}", std::process::id()));
+        fs::write(&tmp, buf)?;
         fs::rename(&tmp, self.journal_path())
     }
 
     pub fn record(&self, tool: &str, action: JournalAction) -> io::Result<JournalEntry> {
         let _lock = self.lock()?;
-        let mut entries = self.load_entries()?;
-        let next_id = entries.last().map(|e| e.id + 1).unwrap_or(1);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let content = self.read_journal()?;
+        let last_id = match Self::complete_lines(&content).last() {
+            Some((n, line)) => {
+                serde_json::from_str::<JournalEntry>(line)
+                    .map_err(|e| corrupt(&self.journal_path(), n, e))?
+                    .id
+            }
+            None => 0,
+        };
         let entry = JournalEntry {
-            id: next_id,
-            timestamp_unix: now,
+            id: last_id + 1,
+            timestamp_unix: now_unix(),
             tool: tool.to_string(),
+            backup_bytes: action.backup_path().map_or(0, |p| path_size(Path::new(p))),
+            backup_purged: false,
             action,
         };
-        entries.push(entry.clone());
-        // Keep last 500 operations
-        if entries.len() > 500 {
-            let drain_count = entries.len() - 500;
-            entries.drain(0..drain_count);
+
+        let mut line = serde_json::to_vec(&entry)?;
+        line.push(b'\n');
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.journal_path())?;
+        if !content.is_empty() && !content.ends_with('\n') {
+            // Drop a fragment left by a crashed append before adding a new line.
+            let keep = content.rfind('\n').map_or(0, |i| i + 1);
+            f.set_len(keep as u64)?;
         }
-        self.save_entries(&entries)?;
+        f.write_all(&line)?;
+
+        // Retention needs a full parse, so run it only when a limit can be exceeded:
+        // past the entry cap, after adding a backup, or periodically to sweep orphans.
+        // Over the cap, allow some slack before compacting back to it, so a full journal
+        // is rewritten once every few dozen records instead of on every one.
+        let entry_count = Self::complete_lines(&content).count() + 1;
+        let slack = (self.max_entries / 16).max(1);
+        if entry_count > self.max_entries + slack
+            || entry.backup_bytes > 0
+            || entry.id.is_multiple_of(64)
+        {
+            self.enforce_retention()?;
+        }
         Ok(entry)
+    }
+
+    /// Applies the entry-count and backup-size limits, deleting the trash payloads of
+    /// whatever no longer fits. Caller must hold the lock.
+    fn enforce_retention(&self) -> io::Result<()> {
+        let mut entries = self.load_entries()?;
+        let mut changed = false;
+
+        if entries.len() > self.max_entries {
+            let excess = entries.len() - self.max_entries;
+            for old in entries.drain(..excess) {
+                if let Some(p) = old.action.payload_path() {
+                    remove_any(Path::new(p))?;
+                }
+            }
+            changed = true;
+        }
+
+        let mut total: u64 = entries
+            .iter()
+            .filter(|e| e.action.backup_path().is_some())
+            .map(|e| e.backup_bytes)
+            .sum();
+        let newest = entries.len().saturating_sub(1);
+        for e in entries[..newest].iter_mut() {
+            if total <= self.backup_limit {
+                break;
+            }
+            if let Some(p) = e.action.drop_backup() {
+                remove_any(Path::new(&p))?;
+                total -= e.backup_bytes;
+                e.backup_purged = true;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.save_entries(&entries)?;
+        }
+        self.sweep_orphans(&entries, now_unix() as i64 - ORPHAN_TTL_SECS)
+    }
+
+    /// Deletes trash items that no entry references and that entered the trash before
+    /// `cutoff` (Unix seconds; normally now minus [`ORPHAN_TTL_SECS`]). Age is the inode change time, which moving an item into the
+    /// trash updates (unlike its modification time).
+    fn sweep_orphans(&self, entries: &[JournalEntry], cutoff: i64) -> io::Result<()> {
+        use std::collections::HashSet;
+        use std::os::unix::fs::MetadataExt;
+
+        let referenced: HashSet<PathBuf> = entries
+            .iter()
+            .filter_map(|e| e.action.payload_path().map(PathBuf::from))
+            .collect();
+        for item in fs::read_dir(self.trash_dir())?.flatten() {
+            let path = item.path();
+            if referenced.contains(&path) {
+                continue;
+            }
+            if item.metadata().is_ok_and(|m| m.ctime() < cutoff) {
+                remove_any(&path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Preserves whatever currently lives at `target` (if anything) in the trash so an
@@ -248,14 +494,20 @@ impl UndoJournal {
                 let src_p = Path::new(src);
                 refuse_existing(src_p)?;
                 move_path(Path::new(dst), src_p)?;
-                if let Some(backup) = backup_path {
-                    move_path(Path::new(backup), Path::new(dst))?;
-                    format!(
-                        "Moved '{}' back to '{}' and restored the original",
+                match backup_path {
+                    Some(backup) => {
+                        move_path(Path::new(backup), Path::new(dst))?;
+                        format!(
+                            "Moved '{}' back to '{}' and restored the original",
+                            dst, src
+                        )
+                    }
+                    None if entry.backup_purged => format!(
+                        "Moved '{}' back to '{}'; the file it replaced was discarded \
+                         (backup limit) and cannot be restored",
                         dst, src
-                    )
-                } else {
-                    format!("Moved '{}' back to '{}'", dst, src)
+                    ),
+                    None => format!("Moved '{}' back to '{}'", dst, src),
                 }
             }
             JournalAction::CopyCreate {
@@ -264,19 +516,76 @@ impl UndoJournal {
                 backup_path,
             } => {
                 let p = Path::new(created_path);
-                if exists_no_follow(p) {
-                    move_path(p, &self.trash_slot(p))?;
-                }
-                if let Some(backup) = backup_path {
-                    move_path(Path::new(backup), p)?;
-                    format!("Restored '{}' to its state before the copy", created_path)
+                if entry.backup_purged {
+                    // The copy is now the only version left; removing it would lose data.
+                    format!(
+                        "Left '{}' as is: the contents it replaced were discarded \
+                         (backup limit) and cannot be restored",
+                        created_path
+                    )
                 } else {
-                    format!("Removed copied target '{}'", created_path)
+                    // Into the trash rather than deleted, in case it was edited since the
+                    // copy; unreferenced, it is swept after ORPHAN_TTL_SECS.
+                    if exists_no_follow(p) {
+                        move_path(p, &self.trash_slot(p))?;
+                    }
+                    match backup_path {
+                        Some(backup) => {
+                            move_path(Path::new(backup), p)?;
+                            format!("Restored '{}' to its state before the copy", created_path)
+                        }
+                        None => format!("Removed copied target '{}'", created_path),
+                    }
                 }
             }
         };
 
         self.save_entries(&entries)?;
         Ok(Some((entry, summary)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn journal_in(dir: &Path) -> UndoJournal {
+        fs::create_dir_all(dir.join("trash")).unwrap();
+        UndoJournal {
+            base_dir: dir.to_path_buf(),
+            max_entries: DEFAULT_MAX_ENTRIES,
+            backup_limit: DEFAULT_BACKUP_LIMIT,
+        }
+    }
+
+    #[test]
+    fn sweep_removes_only_unreferenced_items_older_than_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = journal_in(tmp.path());
+        let kept = j.trash_dir().join("referenced");
+        let orphan = j.trash_dir().join("orphan");
+        fs::write(&kept, "k").unwrap();
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join("inner"), "o").unwrap();
+        let entries = vec![JournalEntry {
+            id: 1,
+            timestamp_unix: 0,
+            tool: "rm".into(),
+            action: JournalAction::TrashRemove {
+                original_path: "/x".into(),
+                trash_path: kept.to_string_lossy().into_owned(),
+            },
+            backup_bytes: 0,
+            backup_purged: false,
+        }];
+
+        // Too young: nothing is touched.
+        j.sweep_orphans(&entries, 0).unwrap();
+        assert!(orphan.exists() && kept.exists());
+
+        // Old enough: the orphan goes, the referenced payload stays.
+        j.sweep_orphans(&entries, now_unix() as i64 + 1).unwrap();
+        assert!(!orphan.exists());
+        assert!(kept.exists());
     }
 }

@@ -110,7 +110,7 @@ $ dogfish ls --tree -L 2 --stats
 ```
 
 ### 3. Reversible File Operations (`rm --safe`, `mv`, `cp` + `dogfish undo`)
-Mistakes shouldn't be fatal. Dogfish maintains a local transaction journal (`~/.dogfish/journal.json` and `~/.dogfish/trash`):
+Mistakes shouldn't be fatal. Dogfish maintains a local transaction journal (`~/.dogfish/journal.ndjson` and `~/.dogfish/trash`, or `$DOGFISH_HOME`). When `cp` or `mv` overwrite a file, the previous version is kept so `undo` can bring it back:
 
 ```bash
 $ dogfish rm --safe -v secret_notes.txt
@@ -119,6 +119,15 @@ trashed 'secret_notes.txt' (undo id #1: run `dogfish undo` to restore)
 $ dogfish undo
 ✔ Undone: [id #1, tool: rm] Restored '/path/to/secret_notes.txt' from trash
 ```
+
+Retention is bounded so the trash cannot grow forever:
+
+| Setting | Default | Meaning |
+| :--- | :--- | :--- |
+| `DOGFISH_JOURNAL_MAX` | `500` | Operations kept for `undo`. Older entries — and anything they hold in the trash, including `rm --safe` files — are deleted. |
+| `DOGFISH_BACKUP_LIMIT` | `1G` | Total size of the automatic backups `cp`/`mv` keep of files they overwrite. Oldest backups are discarded first; the newest is always kept. `rm --safe` files never count against it. |
+
+`undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it.
 
 ### 4. Rich Visual Cards & Unicode Sparklines (`df`, `du`, `stat`, `wc --table`)
 ```text

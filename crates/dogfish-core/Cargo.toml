@@ -16,3 +16,6 @@ chrono.workspace = true
 libc.workspace = true
 unicode-width.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
