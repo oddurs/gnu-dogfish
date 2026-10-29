@@ -3,7 +3,9 @@ id: 28
 uid: 6b613e5b-d858-4b0e-a18f-64d0d3fc451f
 title: "Accept GNU's obsolete option and operand syntax"
 type: bug
-status: backlog
+status: doing
+assignee: claude
+claimed: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -42,3 +44,7 @@ Each tool accepts the obsolete forms exactly where GNU does (including the
 
 - [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
 - [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## 2026-10-29
+
+touch's obsolete `MMDDhhmm[YY]` operand under `_POSIX2_VERSION=199209` is done (tests/touch/obsolescent.sh passes).

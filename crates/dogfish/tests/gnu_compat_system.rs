@@ -365,6 +365,10 @@ gnu_cases! {
     env_long_abbrev: "env" ["--ignore-env", "--nu", "A=1"];
     env_ambiguous: "env" ["--i", "true"];
     env_option_with_value: "env" ["--null=x"];
+    env_shebang_space_hint: "env" ["-v -S cat -n"];
+    env_shebang_tab_hint: "env" ["-i\tA=B"];
+    env_shebang_vtab_hint: "env" ["-i\x0bA=B"];
+    env_space_in_command_hint: "env" ["-i", "no-such cmd", "x"];
 
     // ------------------------------------------------------- printenv / id
     printenv_all: "printenv" [];
@@ -389,6 +393,10 @@ gnu_cases! {
     id_Gz: "id" ["-Gz"];
     id_G_user: "id" ["-G", "daemon"];
     id_un_users: "id" ["-un", "root", "daemon"];
+    id_Gz_users: "id" ["-Gz", "root", "daemon"];
+    id_Gnz_users: "id" ["-Gnz", "root", "daemon", "no-such-user-xyz"];
+    id_Gz_one_user: "id" ["-Gz", "root"];
+    id_uz_users: "id" ["-uz", "root", "daemon"];
     id_a_ignored: "id" ["-a"];
     id_two_choices: "id" ["-u", "-g"];
     id_name_default_format: "id" ["-n"];
@@ -435,6 +443,9 @@ gnu_cases! {
     sleep_empty: "sleep" [""];
     sleep_missing: "sleep" [];
     sleep_dot: "sleep" ["."];
+    sleep_word_suffix: "sleep" ["0d", "0day"];
+    sleep_uppercase_suffix: "sleep" ["0D"];
+    sleep_plural_suffix: "sleep" ["0secs"];
 
     // ---------------------------------------------------------- timeout
     timeout_no_args: "timeout" [];
@@ -469,6 +480,8 @@ gnu_cases! {
     timeout_not_executable: "timeout" ["1", "/etc"];
     timeout_dash_dash: "timeout" ["--", "1", "true"];
     timeout_stops_at_command: "timeout" ["1", "sh", "-c", "echo $0 $1", "-v", "x"];
+    timeout_verbose_signal_zero: "timeout" ["-v", "-s0", "-k", "0.1", "0.1", "sleep", "5"];
+    timeout_signal_zero: "timeout" ["-s", "0", "-k", "0.1", "0.1", "sleep", "5"];
 
     // ---------------------------------------------------------------- seq
     seq_empty_range_no_newline: "seq" ["1", "0"];
@@ -870,6 +883,84 @@ fn yes_dash_dash() {
 fn yes_long_line() {
     let long = "x".repeat(70_000);
     check_yes(&[&long]);
+}
+
+// ----------------------------------------------- tee / timeout environments
+
+/// Runs `cmd` with stdout on a non-blocking pipe that is drained only after a
+/// pause, so that writes hit EAGAIN; returns the exit status and the bytes read.
+fn run_nonblocking_stdout(mut cmd: Command, input: &[u8]) -> (Option<i32>, usize) {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let (mut read_end, write_end) = std::io::pipe().expect("pipe");
+    // SAFETY: fcntl on a descriptor owned by `write_end` takes no pointers;
+    // O_NONBLOCK is shared with the child through the open file description.
+    unsafe {
+        let fd = write_end.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(write_end))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    // The Command still holds a copy of the write end; close it so the read
+    // sees end of file when the child exits.
+    drop(cmd);
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let mut out = Vec::new();
+    read_end.read_to_end(&mut out).unwrap();
+    feeder.join().unwrap();
+    (child.wait().unwrap().code(), out.len())
+}
+
+#[test]
+fn tee_nonblocking_stdout_waits() {
+    let Some(gnu) = gnu_tool("tee") else {
+        return;
+    };
+    let input = vec![b'x'; 1 << 20];
+    let mut ours = Command::new(dogfish_bin());
+    ours.arg("tee");
+    let mut theirs = Command::new(gnu);
+    theirs.arg0("tee");
+    let a = run_nonblocking_stdout(ours, &input);
+    let b = run_nonblocking_stdout(theirs, &input);
+    assert_eq!(a, b);
+    assert_eq!(a, (Some(0), input.len()));
+}
+
+#[test]
+fn timeout_with_sigchld_ignored() {
+    let Some(gnu) = gnu_tool("timeout") else {
+        return;
+    };
+    let run = |mut cmd: Command| {
+        cmd.args(["10", "sh", "-c", "exit 3"]);
+        // SAFETY: only signal(2) between fork and exec, like `trap '' CHLD`.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        exec(cmd, fixtures(), None, "C")
+    };
+    let mut ours = Command::new(dogfish_bin());
+    ours.arg("timeout");
+    let mut theirs = Command::new(gnu);
+    theirs.arg0("timeout");
+    let (a, b) = (run(ours), run(theirs));
+    assert_eq!(a.status.code(), b.status.code());
+    assert_eq!(a.stderr, b.stderr);
+    assert_eq!(a.status.code(), Some(3));
 }
 
 // ----------------------------------------------------------------- --help

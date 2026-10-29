@@ -307,11 +307,14 @@ pub(crate) fn format_time(
             ),
             b'y' => num(&mut out, 2, year.rem_euclid(100), false),
             b'Y' => year_sign(&mut out, 4, year),
+            // Without a known DST state there is no known offset.
+            b'z' if tm.tm_isdst < 0 => {}
             b'z' => {
                 // `c_long` is narrower than i64 on 32-bit targets.
                 #[allow(clippy::useless_conversion)]
                 let off = i64::from(tm.tm_gmtoff);
-                let negative = off < 0;
+                // RFC 3339's "-00": UTC, but the local offset is unknown.
+                let negative = off < 0 || (off == 0 && lt.zone.first() == Some(&b'-'));
                 let a = off.unsigned_abs() as i64;
                 let (h, m, s) = (a / 3600, a / 60 % 60, a % 60);
                 let colons = match colons {
@@ -325,8 +328,16 @@ pub(crate) fn format_time(
                     2 => (9, h * 10000 + m * 100 + s, 0o24),
                     _ => (3, h, 0),
                 };
-                let value = if negative { -value } else { value };
-                push_number(&mut out, digits, value, pad, width, true, mask);
+                push_signed(
+                    &mut out,
+                    digits,
+                    value as u64,
+                    negative,
+                    pad,
+                    width,
+                    true,
+                    mask,
+                );
             }
             b'Z' => {
                 let lower = change_case;
@@ -372,8 +383,32 @@ fn push_number(
     always_sign: bool,
     colon_mask: u32,
 ) {
-    let negative = value < 0;
-    let mut v = value.unsigned_abs();
+    let (v, negative) = (value.unsigned_abs(), value < 0);
+    push_signed(
+        out,
+        digits,
+        v,
+        negative,
+        pad,
+        width,
+        always_sign,
+        colon_mask,
+    );
+}
+
+/// [`push_number`] with the sign apart, so that `-0` can be written.
+#[allow(clippy::too_many_arguments)]
+fn push_signed(
+    out: &mut Vec<u8>,
+    digits: i64,
+    magnitude: u64,
+    negative: bool,
+    pad: u8,
+    width: i64,
+    always_sign: bool,
+    colon_mask: u32,
+) {
+    let mut v = magnitude;
     let mut mask = colon_mask;
     let mut buf: Vec<u8> = Vec::new();
     loop {
