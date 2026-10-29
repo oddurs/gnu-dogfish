@@ -152,7 +152,9 @@ Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary th
 
 When output goes to a pipe or a file, Dogfish behaves like GNU coreutils 9.4 byte for byte for the options it implements: the same output, error messages and exit codes. When output goes to a terminal, the visual tools (`ls`, `df`, `du`, `stat`, `wc --table`, ...) switch to their rich tables and sparklines. `-J/--json` always emits NDJSON for `dogfish query` pipelines.
 
-This is checked on every Linux CI run by a differential suite of more than 1,800 cases, which runs each command through both Dogfish and GNU in identical fixture trees and compares the results (`crates/dogfish/tests/gnu_compat*.rs`). Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`), `ls --dired`, and a handful of rarely used flags.
+This is checked on every Linux CI run by a differential suite of more than 1,800 cases, which runs each command through both Dogfish and GNU in identical fixture trees and compares the results (`crates/dogfish/tests/gnu_compat*.rs`).
+
+GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's tests against Dogfish (only the tests whose programs under test Dogfish implements all of); CI runs it nightly and fails if a test in [`util/gnu-baseline.json`](./util/gnu-baseline.json) stops passing. **Today 229 of 374 such tests pass (61.2%; 43 more skip).** Known gaps are listed in [ROADMAP.md](./ROADMAP.md), and planned work is tracked as [cairn](https://github.com/oddurs/cairn) items in [`cairn/items`](./cairn/items). Main ones: collation in non-C locales (Dogfish sorts and compares bytes as in `LC_ALL=C`), `ls --dired`, and a handful of rarely used flags.
 
 ---
 
