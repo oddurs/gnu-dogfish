@@ -2155,38 +2155,33 @@ impl MountEntry {
     }
 }
 
-/// gnulib `ME_DUMMY`: pseudo file systems hidden unless `-a`.
+/// gnulib `ME_DUMMY` (mountlist.c): file systems hidden unless `-a`.
+///
+/// gnulib's list plus `devtmpfs` and `squashfs`, which Debian/Ubuntu's coreutils
+/// patch in so snap mounts stay out of `df` (upstream GNU lists them). Every other
+/// pseudo file system (cgroup2, tracefs, securityfs, ...) disappears from `df` only
+/// because it reports zero blocks, which `df` checks separately; ones that do report
+/// blocks, like efivarfs, are shown, as GNU shows them.
 fn is_dummy_fs(fs_type: &str) -> bool {
     matches!(
         fs_type,
         "autofs"
             | "proc"
             | "subfs"
-            | "binfmt_misc"
-            | "bpf"
-            | "cgroup"
-            | "cgroup2"
-            | "configfs"
             | "debugfs"
             | "devpts"
-            | "devtmpfs"
-            | "efivarfs"
             | "fusectl"
             | "fuse.portal"
-            | "hugetlbfs"
             | "mqueue"
-            | "nsfs"
-            | "pstore"
             | "rpc_pipefs"
-            | "securityfs"
-            | "squashfs"
             | "sysfs"
-            | "tracefs"
             | "devfs"
             | "kernfs"
             | "ignore"
             | "none"
             | "rootfs"
+            | "devtmpfs"
+            | "squashfs"
     )
 }
 

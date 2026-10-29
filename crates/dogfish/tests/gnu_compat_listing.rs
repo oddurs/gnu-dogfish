@@ -492,7 +492,10 @@ gnu_cases! {
     df_output_total: "df" ["--total", "--output=source,size,itotal,target", "a.txt", "dir"];
     df_output_symlink_operand: "df" ["--output=source,target,file", "link_dir"];
     df_output_device_file: "df" ["--output=source,file", "/dev/null"];
-    df_all_mounts_stable: "df" ["--output=source,fstype,target"];
+    // Distros disagree on which file systems are "dummy" (Ubuntu patches coreutils to
+    // hide devtmpfs and squashfs snaps), so whole-table cases exclude those types
+    // explicitly; `-a` cases show everything and need no exclusion.
+    df_all_mounts_stable: "df" ["--output=source,fstype,target", "-x", "squashfs", "-x", "devtmpfs"];
     df_dangling: "df" ["link_dangling"];
     df_missing: "df" ["nonexist"];
     df_missing_and_file: "df" ["--output=source,target", "nonexist", "a.txt"];
@@ -792,9 +795,19 @@ fn df_all_fields_layout() {
 
 #[test]
 fn df_all_file_systems_layout() {
-    check_volatile("df", &[], mask_df_usage);
-    check_volatile("df", &["-T"], mask_df_usage);
-    check_volatile("df", &["-i"], mask_df_usage);
+    // See `df_all_mounts_stable` for why these exclude squashfs and devtmpfs.
+    const DISTRO_DUMMIES: [&str; 4] = ["-x", "squashfs", "-x", "devtmpfs"];
+    check_volatile("df", &DISTRO_DUMMIES, mask_df_usage);
+    check_volatile(
+        "df",
+        &[&["-T"][..], &DISTRO_DUMMIES].concat(),
+        mask_df_usage,
+    );
+    check_volatile(
+        "df",
+        &[&["-i"][..], &DISTRO_DUMMIES].concat(),
+        mask_df_usage,
+    );
     check_volatile("df", &["-a", "-T"], mask_df_usage);
 }
 
