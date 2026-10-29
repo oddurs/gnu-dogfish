@@ -105,6 +105,27 @@ enum RmStatus {
     Failed,
 }
 
+/// GNU's `directory_status`: whether a directory has entries, or why it
+/// cannot be read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirStatus {
+    Empty,
+    NonEmpty,
+    /// `errno` of the failed opendir/readdir.
+    Unreadable(i32),
+}
+
+fn dir_status(p: &Path) -> DirStatus {
+    match fs::read_dir(p) {
+        Ok(mut d) => match d.next() {
+            None => DirStatus::Empty,
+            Some(Ok(_)) => DirStatus::NonEmpty,
+            Some(Err(e)) => DirStatus::Unreadable(e.raw_os_error().unwrap_or(libc::EIO)),
+        },
+        Err(e) => DirStatus::Unreadable(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
 /// True when the last component of `f` is `.` or `..` (`d/.`, `./`, `..//`).
 fn is_dot_or_dotdot(f: &OsStr) -> bool {
     let last = last_component(f.as_bytes());
@@ -284,18 +305,17 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         };
         // GNU checks, in this order: directory without -r, `.`/`..`, then `/`.
-        if meta.is_dir() && !run.recursive {
-            let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
-            if !run.dir || !empty {
-                let why = if run.dir {
-                    "Directory not empty"
-                } else {
-                    "Is a directory"
-                };
-                eprintln!("rm: cannot remove {}: {why}", qa(f));
-                exit_code = 1;
-                continue;
-            }
+        // Like GNU, `-d` goes on to rmdir(2) unless the directory has entries
+        // (an unreadable one may still be empty).
+        if meta.is_dir() && !run.recursive && (!run.dir || dir_status(p) == DirStatus::NonEmpty) {
+            let why = if run.dir {
+                "Directory not empty"
+            } else {
+                "Is a directory"
+            };
+            eprintln!("rm: cannot remove {}: {why}", qa(f));
+            exit_code = 1;
+            continue;
         }
         if is_dot_or_dotdot(f) {
             eprintln!(
@@ -416,17 +436,28 @@ fn rm_file(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> 
 }
 
 fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> RmStatus {
-    if let Some(protected) = rm_prompt_needed(p, meta, run)
-        && !ask(
-            "rm",
-            &format!(
+    let status = dir_status(p);
+    if let Some(protected) = rm_prompt_needed(p, meta, run) {
+        let question = match status {
+            // GNU asks before trying to remove a directory it cannot read
+            // (with -d, when it may be empty); any other error is final.
+            DirStatus::Unreadable(libc::EACCES) if run.dir => {
+                format!("attempt removal of inaccessible directory {}? ", qa(p))
+            }
+            DirStatus::Unreadable(errno) => {
+                let e = io::Error::from_raw_os_error(errno);
+                eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+                return RmStatus::Failed;
+            }
+            _ => format!(
                 "remove {}directory {}? ",
                 protected_prefix(protected),
                 qa(p)
             ),
-        )
-    {
-        return RmStatus::Declined;
+        };
+        if !ask("rm", &question) {
+            return RmStatus::Declined;
+        }
     }
     match fs::remove_dir(p) {
         Ok(()) => {
@@ -441,6 +472,14 @@ fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext
             RmStatus::Removed
         }
         Err(e) => {
+            // A directory that could not be read and is not empty: GNU names
+            // the read error.
+            let e = match (status, e.raw_os_error()) {
+                (DirStatus::Unreadable(errno), Some(libc::ENOTEMPTY | libc::EEXIST)) => {
+                    io::Error::from_raw_os_error(errno)
+                }
+                _ => e,
+            };
             eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
             RmStatus::Failed
         }
@@ -457,8 +496,18 @@ fn rm_tree(
     run: &RmRun,
     ctx: &DogfishContext,
 ) -> RmStatus {
-    let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
-    if !empty {
+    let status = dir_status(p);
+    // An unreadable directory cannot be descended into; GNU (`FTS_DNR`) goes
+    // straight to removing it, which works if it is empty.
+    if let DirStatus::Unreadable(errno) = status {
+        if rm_prompt_needed(p, meta, run).is_some() && !(run.dir && errno == libc::EACCES) {
+            let e = io::Error::from_raw_os_error(errno);
+            eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+            return RmStatus::Failed;
+        }
+        return rm_empty_dir(p, meta, run, ctx);
+    }
+    if status == DirStatus::NonEmpty {
         if let Some(protected) = rm_prompt_needed(p, meta, run)
             && !ask(
                 "rm",

@@ -6,9 +6,6 @@
 //! Arguments are `OsString`s: a command line need not be UTF-8, and option
 //! arguments and operands reach the tool byte for byte.
 
-// Tools move onto this module one group at a time.
-#![allow(dead_code)]
-
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
@@ -243,11 +240,6 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             Some((i, false)) => format!("-{}", self.specs[i].short.map_or('?', char::from)),
             None => String::new(),
         }
-    }
-
-    /// Whether the option last returned was spelled long.
-    pub(crate) fn last_was_long(&self) -> bool {
-        matches!(self.last, Some((_, true)))
     }
 
     /// The command-line word the option last returned was taken from
@@ -881,7 +873,6 @@ mod tests {
         let mut g = Getopt::new(os(&["--num=1", "-n2"]), SPECS);
         g.next();
         assert_eq!(g.last_spelling(), "--number");
-        assert!(g.last_was_long());
         g.next();
         assert_eq!(g.last_spelling(), "-n");
     }
