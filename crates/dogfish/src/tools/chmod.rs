@@ -1,6 +1,6 @@
 //! chmod — octal and full symbolic modes, -R, -c/-v/-f, --reference
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::common::mode::{
     CHMOD_MODE_BITS, ModeChange, mode_adjust, mode_compile, process_umask, strmode9,
 };
 use crate::common::path::dir_names;
-use crate::common::preserve_root::{is_root_dir, refuse_root};
+use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, qf, quote_locale};
 
 const CHMOD_HELP: &str = "\
@@ -104,6 +104,8 @@ struct ChmodRun {
     verbose: bool,
     quiet: bool,
     diagnose_surprises: bool,
+    /// `/`'s identity under `-R --preserve-root` (GNU `root_dev_ino`).
+    root_dev_ino: Option<DevIno>,
 }
 
 pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -118,9 +120,11 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         verbose: false,
         quiet: false,
         diagnose_surprises: false,
+        root_dev_ino: None,
     };
     let (mut preserve_root, mut reference) = (false, None);
-    let mut mode_pieces: Vec<String> = Vec::new();
+    // Raw bytes, so a diagnostic quotes the mode exactly as given.
+    let mut mode_pieces: Vec<OsString> = Vec::new();
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -137,7 +141,7 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             // Like GNU, the whole argument the mode character came from is
             // the mode (`-rwx`), joined to earlier ones with a comma.
             Mode => {
-                mode_pieces.push(opts.last_word().map(lossy).unwrap_or_default());
+                mode_pieces.push(opts.last_word().unwrap_or_default().to_os_string());
                 run.diagnose_surprises = true;
             }
             Help => return Ok(print_help(CHMOD_HELP)),
@@ -145,12 +149,12 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     let mut files = opts.operands();
-    let mut mode = (!mode_pieces.is_empty()).then(|| mode_pieces.join(","));
+    let mut mode = (!mode_pieces.is_empty()).then(|| mode_pieces.join(OsStr::new(",")));
     if reference.is_none() && mode.is_none() {
         if files.is_empty() {
             return Ok(usage_error("chmod", "missing operand"));
         }
-        mode = Some(lossy(&files.remove(0)));
+        mode = Some(files.remove(0));
     }
     if files.is_empty() {
         return Ok(match (&mode, &reference) {
@@ -174,7 +178,7 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     } else if let Some(m) = &mode {
-        match mode_compile(m) {
+        match mode_compile(&lossy(m)) {
             Some(c) => run.changes = Some(c),
             None => {
                 return Ok(usage_error(
@@ -185,13 +189,21 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
+    if run.recursive && preserve_root {
+        match root_dev_ino() {
+            Ok(r) => run.root_dev_ino = Some(r),
+            Err(e) => {
+                eprintln!(
+                    "chmod: failed to get attributes of '/': {}",
+                    gnu_io_error(&e)
+                );
+                return Ok(1);
+            }
+        }
+    }
+
     let mut ok = true;
     for f in &files {
-        if run.recursive && preserve_root && is_root_dir(Path::new(f)) {
-            refuse_root("chmod", f);
-            ok = false;
-            continue;
-        }
         ok &= chmod_path(Path::new(f), true, &run, ctx);
     }
     Ok(if ok { 0 } else { 1 })
@@ -236,6 +248,12 @@ fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext
     } else {
         lmeta
     };
+    // GNU `process_file`: checked on the stat the walk uses, so a command-line
+    // symlink to `/` (followed, as fts's FTS_COMFOLLOW does) is refused too.
+    if is_root_dev_ino(run.root_dev_ino, &meta) {
+        refuse_root("chmod", path);
+        return false;
+    }
 
     let old = meta.mode() & CHMOD_MODE_BITS;
     let is_dir = meta.is_dir();

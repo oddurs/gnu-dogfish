@@ -90,9 +90,9 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Modify => mtime = true,
             NoCreate => no_create = true,
             NoDeref => no_deref = true,
-            Date => date = v.as_deref().map(lossy),
+            Date => date = v,
             Reference => reference = v,
-            StampArg => stamp = v.as_deref().map(lossy),
+            StampArg => stamp = v,
             Time => {
                 const WORDS: &[(&str, bool)] = &[
                     ("atime", true),
@@ -155,8 +155,8 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             _ => now,
         };
         match (
-            parse_datetime(d, base(a_stamp)),
-            parse_datetime(d, base(m_stamp)),
+            parse_datetime(&lossy(d), base(a_stamp)),
+            parse_datetime(&lossy(d), base(m_stamp)),
         ) {
             (Some((asec, ans)), Some((msec, mns))) => {
                 a_stamp = Stamp::At(asec, ans);
@@ -169,7 +169,7 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
     if let Some(t) = &stamp {
-        match parse_touch_stamp(t) {
+        match parse_touch_stamp(&lossy(t)) {
             Some((sec, ns)) => {
                 a_stamp = Stamp::At(sec, ns);
                 m_stamp = Stamp::At(sec, ns);

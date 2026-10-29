@@ -15,7 +15,12 @@ use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version, try_help,
     usage_error,
 };
-use crate::common::quote::quote_locale;
+use crate::common::quote::{qa, quote_locale};
+
+/// GNU `devmsg` for `-v`: a label and a raw argument (bytes as given) on stderr.
+fn devmsg(label: &[u8], arg: &[u8]) {
+    let _ = io::stderr().write_all(&[label, arg, b"\n"].concat());
+}
 use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
 
 /// Largest signal number worth probing (GNU's SIGNUM_BOUND).
@@ -392,19 +397,21 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut json = false;
     let mut table = false;
     let mut list_signals = false;
-    let mut unset: Vec<String> = Vec::new();
-    let mut chdir: Option<String> = None;
+    // Raw bytes: a name that is not UTF-8 is unset (or a directory entered) as given.
+    let mut unset: Vec<OsString> = Vec::new();
+    let mut chdir: Option<OsString> = None;
     let mut signal_actions: Vec<(SignalAction, Option<Vec<libc::c_int>>)> = Vec::new();
     while let Some(item) = opts.next() {
-        let (key, value) = match item {
-            Ok((key, value)) => (key, value.as_deref().map(lossy)),
+        let (key, raw) = match item {
+            Ok(o) => o,
             Err(e) => return Ok(getopt_error("env", &e)),
         };
+        let value = raw.as_deref().map(lossy);
         match key {
             "ignore-environment" => ignore_env = true,
             "null" => null = true,
-            "unset" => unset.push(value.unwrap_or_default()),
-            "chdir" => chdir = value,
+            "unset" => unset.push(raw.unwrap_or_default()),
+            "chdir" => chdir = raw,
             "debug" => debug = true,
             "json" => json = true,
             "table" => table = true,
@@ -473,12 +480,12 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     } else {
         for name in &unset {
-            if name.is_empty() || name.contains('=') {
-                eprintln!("env: cannot unset {}: Invalid argument", gnu_quote(name));
+            if name.is_empty() || name.as_bytes().contains(&b'=') {
+                eprintln!("env: cannot unset {}: Invalid argument", quote_locale(name));
                 return Ok(EXIT_CANCELED);
             }
             if debug {
-                eprintln!("unset:    {name}");
+                devmsg(b"unset:    ", name.as_bytes());
             }
             env.unset(name.as_bytes());
         }
@@ -489,7 +496,7 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         .count();
     for a in &rest[..assignments] {
         if debug {
-            eprintln!("setenv:   {}", a.to_string_lossy());
+            devmsg(b"setenv:   ", a.as_bytes());
         }
         env.put(a.as_bytes());
     }
@@ -514,19 +521,19 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
     if let Some(dir) = &chdir {
         if debug {
-            eprintln!("chdir:    {}", gnu_quote(dir));
+            eprintln!("chdir:    {}", qa(dir));
         }
         if let Err(e) = std::env::set_current_dir(dir) {
             eprintln!(
                 "env: cannot change directory to {}: {}",
-                gnu_quote(dir),
+                qa(dir),
                 gnu_io_error(&e)
             );
             return Ok(EXIT_CANCELED);
         }
     }
     if debug {
-        eprintln!("executing: {}", command[0].to_string_lossy());
+        devmsg(b"executing: ", command[0].as_bytes());
         for (i, a) in command.iter().enumerate() {
             eprintln!("   arg[{i}]= {}", quote_locale(a));
         }

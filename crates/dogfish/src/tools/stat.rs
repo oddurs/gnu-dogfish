@@ -2,9 +2,10 @@
 
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::SystemTime;
@@ -22,10 +23,9 @@ use crate::common::file_info::{
     meta_birth, meta_ctime, meta_mtime, path_bytes, security_context, user_name,
 };
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy_all, print_help, print_version,
-    usage_error,
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, print_help, print_version, usage_error,
 };
-use crate::common::quote::{Quoting, quote_af, quote_bytes, quote_bytes_raw};
+use crate::common::quote::{Quoting, qa, quote_bytes, quote_bytes_raw};
 use crate::common::strftime::{Timespec, format_local_time};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
@@ -114,7 +114,7 @@ struct StatRecord {
     symlink_target: Option<String>,
 }
 
-pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut parsed = Getopt::new(args.into_iter().skip(1).collect(), STAT_OPTIONS);
     let mut dereference = false;
     let mut file_system = false;
@@ -150,7 +150,8 @@ pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i
             _ => unreachable!("unhandled stat option"),
         }
     }
-    let operands = lossy_all(parsed.operands());
+    // Operands stay raw bytes: a name that is not UTF-8 is still statted and printed as given.
+    let operands = parsed.operands();
     if operands.is_empty() {
         return Ok(usage_error("stat", "missing operand"));
     }
@@ -178,6 +179,7 @@ pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i
     let mut status = 0;
     for name in &operands {
         // `-` means standard input, as in GNU.
+        let name = name.as_os_str();
         let path = if name == "-" {
             Path::new("/dev/stdin")
         } else {
@@ -189,12 +191,20 @@ pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i
         };
         let mut buf = Vec::new();
         let expanded = if file_system {
+            if name == "-" {
+                eprintln!(
+                    "stat: using {} to denote standard input does not work in file system mode",
+                    qa(name)
+                );
+                status = 1;
+                continue;
+            }
             let info = match FsStats::query(path) {
                 Ok(info) => info,
                 Err(e) => {
                     eprintln!(
                         "stat: cannot read file system information for {}: {}",
-                        quote_af(name),
+                        qa(name),
                         gnu_io_error(&e)
                     );
                     status = 1;
@@ -218,11 +228,7 @@ pub fn run_stat(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i
             let meta = match meta {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!(
-                        "stat: cannot statx {}: {}",
-                        quote_af(name),
-                        gnu_io_error(&e)
-                    );
+                    eprintln!("stat: cannot statx {}: {}", qa(name), gnu_io_error(&e));
                     status = 1;
                     continue;
                 }
@@ -554,7 +560,7 @@ fn stat_human_time(t: Timespec) -> Vec<u8> {
 
 /// A file being described by `stat` (without `-f`).
 struct StatFile<'a> {
-    name: &'a str,
+    name: &'a OsStr,
     path: &'a Path,
     meta: &'a fs::Metadata,
     /// How `%N` quotes names.
@@ -704,7 +710,7 @@ impl FsStats {
         })
     }
 
-    fn directive(&self, name: &str, d: &StatDirective) -> Option<StatValue> {
+    fn directive(&self, name: &OsStr, d: &StatDirective) -> Option<StatValue> {
         if d.modifier.is_some() {
             return None;
         }
@@ -877,7 +883,12 @@ fn linux_fs_type_name(magic: u64) -> String {
 }
 
 /// The Dogfish visual card (TTY) and `--json` records.
-fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishContext) -> Result<i32> {
+fn stat_card(
+    files: &[OsString],
+    dereference: bool,
+    json: bool,
+    ctx: &DogfishContext,
+) -> Result<i32> {
     let mut records = Vec::with_capacity(files.len());
     let mut exit_code = 0;
 
@@ -891,7 +902,7 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
         let meta = match meta_res {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("stat: cannot statx {}: {}", quote_af(f), gnu_io_error(&e));
+                eprintln!("stat: cannot statx {}: {}", qa(f), gnu_io_error(&e));
                 exit_code = 1;
                 continue;
             }
@@ -930,7 +941,7 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
         };
 
         let rec = StatRecord {
-            name: f.clone(),
+            name: f.to_string_lossy().into_owned(),
             file_type: ftype.to_string(),
             size: meta.len(),
             size_human: format_size(meta.len(), true),
