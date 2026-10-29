@@ -560,6 +560,7 @@ impl Tail {
 
     /// `error (0, errnum, ...)`: `tail: MSG: STRERROR`, or `tail: MSG` when
     /// `errnum` is 0.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn diag_errno(&mut self, errnum: i32, msg: impl std::fmt::Display) {
         if errnum > 0 {
             let e = io::Error::from_raw_os_error(errnum);

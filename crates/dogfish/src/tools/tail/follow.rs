@@ -43,9 +43,12 @@ pub(super) struct FileSpec {
     /// 1 if `O_NONBLOCK` is clear, 0 if set, -1 if not known.
     pub(super) blocking: i8,
     /// The inotify watch on the file, and on its directory (by name).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) wd: i32,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) parent_wd: i32,
     /// Offset of the last component in `name`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) basename_start: usize,
     pub(super) n_unchanged_stats: u64,
 }
