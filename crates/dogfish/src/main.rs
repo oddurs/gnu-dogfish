@@ -332,7 +332,12 @@ fn main() -> ExitCode {
     // prints the version instead of being parsed as an operand or rejected.
     if filtered_args.len() == 2 && filtered_args[1] == "--version" {
         println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+        // GNU `false` fails even when asked for its version.
+        return if tool_name == "false" {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
     }
     let res = dispatch(&tool_name, filtered_args, &ctx);
     ctx.finish();

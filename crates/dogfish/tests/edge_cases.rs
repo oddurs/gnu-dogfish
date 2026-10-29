@@ -64,6 +64,8 @@ fn every_tool_answers_version() {
             format!("{tool} (GNU/Dogfish) {}\n", env!("CARGO_PKG_VERSION"))
         );
     }
+    // Like GNU, `false` still fails.
+    assert_eq!(run(&["false", "--version"]).1, Some(1));
     // Only a lone `--version` is special; elsewhere it is ordinary data.
     assert_eq!(run(&["echo", "a", "--version"]).0, "a --version\n");
 }
