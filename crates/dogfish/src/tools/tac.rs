@@ -149,7 +149,24 @@ fn tac_buffer<W: Write>(data: &[u8], sep: &Separator, before: bool, out: &mut W)
 
 /// Reads one input whole; standard input is read from its start when it
 /// is a regular file, as GNU's seekable path does.
-fn read_input(src: &InputSource) -> std::result::Result<Vec<u8>, (bool, io::Error)> {
+/// One input's bytes: a regular file stays mapped (no 100 MB copy).
+enum TacInput {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for TacInput {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            TacInput::Mapped(m) => m,
+            TacInput::Owned(v) => v,
+        }
+    }
+}
+
+fn read_input(src: &InputSource) -> std::result::Result<TacInput, (bool, io::Error)> {
     match src {
         InputSource::Stdin => {
             let mut stdin = stdin_file();
@@ -158,12 +175,15 @@ fn read_input(src: &InputSource) -> std::result::Result<Vec<u8>, (bool, io::Erro
             }
             let mut data = Vec::new();
             stdin.read_to_end(&mut data).map_err(|e| (false, e))?;
-            Ok(data)
+            Ok(TacInput::Owned(data))
         }
         InputSource::File(path) => {
             let file = File::open(path).map_err(|e| (true, e))?;
             FastReader::from_file(file)
-                .and_then(|r| r.into_bytes())
+                .and_then(|r| match r {
+                    FastReader::Mapped(m) => Ok(TacInput::Mapped(m)),
+                    r => r.into_bytes().map(TacInput::Owned),
+                })
                 .map_err(|e| (false, e))
         }
     }
