@@ -560,7 +560,7 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let json_fields = parsed.fields.is_some() && spec.is_err();
     if sources.len() == 1
         && matches!(sources[0], InputSource::Stdin)
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
         && !parsed.zero_terminated
         && (json_fields || parsed.where_expr.is_some() || parsed.json)
     {

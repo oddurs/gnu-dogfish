@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::format::{Style, format_duration_human, format_size};
@@ -114,9 +114,10 @@ impl Switches {
 pub struct DogfishContext {
     pub tool_name: String,
     pub start_time: Instant,
-    pub stdin_is_tty: bool,
-    pub stdout_is_tty: bool,
-    pub stderr_is_tty: bool,
+    /// Whether standard input, output and error are terminals, asked of the
+    /// kernel only when a tool first wants to know (most never do when
+    /// their output is not a terminal).
+    is_tty: [OnceLock<bool>; 3],
     pub force_json: bool,
     /// `--stats` and the colour mode: off and automatic until the utility's
     /// own option parser sees a Dogfish switch it accepts (`DOGFISH_STATS`
@@ -133,13 +134,26 @@ impl DogfishContext {
         Self {
             tool_name: tool_name.into(),
             start_time: Instant::now(),
-            stdin_is_tty: io::stdin().is_terminal(),
-            stdout_is_tty: io::stdout().is_terminal(),
-            stderr_is_tty: io::stderr().is_terminal(),
+            is_tty: Default::default(),
             force_json: false,
             switches: Arc::new(Switches::new(std::env::var_os("DOGFISH_STATS").is_some())),
             telemetry: Arc::new(Telemetry::default()),
         }
+    }
+
+    /// Whether standard input is a terminal.
+    pub fn stdin_is_tty(&self) -> bool {
+        *self.is_tty[0].get_or_init(|| io::stdin().is_terminal())
+    }
+
+    /// Whether standard output is a terminal.
+    pub fn stdout_is_tty(&self) -> bool {
+        *self.is_tty[1].get_or_init(|| io::stdout().is_terminal())
+    }
+
+    /// Whether standard error is a terminal.
+    pub fn stderr_is_tty(&self) -> bool {
+        *self.is_tty[2].get_or_init(|| io::stderr().is_terminal())
     }
 
     pub fn color_mode(&self) -> ColorMode {
@@ -151,11 +165,11 @@ impl DogfishContext {
     }
 
     pub fn use_color(&self) -> bool {
-        self.color_mode().should_color(self.stdout_is_tty)
+        self.color_mode().should_color(self.stdout_is_tty())
     }
 
     pub fn use_stderr_color(&self) -> bool {
-        self.color_mode().should_color(self.stderr_is_tty)
+        self.color_mode().should_color(self.stderr_is_tty())
     }
 
     pub fn style(&self) -> Style {

@@ -151,8 +151,8 @@ pub fn read_ndjson_stdin(lines: &[String]) -> Option<Vec<Value>> {
 }
 
 /// Emits a slice of JSON objects as:
-/// - **NDJSON** when piped (`!ctx.stdout_is_tty`) or when `force_json` is false in a pipeline
-/// - **Pretty JSON Array** if `--json` was explicitly passed on a TTY (`force_json && ctx.stdout_is_tty`)
+/// - **NDJSON** when piped (`!ctx.stdout_is_tty()`) or when `force_json` is false in a pipeline
+/// - **Pretty JSON Array** if `--json` was explicitly passed on a TTY (`force_json && ctx.stdout_is_tty()`)
 /// - **Auto-formatted Terminal Table** if rendering an NDJSON stream to an interactive TTY!
 pub fn emit_objects_or_table<T: Serialize>(
     items: &[T],
@@ -167,7 +167,7 @@ pub fn emit_objects_or_table<T: Serialize>(
         .filter_map(|item| serde_json::to_value(item).ok())
         .collect();
 
-    if explicit_json && !ctx.stdout_is_tty {
+    if explicit_json && !ctx.stdout_is_tty() {
         // Emit NDJSON into the pipe so downstream Dogfish utilities can stream-parse it!
         for val in &values {
             serde_json::to_writer(&mut out, val)?;
@@ -176,14 +176,14 @@ pub fn emit_objects_or_table<T: Serialize>(
         return out.flush();
     }
 
-    if explicit_json && ctx.stdout_is_tty && !render_tty_table {
+    if explicit_json && ctx.stdout_is_tty() && !render_tty_table {
         // Emit pretty JSON on terminal when explicitly asked via `-J`
         serde_json::to_writer_pretty(&mut out, &values)?;
         writeln!(out)?;
         return out.flush();
     }
 
-    if ctx.stdout_is_tty {
+    if ctx.stdout_is_tty() {
         render_json_objects_as_table(&values, &mut out, ctx.style())?;
         return out.flush();
     }

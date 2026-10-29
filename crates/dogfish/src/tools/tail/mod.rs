@@ -1148,9 +1148,9 @@ pub fn run_tail(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !a.forever
         && a.header_mode != HeaderMode::Always
         && a.line_end == b'\n'
-        && !ctx.stdin_is_tty
+        && !ctx.stdin_is_tty()
         && !stdin_is_closed()
-        && (ctx.stdout_is_tty || a.json)
+        && (ctx.stdout_is_tty() || a.json)
     {
         return tail_ndjson(&a, ctx);
     }
