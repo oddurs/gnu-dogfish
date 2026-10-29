@@ -288,8 +288,16 @@ pub unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_cha
     for fd in 0..3 {
         // SAFETY: fcntl(F_GETFD) only queries the descriptor.
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            // A closed standard input is held by a write-only /dev/null, so
+            // reading it fails with EBADF as GNU's reads of `<&-` do.
+            let mode = if fd == libc::STDIN_FILENO {
+                common::input::stdin_started_closed();
+                libc::O_WRONLY
+            } else {
+                libc::O_RDWR
+            };
             // SAFETY: a NUL-terminated path; the lowest free descriptor is `fd`.
-            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            unsafe { libc::open(c"/dev/null".as_ptr(), mode) };
             if fd == libc::STDOUT_FILENO {
                 stdout::started_closed();
             }

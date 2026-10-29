@@ -96,7 +96,13 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Suffix => suffix_opt = v.map(OsString::into_vec),
         }
     }
+    // -q hides only failures to create the file or directory; a bad
+    // template is always diagnosed (GNU).
     let fail = |msg: String| {
+        eprintln!("mktemp: {msg}");
+        Ok(1)
+    };
+    let fail_create = |msg: String| {
         if !quiet {
             eprintln!("mktemp: {msg}");
         }
@@ -120,7 +126,7 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             if template.last() != Some(&b'X') {
                 return fail(format!(
                     "with --suffix, template {} must end in X",
-                    q(&[&template[..], s].concat())
+                    q(&template)
                 ));
             }
             ([&template[..], s].concat(), s.clone())
@@ -177,7 +183,7 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut urandom = match fs::File::open("/dev/urandom") {
         Ok(f) => f,
-        Err(e) => return fail(format!("cannot open /dev/urandom: {}", gnu_io_error(&e))),
+        Err(e) => return fail_create(format!("cannot open /dev/urandom: {}", gnu_io_error(&e))),
     };
     let mut random = vec![0u8; x_count];
     let kind = if directory { "directory" } else { "file" };
@@ -233,7 +239,7 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return fail(format!(
+                return fail_create(format!(
                     "failed to create {kind} via template {}: {}",
                     quote_locale(&full_template),
                     gnu_io_error(&e)
@@ -241,7 +247,7 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    fail(format!(
+    fail_create(format!(
         "failed to create {kind} via template {}: File exists",
         quote_locale(&full_template)
     ))

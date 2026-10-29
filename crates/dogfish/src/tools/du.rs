@@ -1158,7 +1158,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                 Some(name) => name,
                 None => break,
             },
-            Some(list) => match list.next_name() {
+            Some(list) => match list.next_os_name() {
                 Ok(Some(name)) => {
                     if let Some(msg) = list.check_name(&name, list.count(), true) {
                         walker.error(msg);

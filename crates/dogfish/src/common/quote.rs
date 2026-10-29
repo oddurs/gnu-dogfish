@@ -88,7 +88,7 @@ impl Quoting {
 
 /// True when the character-type locale is UTF-8, so multibyte characters
 /// count as printable (otherwise every non-ASCII byte is, as in the C locale).
-fn locale_is_utf8() -> bool {
+pub(crate) fn locale_is_utf8() -> bool {
     static UTF8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *UTF8.get_or_init(|| {
         let value = ["LC_ALL", "LC_CTYPE", "LANG"]
@@ -350,11 +350,6 @@ pub(crate) fn quote_bytes_raw(arg: &[u8], style: Quoting, extra: &[u8]) -> Vec<u
         out.extend_from_slice(close);
     }
     out
-}
-
-/// coreutils `quoteaf`: shell-escape-always quoting used in diagnostics.
-pub(crate) fn quote_af(name: &str) -> String {
-    quote_bytes(name.as_bytes(), Quoting::ShellEscapeAlways)
 }
 
 /// coreutils `quotef`: shell-escape quoting, only when needed.

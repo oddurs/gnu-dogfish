@@ -3,7 +3,10 @@ id: 55
 uid: 0b769c4a-cd56-495c-a5c7-aba9c859be03
 title: "Small text tools: echo octal, paste backslash, uniq -D and -f, wc --total, mktemp messages"
 type: bug
-status: backlog
+status: done
+assignee: claude
+claimed: 2026-10-29
+closed_at: 2026-10-29
 milestone: "v1.0"
 depends_on:
 - 8
@@ -41,5 +44,9 @@ The listed tests pass once 0029 and 0031 (their other causes) are done.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Result
+
+echo `\NNN` octal, paste's unescaped-backslash error, uniq `-D`/`--all-repeated[=METHOD]`/`--group` and `-f HUGE` without iterating, wc `--total=WHEN`, mktemp `-q`/`--suffix` messages; the listed tests pass.

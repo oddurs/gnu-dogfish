@@ -78,8 +78,8 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `open` | `Mmap::map` of an input file | Read-only private mapping of a regular file we opened; see "Accepted risk" above. |
-| `open` | `madvise(MADV_SEQUENTIAL)` | Pointer and length describe the mapping just created; `madvise` is a hint and never changes the contents. |
+| `from_file` | `Mmap::map` of an input file | Read-only private mapping of a regular file the caller opened; see "Accepted risk" above. |
+| `from_file` | `madvise(MADV_SEQUENTIAL)` | Pointer and length describe the mapping just created; `madvise` is a hint and never changes the contents. |
 | `copy_file_fast` | `clonefile` (macOS) | C paths. |
 | `copy_file_fast` | `ioctl(FICLONE)` (Linux) | Descriptor only (both files open for the call). |
 | `make_node_like` | `mknod` | C path. |
@@ -181,6 +181,20 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `set_file_times` | `utimensat` | C path; an array of two `timespec`s. |
 
+### `crates/dogfish/src/common/input.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `stdin_file` | `File::from_raw_fd(0)` in a `ManuallyDrop` | Descriptor only: fd 0 is always open (`main` fills a closed one with `/dev/null`), and `ManuallyDrop` keeps the `File` from closing it. |
+| `bytes_available` | `ioctl(FIONREAD)` | Out-pointer: one `c_int` local; a bad descriptor only makes the call fail. |
+| `close_stdin` | `close(0)` | Descriptor only, closed once after the last read. |
+
+### `crates/dogfish/src/common/locale.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `utf8_locale` | `setlocale(LC_CTYPE)`, `nl_langinfo(CODESET)`, `CStr::from_ptr` | C path (literal locale names); static storage: the codeset string is compared before the next `setlocale`, which restores `"C"`. Runs once, through a `OnceLock`. |
+
 ### `crates/dogfish/src/common/mode.rs`
 
 | Item | Operation | Why it is sound |
@@ -247,6 +261,7 @@ and non-regular files are read with `read(2)` instead.
 | --- | --- | --- |
 | `run_cat` | `mem::zeroed::<stat>()` | Out-pointer (zeroed plain data). |
 | `run_cat` | `fstat(1)` | Descriptor only, plus the out-pointer. |
+| `cat_plain` | `copy_file_range` (Linux) | Descriptor only (the input `File` and standard output); null offset pointers make the kernel use and advance the file offsets. |
 
 ### `crates/dogfish/src/tools/cp.rs`
 
@@ -361,8 +376,7 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `stdin_stat` | `mem::zeroed::<stat>()` | Out-pointer (zeroed plain data). |
-| `stdin_stat` | `fstat(0)` | Descriptor only, plus the out-pointer. |
+| `count_bytes_only` | `sysconf(_SC_PAGESIZE)` | No preconditions. |
 
 ### `crates/dogfish/src/tools/whoami.rs`
 
