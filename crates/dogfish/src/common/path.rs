@@ -13,6 +13,24 @@ pub(crate) fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// `p` absolute with its directory resolved (but not its last component, which
+/// may be a symlink): a name for the same file that stays valid when the
+/// operation moves something on the way to it. `mv c c/link` (`link` pointing
+/// to `../a`) moves `c` to `a/c`, which `c/link/c` no longer names afterwards.
+/// A trailing slash (which makes the name mean a directory) is kept as is.
+pub(crate) fn stable_path(p: &Path) -> PathBuf {
+    let abs = absolute(p);
+    if p.as_os_str().as_bytes().ends_with(b"/") {
+        return abs;
+    }
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|d| d.join(name))
+            .unwrap_or(abs),
+        _ => abs,
+    }
+}
+
 /// gnulib `last_component`: the final name in `s`, ignoring trailing slashes
 /// (empty for `/` or the empty string).
 pub(crate) fn last_component(s: &[u8]) -> &[u8] {

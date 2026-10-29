@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
+
+use crate::crash::crash_point;
 
 /// 64 KiB aligned buffer size for high-throughput streaming.
 pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
@@ -229,17 +232,34 @@ pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<(u64, CopyMethod)> {
 
 /// Recursively copies `src` to `dst`, recreating symlinks rather than following them.
 /// FIFOs, sockets and device nodes are recreated, never opened: reading a FIFO
-/// would block forever and a device such as `/dev/zero` never ends.
+/// would block forever and a device such as `/dev/zero` never ends. Files hard-linked
+/// to each other inside `src` are hard-linked to each other in the copy.
 pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    copy_tree_linked(src, dst, &mut HashMap::new())
+}
+
+fn copy_tree_linked(
+    src: &Path,
+    dst: &Path,
+    links: &mut HashMap<(u64, u64), PathBuf>,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(src)?;
     let ty = meta.file_type();
+    crash_point();
+    if !ty.is_dir() && meta.nlink() > 1 {
+        if let Some(first) = links.get(&(meta.dev(), meta.ino())) {
+            return fs::hard_link(first, dst);
+        }
+        links.insert((meta.dev(), meta.ino()), dst.to_path_buf());
+    }
     if ty.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)
     } else if ty.is_dir() {
         fs::create_dir_all(dst)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_tree_linked(&entry.path(), &dst.join(entry.file_name()), links)?;
         }
         fs::set_permissions(dst, meta.permissions())
     } else if ty.is_file() {
@@ -268,17 +288,44 @@ fn make_node_like(dst: &Path, meta: &fs::Metadata) -> io::Result<()> {
 
 /// Renames `src` to `dst`, falling back to copy + remove when they live on
 /// different filesystems (`EXDEV`).
+///
+/// The fallback copies to a temporary name next to `dst` and renames it into
+/// place before removing `src`, so whenever `dst` exists it is complete: a
+/// crash part-way leaves `src` intact, or a complete `dst` beside what is left
+/// of `src`.
 pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
+    crash_point();
     match fs::rename(src, dst) {
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            copy_tree(src, dst)?;
-            if fs::symlink_metadata(src)?.is_dir() {
-                fs::remove_dir_all(src)
-            } else {
-                fs::remove_file(src)
+            let part = partial_path(dst);
+            remove_any(&part)?;
+            if let Err(e) = copy_tree(src, &part) {
+                let _ = remove_any(&part);
+                return Err(e);
             }
+            crash_point();
+            fs::rename(&part, dst)?;
+            crash_point();
+            remove_any(src)
         }
         res => res,
+    }
+}
+
+/// Where [`move_path`] assembles a copy of `dst` before renaming it into place.
+fn partial_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or("item".as_ref()).to_os_string();
+    name.push(format!(".dogfish-partial-{}", std::process::id()));
+    dst.with_file_name(name)
+}
+
+/// Removes a file or a whole tree, not following symlinks; missing is fine.
+pub(crate) fn remove_any(p: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+        Ok(_) => fs::remove_file(p),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

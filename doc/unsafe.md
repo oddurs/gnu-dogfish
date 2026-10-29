@@ -102,7 +102,15 @@ and non-regular files are read with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `drop` | `flock(LOCK_UN)` on the journal lock | Descriptor only (owned by the lock guard). |
+| `process_alive` | `kill(pid, 0)` on the process of a pending entry | Signal 0 only checks that the process exists; no pointers. |
 | `lock` | `flock(LOCK_EX)` on the journal lock | Descriptor only. |
+| `trash_dir_for` | `geteuid` | No preconditions. |
+
+### `crates/dogfish-core/src/crash.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `crash_point` | `kill(getpid(), SIGKILL)` (debug builds, `DOGFISH_CRASH_AT` only) | No pointers; kills this process, which is the point. |
 
 ### `crates/dogfish/src/main.rs`
 
@@ -395,6 +403,18 @@ and non-regular files are read with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `sigbus_from_truncated_mmap_is_a_clean_error` | `kill(SIGBUS)` (test) | Signals our own child, which has not been waited for yet. |
+
+### `crates/dogfish/tests/fs_safety.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `undo_restores_a_fifo_that_remove_destination_replaced` | `mkfifo` (test) | C path. |
+
+### `crates/dogfish/tests/undo_model.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `mkfifo` | `mkfifo` (test) | C path. |
 
 ### `crates/dogfish/tests/gnu_compat_listing.rs`
 

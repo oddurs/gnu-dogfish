@@ -39,5 +39,8 @@ tempfile.workspace = true
 itoa.workspace = true
 ring.workspace = true
 
+[dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+
 [lints]
 workspace = true

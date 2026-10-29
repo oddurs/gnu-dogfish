@@ -497,3 +497,169 @@ fn undo_recording_can_be_turned_off_but_rm_safe_still_trashes() {
     assert!(sb.run(&["undo"]).status.success());
     assert_eq!(sb.read("f"), "keep me");
 }
+
+// ---------------------------------------------------------------------------
+// Counterexamples found by the model-based tests (tests/undo_model.rs), each
+// reduced to its smallest form.
+
+/// A directory on another file system than the sandbox, when there is one.
+fn other_fs_dir() -> Option<tempfile::TempDir> {
+    use std::os::unix::fs::MetadataExt;
+    let here = fs::metadata(std::env::temp_dir()).ok()?.dev();
+    tempfile::tempdir_in("/dev/shm")
+        .ok()
+        .filter(|d| fs::metadata(d.path()).is_ok_and(|m| m.dev() != here))
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (fs::metadata(a).unwrap(), fs::metadata(b).unwrap());
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// Removes the trash directories this sandbox's journal made on other file
+/// systems (listed in `$DOGFISH_HOME/trash-dirs`).
+fn remove_other_fs_trash(sb: &Sandbox) {
+    if let Ok(list) = fs::read_to_string(sb.path(".dogfish/trash-dirs")) {
+        for dir in list.lines() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[test]
+fn failed_mv_records_nothing() {
+    // `mv missing b` used to record a move, and undo then renamed b to `missing`.
+    let sb = Sandbox::new();
+    sb.write("b", "keep");
+    assert!(!sb.run(&["mv", "missing", "b"]).status.success());
+    assert!(sb.history().is_empty());
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("b"), "keep");
+    assert!(!sb.exists("missing"));
+}
+
+#[test]
+fn mv_that_leaves_its_source_alone_records_nothing() {
+    let sb = Sandbox::new();
+    sb.write("a", "a");
+    sb.write("b", "b");
+    sb.run(&["mv", "-n", "a", "a"]);
+    sb.run(&["mv", "-n", "a/", "b"]);
+    assert!(sb.history().is_empty());
+}
+
+#[test]
+fn undo_of_cp_into_a_hard_linked_file_restores_every_link() {
+    // cp writes into the existing inode, so every link sees the new contents;
+    // undo used to rename the backup over `a`, leaving `l` with them.
+    let sb = Sandbox::new();
+    sb.write("a", "old");
+    fs::hard_link(sb.path("a"), sb.path("l")).unwrap();
+    sb.write("b", "new");
+    assert!(sb.run(&["cp", "b", "a"]).status.success());
+    assert_eq!(sb.read("l"), "new");
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("a"), "old");
+    assert_eq!(sb.read("l"), "old");
+    assert!(same_inode(&sb.path("a"), &sb.path("l")));
+}
+
+#[test]
+fn undo_of_cp_merging_into_a_directory_keeps_its_inodes() {
+    let sb = Sandbox::new();
+    sb.write("src/d/f", "new");
+    sb.write("dst/d/f", "old");
+    fs::hard_link(sb.path("dst/d/f"), sb.path("outside")).unwrap();
+    assert!(sb.run(&["cp", "-r", "src/d", "dst"]).status.success());
+    assert_eq!(sb.read("outside"), "new");
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(sb.read("dst/d/f"), "old");
+    assert_eq!(sb.read("outside"), "old");
+    assert!(same_inode(&sb.path("dst/d/f"), &sb.path("outside")));
+}
+
+#[test]
+fn undo_restores_a_fifo_that_remove_destination_replaced() {
+    use std::os::unix::fs::FileTypeExt;
+    let sb = Sandbox::new();
+    let c = std::ffi::CString::new(sb.path("f").to_str().unwrap()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+    sb.write("a", "data");
+    let out = sb.run(&["cp", "--remove-destination", "a", "f"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(sb.run(&["undo"]).status.success());
+    let meta = fs::symlink_metadata(sb.path("f")).unwrap();
+    assert!(meta.file_type().is_fifo());
+}
+
+#[test]
+fn undo_of_mv_into_a_symlinked_directory_moves_it_back() {
+    // `mv b x b` with `b` a symlink to `d` renames the link itself to d/b
+    // (as GNU does), after which `b/b` names nothing: the journal must record
+    // where it really went.
+    let sb = Sandbox::new();
+    fs::create_dir(sb.path("d")).unwrap();
+    symlink("d", sb.path("b")).unwrap();
+    let out = sb.run(&["mv", "b", "missing", "b"]);
+    assert!(!out.status.success());
+    assert!(
+        !stderr(&out).contains("cannot stat 'b/b'"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fs::symlink_metadata(sb.path("d/b")).is_ok());
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(fs::read_link(sb.path("b")).unwrap(), Path::new("d"));
+    assert!(fs::symlink_metadata(sb.path("d/b")).is_err());
+}
+
+#[test]
+fn undo_of_cp_backup_undoes_the_copy_before_the_backup_rename() {
+    let sb = Sandbox::new();
+    sb.write("a", "old");
+    sb.write("b", "new");
+    assert!(sb.run(&["cp", "-b", "b", "a"]).status.success());
+    assert_eq!(sb.read("a~"), "old");
+    assert!(sb.run(&["undo", "-n", "2"]).status.success());
+    assert_eq!(sb.read("a"), "old");
+    assert!(!sb.exists("a~"));
+}
+
+#[test]
+fn rm_safe_on_another_file_system_keeps_hard_links() {
+    // The home trash is elsewhere: moving there copied, and undo brought back
+    // a new inode. Each file system now gets a trash of its own.
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    let sb = Sandbox::new();
+    let (a, b) = (other.path().join("a"), other.path().join("b"));
+    fs::write(&a, "data").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    let out = sb.run(&["rm", "--safe", a.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(sb.run(&["undo"]).status.success());
+    assert!(same_inode(&a, &b));
+    remove_other_fs_trash(&sb);
+}
+
+#[test]
+fn failed_cp_link_with_backup_puts_the_backup_back_and_records_nothing() {
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    let sb = Sandbox::new();
+    sb.write("b", "src");
+    let c = other.path().join("c");
+    fs::write(&c, "keep").unwrap();
+    // A hard link across file systems fails after the backup rename.
+    let out = sb.run(&["cp", "--backup=numbered", "-l", "b", c.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&c).unwrap(), "keep");
+    assert!(sb.history().is_empty(), "{:?}", sb.history());
+    remove_other_fs_trash(&sb);
+}

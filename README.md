@@ -132,7 +132,7 @@ Retention is bounded so the trash cannot grow forever:
 | `DOGFISH_BACKUP_LIMIT` | `1G` | Total size of the automatic backups `cp`/`mv` keep of files they overwrite. Oldest backups are discarded first; the newest is always kept. `rm --safe` files never count against it. |
 | `DOGFISH_UNDO` | on | Set to `off` to stop `cp`/`mv` recording undo entries and keeping backups of what they overwrite (overwrites then cost what GNU's do, and can't be undone). `rm --safe` still uses the trash. |
 
-`undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it.
+`undo` never overwrites a file that has reappeared at a path it would restore, and an `undo` whose backup was discarded leaves the current file in place rather than deleting it. Operations are journaled before they start, so even a `cp`, `mv` or `rm --safe` killed half-way can be undone; files on other file systems go to a trash on that file system (`.dogfish-trash-<uid>-…` at its top), so trashing is a rename that keeps hard links. The guarantees are listed in [SECURITY.md](SECURITY.md#undo-and-the-trash).
 
 ### 4. Rich Visual Cards & Unicode Sparklines (`df`, `du`, `stat`, `wc --table`)
 ```text

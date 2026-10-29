@@ -6,7 +6,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use dogfish_core::{JournalAction, UndoJournal, move_path};
+use dogfish_core::journal::inode;
+use dogfish_core::{JournalAction, JournalEntry, UndoJournal, crash_point, move_path};
 
 use crate::common::getopt::argmatch;
 use crate::common::path::{absolute, base_len, c_path, last_component, rename_noreplace};
@@ -178,30 +179,51 @@ fn check_extension(s: &mut Vec<u8>, filelen: usize, dir: &Path) -> bool {
 }
 
 /// gnulib `backup_file_rename`: renames `dst` to its backup name (never over an
-/// existing numbered backup) and returns that name. With a journal, a backup
-/// file that is about to be replaced is saved first, and the rename is
-/// recorded so `dogfish undo` can bring everything back.
+/// existing numbered backup) and returns that name, with its journal entry.
+/// With a journal, the rename is recorded (before it happens, see
+/// [`UndoJournal::begin`]) and a backup file that is about to be replaced is
+/// saved first, so `dogfish undo` can bring everything back.
 pub(crate) fn make_backup(
     dst: &Path,
     mode: BackupMode,
     suffix: &str,
     journal: Option<&UndoJournal>,
     tool: &str,
-) -> io::Result<PathBuf> {
+) -> io::Result<(PathBuf, Option<JournalEntry>)> {
     loop {
         let (backup, mode, fits) = backup_candidate(dst, mode, suffix);
-        let saved = match journal {
-            Some(j) if mode == BackupMode::Simple => j.backup_existing(&backup, false)?,
+        let mut entry = match journal {
+            Some(j) => Some(j.begin(
+                tool,
+                JournalAction::Move {
+                    src: absolute(dst),
+                    dst: absolute(&backup),
+                    backup_path: None,
+                    copied: false,
+                    existed: fs::symlink_metadata(&backup).is_ok(),
+                    src_inode: inode(dst),
+                },
+            )?),
+            None => None,
+        };
+        let saved = match (journal, &mut entry) {
+            (Some(j), Some(e)) if mode == BackupMode::Simple => j.take(e, &backup, false)?,
             _ => None,
         };
+        crash_point();
         let res = if mode == BackupMode::Simple {
             fs::rename(dst, &backup)
         } else {
             rename_noreplace(dst, &backup)
         };
         if let Err(e) = res {
-            if let Some(s) = &saved {
-                let _ = move_path(Path::new(s), &backup);
+            if let (Some(j), Some(mut entry)) = (journal, entry) {
+                let back = saved
+                    .as_ref()
+                    .is_none_or(|s| move_path(Path::new(s), &backup).is_ok());
+                if back {
+                    let _ = j.cancel(&mut entry);
+                }
             }
             // Another process took that number: try the next one.
             if e.raw_os_error() == Some(libc::EEXIST) && fits && mode != BackupMode::Simple {
@@ -209,16 +231,9 @@ pub(crate) fn make_backup(
             }
             return Err(e);
         }
-        if let Some(j) = journal {
-            let _ = j.record(
-                tool,
-                JournalAction::Move {
-                    src: absolute(dst),
-                    dst: absolute(&backup),
-                    backup_path: saved,
-                },
-            );
+        if let (Some(j), Some(e)) = (journal, &mut entry) {
+            let _ = j.commit(e);
         }
-        return Ok(backup);
+        return Ok((backup, entry));
     }
 }

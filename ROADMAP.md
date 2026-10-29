@@ -15,7 +15,8 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - **`ls`**: `--dired` (`-D`) is not implemented; `--hyperlink=WHEN` is validated but no hyperlinks are emitted. `--color` follows GNU's built-in table and `LS_COLORS` exactly, except the `ca` (file capabilities) colour, which is never applied: the reference GNU build (Ubuntu) has no libcap and doesn't apply it either.
 - **`cp` / `mv` / `ln`**
   - `cp -r` refuses to copy a directory into itself before anything is copied, whereas GNU copies part of the tree first (and lists it with `-v`). The message and exit status match.
-  - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour). FIFOs and device files hold no data and are not kept: undoing a copy over one removes the copy but does not bring the special file back.
+  - Overwritten and removed files are kept in the undo trash, so other hard links to them show a link count one higher than under GNU (`DOGFISH_UNDO=off` restores GNU's behaviour). Device files are not kept: undoing a copy over one removes the copy but does not bring the device back.
+  - For files on another file system than `$DOGFISH_HOME`, the trash is a private `.dogfish-trash-<uid>-<hash>` directory at the top of that file system (as the freedesktop trash's `.Trash-<uid>`), created when first needed if the top is writable; GNU creates nothing there.
   - Extended attributes, ACLs and SELinux contexts are not copied (`--preserve=xattr,context` and `-a` accept them). `cp --debug` prints nothing.
   - `cp -n` behaves as upstream 9.4 (`not replacing 'f'`, exit status 1; `-b -n` is rejected). Ubuntu's 9.4 package carries 9.5's behaviour instead (a warning, then skipping with status 0).
   - GNU 9.4's `mv -b -n` prints its "mutually exclusive" error and still moves the file (a GNU bug); Dogfish errors without moving.
