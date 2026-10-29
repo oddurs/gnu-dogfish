@@ -28,3 +28,13 @@ Port `hash.rs` to the 0.11 APIs in one change; check `b2sum -l`, the md5/sha
 ## Acceptance criteria
 
 - [ ] The grouped Dependabot PR (or a manual one) merges with the full suite green.
+
+## 2026-10-29
+
+Dependabot's grouped PR #13 (digest 0.11.3, blake2 0.11.0) does not compile:
+blake2 0.11 removed `Blake2bVar` (b2sum `-l` needs runtime-length BLAKE2b),
+md-5 0.11 removed the `asm` feature (so it could not join the group), and
+the ring SHA-256 adapter implements digest 0.10's traits. Closed #13 and
+added a Dependabot `ignore` for the four crates' 0.11+ in
+`.github/dependabot.yml`; remove it as part of this item. Bench md-5 without
+`asm` before switching.
