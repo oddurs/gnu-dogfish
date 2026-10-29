@@ -1313,9 +1313,8 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && let Some(InputSource::File(path)) =
             sources.iter().find(|s| matches!(s, InputSource::File(_)))
     {
-        let blksize = std::fs::metadata(path).map_or(0, |m| {
-            std::os::unix::fs::MetadataExt::blksize(&m)
-        });
+        let blksize =
+            std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blksize(&m));
         stdout::gnu_input_on_fd1(blksize, true);
     }
     // Inputs stay mapped, except with -o, which may truncate one of them.

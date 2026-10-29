@@ -464,7 +464,7 @@ pub fn gnu_putchars(n: usize) {
 }
 
 /// GNU flushes standard output here: an `fflush`, or glibc's `error`,
-/// which flushes it before every diagnostic (see [`gnu_error!`]). Buffered
+/// which flushes it before every diagnostic (see [`crate::gnu_error!`]). Buffered
 /// bytes are written out now too, so that they come before the diagnostic.
 pub fn gnu_fflush() {
     let mut st = state();
