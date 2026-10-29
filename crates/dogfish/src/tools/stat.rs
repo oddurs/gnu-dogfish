@@ -192,6 +192,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let mut buf = Vec::new();
         let expanded = if file_system {
             if name == "-" {
+                ignore_broken_pipe(out.flush())?; // GNU error() flushes stdout first.
                 eprintln!(
                     "stat: using {} to denote standard input does not work in file system mode",
                     qa(name)
@@ -202,6 +203,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             let info = match FsStats::query(path) {
                 Ok(info) => info,
                 Err(e) => {
+                    ignore_broken_pipe(out.flush())?;
                     eprintln!(
                         "stat: cannot read file system information for {}: {}",
                         qa(name),
@@ -228,6 +230,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             let meta = match meta {
                 Ok(m) => m,
                 Err(e) => {
+                    ignore_broken_pipe(out.flush())?;
                     eprintln!("stat: cannot statx {}: {}", qa(name), gnu_io_error(&e));
                     status = 1;
                     continue;

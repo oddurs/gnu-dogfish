@@ -151,6 +151,12 @@ pub fn started_closed() {
     state().closed = true;
 }
 
+/// Whether descriptor 1 was closed when the process started, for tools that
+/// use the descriptor other than by writing (`touch -`).
+pub fn was_closed() -> bool {
+    state().closed
+}
+
 /// Writes out any buffered bytes (before running a child process that shares
 /// the descriptor, or when output must reach a reader now).
 pub fn flush() -> io::Result<()> {

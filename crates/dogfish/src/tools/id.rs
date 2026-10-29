@@ -375,6 +375,11 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             line.extend_from_slice(id_full_format(&who, st).as_bytes());
         }
         line.push(term);
+        // With several users, -Gz ends each record with two NULs so that
+        // the records can be told apart.
+        if parsed.zero && parsed.groups && parsed.users.len() > 1 {
+            line.push(b'\0');
+        }
         ignore_broken_pipe(out.write_all(&line))?;
     }
     ignore_broken_pipe(out.flush())?;

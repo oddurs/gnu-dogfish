@@ -1,15 +1,13 @@
-//! Setting access and modification times (cp, touch).
+//! Setting access and modification times (cp).
 
 use std::io;
 use std::path::Path;
 
 use crate::common::path::c_path;
 
-/// A time to set with `utimensat`.
+/// A time to set with `utimensat`: seconds and nanoseconds.
 #[derive(Clone, Copy)]
 pub(crate) enum Stamp {
-    Now,
-    Omit,
     At(i64, u32),
 }
 
@@ -20,14 +18,6 @@ pub(crate) fn set_file_times(
     follow: bool,
 ) -> io::Result<()> {
     let spec = |s: Stamp| match s {
-        Stamp::Now => libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_NOW,
-        },
-        Stamp::Omit => libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
         Stamp::At(sec, nsec) => libc::timespec {
             tv_sec: sec,
             tv_nsec: nsec.into(),
