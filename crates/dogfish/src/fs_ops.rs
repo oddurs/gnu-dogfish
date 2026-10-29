@@ -2125,7 +2125,8 @@ mod tests {
     // regression can never turn the test into an actual `rm -r /`.
     #[test]
     fn is_root_dir_matches_every_spelling_of_root() {
-        for p in ["/", "//", "/.", "/./", "/tmp/..", "/usr/../."] {
+        // `/usr` rather than `/tmp`: on macOS `/tmp` is a symlink, so `/tmp/..` is `/private`.
+        for p in ["/", "//", "/.", "/./", "/usr/..", "/usr/../."] {
             assert!(is_root_dir(Path::new(p)), "{p}");
         }
     }
