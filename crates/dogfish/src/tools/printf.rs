@@ -7,6 +7,7 @@ use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::getopt::print_help;
+use crate::common::locale::utf8_locale;
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 
@@ -30,19 +31,11 @@ impl<'a> PrintfRun<'a> {
     /// clamping to the range of `intmax_t` (`signed`) or `uintmax_t`.
     fn int_arg(&mut self, s: Option<&str>, signed: bool) -> i128 {
         let Some(raw) = s else { return 0 };
+        if let Some(code) = self.char_constant(raw) {
+            return i128::from(code);
+        }
         let t = raw.trim_start();
         let b = t.as_bytes();
-        if let [b'\'' | b'"', rest @ ..] = b {
-            let code = std::str::from_utf8(rest)
-                .ok()
-                .and_then(|r| r.chars().next())
-                .map(|c| c as i128)
-                .or_else(|| rest.first().map(|&c| i128::from(c)));
-            if code.is_none() {
-                self.complain(raw, "expected a numeric value");
-            }
-            return code.unwrap_or(0);
-        }
         let (neg, body) = match b.first() {
             Some(b'-') => (true, &t[1..]),
             Some(b'+') => (false, &t[1..]),
@@ -85,8 +78,8 @@ impl<'a> PrintfRun<'a> {
 
     fn float_arg(&mut self, s: Option<&str>) -> f64 {
         let Some(raw) = s else { return 0.0 };
-        if let [b'\'' | b'"', rest @ ..] = raw.trim_start().as_bytes() {
-            return rest.first().copied().unwrap_or(0) as f64;
+        if let Some(code) = self.char_constant(raw) {
+            return f64::from(code);
         }
         match strtod_prefix(raw) {
             Some((v, used)) if used == raw.len() => v,
@@ -99,6 +92,31 @@ impl<'a> PrintfRun<'a> {
                 0.0
             }
         }
+    }
+
+    /// GNU's character constants: `'c` or `"c` is the code of `c` (a whole
+    /// UTF-8 character in a UTF-8 locale, else one byte), with a warning
+    /// when more characters follow. `None` when `raw` is no such constant.
+    fn char_constant(&mut self, raw: &str) -> Option<u32> {
+        let b = raw.as_bytes();
+        if b.len() < 2 || !matches!(b[0], b'\'' | b'"') {
+            return None;
+        }
+        let rest = &raw[1..];
+        let (code, len) = match rest.chars().next() {
+            Some(c) if utf8_locale() => (c as u32, c.len_utf8()),
+            _ => (u32::from(b[1]), 1),
+        };
+        let after = &b[1 + len..];
+        if !after.is_empty() && std::env::var_os("POSIXLY_CORRECT").is_none() {
+            let mut msg = b"printf: warning: ".to_vec();
+            msg.extend_from_slice(after);
+            msg.extend_from_slice(
+                b": character(s) following character constant have been ignored\n",
+            );
+            let _ = io::stderr().write_all(&msg);
+        }
+        Some(code)
     }
 
     fn complain(&mut self, raw: &str, what: &str) {
@@ -194,12 +212,24 @@ fn printf_once(
                     while i < fmt.len() && i - st < max && fmt[i].is_ascii_hexdigit() {
                         i += 1;
                     }
-                    if i == st {
+                    // \x takes 1 or 2 digits; \u and \U exactly 4 and 8.
+                    if i == st || (e != b'x' && i - st < max) {
                         eprintln!("printf: missing hexadecimal number in escape");
                         return Err(());
                     }
-                    let v = u32::from_str_radix(std::str::from_utf8(&fmt[st..i]).unwrap(), 16)
-                        .unwrap_or(0);
+                    let v = fmt[st..i].iter().fold(0u32, |v, &d| {
+                        v.wrapping_mul(16)
+                            .wrapping_add(char::from(d).to_digit(16).unwrap_or(0))
+                    });
+                    if e != b'x' && (0xd800..=0xdfff).contains(&v) {
+                        eprintln!(
+                            "printf: invalid universal character name \\{}{:0w$x}",
+                            e as char,
+                            v,
+                            w = max
+                        );
+                        return Err(());
+                    }
                     if e == b'x' {
                         out.push(v as u8);
                     } else {
@@ -226,14 +256,40 @@ fn printf_once(
             i += 1;
             continue;
         }
+        // %b and %q take no flags, width or precision (as in GNU).
+        if let Some(&c @ (b'b' | b'q')) = fmt.get(i) {
+            i += 1;
+            if let Some(a) = run.take() {
+                if c == b'q' {
+                    out.extend_from_slice(gnu_quote_file(a).as_bytes());
+                } else {
+                    let (bytes, stop) = unescape_echo_bytes(a.as_bytes(), true);
+                    out.extend(bytes);
+                    if stop {
+                        return Ok(false);
+                    }
+                }
+            }
+            continue;
+        }
         let mut flags = PrintfFlags::default();
+        // GNU's `ok` table: conversions each flag (and a precision) allows.
+        let mut bad_for: Vec<u8> = Vec::new();
         while let Some(&f) = fmt.get(i) {
             match f {
                 b'-' => flags.left = true,
-                b'0' => flags.zero = true,
+                b'0' => {
+                    flags.zero = true;
+                    bad_for.extend_from_slice(b"cs");
+                }
                 b'+' => flags.plus = true,
                 b' ' => flags.space = true,
-                b'#' => flags.alt = true,
+                b'#' => {
+                    flags.alt = true;
+                    bad_for.extend_from_slice(b"cdisu");
+                }
+                // Thousands grouping: nothing to group in GNU's C locale.
+                b'\'' | b'I' => bad_for.extend_from_slice(b"aAceEosxX"),
                 _ => break,
             }
             i += 1;
@@ -241,8 +297,16 @@ fn printf_once(
         let mut width = 0usize;
         if fmt.get(i) == Some(&b'*') {
             i += 1;
-            let w = run.take();
-            let w = run.int_arg(w, true);
+            let arg = run.take();
+            let w = run.int_arg(arg, true);
+            // GNU: the width must fit an int (no 2 GiB padding).
+            if !(i128::from(i32::MIN)..=i128::from(i32::MAX)).contains(&w) {
+                eprintln!(
+                    "printf: invalid field width: {}",
+                    gnu_quote(arg.unwrap_or_default())
+                );
+                return Err(());
+            }
             if w < 0 {
                 flags.left = true;
             }
@@ -256,10 +320,20 @@ fn printf_once(
         let mut prec: Option<usize> = None;
         if fmt.get(i) == Some(&b'.') {
             i += 1;
+            bad_for.push(b'c');
             if fmt.get(i) == Some(&b'*') {
                 i += 1;
-                let p = run.take();
-                let p = run.int_arg(p, true);
+                let arg = run.take();
+                let p = run.int_arg(arg, true);
+                // A negative precision is as if omitted; one beyond INT_MAX
+                // is an error.
+                if p > i128::from(i32::MAX) {
+                    eprintln!(
+                        "printf: invalid precision: {}",
+                        gnu_quote(arg.unwrap_or_default())
+                    );
+                    return Err(());
+                }
                 prec = (p >= 0).then_some(p as usize);
             } else {
                 let mut p = 0usize;
@@ -282,6 +356,13 @@ fn printf_once(
             return Err(());
         };
         i += 1;
+        if bad_for.contains(&conv) || !b"aAcdeEfFgGiosuxX".contains(&conv) {
+            eprintln!(
+                "printf: {}: invalid conversion specification",
+                String::from_utf8_lossy(&fmt[spec_start..i])
+            );
+            return Err(());
+        }
         let field: Vec<u8> = match conv {
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
                 let a = run.take();
@@ -302,23 +383,6 @@ fn printf_once(
                     None => a,
                 };
                 pad_field(a.to_vec(), width, flags, false)
-            }
-            b'b' => {
-                let a = run.take().unwrap_or("");
-                let (bytes, stop) = unescape_echo_bytes(a.as_bytes(), true);
-                let bytes = match prec {
-                    Some(p) => bytes[..p.min(bytes.len())].to_vec(),
-                    None => bytes,
-                };
-                out.extend(pad_field(bytes, width, flags, false));
-                if stop {
-                    return Ok(false);
-                }
-                continue;
-            }
-            b'q' => {
-                let a = run.take().unwrap_or("");
-                pad_field(gnu_quote_file(a).as_bytes().to_vec(), width, flags, false)
             }
             b'c' => {
                 let a = run.take().unwrap_or("");

@@ -38,6 +38,10 @@ fn fixtures() -> &'static Path {
             ("names0-dash.txt", b"-\0"),
             ("dup.txt", b"a\na\nb\nc\nc\nc\nd\n"),
             ("fields.txt", b"a:b:c\nd:e\nfgh\n"),
+            (
+                "u8.txt",
+                b"h\xc3\xa9llo w\xffrld \xc2\xa0x\n\xe6\x97\xa5\xe6\x9c\xac\n",
+            ),
         ];
         common::write_files(&dir, files);
         dir
@@ -100,6 +104,16 @@ gnu_cases! {
     wc_total_invalid: "wc" ["--total", "lines.txt", "many.txt"];
     wc_directory: "wc" [".", "lines.txt"];
     wc_bytes_regular: "wc" ["-c", "many.txt", "lines.txt"];
+    wc_chars_c_locale: "wc" ["-m", "u8.txt"];
+    wc_chars_bytes_c_locale: "wc" ["-mc", "u8.txt"];
+    wc_chars_stdin_c_locale: "wc" ["-m"] stdin b"h\xc3\xa9llo\n";
+    wc_all_c_locale: "wc" ["-lwmcL", "u8.txt"];
+    wc_width_c_locale: "wc" ["-L", "u8.txt"];
+    wc_words_c_locale: "wc" ["-w", "u8.txt"];
+    wc_chars_utf8: "wc" ["-m", "u8.txt"] @ "C.UTF-8";
+    wc_chars_bytes_utf8: "wc" ["-mc", "u8.txt"] @ "C.UTF-8";
+    wc_all_utf8: "wc" ["-lwmcL", "u8.txt"] @ "C.UTF-8";
+    wc_chars_stdin_utf8: "wc" ["-m"] @ "C.UTF-8" stdin b"h\xc3\xa9llo\n";
     wc_files0_from_one_name: "wc" ["--files0-from=-"] stdin b"lines.txt\0";
 
     // --------------------------------------------------------------- sort
@@ -212,6 +226,29 @@ gnu_cases! {
     tac_regex_default_separator: "tac" ["-r"] stdin b"a\nb\n";
     tac_two_files: "tac" ["lines.txt", "notrail.txt"];
     tac_missing_file: "tac" ["nonexist", "lines.txt"];
+
+    // ------------------------------------------------------------- printf
+    printf_width_too_large: "printf" ["%*d", "2147483648", "15"];
+    printf_width_too_small: "printf" ["%*d", "-2147483649", "15"];
+    printf_precision_too_large: "printf" ["%.*d", "2147483648", "15"];
+    printf_precision_negative: "printf" ["%.*d", "-3", "15"];
+    printf_precision_huge_negative: "printf" ["10 %.*dx", "-2147483649", "0"];
+    printf_width_not_numeric: "printf" ["%*d", "x", "1"];
+    printf_hash_d: "printf" ["%#d", "0"];
+    printf_zero_s: "printf" ["%0s", "0"];
+    printf_precision_c: "printf" ["%.9c", "0"];
+    printf_quote_s: "printf" ["%'s", "0"];
+    printf_quote_d: "printf" ["%'d", "3333"];
+    printf_width_b: "printf" ["%5b", "x"];
+    printf_char_constant_trailing: "printf" ["%d\n", "\"a\""];
+    printf_char_constant_alone: "printf" ["%d\n", "\""];
+    printf_char_constant_utf8: "printf" ["%d\n", "'\u{e9}"] @ "C.UTF-8";
+    printf_char_constant_c_locale: "printf" ["%d\n", "'\u{e9}"];
+    printf_leading_space_quote: "printf" ["%d\n", " 'a"];
+    printf_u_short: "printf" ["\\u00"];
+    printf_big_u_short: "printf" ["\\U0000"];
+    printf_u_surrogate: "printf" ["\\ud800"];
+    printf_u_ok: "printf" ["\\u0030"];
 }
 
 // ------------------------------------------------------- shell pipelines
