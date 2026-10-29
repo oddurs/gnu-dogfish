@@ -188,6 +188,16 @@ and non-regular files are read with `read(2)` instead.
 | `process_umask` | `umask(0)` to read the mask | No preconditions. Called before any thread that creates files starts, so the moment with mask 0 is never observed. |
 | `process_umask` | `umask(old)` to restore it | No preconditions. |
 
+### `crates/dogfish/src/common/parse_datetime.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `extern` | declares `tzset(void)` | The declaration matches POSIX `void tzset(void)`; the `libc` crate does not bind it on every Unix. |
+| `tzset` | `tzset()` | No arguments; re-reads `TZ` into libc's zone state. |
+| `with` | `env::set_var` / `env::remove_var` of `TZ` around a `localtime`/`mktime` call (gnulib's `time_rz` method) | Unsafe since edition 2024 because another thread could read the environment at the same time; `date` and `touch` have no other threads. The value comes from a C string or the environment, so it holds no NUL. |
+| `mktime` | `mktime` | `tm` is a valid, initialised `struct tm` that the call normalises in place. |
+| `gmtime` | `gmtime_r` | Out-pointer (a zeroed `struct tm`) and a pointer to a live `time_t`. |
+| `zero_tm` | `mem::zeroed::<tm>()` | Out-pointer (zeroed plain data); a `tm_zone` of null is valid. |
 ### `crates/dogfish/src/common/path.rs`
 
 | Item | Operation | Why it is sound |
@@ -248,11 +258,7 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `extern` | declares `tzset(void)` | The declaration matches POSIX `void tzset(void)`; the `libc` crate does not bind it on every Unix. |
-| `utc_time` | `gmtime_r` | Out-pointer. |
-| `make_time` | `timegm` / `mktime` | `tm` is a valid, initialised `struct tm` that the call normalises in place. |
 | `run_date` | `env::set_var("TZ", "UTC0")` for `-u` | Unsafe since edition 2024 because another thread could read the environment at the same time; `date` has no other threads. |
-| `run_date` | `tzset()` | No arguments; re-reads `TZ` into libc's zone state. |
 
 ### `crates/dogfish/src/tools/df.rs`
 
@@ -328,6 +334,10 @@ and non-regular files are read with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
+| `fstat_mode` | `fstat` | Descriptor only (0, 1 or a `File` this code owns), plus an out-pointer (zeroed `stat`). |
+| `iopoll` | `poll` on standard input and an output | The pointer and count describe a live array of two `pollfd`s. |
+| `write_wait` | `write(2)` | The pointer and length describe the live `buf` slice; a bad descriptor only makes the call fail. |
+| `write_wait` | `poll(POLLOUT)` after `EAGAIN` | A pointer to one live `pollfd`. |
 | `run_tee` | `signal(SIGINT/SIGPIPE, SIG_IGN)` for `-i` and `--output-error` | Signals: dispositions only, before any I/O. |
 
 ### `crates/dogfish/src/tools/timeout.rs`
@@ -341,6 +351,12 @@ and non-regular files are read with `read(2)` instead.
 | `run_timeout` | `getpid`, `getpgrp` | No preconditions. |
 | `run_timeout` | `setrlimit`, `signal`, `sigprocmask`, `raise` to die by the child's signal | Plain calls on this process with initialised arguments. |
 
+### `crates/dogfish/src/tools/touch.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `touch_one` | `futimens` | Descriptor only (standard output or a `File` opened just above), plus null or an array of two `timespec`s. |
+| `touch_one` | `utimensat` | C path; null or an array of two `timespec`s. |
 ### `crates/dogfish/src/tools/wc.rs`
 
 | Item | Operation | Why it is sound |
@@ -371,3 +387,10 @@ and non-regular files are read with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `build_fixture` | `mkfifo` (test) | C path. |
+
+### `crates/dogfish/tests/gnu_compat_system.rs`
+
+| Item | Operation | Why it is sound |
+| --- | --- | --- |
+| `run_nonblocking_stdout` | `fcntl(F_GETFL/F_SETFL, O_NONBLOCK)` on a pipe (test) | Descriptor only (owned by the `PipeWriter`). |
+| `timeout_with_sigchld_ignored` | `CommandExt::pre_exec` running `signal(SIGCHLD, SIG_IGN)` (test) | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
