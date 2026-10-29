@@ -1,419 +1,2992 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{
+    DirBuilderExt, DirEntryExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink,
+};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Local};
-use clap::Parser;
+use anyhow::Result;
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use dogfish_core::{
-    ColumnAlign, DogfishContext, JournalAction, Style, Table, UndoJournal, copy_file_fast,
+    ColumnAlign, CopyMethod, DogfishContext, JournalAction, Style, Table, UndoJournal,
     emit_objects_or_table, format_mode_rwx, format_relative_time, format_size, gnu_io_error,
     io::ignore_broken_pipe, move_path, same_file, sparkline_bar,
 };
-use filetime::FileTime;
-use jwalk::WalkDir;
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::sys::{get_groupname_by_gid, get_username_by_uid};
 
 // ---------------------------------------------------------------------------
+// 0. GNU conventions shared by the file tools: getopt-style option parsing,
+//    quoting of file names in messages, prompts, mode strings and backups.
+// ---------------------------------------------------------------------------
+
+// Permission bits as `u32` (`libc::mode_t` is `u16` on macOS).
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_ISVTX: u32 = 0o1000;
+const S_IRWXU: u32 = 0o700;
+const S_IRWXG: u32 = 0o070;
+const S_IRWXO: u32 = 0o007;
+const S_IRWXUGO: u32 = 0o777;
+const CHMOD_MODE_BITS: u32 = 0o7777;
+
+/// Whether an option takes an argument, as in `getopt_long`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HasArg {
+    No,
+    Required,
+    Optional,
+}
+
+/// One option: any of the letters in `shorts` and/or the `long` name.
+struct ToolOpt<T> {
+    shorts: &'static str,
+    long: &'static str,
+    arg: HasArg,
+    id: T,
+}
+
+const fn opt<T>(shorts: &'static str, long: &'static str, arg: HasArg, id: T) -> ToolOpt<T> {
+    ToolOpt {
+        shorts,
+        long,
+        arg,
+        id,
+    }
+}
+
+/// Parsed command line: options in the order given (so later flags can override
+/// earlier ones, as in GNU) and the operands.
+struct ToolArgs<T> {
+    opts: Vec<(T, Option<String>)>,
+    operands: Vec<String>,
+}
+
+/// Prints a usage error the way every GNU utility does; returns exit status 1.
+fn usage_error(tool: &str, msg: &str) -> i32 {
+    eprintln!("{tool}: {msg}\nTry '{tool} --help' for more information.");
+    1
+}
+
+enum LongMatch<'a, T> {
+    Spec(&'a ToolOpt<T>),
+    Help,
+    Version,
+}
+
+/// Resolves a (possibly abbreviated) long option name. `Err` lists the
+/// candidates: none means unrecognized, several means ambiguous.
+fn find_long<'a, T: Copy + PartialEq>(
+    name: &str,
+    specs: &'a [ToolOpt<T>],
+) -> std::result::Result<(&'static str, LongMatch<'a, T>), Vec<&'static str>> {
+    let mut candidates: Vec<(&'static str, LongMatch<'a, T>)> = specs
+        .iter()
+        .filter(|s| !s.long.is_empty())
+        .map(|s| (s.long, LongMatch::Spec(s)))
+        .collect();
+    candidates.push(("help", LongMatch::Help));
+    candidates.push(("version", LongMatch::Version));
+    if let Some(i) = candidates.iter().position(|(long, _)| *long == name) {
+        return Ok(candidates.swap_remove(i));
+    }
+    let mut matches: Vec<_> = candidates
+        .into_iter()
+        .filter(|(long, _)| long.starts_with(name))
+        .collect();
+    let same_option = |a: &LongMatch<T>, b: &LongMatch<T>| match (a, b) {
+        (LongMatch::Spec(x), LongMatch::Spec(y)) => x.id == y.id && x.arg == y.arg,
+        _ => false,
+    };
+    if matches.len() == 1
+        || (!matches.is_empty() && matches.iter().all(|m| same_option(&m.1, &matches[0].1)))
+    {
+        return Ok(matches.swap_remove(0));
+    }
+    Err(matches.into_iter().map(|(long, _)| long).collect())
+}
+
+/// Parses `args` (including `argv[0]`) like glibc's `getopt_long`: options and
+/// operands may be interleaved, short options bundle, long options may be
+/// abbreviated, and `--` ends option processing. `--help` and `--version` are
+/// handled here. `Err` carries the exit status after help, version or a usage
+/// error has been printed.
+fn parse_tool_args<T: Copy + PartialEq>(
+    tool: &str,
+    args: &[String],
+    specs: &[ToolOpt<T>],
+    help: &str,
+) -> std::result::Result<ToolArgs<T>, i32> {
+    getopt_impl(tool, args, specs, help, false)
+}
+
+/// Like [`parse_tool_args`], but options end at the first operand (getopt's `+`
+/// mode, used by `basename`).
+fn parse_tool_args_posix<T: Copy + PartialEq>(
+    tool: &str,
+    args: &[String],
+    specs: &[ToolOpt<T>],
+    help: &str,
+) -> std::result::Result<ToolArgs<T>, i32> {
+    getopt_impl(tool, args, specs, help, true)
+}
+
+fn getopt_impl<T: Copy + PartialEq>(
+    tool: &str,
+    args: &[String],
+    specs: &[ToolOpt<T>],
+    help: &str,
+    stop_at_operand: bool,
+) -> std::result::Result<ToolArgs<T>, i32> {
+    let mut opts = Vec::new();
+    let mut operands = Vec::new();
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            operands.extend(rest.cloned());
+            break;
+        }
+        if let Some(body) = arg.strip_prefix("--") {
+            let (name, value) = match body.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (body, None),
+            };
+            let (full, found) = match find_long(name, specs) {
+                Ok(m) => m,
+                Err(c) if c.is_empty() => {
+                    return Err(usage_error(tool, &format!("unrecognized option '{arg}'")));
+                }
+                Err(c) => {
+                    let list: Vec<String> = c.iter().map(|l| format!("'--{l}'")).collect();
+                    return Err(usage_error(
+                        tool,
+                        &format!(
+                            "option '--{name}' is ambiguous; possibilities: {}",
+                            list.join(" ")
+                        ),
+                    ));
+                }
+            };
+            let has_arg = match &found {
+                LongMatch::Spec(s) => s.arg,
+                _ => HasArg::No,
+            };
+            let value = match (has_arg, value) {
+                (HasArg::No, Some(_)) => {
+                    return Err(usage_error(
+                        tool,
+                        &format!("option '--{full}' doesn't allow an argument"),
+                    ));
+                }
+                (HasArg::Required, None) => match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(usage_error(
+                            tool,
+                            &format!("option '--{full}' requires an argument"),
+                        ));
+                    }
+                },
+                (_, v) => v,
+            };
+            match found {
+                LongMatch::Spec(s) => opts.push((s.id, value)),
+                LongMatch::Help => {
+                    print!("{help}");
+                    return Err(0);
+                }
+                LongMatch::Version => {
+                    println!("{tool} (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
+                    return Err(0);
+                }
+            }
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            let body = &arg[1..];
+            for (idx, c) in body.char_indices() {
+                let Some(spec) = specs.iter().find(|s| s.shorts.contains(c)) else {
+                    return Err(usage_error(tool, &format!("invalid option -- '{c}'")));
+                };
+                let tail = &body[idx + c.len_utf8()..];
+                match spec.arg {
+                    HasArg::No => opts.push((spec.id, None)),
+                    HasArg::Optional => {
+                        opts.push((spec.id, (!tail.is_empty()).then(|| tail.to_string())));
+                        break;
+                    }
+                    HasArg::Required => {
+                        let value = if !tail.is_empty() {
+                            tail.to_string()
+                        } else if let Some(v) = rest.next() {
+                            v.clone()
+                        } else {
+                            return Err(usage_error(
+                                tool,
+                                &format!("option requires an argument -- '{c}'"),
+                            ));
+                        };
+                        opts.push((spec.id, Some(value)));
+                        break;
+                    }
+                }
+            }
+        } else {
+            operands.push(arg.clone());
+            if stop_at_operand {
+                operands.extend(rest.cloned());
+                break;
+            }
+        }
+    }
+    Ok(ToolArgs { opts, operands })
+}
+
+/// Matches `arg` (or an unambiguous prefix of it) against `table`, like GNU
+/// `argmatch`; prints GNU's diagnostic and returns `Err(1)` otherwise.
+fn argmatch<V: Copy + PartialEq>(
+    tool: &str,
+    context: &str,
+    arg: &str,
+    table: &[(&str, V)],
+) -> std::result::Result<V, i32> {
+    if let Some((_, v)) = table.iter().find(|(name, _)| *name == arg) {
+        return Ok(*v);
+    }
+    let matches: Vec<V> = table
+        .iter()
+        .filter(|(name, _)| name.starts_with(arg) && !arg.is_empty())
+        .map(|(_, v)| *v)
+        .collect();
+    if let Some(first) = matches.first()
+        && matches.iter().all(|v| v == first)
+    {
+        return Ok(*first);
+    }
+    let problem = if matches.is_empty() {
+        "invalid"
+    } else {
+        "ambiguous"
+    };
+    let mut msg = format!(
+        "{tool}: {problem} argument {} for {}\nValid arguments are:",
+        quote_locale(arg),
+        quote_locale(context)
+    );
+    let mut prev: Option<V> = None;
+    for (name, v) in table {
+        if prev == Some(*v) {
+            msg.push_str(&format!(", '{name}'"));
+        } else {
+            msg.push_str(&format!("\n  - '{name}'"));
+        }
+        prev = Some(*v);
+    }
+    eprintln!("{msg}\nTry '{tool} --help' for more information.");
+    Err(1)
+}
+
+/// `quoteaf`: how GNU names files in most messages (`'a b'`, `"it's"`, `'nl'$'\n''x'`).
+fn qa(s: impl AsRef<OsStr>) -> String {
+    quote_bytes(s.as_ref().as_bytes(), Quoting::ShellEscapeAlways)
+}
+
+/// `quotef`: quotes only names that need it, and `:` (used before `: error` text).
+fn qf(s: impl AsRef<OsStr>) -> String {
+    String::from_utf8_lossy(&quote_bytes_raw(
+        s.as_ref().as_bytes(),
+        Quoting::ShellEscape,
+        b":",
+    ))
+    .into_owned()
+}
+
+/// `quote`: GNU's locale quoting, `'tab\tname'` (curly quotes in UTF-8 locales).
+fn quote_locale(s: impl AsRef<OsStr>) -> String {
+    quote_bytes(s.as_ref().as_bytes(), Quoting::Locale)
+}
+
+/// Prints `tool: question` on stderr and reads one line from stdin; true when it
+/// starts with `y` or `Y` (GNU's `yesno` in the C locale). EOF answers no.
+fn ask(tool: &str, question: &str) -> bool {
+    eprint!("{tool}: {question}");
+    let _ = io::stderr().flush();
+    let mut line = Vec::new();
+    match io::stdin().lock().read_until(b'\n', &mut line) {
+        Ok(n) if n > 0 => matches!(line[0], b'y' | b'Y'),
+        _ => false,
+    }
+}
+
+/// The process umask (reading it requires setting it, so it is restored at once).
+fn process_umask() -> u32 {
+    let old = unsafe { libc::umask(0) };
+    unsafe { libc::umask(old) };
+    mode_t_to_u32(old)
+}
+
+// `libc::mode_t` is `u32` on Linux and `u16` on macOS: the casts below are
+// needed on one platform and redundant on the other.
+#[allow(clippy::unnecessary_cast)]
+fn mode_t_to_u32(mode: libc::mode_t) -> u32 {
+    mode as u32
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn u32_to_mode_t(mode: u32) -> libc::mode_t {
+    (mode & CHMOD_MODE_BITS) as libc::mode_t
+}
+
+/// The nine `rwx` characters of `mode`, with `s`/`S`/`t`/`T` for the special bits
+/// (`strmode` without the type letter).
+fn strmode9(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for (shift, special, letter) in [(6, S_ISUID, 's'), (3, S_ISGID, 's'), (0, S_ISVTX, 't')] {
+        let bits = (mode >> shift) & 7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        s.push(match (bits & 1 != 0, mode & special != 0) {
+            (true, true) => letter,
+            (false, true) => letter.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeFlag {
+    Ordinary,
+    CopyExisting,
+    XIfAnyX,
+}
+
+/// One clause of a compiled `chmod` mode (a port of gnulib's `modechange`).
+#[derive(Clone, Copy)]
+struct ModeChange {
+    op: u8,
+    flag: ModeFlag,
+    affected: u32,
+    value: u32,
+    mentioned: u32,
+}
+
+/// Compiles an octal or symbolic mode (`755`, `u+x,g-w`, `=rwX`, `go=u`).
+fn mode_compile(spec: &str) -> Option<Vec<ModeChange>> {
+    let s = spec.as_bytes();
+    let octal_digit = |b: Option<&u8>| b.copied().filter(|b| (b'0'..=b'7').contains(b));
+    if octal_digit(s.first()).is_some() {
+        let mut octal = 0u32;
+        for &b in s {
+            octal_digit(Some(&b))?;
+            octal = octal * 8 + u32::from(b - b'0');
+            if octal > CHMOD_MODE_BITS {
+                return None;
+            }
+        }
+        // Fewer than five digits leave a directory's set-id bits alone.
+        let mentioned = if s.len() < 5 {
+            (octal & (S_ISUID | S_ISGID)) | S_ISVTX | S_IRWXUGO
+        } else {
+            CHMOD_MODE_BITS
+        };
+        return Some(vec![ModeChange {
+            op: b'=',
+            flag: ModeFlag::Ordinary,
+            affected: CHMOD_MODE_BITS,
+            value: octal,
+            mentioned,
+        }]);
+    }
+
+    let mut changes = Vec::new();
+    let mut i = 0;
+    loop {
+        let mut affected = 0;
+        loop {
+            match s.get(i) {
+                Some(b'u') => affected |= S_ISUID | S_IRWXU,
+                Some(b'g') => affected |= S_ISGID | S_IRWXG,
+                Some(b'o') => affected |= S_ISVTX | S_IRWXO,
+                Some(b'a') => affected |= CHMOD_MODE_BITS,
+                Some(b'=' | b'+' | b'-') => break,
+                _ => return None,
+            }
+            i += 1;
+        }
+        loop {
+            let op = s[i];
+            i += 1;
+            let mut mentioned = 0;
+            let mut flag = ModeFlag::CopyExisting;
+            let value;
+            match s.get(i) {
+                Some(b'0'..=b'7') => {
+                    let mut octal = 0u32;
+                    while let Some(b) = octal_digit(s.get(i)) {
+                        octal = octal * 8 + u32::from(b - b'0');
+                        if octal > CHMOD_MODE_BITS {
+                            return None;
+                        }
+                        i += 1;
+                    }
+                    if affected != 0 || s.get(i).is_some_and(|&b| b != b',') {
+                        return None;
+                    }
+                    affected = CHMOD_MODE_BITS;
+                    mentioned = CHMOD_MODE_BITS;
+                    value = octal;
+                    flag = ModeFlag::Ordinary;
+                }
+                Some(b'u') => {
+                    value = S_IRWXU;
+                    i += 1;
+                }
+                Some(b'g') => {
+                    value = S_IRWXG;
+                    i += 1;
+                }
+                Some(b'o') => {
+                    value = S_IRWXO;
+                    i += 1;
+                }
+                _ => {
+                    let mut v = 0;
+                    flag = ModeFlag::Ordinary;
+                    loop {
+                        match s.get(i) {
+                            Some(b'r') => v |= 0o444,
+                            Some(b'w') => v |= 0o222,
+                            Some(b'x') => v |= 0o111,
+                            Some(b'X') => flag = ModeFlag::XIfAnyX,
+                            Some(b's') => v |= S_ISUID | S_ISGID,
+                            Some(b't') => v |= S_ISVTX,
+                            _ => break,
+                        }
+                        i += 1;
+                    }
+                    value = v;
+                }
+            }
+            changes.push(ModeChange {
+                op,
+                flag,
+                affected,
+                value,
+                mentioned: if mentioned != 0 {
+                    mentioned
+                } else if affected != 0 {
+                    affected & value
+                } else {
+                    value
+                },
+            });
+            if !matches!(s.get(i), Some(b'=' | b'+' | b'-')) {
+                break;
+            }
+        }
+        match s.get(i) {
+            Some(b',') => i += 1,
+            None => return Some(changes),
+            _ => return None,
+        }
+    }
+}
+
+/// Applies compiled `changes` to `old`; returns the new mode and the bits the
+/// changes cared about. Clauses without a `who` part honour `umask`.
+fn mode_adjust(old: u32, dir: bool, umask: u32, changes: &[ModeChange]) -> (u32, u32) {
+    let mut mode = old & CHMOD_MODE_BITS;
+    let mut mode_bits = 0;
+    for c in changes {
+        let omit = (if dir { S_ISUID | S_ISGID } else { 0 }) & !c.mentioned;
+        let mut value = c.value;
+        match c.flag {
+            ModeFlag::Ordinary => {}
+            ModeFlag::CopyExisting => {
+                value &= mode;
+                let spread = |mask: u32, all: u32| if value & mask != 0 { all } else { 0 };
+                value |= spread(0o444, 0o444) | spread(0o222, 0o222) | spread(0o111, 0o111);
+            }
+            ModeFlag::XIfAnyX => {
+                if mode & 0o111 != 0 || dir {
+                    value |= 0o111;
+                }
+            }
+        }
+        value &= (if c.affected != 0 { c.affected } else { !umask }) & !omit;
+        match c.op {
+            b'=' => {
+                let preserved = (if c.affected != 0 { !c.affected } else { 0 }) | omit;
+                mode_bits |= CHMOD_MODE_BITS & !preserved;
+                mode = (mode & preserved) | value;
+            }
+            b'+' => {
+                mode_bits |= value;
+                mode |= value;
+            }
+            _ => {
+                mode_bits |= value;
+                mode &= !value;
+            }
+        }
+    }
+    (mode, mode_bits)
+}
+
+/// `--backup` version control, as in GNU `backupfile`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupMode {
+    None,
+    Simple,
+    Numbered,
+    Existing,
+}
+
+const BACKUP_ARGS: &[(&str, BackupMode)] = &[
+    ("none", BackupMode::None),
+    ("off", BackupMode::None),
+    ("simple", BackupMode::Simple),
+    ("never", BackupMode::Simple),
+    ("existing", BackupMode::Existing),
+    ("nil", BackupMode::Existing),
+    ("numbered", BackupMode::Numbered),
+    ("t", BackupMode::Numbered),
+];
+
+/// The mode for `-b` / `--backup[=CONTROL]`: CONTROL, else `$VERSION_CONTROL`,
+/// else `existing`.
+fn backup_mode(tool: &str, arg: Option<&str>) -> std::result::Result<BackupMode, i32> {
+    match arg {
+        Some(a) => argmatch(tool, "backup type", a, BACKUP_ARGS),
+        None => match std::env::var("VERSION_CONTROL") {
+            Ok(v) if !v.is_empty() => argmatch(tool, "$VERSION_CONTROL", &v, BACKUP_ARGS),
+            _ => Ok(BackupMode::Existing),
+        },
+    }
+}
+
+/// `-S SUFFIX`, else `$SIMPLE_BACKUP_SUFFIX`, else `~` (a suffix with a `/` is ignored).
+fn backup_suffix(arg: Option<String>) -> String {
+    arg.or_else(|| std::env::var("SIMPLE_BACKUP_SUFFIX").ok())
+        .filter(|s| !s.is_empty() && !s.contains('/'))
+        .unwrap_or_else(|| "~".to_string())
+}
+
+/// The name an existing `dst` is renamed to before being replaced.
+fn backup_name(dst: &Path, mode: BackupMode, suffix: &str) -> PathBuf {
+    let with_suffix = |s: &str| {
+        let mut name = dst.as_os_str().to_os_string();
+        name.push(s);
+        PathBuf::from(name)
+    };
+    if mode == BackupMode::Simple {
+        return with_suffix(suffix);
+    }
+    let base = dst.file_name().map(OsStr::as_bytes).unwrap_or_default();
+    let dir = match dst.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let highest = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let rest = name.as_bytes().strip_prefix(base)?.strip_prefix(b".~")?;
+            let digits = rest.strip_suffix(b"~")?;
+            (digits.first().is_some_and(|d| (b'1'..=b'9').contains(d))
+                && digits.iter().all(u8::is_ascii_digit))
+            .then(|| std::str::from_utf8(digits).ok()?.parse::<u64>().ok())
+            .flatten()
+        })
+        .max();
+    match (mode, highest) {
+        (BackupMode::Existing, None) => with_suffix(suffix),
+        (_, n) => with_suffix(&format!(".~{}~", n.unwrap_or(0) + 1)),
+    }
+}
+
+/// Renames `dst` to its backup name before it is replaced. With a journal, a
+/// backup file that already exists is itself saved first, and the rename is
+/// recorded so `dogfish undo` can bring everything back.
+fn make_backup(
+    dst: &Path,
+    mode: BackupMode,
+    suffix: &str,
+    journal: Option<&UndoJournal>,
+    tool: &str,
+) -> io::Result<PathBuf> {
+    let backup = backup_name(dst, mode, suffix);
+    let saved = match journal {
+        Some(j) => j.backup_existing(&backup, false)?,
+        None => None,
+    };
+    if let Err(e) = fs::rename(dst, &backup) {
+        if let Some(s) = &saved {
+            let _ = move_path(Path::new(s), &backup);
+        }
+        return Err(e);
+    }
+    if let Some(j) = journal {
+        let _ = j.record(
+            tool,
+            JournalAction::Move {
+                src: absolute_lossy(dst),
+                dst: absolute_lossy(&backup),
+                backup_path: saved,
+            },
+        );
+    }
+    Ok(backup)
+}
+
+fn absolute_lossy(p: &Path) -> String {
+    std::path::absolute(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// gnulib `last_component`: the final name in `s`, ignoring trailing slashes
+/// (empty for `/` or the empty string).
+fn last_component(s: &[u8]) -> &[u8] {
+    let mut base = s.iter().take_while(|&&b| b == b'/').count();
+    let mut last_was_slash = false;
+    for (i, &b) in s.iter().enumerate().skip(base) {
+        if b == b'/' {
+            last_was_slash = true;
+        } else if last_was_slash {
+            base = i;
+            last_was_slash = false;
+        }
+    }
+    &s[base..]
+}
+
+/// gnulib `base_len`: length of `s` without trailing slashes (but `/` stays).
+fn base_len(s: &[u8]) -> usize {
+    let mut len = s.len();
+    while len > 1 && s[len - 1] == b'/' {
+        len -= 1;
+    }
+    len
+}
+
+/// The file name a source keeps inside a target directory (`d/` → `d`).
+fn operand_base(src: &str) -> OsString {
+    let last = last_component(src.as_bytes());
+    OsString::from_vec(last[..base_len(last)].to_vec())
+}
+
+/// `dir/name` without doubling a trailing slash (gnulib `file_name_concat`).
+fn concat_path(dir: &str, name: &OsStr) -> PathBuf {
+    let mut s = OsString::from(dir);
+    if !dir.ends_with('/') {
+        s.push("/");
+    }
+    s.push(name);
+    PathBuf::from(s)
+}
+
+/// Strips trailing slashes, keeping a lone `/`.
+fn strip_trailing_slashes(s: &str) -> String {
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() && !s.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// True if `a` and `b` (already stat'ed) are the same inode.
+fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// The names in `dir`: in `readdir` order (as GNU's `fts` visits them), or sorted
+/// by inode number (as GNU `cp` copies them).
+fn dir_names(dir: &Path, by_inode: bool) -> io::Result<Vec<OsString>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|e| e.map(|e| (e.ino(), e.file_name())))
+        .collect::<io::Result<Vec<_>>>()?;
+    if by_inode {
+        names.sort_by_key(|(ino, _)| *ino);
+    }
+    Ok(names.into_iter().map(|(_, name)| name).collect())
+}
+
+fn c_path(p: &Path) -> io::Result<CString> {
+    CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// True when the calling user may not write `p` (GNU asks before removing or
+/// replacing such files). Symbolic links are never write-protected.
+fn write_protected(p: &Path) -> bool {
+    let Ok(c) = c_path(p) else {
+        return false;
+    };
+    let denied = unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0;
+    denied && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+}
+
+/// A time to set with `utimensat`.
+#[derive(Clone, Copy)]
+enum Stamp {
+    Now,
+    Omit,
+    At(i64, u32),
+}
+
+fn set_file_times(path: &Path, atime: Stamp, mtime: Stamp, follow: bool) -> io::Result<()> {
+    let spec = |s: Stamp| match s {
+        Stamp::Now => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+        Stamp::Omit => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        Stamp::At(sec, nsec) => libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec.into(),
+        },
+    };
+    let times = [spec(atime), spec(mtime)];
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let c = c_path(path)?;
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Decides whether `rm`, `mv` or `cp` should ask before acting on a file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interactive {
+    /// Never ask (`-f`).
+    Never,
+    /// Ask only about write-protected files when stdin is a terminal (the default).
+    Sometimes,
+    /// Always ask (`-i`).
+    Always,
+}
+
+/// The `--preserve-root` failsafe message for recursive `rm`, `chmod` and `chown`.
+fn refuse_root(tool: &str, operand: &str) {
+    if operand == "/" {
+        eprintln!("{tool}: it is dangerous to operate recursively on '/'");
+    } else {
+        eprintln!(
+            "{tool}: it is dangerous to operate recursively on {} (same as '/')",
+            qa(operand)
+        );
+    }
+    eprintln!("{tool}: use --no-preserve-root to override this failsafe");
+}
+
+// ---------------------------------------------------------------------------
 // 1. mkdir
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(
-    name = "mkdir",
-    about = "Create directories if they do not already exist"
-)]
-struct MkdirArgs {
-    /// No error if existing, make parent directories as needed
-    #[arg(short = 'p', long = "parents")]
-    parents: bool,
+const MKDIR_HELP: &str = "\
+Usage: mkdir [OPTION]... DIRECTORY...
+Create the DIRECTORY(ies), if they do not already exist.
 
-    /// Set file mode (as in chmod), e.g., 755
-    #[arg(short = 'm', long = "mode")]
-    mode: Option<String>,
+  -m, --mode=MODE   set file mode (as in chmod), not a=rwx - umask
+  -p, --parents     no error if existing, make parent directories as needed,
+                    with their file modes unaffected by any -m option
+  -v, --verbose     print a message for each created directory
+  -Z, --context     accepted for compatibility (SELinux is not supported)
+      --help        display this help and exit
+      --version     output version information and exit
+";
 
-    /// Print a message for each created directory
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-
-    #[arg(required = true)]
-    dirs: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MkdirOpt {
+    Mode,
+    Parents,
+    Verbose,
+    Context,
 }
 
 pub fn run_mkdir(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = MkdirArgs::try_parse_from(args)?;
-    let mut exit_code = 0;
+    use MkdirOpt::*;
+    const SPECS: &[ToolOpt<MkdirOpt>] = &[
+        opt("m", "mode", HasArg::Required, Mode),
+        opt("p", "parents", HasArg::No, Parents),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("Z", "", HasArg::No, Context),
+        opt("", "context", HasArg::Optional, Context),
+    ];
+    let parsed = match parse_tool_args("mkdir", &args, SPECS, MKDIR_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let (mut mode_arg, mut parents, mut verbose) = (None, false, false);
+    for (o, v) in parsed.opts {
+        match o {
+            Mode => mode_arg = v,
+            Parents => parents = true,
+            Verbose => verbose = true,
+            Context => {}
+        }
+    }
+    if parsed.operands.is_empty() {
+        return Ok(usage_error("mkdir", "missing operand"));
+    }
 
-    for dir in &parsed.dirs {
-        let res = if parsed.parents {
-            fs::create_dir_all(dir)
-        } else {
-            fs::create_dir(dir)
-        };
-        match res {
-            Ok(()) => {
-                if let Some(ref m_str) = parsed.mode
-                    && let Ok(oct) = u32::from_str_radix(m_str.trim_start_matches('0'), 8)
-                {
-                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(oct));
-                }
-                ctx.telemetry.add_items(1);
-                if parsed.verbose {
-                    println!("mkdir: created directory '{}'", dir);
-                }
+    // As in GNU: the final directory is made under `umask & !mode` (so -m wins),
+    // ancestors under the umask minus u+wx.
+    let umask = process_umask();
+    let (mode, mode_bits) = match &mode_arg {
+        Some(m) => match mode_compile(m) {
+            Some(changes) => mode_adjust(S_IRWXUGO, true, umask, &changes),
+            None => {
+                eprintln!("mkdir: invalid mode {}", quote_locale(m));
+                return Ok(1);
             }
-            Err(e) => {
-                eprintln!("mkdir: cannot create directory '{}': {}", dir, e);
-                exit_code = 1;
+        },
+        None => (S_IRWXUGO, 0),
+    };
+    let masks = MkdirMasks {
+        own: if mode_arg.is_some() {
+            umask & !mode
+        } else {
+            umask
+        },
+        ancestor: umask & !0o300,
+    };
+
+    let mut status = 0;
+    for dir in &parsed.operands {
+        match mkdir_one(dir, parents, mode, mode_bits, masks, verbose) {
+            Ok(()) => ctx.telemetry.add_items(1),
+            Err(msg) => {
+                eprintln!("mkdir: {msg}");
+                status = 1;
             }
         }
     }
-    Ok(exit_code)
+    Ok(status)
+}
+
+/// The umasks `mkdir` creates directories under.
+#[derive(Clone, Copy)]
+struct MkdirMasks {
+    own: u32,
+    ancestor: u32,
+}
+
+/// mkdir(2) under a given umask (restored afterwards).
+fn mkdir_with_umask(path: &str, mode: u32, umask: u32) -> io::Result<()> {
+    let old = unsafe { libc::umask(u32_to_mode_t(umask)) };
+    let res = fs::DirBuilder::new().mode(mode).create(path);
+    unsafe { libc::umask(old) };
+    res
+}
+
+/// Byte offsets where each non-final component of `path` ends.
+fn ancestor_ends(path: &str) -> Vec<usize> {
+    let b = path.as_bytes();
+    let mut ends = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        while i < b.len() && b[i] != b'/' {
+            i += 1;
+        }
+        ends.push(i);
+    }
+    ends.pop();
+    ends
+}
+
+fn mkdir_one(
+    dir: &str,
+    parents: bool,
+    mode: u32,
+    mode_bits: u32,
+    masks: MkdirMasks,
+    verbose: bool,
+) -> std::result::Result<(), String> {
+    let announce = |d: &str| {
+        if verbose {
+            println!("mkdir: created directory {}", qa(d));
+        }
+    };
+    let cannot =
+        |d: &str, why: String| format!("cannot create directory {}: {why}", quote_locale(d));
+    if parents {
+        for end in ancestor_ends(dir) {
+            let prefix = &dir[..end];
+            match mkdir_with_umask(prefix, S_IRWXUGO, masks.ancestor) {
+                Ok(()) => announce(prefix),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if !Path::new(prefix).is_dir() {
+                        let dangling = fs::metadata(prefix).is_err();
+                        let why = if dangling {
+                            "File exists"
+                        } else {
+                            "Not a directory"
+                        };
+                        return Err(cannot(prefix, why.to_string()));
+                    }
+                }
+                Err(e) => return Err(cannot(prefix, gnu_io_error(&e))),
+            }
+        }
+    }
+    // gnulib `make_dir_parents`: when special bits are involved, create the
+    // directory without group/other write first, then fix the bits -m asked for.
+    let keep_special = ((mode_bits & (S_ISUID | S_ISGID)) | (mode & S_ISVTX)) == 0;
+    let mkdir_mode = if keep_special { mode } else { mode & !0o022 };
+    match mkdir_with_umask(dir, mkdir_mode, masks.own) {
+        Ok(()) => {
+            announce(dir);
+            let umask_ok = mode & mode_bits & S_IRWXUGO == 0;
+            if !(keep_special && umask_ok)
+                && let Ok(meta) = fs::metadata(dir)
+            {
+                let st = meta.mode() & CHMOD_MODE_BITS;
+                if (st ^ mode) & mode_bits != 0 {
+                    let new = mode | (st & !mode_bits);
+                    fs::set_permissions(dir, fs::Permissions::from_mode(new)).map_err(|e| {
+                        format!(
+                            "cannot change permissions of {}: {}",
+                            qa(dir),
+                            gnu_io_error(&e)
+                        )
+                    })?;
+                }
+            }
+            Ok(())
+        }
+        Err(e)
+            if parents && e.kind() == io::ErrorKind::AlreadyExists && Path::new(dir).is_dir() =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(cannot(dir, gnu_io_error(&e))),
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 2. touch
+// 2. touch — `-d` understands the common GNU date formats (see `parse_datetime`)
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(
-    name = "touch",
-    about = "Update the access and modification times of each FILE to the current time"
-)]
-struct TouchArgs {
-    /// Do not create any files
-    #[arg(short = 'c', long = "no-create")]
-    no_create: bool,
+const TOUCH_HELP: &str = "\
+Usage: touch [OPTION]... FILE...
+Update the access and modification times of each FILE to the current time.
 
-    /// Change only the access time
-    #[arg(short = 'a')]
-    access_only: bool,
+A FILE argument that does not exist is created empty, unless -c or -h
+is supplied.
 
-    /// Change only the modification time
-    #[arg(short = 'm')]
-    modify_only: bool,
+  -a                     change only the access time
+  -c, --no-create        do not create any files
+  -d, --date=STRING      parse STRING and use it instead of current time
+  -f                     (ignored)
+  -h, --no-dereference   affect each symbolic link instead of any referenced
+                         file
+  -m                     change only the modification time
+  -r, --reference=FILE   use this file's times instead of current time
+  -t STAMP               use [[CC]YY]MMDDhhmm[.ss] instead of current time
+      --time=WORD        change the specified time:
+                           WORD is access, atime, or use: equivalent to -a
+                           WORD is modify or mtime: equivalent to -m
+      --help             display this help and exit
+      --version          output version information and exit
 
-    /// Use this file's times instead of current time
-    #[arg(short = 'r', long = "reference")]
-    reference: Option<String>,
+STRING may be '@SECONDS', an ISO date such as '2020-01-31 13:45:00.5 +0100',
+'Jan 31 2020', '1/31/2020', and relative items like 'yesterday',
+'2 days ago' or '+3 hours'.
+";
 
-    #[arg(required = true)]
-    files: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TouchOpt {
+    Access,
+    NoCreate,
+    Date,
+    Ignored,
+    NoDeref,
+    Modify,
+    Reference,
+    StampArg,
+    Time,
 }
 
 pub fn run_touch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = TouchArgs::try_parse_from(args)?;
-    let (ref_atime, ref_mtime) = if let Some(ref rpath) = parsed.reference {
-        let meta = fs::metadata(rpath)?;
-        (
-            FileTime::from_last_access_time(&meta),
-            FileTime::from_last_modification_time(&meta),
-        )
-    } else {
-        let now = FileTime::now();
-        (now, now)
+    use TouchOpt::*;
+    const SPECS: &[ToolOpt<TouchOpt>] = &[
+        opt("a", "", HasArg::No, Access),
+        opt("c", "no-create", HasArg::No, NoCreate),
+        opt("d", "date", HasArg::Required, Date),
+        opt("f", "", HasArg::No, Ignored),
+        opt("h", "no-dereference", HasArg::No, NoDeref),
+        opt("m", "", HasArg::No, Modify),
+        opt("r", "reference", HasArg::Required, Reference),
+        opt("t", "", HasArg::Required, StampArg),
+        opt("", "time", HasArg::Required, Time),
+    ];
+    let parsed = match parse_tool_args("touch", &args, SPECS, TOUCH_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
+    let (mut atime, mut mtime, mut no_create, mut no_deref) = (false, false, false, false);
+    let (mut date, mut reference, mut stamp) = (None, None, None);
+    for (o, v) in parsed.opts {
+        match o {
+            Access => atime = true,
+            Modify => mtime = true,
+            NoCreate => no_create = true,
+            NoDeref => no_deref = true,
+            Date => date = v,
+            Reference => reference = v,
+            StampArg => stamp = v,
+            Time => {
+                const WORDS: &[(&str, bool)] = &[
+                    ("atime", true),
+                    ("access", true),
+                    ("use", true),
+                    ("mtime", false),
+                    ("modify", false),
+                ];
+                match argmatch("touch", "--time", v.as_deref().unwrap_or_default(), WORDS) {
+                    Ok(true) => atime = true,
+                    Ok(false) => mtime = true,
+                    Err(code) => return Ok(code),
+                }
+            }
+            Ignored => {}
+        }
+    }
+    if stamp.is_some() && (date.is_some() || reference.is_some()) {
+        return Ok(usage_error(
+            "touch",
+            "cannot specify times from more than one source",
+        ));
+    }
+    if !atime && !mtime {
+        atime = true;
+        mtime = true;
+    }
+    if parsed.operands.is_empty() {
+        return Ok(usage_error("touch", "missing file operand"));
+    }
 
-    for path_str in &parsed.files {
-        let path = Path::new(path_str);
-        if !path.exists() {
-            if parsed.no_create {
+    let now = now_stamp();
+    let (mut a_stamp, mut m_stamp) = (Stamp::Now, Stamp::Now);
+    if let Some(r) = &reference {
+        let meta = if no_deref {
+            fs::symlink_metadata(r)
+        } else {
+            fs::metadata(r)
+        };
+        let meta = match meta {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "touch: failed to get attributes of {}: {}",
+                    qa(r),
+                    gnu_io_error(&e)
+                );
+                return Ok(1);
+            }
+        };
+        let ns = |n: i64| u32::try_from(n).unwrap_or(0);
+        a_stamp = Stamp::At(meta.atime(), ns(meta.atime_nsec()));
+        m_stamp = Stamp::At(meta.mtime(), ns(meta.mtime_nsec()));
+    }
+    if let Some(d) = &date {
+        // With -r, the date is relative to the reference file's times.
+        let base = |s: Stamp| match s {
+            Stamp::At(sec, ns) => (sec, ns),
+            _ => now,
+        };
+        match (
+            parse_datetime(d, base(a_stamp)),
+            parse_datetime(d, base(m_stamp)),
+        ) {
+            (Some((asec, ans)), Some((msec, mns))) => {
+                a_stamp = Stamp::At(asec, ans);
+                m_stamp = Stamp::At(msec, mns);
+            }
+            _ => {
+                eprintln!("touch: invalid date format {}", quote_locale(d));
+                return Ok(1);
+            }
+        }
+    }
+    if let Some(t) = &stamp {
+        match parse_touch_stamp(t) {
+            Some((sec, ns)) => {
+                a_stamp = Stamp::At(sec, ns);
+                m_stamp = Stamp::At(sec, ns);
+            }
+            None => {
+                eprintln!("touch: invalid date format {}", quote_locale(t));
+                return Ok(1);
+            }
+        }
+    }
+    if !atime {
+        a_stamp = Stamp::Omit;
+    }
+    if !mtime {
+        m_stamp = Stamp::Omit;
+    }
+
+    let mut status = 0;
+    for file in &parsed.operands {
+        let path = Path::new(file);
+        let mut open_err = None;
+        if !no_create && !no_deref {
+            // O_CREAT without O_TRUNC: never truncates, even if the file appeared meanwhile.
+            if let Err(e) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .mode(0o666)
+                .open(path)
+            {
+                open_err = Some(e);
+            }
+        }
+        match set_file_times(path, a_stamp, m_stamp, !no_deref) {
+            Ok(()) => ctx.telemetry.add_items(1),
+            Err(e) => {
+                if let Some(oe) = open_err {
+                    eprintln!("touch: cannot touch {}: {}", qa(file), gnu_io_error(&oe));
+                } else if no_create && e.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                } else {
+                    eprintln!("touch: setting times of {}: {}", qa(file), gnu_io_error(&e));
+                }
+                status = 1;
+            }
+        }
+    }
+    Ok(status)
+}
+
+fn now_stamp() -> (i64, u32) {
+    let d = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    (
+        i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        d.subsec_nanos(),
+    )
+}
+
+/// Seconds since the epoch of a local wall-clock time; in a DST gap the time is
+/// read with the offset in force before the gap (as `mktime` does).
+fn local_to_epoch(date: NaiveDate, secs_of_day: i64) -> Option<i64> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    let naive = midnight + chrono::Duration::seconds(secs_of_day);
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(t) => Some(t.timestamp()),
+        chrono::LocalResult::Ambiguous(t, _) => Some(t.timestamp()),
+        chrono::LocalResult::None => {
+            let before = Local
+                .from_local_datetime(&(naive - chrono::Duration::hours(3)))
+                .earliest()?;
+            Some(naive.and_utc().timestamp() - i64::from(before.offset().local_minus_utc()))
+        }
+    }
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let y = i32::try_from(year).unwrap_or(1970);
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(y + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(y, month + 1, 1)
+    };
+    next.and_then(|n| n.pred_opt()).map_or(31, |d| d.day())
+}
+
+/// `touch -t [[CC]YY]MMDDhhmm[.ss]`, in local time.
+fn parse_touch_stamp(s: &str) -> Option<(i64, u32)> {
+    let (main, secs) = match s.split_once('.') {
+        Some((m, ss)) if ss.len() == 2 && ss.bytes().all(|b| b.is_ascii_digit()) => {
+            (m, ss.parse::<i64>().ok()?)
+        }
+        Some(_) => return None,
+        None => (s, 0),
+    };
+    if !main.bytes().all(|b| b.is_ascii_digit()) || ![8, 10, 12].contains(&main.len()) {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| main[r].parse::<u32>().ok();
+    let n = main.len();
+    let (month, day, hour, minute) = (
+        num(n - 8..n - 6)?,
+        num(n - 6..n - 4)?,
+        num(n - 4..n - 2)?,
+        num(n - 2..n)?,
+    );
+    let year = match n {
+        12 => i64::from(num(0..4)?),
+        10 => {
+            let yy = i64::from(num(0..2)?);
+            if yy < 69 { 2000 + yy } else { 1900 + yy }
+        }
+        _ => i64::from(Local::now().year()),
+    };
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || secs > 60
+    {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)?;
+    let epoch = local_to_epoch(date, i64::from(hour * 3600 + minute * 60))?;
+    Some((epoch + secs, 0))
+}
+
+/// Time-zone abbreviations GNU `parse_datetime` knows, in seconds east of UTC.
+const TZ_NAMES: &[(&str, i64)] = &[
+    ("gmt", 0),
+    ("ut", 0),
+    ("utc", 0),
+    ("z", 0),
+    ("wet", 0),
+    ("west", 3600),
+    ("bst", 3600),
+    ("art", -3 * 3600),
+    ("brt", -3 * 3600),
+    ("brst", -2 * 3600),
+    ("nst", -(3 * 3600 + 1800)),
+    ("ndt", -(2 * 3600 + 1800)),
+    ("ast", -4 * 3600),
+    ("adt", -3 * 3600),
+    ("est", -5 * 3600),
+    ("edt", -4 * 3600),
+    ("cst", -6 * 3600),
+    ("cdt", -5 * 3600),
+    ("mst", -7 * 3600),
+    ("mdt", -6 * 3600),
+    ("pst", -8 * 3600),
+    ("pdt", -7 * 3600),
+    ("akst", -9 * 3600),
+    ("akdt", -8 * 3600),
+    ("hst", -10 * 3600),
+    ("hast", -10 * 3600),
+    ("hadt", -9 * 3600),
+    ("sst", -11 * 3600),
+    ("wat", 3600),
+    ("cet", 3600),
+    ("cest", 2 * 3600),
+    ("met", 3600),
+    ("mez", 3600),
+    ("mest", 2 * 3600),
+    ("mesz", 2 * 3600),
+    ("eet", 2 * 3600),
+    ("eest", 3 * 3600),
+    ("cat", 2 * 3600),
+    ("sast", 2 * 3600),
+    ("eat", 3 * 3600),
+    ("msk", 3 * 3600),
+    ("msd", 4 * 3600),
+    ("ist", 5 * 3600 + 1800),
+    ("sgt", 8 * 3600),
+    ("kst", 9 * 3600),
+    ("jst", 9 * 3600),
+    ("gst", 10 * 3600),
+    ("nzst", 12 * 3600),
+    ("nzdt", 13 * 3600),
+];
+
+const MONTH_NAMES: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+fn month_number(word: &str) -> Option<u32> {
+    let word = word.strip_suffix('.').unwrap_or(word);
+    if word == "sept" {
+        return Some(9);
+    }
+    let pos = MONTH_NAMES
+        .iter()
+        .position(|m| word.len() >= 3 && m.starts_with(&word[..3]))?;
+    let full = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ][pos];
+    (word.len() == 3 || full == word).then_some(pos as u32 + 1)
+}
+
+fn day_number(word: &str) -> Option<u32> {
+    let word = word.strip_suffix('.').unwrap_or(word);
+    let full = [
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+    ];
+    let pos = DAY_NAMES
+        .iter()
+        .position(|d| word.len() >= 3 && d.starts_with(&word[..3]))?;
+    (word.len() == 3 || full[pos] == word || (word.len() == 4 && full[pos].starts_with(word)))
+        .then_some(pos as u32)
+}
+
+/// Relative units: (months, seconds) per unit.
+fn rel_unit(word: &str) -> Option<(i64, i64)> {
+    let word = word
+        .strip_suffix('s')
+        .filter(|w| !w.is_empty())
+        .unwrap_or(word);
+    Some(match word {
+        "year" => (12, 0),
+        "month" => (1, 0),
+        "fortnight" => (0, 14 * 86400),
+        "week" => (0, 7 * 86400),
+        "day" => (0, 86400),
+        "hour" => (0, 3600),
+        "minute" | "min" => (0, 60),
+        "second" | "sec" => (0, 1),
+        _ => return None,
+    })
+}
+
+/// The items of a date string, as GNU `parse_datetime` collects them.
+#[derive(Default)]
+struct DateItems {
+    year: Option<(i64, usize)>,
+    month_day: Option<(u32, u32)>,
+    time: Option<(u32, u32, u32, u32)>,
+    meridian: Option<bool>,
+    zone: Option<i64>,
+    /// Day of the week (0 = Sunday) and its ordinal (`next` = 1, `last` = -1).
+    weekday: Option<(u32, i64)>,
+    rel_months: i64,
+    rel_days: i64,
+    rel_secs: i64,
+    rels_seen: bool,
+    last_rel: Option<(i64, i64, i64)>,
+}
+
+impl DateItems {
+    fn add_rel(&mut self, n: i64, (months, secs): (i64, i64)) {
+        let (m, d, s) = if secs % 86400 == 0 && secs != 0 {
+            (0, n * (secs / 86400), 0)
+        } else {
+            (n * months, 0, n * secs)
+        };
+        self.rel_months += m;
+        self.rel_days += d;
+        self.rel_secs += s;
+        self.rels_seen = true;
+        self.last_rel = Some((m, d, s));
+    }
+
+    fn set_date(&mut self, year: Option<(i64, usize)>, month: u32, day: u32) -> Option<()> {
+        if self.month_day.is_some() {
+            return None;
+        }
+        self.month_day = Some((month, day));
+        if year.is_some() {
+            self.year = year;
+        }
+        Some(())
+    }
+
+    fn set_time(&mut self, t: (u32, u32, u32, u32)) -> Option<()> {
+        if self.time.is_some() {
+            return None;
+        }
+        self.time = Some(t);
+        Some(())
+    }
+}
+
+/// A cursor over the lowercased input.
+struct DateLexer<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl DateLexer<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+
+    fn digits(&mut self) -> Option<(i64, usize)> {
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        let len = self.i - start;
+        if len == 0 || len > 18 {
+            return None;
+        }
+        Some((
+            std::str::from_utf8(&self.s[start..self.i])
+                .ok()?
+                .parse()
+                .ok()?,
+            len,
+        ))
+    }
+
+    fn word(&mut self) -> &str {
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'.')
+        {
+            self.i += 1;
+        }
+        std::str::from_utf8(&self.s[start..self.i]).unwrap_or("")
+    }
+
+    fn peek_word(&self) -> &str {
+        let mut j = self.i;
+        while self.s.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+            j += 1;
+        }
+        let start = j;
+        while self.s.get(j).is_some_and(|c| c.is_ascii_alphabetic()) {
+            j += 1;
+        }
+        std::str::from_utf8(&self.s[start..j]).unwrap_or("")
+    }
+
+    /// `HH:MM[:SS[.frac]]` after the hour has been read.
+    fn clock(&mut self, hour: i64) -> Option<(u32, u32, u32, u32)> {
+        self.i += 1; // ':'
+        let (minute, mlen) = self.digits()?;
+        if mlen != 2 {
+            return None;
+        }
+        let (mut second, mut nanos) = (0, 0);
+        if self.peek() == Some(b':') {
+            self.i += 1;
+            let (s, slen) = self.digits()?;
+            if slen != 2 {
+                return None;
+            }
+            second = s;
+            if matches!(self.peek(), Some(b'.' | b','))
+                && self.s.get(self.i + 1).is_some_and(u8::is_ascii_digit)
+            {
+                self.i += 1;
+                let start = self.i;
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.i += 1;
+                }
+                let frac = &self.s[start..self.i];
+                for k in 0..9 {
+                    nanos = nanos * 10 + frac.get(k).map_or(0, |d| u32::from(d - b'0'));
+                }
+            }
+        }
+        Some((
+            u32::try_from(hour).ok()?,
+            u32::try_from(minute).ok()?,
+            u32::try_from(second).ok()?,
+            nanos,
+        ))
+    }
+
+    /// A numeric zone `+HH`, `+HHMM` or `+HH:MM`, if one starts here.
+    fn numeric_zone(&mut self) -> Option<i64> {
+        let save = self.i;
+        let sign = match self.peek() {
+            Some(b'+') => 1,
+            Some(b'-') => -1,
+            _ => return None,
+        };
+        self.i += 1;
+        let Some((n, len)) = self.digits() else {
+            self.i = save;
+            return None;
+        };
+        let secs = match len {
+            1 | 2 if self.peek() == Some(b':') => {
+                self.i += 1;
+                let (m, mlen) = self.digits()?;
+                if mlen != 2 {
+                    return None;
+                }
+                n * 3600 + m * 60
+            }
+            1 | 2 => n * 3600,
+            4 => (n / 100) * 3600 + (n % 100) * 60,
+            _ => {
+                self.i = save;
+                return None;
+            }
+        };
+        Some(sign * secs)
+    }
+
+    /// After a time of day: an optional am/pm and an optional zone.
+    fn time_suffix(&mut self, items: &mut DateItems) -> Option<()> {
+        let save = self.i;
+        self.skip_space();
+        let w = self.peek_word().to_string();
+        let meridian = match w.as_str() {
+            "am" | "a" => Some(false),
+            "pm" | "p" => Some(true),
+            _ => None,
+        };
+        if let Some(pm) = meridian {
+            self.word();
+            if self.peek() == Some(b'.') {
+                self.i += 1;
+            }
+            items.meridian = Some(pm);
+        } else {
+            self.i = save;
+        }
+        if self.peek() == Some(b'z') && !self.s.get(self.i + 1).is_some_and(u8::is_ascii_alphabetic)
+        {
+            self.i += 1;
+            items.zone = Some(0);
+        } else if let Some(z) = self.numeric_zone() {
+            items.zone = Some(z);
+        }
+        Some(())
+    }
+}
+
+/// Parses the date formats GNU `touch -d` / `date -d` accept most often:
+/// `@SECONDS[.frac]`, ISO 8601 dates and times (`2020-01-31`, `2020-01-31T13:45:00Z`,
+/// `2020-01-31 13:45:00.5 +0100`), `YYYYMMDD`, `1/31/2020`, `Jan 31 2020`,
+/// `31 Jan 2020`, times with `am`/`pm`, zone names (`UTC`, `EST`, `CET`, …),
+/// weekdays, and relative items (`yesterday`, `2 days ago`, `+3 hours`,
+/// `next week`). `now` is `(seconds, nanoseconds)`; unspecified fields default
+/// like GNU: a date alone means midnight, relative items alone apply to `now`.
+fn parse_datetime(input: &str, now: (i64, u32)) -> Option<(i64, u32)> {
+    let lower = input.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix('@') {
+        return parse_epoch(rest.trim());
+    }
+    let mut lx = DateLexer {
+        s: lower.as_bytes(),
+        i: 0,
+    };
+    let mut it = DateItems::default();
+    loop {
+        lx.skip_space();
+        let Some(c) = lx.peek() else { break };
+        if c.is_ascii_digit() {
+            let (n, len) = lx.digits()?;
+            match lx.peek() {
+                Some(b'-')
+                    if lx.s.get(lx.i + 1).is_some_and(u8::is_ascii_digit)
+                        && it.month_day.is_none() =>
+                {
+                    // ISO 8601: YYYY-MM-DD[THH:MM[:SS]]
+                    lx.i += 1;
+                    let (month, _) = lx.digits()?;
+                    if lx.peek() != Some(b'-') {
+                        return None;
+                    }
+                    lx.i += 1;
+                    let (day, _) = lx.digits()?;
+                    it.set_date(
+                        Some((n, len)),
+                        u32::try_from(month).ok()?,
+                        u32::try_from(day).ok()?,
+                    )?;
+                    if lx.peek() == Some(b't') && lx.s.get(lx.i + 1).is_some_and(u8::is_ascii_digit)
+                    {
+                        lx.i += 1;
+                        let (h, _) = lx.digits()?;
+                        if lx.peek() != Some(b':') {
+                            return None;
+                        }
+                        let t = lx.clock(h)?;
+                        it.set_time(t)?;
+                        lx.time_suffix(&mut it)?;
+                    }
+                }
+                Some(b':') => {
+                    let t = lx.clock(n)?;
+                    it.set_time(t)?;
+                    lx.time_suffix(&mut it)?;
+                }
+                Some(b'/') => {
+                    // US style: MM/DD[/YYYY]
+                    lx.i += 1;
+                    let (day, _) = lx.digits()?;
+                    let mut year = None;
+                    if lx.peek() == Some(b'/') {
+                        lx.i += 1;
+                        year = Some(lx.digits()?);
+                    }
+                    it.set_date(year, u32::try_from(n).ok()?, u32::try_from(day).ok()?)?;
+                }
+                _ => {
+                    let next = lx.peek_word().to_string();
+                    if let Some(unit) = rel_unit(&next) {
+                        lx.skip_space();
+                        lx.word();
+                        it.add_rel(n, unit);
+                    } else if let Some(month) = month_number(&next) {
+                        // DD Month [YYYY]
+                        lx.skip_space();
+                        lx.word();
+                        lx.skip_space();
+                        let save = lx.i;
+                        let year = match lx.digits() {
+                            Some(y) if lx.peek() != Some(b':') => Some(y),
+                            _ => {
+                                lx.i = save;
+                                None
+                            }
+                        };
+                        it.set_date(year, month, u32::try_from(n).ok()?)?;
+                    } else if matches!(next.as_str(), "am" | "pm" | "a" | "p") && len <= 2 {
+                        it.set_time((u32::try_from(n).ok()?, 0, 0, 0))?;
+                        lx.time_suffix(&mut it)?;
+                    } else if it.month_day.is_some()
+                        && it.year.is_none()
+                        && !it.rels_seen
+                        && (it.time.is_some() || len > 2)
+                    {
+                        it.year = Some((n, len));
+                    } else if len > 4 {
+                        it.set_date(
+                            Some((n / 10000, len - 4)),
+                            u32::try_from((n / 100) % 100).ok()?,
+                            u32::try_from(n % 100).ok()?,
+                        )?;
+                    } else {
+                        let (h, m) = if len <= 2 { (n, 0) } else { (n / 100, n % 100) };
+                        it.set_time((u32::try_from(h).ok()?, u32::try_from(m).ok()?, 0, 0))?;
+                    }
+                }
+            }
+        } else if c == b'+' || c == b'-' {
+            let save = lx.i;
+            if it.time.is_some()
+                && it.zone.is_none()
+                && let Some(z) = lx.numeric_zone()
+                && rel_unit(lx.peek_word()).is_none()
+            {
+                it.zone = Some(z);
                 continue;
             }
-            // Never truncate: another process may have created it since the check.
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            lx.i = save + 1;
+            let (n, _) = lx.digits()?;
+            let n = if c == b'-' { -n } else { n };
+            let unit = rel_unit(lx.peek_word())?;
+            lx.skip_space();
+            lx.word();
+            it.add_rel(n, unit);
+        } else if c.is_ascii_alphabetic() {
+            let word = lx.word().to_string();
+            let word = word.trim_end_matches('.');
+            if let Some(month) = month_number(word) {
+                // Month DD [[,] YYYY]
+                lx.skip_space();
+                let (day, _) = lx.digits()?;
+                if lx.peek() == Some(b',') {
+                    lx.i += 1;
+                }
+                lx.skip_space();
+                let save = lx.i;
+                let year = match lx.digits() {
+                    Some(y) if lx.peek() != Some(b':') => Some(y),
+                    _ => {
+                        lx.i = save;
+                        None
+                    }
+                };
+                it.set_date(year, month, u32::try_from(day).ok()?)?;
+            } else if let Some(day) = day_number(word) {
+                if it.weekday.replace((day, 0)).is_some() {
+                    return None;
+                }
+            } else if let Some(&(_, off)) = TZ_NAMES.iter().find(|(name, _)| *name == word) {
+                if it.zone.is_some() {
+                    return None;
+                }
+                let correction = lx.numeric_zone().unwrap_or(0);
+                it.zone = Some(off + correction);
+            } else {
+                match word {
+                    "now" | "today" => it.rels_seen = true,
+                    "yesterday" => it.add_rel(-1, (0, 86400)),
+                    "tomorrow" => it.add_rel(1, (0, 86400)),
+                    "ago" => {
+                        let (m, d, s) = it.last_rel.take()?;
+                        it.rel_months -= 2 * m;
+                        it.rel_days -= 2 * d;
+                        it.rel_secs -= 2 * s;
+                    }
+                    "next" | "last" | "this" => {
+                        let n = match word {
+                            "next" => 1,
+                            "last" => -1,
+                            _ => 0,
+                        };
+                        let next = lx.peek_word().to_string();
+                        if let Some(day) = day_number(&next) {
+                            if it.weekday.replace((day, n)).is_some() {
+                                return None;
+                            }
+                        } else {
+                            it.add_rel(n, rel_unit(&next)?);
+                        }
+                        lx.skip_space();
+                        lx.word();
+                    }
+                    w => it.add_rel(1, rel_unit(w)?),
+                }
+            }
+        } else {
+            return None;
         }
-        let meta = fs::metadata(path)?;
-        let new_atime = if parsed.modify_only && !parsed.access_only {
-            FileTime::from_last_access_time(&meta)
-        } else {
-            ref_atime
-        };
-        let new_mtime = if parsed.access_only && !parsed.modify_only {
-            FileTime::from_last_modification_time(&meta)
-        } else {
-            ref_mtime
-        };
-        filetime::set_file_times(path, new_atime, new_mtime)?;
-        ctx.telemetry.add_items(1);
     }
-    Ok(0)
+    resolve_date(&it, now, lower.is_empty())
+}
+
+/// `@SECONDS[.frac]`.
+fn parse_epoch(s: &str) -> Option<(i64, u32)> {
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (int, frac) = match digits.find(['.', ',']) {
+        Some(i) => (&digits[..i], &digits[i + 1..]),
+        None => (digits, ""),
+    };
+    if int.is_empty()
+        || !int.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let secs: i64 = int.parse().ok()?;
+    let mut nanos: u32 = 0;
+    for k in 0..9 {
+        nanos = nanos * 10 + frac.as_bytes().get(k).map_or(0, |d| u32::from(d - b'0'));
+    }
+    if !neg {
+        return Some((secs, nanos));
+    }
+    if nanos == 0 {
+        Some((-secs, 0))
+    } else {
+        Some((-secs - 1, 1_000_000_000 - nanos))
+    }
+}
+
+fn resolve_date(it: &DateItems, now: (i64, u32), empty: bool) -> Option<(i64, u32)> {
+    let now_local = Local.timestamp_opt(now.0, now.1).single()?;
+    let has_date = it.month_day.is_some();
+    let (mut year, mut month, mut day) = (
+        i64::from(now_local.year()),
+        now_local.month(),
+        now_local.day(),
+    );
+    if let Some((y, digits)) = it.year {
+        year = if digits == 2 {
+            if y < 69 { y + 2000 } else { y + 1900 }
+        } else {
+            y
+        };
+    }
+    if let Some((m, d)) = it.month_day {
+        month = m;
+        day = d;
+    }
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let (mut hour, minute, second, nanos) = match it.time {
+        Some(t) => t,
+        None if has_date || empty || it.weekday.is_some() => (0, 0, 0, 0),
+        None => (
+            now_local.hour(),
+            now_local.minute(),
+            now_local.second(),
+            now.1,
+        ),
+    };
+    if let Some(pm) = it.meridian {
+        if hour == 0 || hour > 12 {
+            return None;
+        }
+        hour = hour % 12 + if pm { 12 } else { 0 };
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    // A weekday moves to that day (unless a date was given), as GNU does:
+    // `monday` is today or the coming Monday, `next monday` the one after today.
+    let mut day = i64::from(day);
+    if let Some((wd, ordinal)) = it.weekday.filter(|_| !has_date) {
+        let today = NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, 1)?
+            .checked_add_signed(chrono::Duration::days(day - 1))?
+            .weekday()
+            .num_days_from_sunday();
+        let (wd, today) = (i64::from(wd), i64::from(today));
+        day += (wd - today + 7) % 7 + 7 * (ordinal - i64::from(ordinal > 0 && today != wd));
+    }
+    // Then relative months (with mktime-style day overflow), then days.
+    let months = year * 12 + i64::from(month) - 1 + it.rel_months;
+    let first = NaiveDate::from_ymd_opt(
+        i32::try_from(months.div_euclid(12)).ok()?,
+        u32::try_from(months.rem_euclid(12)).ok()? + 1,
+        1,
+    )?;
+    let date = first.checked_add_signed(chrono::Duration::days(day - 1 + it.rel_days))?;
+    let secs_of_day = i64::from(hour) * 3600 + i64::from(minute) * 60;
+    let midnight_utc = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
+    let base = match it.zone {
+        Some(z) => midnight_utc + secs_of_day - z,
+        // Only relative items: like GNU, keep the current UTC offset, so
+        // `next week` is exactly 7 * 24 hours away even across a DST change.
+        None if !has_date && it.time.is_none() && it.weekday.is_none() && !empty => {
+            midnight_utc + secs_of_day - i64::from(now_local.offset().local_minus_utc())
+        }
+        None => local_to_epoch(date, secs_of_day)?,
+    };
+    Some((base + i64::from(second) + it.rel_secs, nanos))
 }
 
 // ---------------------------------------------------------------------------
 // 3. ln
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "ln", about = "Make links between files")]
-struct LnArgs {
-    /// Make symbolic links instead of hard links
-    #[arg(short = 's', long = "symbolic")]
-    symbolic: bool,
+const LN_HELP: &str = "\
+Usage: ln [OPTION]... [-T] TARGET LINK_NAME
+  or:  ln [OPTION]... TARGET
+  or:  ln [OPTION]... TARGET... DIRECTORY
+  or:  ln [OPTION]... -t DIRECTORY TARGET...
+Create links to each TARGET; hard links by default, symbolic links with -s.
 
-    /// Remove existing destination files
-    #[arg(short = 'f', long = "force")]
+      --backup[=CONTROL]      make a backup of each existing destination file
+  -b                          like --backup but does not accept an argument
+  -d, -F, --directory         (hard links to directories are not allowed)
+  -f, --force                 remove existing destination files
+  -i, --interactive           prompt whether to remove destinations
+  -L, --logical               dereference TARGETs that are symbolic links
+  -n, --no-dereference        treat LINK_NAME as a normal file if
+                                it is a symbolic link to a directory
+  -P, --physical              make hard links directly to symbolic links
+  -r, --relative              with -s, create links relative to link location
+  -s, --symbolic              make symbolic links instead of hard links
+  -S, --suffix=SUFFIX         override the usual backup suffix
+  -t, --target-directory=DIRECTORY  specify the DIRECTORY in which to create
+                                the links
+  -T, --no-target-directory   treat LINK_NAME as a normal file always
+  -v, --verbose               print name of each linked file
+      --help        display this help and exit
+      --version     output version information and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LnOpt {
+    Backup,
+    BackupArg,
+    Directory,
+    Force,
+    Interactive,
+    Logical,
+    NoDeref,
+    Physical,
+    Relative,
+    Symbolic,
+    Suffix,
+    TargetDir,
+    NoTargetDir,
+    Verbose,
+}
+
+struct LnOpts {
+    backup: BackupMode,
+    suffix: String,
     force: bool,
-
-    /// Print name of each linked file
-    #[arg(short = 'v', long = "verbose")]
+    interactive: bool,
+    logical: bool,
+    relative: bool,
+    symbolic: bool,
     verbose: bool,
-
-    target: String,
-    link_name: String,
 }
 
 pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = LnArgs::try_parse_from(args)?;
-    let link_path = Path::new(&parsed.link_name);
-    let final_link = if link_path.is_dir() {
-        let fname = Path::new(&parsed.target)
-            .file_name()
-            .ok_or_else(|| anyhow!("invalid target"))?;
-        link_path.join(fname)
-    } else {
-        link_path.to_path_buf()
+    use LnOpt::*;
+    const SPECS: &[ToolOpt<LnOpt>] = &[
+        opt("b", "", HasArg::No, Backup),
+        opt("", "backup", HasArg::Optional, BackupArg),
+        opt("dF", "directory", HasArg::No, Directory),
+        opt("f", "force", HasArg::No, Force),
+        opt("i", "interactive", HasArg::No, Interactive),
+        opt("L", "logical", HasArg::No, Logical),
+        opt("n", "no-dereference", HasArg::No, NoDeref),
+        opt("P", "physical", HasArg::No, Physical),
+        opt("r", "relative", HasArg::No, Relative),
+        opt("s", "symbolic", HasArg::No, Symbolic),
+        opt("S", "suffix", HasArg::Required, Suffix),
+        opt("t", "target-directory", HasArg::Required, TargetDir),
+        opt("T", "no-target-directory", HasArg::No, NoTargetDir),
+        opt("v", "verbose", HasArg::No, Verbose),
+    ];
+    let parsed = match parse_tool_args("ln", &args, SPECS, LN_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
     };
-
-    // Resolve the target relative to the link's directory (how a symlink would) and
-    // refuse to replace a file with a link to itself: `ln -f a a` would delete `a`.
-    let target_from_link = final_link
-        .parent()
-        .unwrap_or(Path::new(""))
-        .join(&parsed.target);
-    let link_target = if parsed.symbolic {
-        target_from_link.as_path()
-    } else {
-        Path::new(&parsed.target)
+    let mut o = LnOpts {
+        backup: BackupMode::None,
+        suffix: String::new(),
+        force: false,
+        interactive: false,
+        logical: false,
+        relative: false,
+        symbolic: false,
+        verbose: false,
     };
-    let link_is_symlink = final_link
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink());
-    if !link_is_symlink && same_file(link_target, &final_link) {
-        return Err(anyhow!(
-            "ln: '{}' and '{}' are the same file",
-            parsed.target,
-            final_link.display()
-        ));
-    }
-    if parsed.force && final_link.symlink_metadata().is_ok() {
-        if final_link.symlink_metadata()?.is_dir() {
-            return Err(anyhow!(
-                "ln: '{}': cannot overwrite directory",
-                final_link.display()
-            ));
+    let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
+    let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None, false);
+    for (opt, v) in parsed.opts {
+        match opt {
+            Backup => want_backup = true,
+            BackupArg => {
+                want_backup = true;
+                backup_arg = v;
+            }
+            Directory => {}
+            Force => {
+                o.force = true;
+                o.interactive = false;
+            }
+            Interactive => {
+                o.force = false;
+                o.interactive = true;
+            }
+            Logical => o.logical = true,
+            Physical => o.logical = false,
+            NoDeref => no_deref = true,
+            Relative => o.relative = true,
+            Symbolic => o.symbolic = true,
+            Suffix => {
+                want_backup = true;
+                suffix = v;
+            }
+            TargetDir => target_dir = v,
+            NoTargetDir => no_target_dir = true,
+            Verbose => o.verbose = true,
         }
-        fs::remove_file(&final_link)?;
+    }
+    if want_backup {
+        o.backup = match backup_mode("ln", backup_arg.as_deref()) {
+            Ok(m) => m,
+            Err(code) => return Ok(code),
+        };
+    }
+    o.suffix = backup_suffix(suffix);
+    if o.relative && !o.symbolic {
+        eprintln!("ln: cannot do --relative without --symbolic");
+        return Ok(1);
     }
 
-    if parsed.symbolic {
-        symlink(&parsed.target, &final_link)?;
+    let mut files = parsed.operands;
+    let is_dir = |p: &str| {
+        let m = if no_deref {
+            fs::symlink_metadata(p)
+        } else {
+            fs::metadata(p)
+        };
+        m.is_ok_and(|m| m.is_dir())
+    };
+    let target_dir = match (target_dir, no_target_dir) {
+        (Some(_), true) => {
+            eprintln!("ln: cannot combine --target-directory and --no-target-directory");
+            return Ok(1);
+        }
+        (Some(d), false) => {
+            if let Err(e) = fs::metadata(&d).and_then(|m| {
+                if m.is_dir() {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ENOTDIR))
+                }
+            }) {
+                eprintln!("ln: target directory {}: {}", qa(&d), gnu_io_error(&e));
+                return Ok(1);
+            }
+            if files.is_empty() {
+                return Ok(usage_error("ln", "missing file operand"));
+            }
+            Some(d)
+        }
+        (None, true) => {
+            match files.len() {
+                0 => return Ok(usage_error("ln", "missing file operand")),
+                1 => {
+                    return Ok(usage_error(
+                        "ln",
+                        &format!("missing destination file operand after {}", qa(&files[0])),
+                    ));
+                }
+                2 => {}
+                _ => {
+                    return Ok(usage_error(
+                        "ln",
+                        &format!("extra operand {}", qa(&files[2])),
+                    ));
+                }
+            }
+            None
+        }
+        (None, false) => match files.len() {
+            0 => return Ok(usage_error("ln", "missing file operand")),
+            1 => Some(".".to_string()),
+            n if is_dir(&files[n - 1]) => files.pop(),
+            2 => None,
+            n => {
+                let last = &files[n - 1];
+                let meta = if no_deref {
+                    fs::symlink_metadata(last)
+                } else {
+                    fs::metadata(last)
+                };
+                let err = meta
+                    .err()
+                    .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOTDIR));
+                eprintln!("ln: target {}: {}", qa(last), gnu_io_error(&err));
+                return Ok(1);
+            }
+        },
+    };
+
+    let mut status = 0;
+    match target_dir {
+        Some(dir) => {
+            for src in &files {
+                let dest = concat_path(&dir, &operand_base(src));
+                if !ln_one(src, &dest, &o, ctx) {
+                    status = 1;
+                }
+            }
+        }
+        None => {
+            if !ln_one(&files[0], Path::new(&files[1]), &o, ctx) {
+                status = 1;
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// True when `a` and `b` name the same directory entry (same parent, same name).
+fn same_name(a: &Path, b: &Path) -> bool {
+    let parent = |p: &Path| match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    a.file_name() == b.file_name() && same_file(&parent(a), &parent(b))
+}
+
+fn ln_one(src: &str, dest: &Path, o: &LnOpts, ctx: &DogfishContext) -> bool {
+    let src_path = Path::new(src);
+    let src_meta = if o.symbolic {
+        None
     } else {
-        fs::hard_link(&parsed.target, &final_link)?;
+        let m = if o.logical {
+            fs::metadata(src_path)
+        } else {
+            fs::symlink_metadata(src_path)
+        };
+        match m {
+            Err(e) => {
+                eprintln!("ln: failed to access {}: {}", qa(src), gnu_io_error(&e));
+                return false;
+            }
+            Ok(m) if m.is_dir() => {
+                eprintln!("ln: {}: hard link not allowed for directory", qf(src));
+                return false;
+            }
+            Ok(m) => Some(m),
+        }
+    };
+    // With -L, resolve the source before DEST (which may be that symlink) is removed.
+    let real_src = if o.logical && !o.symbolic {
+        match fs::canonicalize(src_path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("ln: failed to access {}: {}", qa(src), gnu_io_error(&e));
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let target: OsString = if o.relative {
+        relative_link_target(src_path, dest)
+    } else {
+        OsString::from(src)
+    };
+
+    let mut backup = None;
+    if (o.force || o.interactive || o.backup != BackupMode::None)
+        && let Ok(dm) = fs::symlink_metadata(dest)
+    {
+        if dm.is_dir() {
+            eprintln!("ln: {}: cannot overwrite directory", qf(dest));
+            return false;
+        }
+        // Replacing DEST must not delete the file SOURCE names.
+        let same = (o.force || o.interactive || (o.backup != BackupMode::None && !o.symbolic))
+            && if o.symbolic {
+                fs::metadata(src_path).ok()
+            } else {
+                src_meta.clone()
+            }
+            .is_some_and(|sm| {
+                same_inode(&sm, &dm) && (sm.nlink() == 1 || same_name(src_path, dest))
+            });
+        // Nor may `ln -sf` turn a file into a link to itself.
+        let self_link = o.symbolic && o.force && !dm.is_symlink() && {
+            let dir = dest.parent().unwrap_or(Path::new(""));
+            same_file(&dir.join(&target), dest)
+        };
+        let fatal_same = same && (o.force || (o.backup != BackupMode::None && !o.symbolic));
+        if same && !fatal_same {
+            // `ln -i` replacing a file with itself is a no-op (GNU renames a fresh
+            // link over it); never remove it.
+            return ask("ln", &format!("replace {}? ", qa(dest)));
+        }
+        if fatal_same || self_link {
+            eprintln!("ln: {} and {} are the same file", qa(src), qa(dest));
+            return false;
+        }
+        if o.interactive && !ask("ln", &format!("replace {}? ", qa(dest))) {
+            return false;
+        }
+        let remove = o.force || o.interactive;
+        if o.backup != BackupMode::None {
+            let name = backup_name(dest, o.backup, &o.suffix);
+            match fs::rename(dest, &name) {
+                Ok(()) => backup = Some(name),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("ln: cannot backup {}: {}", qa(dest), gnu_io_error(&e));
+                    return false;
+                }
+            }
+        } else if remove
+            && let Err(e) = fs::remove_file(dest)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("ln: cannot remove {}: {}", qa(dest), gnu_io_error(&e));
+            return false;
+        }
     }
-    ctx.telemetry.add_items(1);
-    if parsed.verbose {
-        println!("'{}' -> '{}'", final_link.display(), parsed.target);
+
+    let res = if o.symbolic {
+        symlink(&target, dest)
+    } else if let Some(real) = &real_src {
+        fs::hard_link(real, dest)
+    } else {
+        fs::hard_link(src_path, dest)
+    };
+    let arrow = if o.symbolic { "->" } else { "=>" };
+    match res {
+        Ok(()) => {
+            ctx.telemetry.add_items(1);
+            if o.verbose {
+                match &backup {
+                    Some(b) => println!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&target)),
+                    None => println!("{} {arrow} {}", qa(dest), qa(&target)),
+                }
+            }
+            true
+        }
+        Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(0);
+            let msg = if o.symbolic {
+                if errno != libc::ENAMETOOLONG && !target.is_empty() {
+                    format!("failed to create symbolic link {}", qa(dest))
+                } else {
+                    format!(
+                        "failed to create symbolic link {} -> {}",
+                        qa(dest),
+                        qa(&target)
+                    )
+                }
+            } else if errno == libc::EMLINK {
+                format!("failed to create hard link to {}", qa(src))
+            } else if [libc::EDQUOT, libc::EEXIST, libc::ENOSPC, libc::EROFS].contains(&errno) {
+                format!("failed to create hard link {}", qa(dest))
+            } else {
+                format!("failed to create hard link {} => {}", qa(dest), qa(src))
+            };
+            eprintln!("ln: {msg}: {}", gnu_io_error(&e));
+            if let Some(b) = backup {
+                let _ = fs::rename(b, dest);
+            }
+            false
+        }
     }
-    Ok(0)
+}
+
+/// `ln -sr`: SOURCE relative to the directory that will contain DEST.
+fn relative_link_target(src: &Path, dest: &Path) -> OsString {
+    let real_src =
+        canonicalize_mode(src, CanMode::Missing, false).unwrap_or_else(|_| src.to_path_buf());
+    let real_dest =
+        canonicalize_mode(dest, CanMode::Missing, false).unwrap_or_else(|_| dest.to_path_buf());
+    let dir = real_dest.parent().unwrap_or(Path::new("/"));
+    relpath(&real_src, dir).into_os_string()
 }
 
 // ---------------------------------------------------------------------------
-// 4. chmod — Supports both octal (`755`) and symbolic (`+x`, `u+rw`, `go-w`) + `-R`
+// 4. chmod — octal and full symbolic modes, -R, -c/-v/-f, --reference
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "chmod", about = "Change file mode bits")]
-#[command(allow_hyphen_values = true)]
-struct ChmodArgs {
-    /// Change files and directories recursively
-    #[arg(short = 'R', long = "recursive")]
+const CHMOD_HELP: &str = "\
+Usage: chmod [OPTION]... MODE[,MODE]... FILE...
+  or:  chmod [OPTION]... OCTAL-MODE FILE...
+  or:  chmod [OPTION]... --reference=RFILE FILE...
+Change the mode of each FILE to MODE.
+With --reference, change the mode of each FILE to that of RFILE.
+
+  -c, --changes          like verbose but report only when a change is made
+  -f, --silent, --quiet  suppress most error messages
+  -v, --verbose          output a diagnostic for every file processed
+      --no-preserve-root  do not treat '/' specially (the default)
+      --preserve-root    fail to operate recursively on '/'
+      --reference=RFILE  use RFILE's mode instead of specifying MODE values
+  -R, --recursive        change files and directories recursively
+      --help        display this help and exit
+      --version     output version information and exit
+
+Each MODE is of the form '[ugoa]*([-+=]([rwxXst]*|[ugo]))+|[-+=][0-7]+'.
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChmodOpt {
+    Changes,
+    Quiet,
+    Verbose,
+    NoPreserveRoot,
+    PreserveRoot,
+    Reference,
+    Recursive,
+}
+
+struct ChmodRun {
+    changes: Option<Vec<ModeChange>>,
+    reference_mode: u32,
+    umask: u32,
     recursive: bool,
-
-    /// Output a diagnostic for every file processed
-    #[arg(short = 'v', long = "verbose")]
+    report_changes: bool,
     verbose: bool,
-
-    mode: String,
-
-    #[arg(required = true)]
-    files: Vec<String>,
+    quiet: bool,
+    diagnose_surprises: bool,
 }
 
 pub fn run_chmod(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = ChmodArgs::try_parse_from(args)?;
-    for f in &parsed.files {
-        if parsed.recursive {
-            for e in WalkDir::new(f).into_iter().flatten() {
-                let p = e.path();
-                apply_chmod(&p, &parsed.mode, parsed.verbose)?;
-                ctx.telemetry.add_items(1);
-            }
+    use ChmodOpt::*;
+    const SPECS: &[ToolOpt<ChmodOpt>] = &[
+        opt("c", "changes", HasArg::No, Changes),
+        opt("f", "silent", HasArg::No, Quiet),
+        opt("", "quiet", HasArg::No, Quiet),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
+        opt("", "preserve-root", HasArg::No, PreserveRoot),
+        opt("", "reference", HasArg::Required, Reference),
+        opt("R", "recursive", HasArg::No, Recursive),
+    ];
+    // Like GNU, accept modes that look like options (`chmod -w file`).
+    let mut mode_pieces = Vec::new();
+    let mut rest = vec![args.first().cloned().unwrap_or_default()];
+    let mut ended = false;
+    for a in args.iter().skip(1) {
+        ended |= a == "--";
+        let mode_like = !ended
+            && a.len() > 1
+            && a.starts_with('-')
+            && a[1..2].chars().all(|c| "rwxXstugoa,+=01234567".contains(c));
+        if mode_like {
+            mode_pieces.push(a.clone());
         } else {
-            apply_chmod(Path::new(f), &parsed.mode, parsed.verbose)?;
-            ctx.telemetry.add_items(1);
+            rest.push(a.clone());
         }
     }
-    Ok(0)
-}
-
-fn apply_chmod(path: &Path, mode_spec: &str, verbose: bool) -> Result<()> {
-    let meta = fs::metadata(path)?;
-    let current = meta.mode() & 0o7777;
-    let new_mode = parse_chmod_mode(mode_spec, current)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(new_mode))?;
-    if verbose {
-        println!(
-            "mode of '{}' changed from {:04o} to {:04o} ({})",
-            path.display(),
-            current,
-            new_mode,
-            &format_mode_rwx(new_mode)[1..]
-        );
+    let parsed = match parse_tool_args("chmod", &rest, SPECS, CHMOD_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let mut run = ChmodRun {
+        changes: None,
+        reference_mode: 0,
+        umask: process_umask(),
+        recursive: false,
+        report_changes: false,
+        verbose: false,
+        quiet: false,
+        diagnose_surprises: !mode_pieces.is_empty(),
+    };
+    let (mut preserve_root, mut reference) = (false, None);
+    for (o, v) in parsed.opts {
+        match o {
+            Changes => run.report_changes = true,
+            Quiet => run.quiet = true,
+            Verbose => run.verbose = true,
+            NoPreserveRoot => preserve_root = false,
+            PreserveRoot => preserve_root = true,
+            Reference => reference = v,
+            Recursive => run.recursive = true,
+        }
     }
-    Ok(())
-}
-
-fn parse_chmod_mode(spec: &str, current: u32) -> Result<u32> {
-    if let Ok(oct) = u32::from_str_radix(spec, 8) {
-        return Ok(oct);
+    let mut files = parsed.operands;
+    let mut mode = (!mode_pieces.is_empty()).then(|| mode_pieces.join(","));
+    if reference.is_none() && mode.is_none() {
+        if files.is_empty() {
+            return Ok(usage_error("chmod", "missing operand"));
+        }
+        mode = Some(files.remove(0));
     }
-    let mut mode = current;
-    for clause in spec.split(',') {
-        let op_idx = clause
-            .find(['+', '-', '='])
-            .ok_or_else(|| anyhow!("invalid mode: '{}'", spec))?;
-        let (who_part, rest) = clause.split_at(op_idx);
-        let op = rest.chars().next().unwrap();
-        let perms_part = &rest[1..];
-
-        let mut who_mask = 0u32;
-        if who_part.is_empty() || who_part.contains('a') {
-            who_mask = 0o777;
-        } else {
-            if who_part.contains('u') {
-                who_mask |= 0o700;
-            }
-            if who_part.contains('g') {
-                who_mask |= 0o070;
-            }
-            if who_part.contains('o') {
-                who_mask |= 0o007;
+    if files.is_empty() {
+        return Ok(match (&mode, &reference) {
+            (Some(m), None) => usage_error(
+                "chmod",
+                &format!("missing operand after {}", quote_locale(m)),
+            ),
+            _ => usage_error("chmod", "missing operand"),
+        });
+    }
+    if let Some(r) = &reference {
+        match fs::metadata(r) {
+            Ok(m) => run.reference_mode = m.mode() & CHMOD_MODE_BITS,
+            Err(e) => {
+                eprintln!(
+                    "chmod: failed to get attributes of {}: {}",
+                    qa(r),
+                    gnu_io_error(&e)
+                );
+                return Ok(1);
             }
         }
+    } else if let Some(m) = &mode {
+        match mode_compile(m) {
+            Some(c) => run.changes = Some(c),
+            None => {
+                return Ok(usage_error(
+                    "chmod",
+                    &format!("invalid mode: {}", quote_locale(m)),
+                ));
+            }
+        }
+    }
 
-        let mut perm_bits = 0u32;
-        for ch in perms_part.chars() {
-            match ch {
-                'r' => perm_bits |= 0o444,
-                'w' => perm_bits |= 0o222,
-                'x' => perm_bits |= 0o111,
-                'X' if current & 0o111 != 0 => {
-                    perm_bits |= 0o111;
+    let mut ok = true;
+    for f in &files {
+        if run.recursive && preserve_root && is_root_dir(Path::new(f)) {
+            refuse_root("chmod", f);
+            ok = false;
+            continue;
+        }
+        ok &= chmod_path(Path::new(f), true, &run, ctx);
+    }
+    Ok(if ok { 0 } else { 1 })
+}
+
+fn chmod_path(path: &Path, top_level: bool, run: &ChmodRun, ctx: &DogfishContext) -> bool {
+    let lmeta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            if !run.quiet {
+                eprintln!("chmod: cannot access {}: {}", qa(path), gnu_io_error(&e));
+            }
+            if run.verbose {
+                println!("{} could not be accessed", qa(path));
+            }
+            return false;
+        }
+    };
+    let meta = if lmeta.is_symlink() {
+        if !top_level {
+            // During -R traversal, symbolic links are not followed or changed.
+            if run.verbose {
+                println!(
+                    "neither symbolic link {} nor referent has been changed",
+                    qa(path)
+                );
+            }
+            return true;
+        }
+        match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => {
+                if !run.quiet {
+                    eprintln!("chmod: cannot operate on dangling symlink {}", qa(path));
                 }
-                _ => {}
+                if run.verbose {
+                    println!("{} could not be accessed", qa(path));
+                }
+                return false;
             }
         }
-        let masked = perm_bits & who_mask;
-        match op {
-            '+' => mode |= masked,
-            '-' => mode &= !masked,
-            '=' => mode = (mode & !who_mask) | masked,
-            _ => {}
+    } else {
+        lmeta
+    };
+
+    let old = meta.mode() & CHMOD_MODE_BITS;
+    let is_dir = meta.is_dir();
+    let new = match &run.changes {
+        Some(c) => mode_adjust(old, is_dir, run.umask, c).0,
+        None => run.reference_mode,
+    };
+    let mut ok = true;
+    let applied = match fs::set_permissions(path, fs::Permissions::from_mode(new)) {
+        Ok(()) => {
+            ctx.telemetry.add_items(1);
+            true
+        }
+        Err(e) => {
+            if !run.quiet {
+                eprintln!(
+                    "chmod: changing permissions of {}: {}",
+                    qa(path),
+                    gnu_io_error(&e)
+                );
+            }
+            ok = false;
+            false
+        }
+    };
+    let changed = applied && old != new;
+    if run.verbose || (run.report_changes && changed) {
+        let (o, n) = (strmode9(old), strmode9(new));
+        if !applied {
+            println!(
+                "failed to change mode of {} from {old:04o} ({o}) to {new:04o} ({n})",
+                qa(path)
+            );
+        } else if changed {
+            println!(
+                "mode of {} changed from {old:04o} ({o}) to {new:04o} ({n})",
+                qa(path)
+            );
+        } else {
+            println!("mode of {} retained as {new:04o} ({n})", qa(path));
         }
     }
-    Ok(mode)
+    if applied
+        && run.diagnose_surprises
+        && let Some(c) = &run.changes
+    {
+        let naive = mode_adjust(old, is_dir, 0, c).0;
+        if new & !naive != 0 {
+            eprintln!(
+                "chmod: {}: new permissions are {}, not {}",
+                qf(path),
+                strmode9(new),
+                strmode9(naive)
+            );
+            ok = false;
+        }
+    }
+
+    if run.recursive && is_dir {
+        match dir_names(path, false) {
+            Ok(names) => {
+                for name in names {
+                    ok &= chmod_path(&path.join(name), false, run, ctx);
+                }
+            }
+            Err(e) => {
+                if !run.quiet {
+                    eprintln!(
+                        "chmod: cannot read directory {}: {}",
+                        qa(path),
+                        gnu_io_error(&e)
+                    );
+                }
+                ok = false;
+            }
+        }
+    }
+    ok
 }
 
 // ---------------------------------------------------------------------------
-// 5. chown
+// 5. chown — USER[:GROUP], :GROUP, USER:, numeric ids, -R/-h/-H/-L/-P, --from
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "chown", about = "Change file owner and group")]
-struct ChownArgs {
-    #[arg(short = 'R', long = "recursive")]
+const CHOWN_HELP: &str = "\
+Usage: chown [OPTION]... [OWNER][:[GROUP]] FILE...
+  or:  chown [OPTION]... --reference=RFILE FILE...
+Change the owner and/or group of each FILE to OWNER and/or GROUP.
+With --reference, change the owner and group of each FILE to those of RFILE.
+
+  -c, --changes          like verbose but report only when a change is made
+  -f, --silent, --quiet  suppress most error messages
+  -v, --verbose          output a diagnostic for every file processed
+      --dereference      affect the referent of each symbolic link (this is
+                         the default), rather than the symbolic link itself
+  -h, --no-dereference   affect symbolic links instead of any referenced file
+      --from=CURRENT_OWNER:CURRENT_GROUP
+                         change the owner and/or group of each file only if
+                         its current owner and/or group match those specified
+      --no-preserve-root  do not treat '/' specially (the default)
+      --preserve-root    fail to operate recursively on '/'
+      --reference=RFILE  use RFILE's owner and group rather than specifying
+                         OWNER:GROUP values
+  -R, --recursive        operate on files and directories recursively
+
+The following options modify how a hierarchy is traversed when the -R
+option is also specified.  If more than one is specified, only the final
+one takes effect.
+
+  -H                     if a command line argument is a symbolic link
+                         to a directory, traverse it
+  -L                     traverse every symbolic link to a directory
+                         encountered
+  -P                     do not traverse any symbolic links (default)
+
+      --help        display this help and exit
+      --version     output version information and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChownOpt {
+    Changes,
+    Quiet,
+    Verbose,
+    Deref,
+    NoDeref,
+    From,
+    NoPreserveRoot,
+    PreserveRoot,
+    Reference,
+    Recursive,
+    TraverseCmdline,
+    TraverseAll,
+    TraverseNone,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Traverse {
+    None,
+    CommandLine,
+    All,
+}
+
+/// A parsed `[OWNER][:[GROUP]]`: ids to set and the names to report.
+#[derive(Default)]
+struct OwnerSpec {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    user: Option<String>,
+    group: Option<String>,
+}
+
+struct ChownRun {
+    spec: OwnerSpec,
+    from_uid: Option<u32>,
+    from_gid: Option<u32>,
     recursive: bool,
-
-    #[arg(short = 'v', long = "verbose")]
+    traverse: Traverse,
+    affect_referent: bool,
+    report_changes: bool,
     verbose: bool,
-
-    owner_group: String,
-
-    #[arg(required = true)]
-    files: Vec<String>,
+    quiet: bool,
 }
 
 pub fn run_chown(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = ChownArgs::try_parse_from(args)?;
-    let (uid, gid) = parse_owner_group(&parsed.owner_group)?;
-
-    for f in &parsed.files {
-        if parsed.recursive {
-            for e in WalkDir::new(f).into_iter().flatten() {
-                chown_path(&e.path(), uid, gid)?;
-                ctx.telemetry.add_items(1);
-            }
-        } else {
-            chown_path(Path::new(f), uid, gid)?;
-            ctx.telemetry.add_items(1);
+    use ChownOpt::*;
+    const SPECS: &[ToolOpt<ChownOpt>] = &[
+        opt("c", "changes", HasArg::No, Changes),
+        opt("f", "silent", HasArg::No, Quiet),
+        opt("", "quiet", HasArg::No, Quiet),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("", "dereference", HasArg::No, Deref),
+        opt("h", "no-dereference", HasArg::No, NoDeref),
+        opt("", "from", HasArg::Required, From),
+        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
+        opt("", "preserve-root", HasArg::No, PreserveRoot),
+        opt("", "reference", HasArg::Required, Reference),
+        opt("R", "recursive", HasArg::No, Recursive),
+        opt("H", "", HasArg::No, TraverseCmdline),
+        opt("L", "", HasArg::No, TraverseAll),
+        opt("P", "", HasArg::No, TraverseNone),
+    ];
+    let parsed = match parse_tool_args("chown", &args, SPECS, CHOWN_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let mut run = ChownRun {
+        spec: OwnerSpec::default(),
+        from_uid: None,
+        from_gid: None,
+        recursive: false,
+        traverse: Traverse::None,
+        affect_referent: true,
+        report_changes: false,
+        verbose: false,
+        quiet: false,
+    };
+    let (mut deref, mut preserve_root, mut from, mut reference) = (None, false, None, None);
+    for (o, v) in parsed.opts {
+        match o {
+            Changes => run.report_changes = true,
+            Quiet => run.quiet = true,
+            Verbose => run.verbose = true,
+            Deref => deref = Some(true),
+            NoDeref => deref = Some(false),
+            From => from = v,
+            NoPreserveRoot => preserve_root = false,
+            PreserveRoot => preserve_root = true,
+            Reference => reference = v,
+            Recursive => run.recursive = true,
+            TraverseCmdline => run.traverse = Traverse::CommandLine,
+            TraverseAll => run.traverse = Traverse::All,
+            TraverseNone => run.traverse = Traverse::None,
         }
     }
-    Ok(0)
-}
+    if run.recursive && run.traverse == Traverse::None {
+        if deref == Some(true) {
+            eprintln!("chown: -R --dereference requires either -H or -L");
+            return Ok(1);
+        }
+        deref = Some(false);
+    }
+    if !run.recursive {
+        run.traverse = Traverse::None;
+    }
+    run.affect_referent = deref != Some(false);
 
-fn parse_owner_group(spec: &str) -> Result<(Option<u32>, Option<u32>)> {
-    let (u_part, g_part) = match spec.split_once(':') {
-        Some((u, g)) => (u, Some(g)),
-        None => (spec, None),
-    };
-    let uid = if u_part.is_empty() {
-        None
-    } else if let Ok(id) = u_part.parse::<u32>() {
-        Some(id)
+    let mut files = parsed.operands;
+    if let Some(r) = &reference {
+        match fs::metadata(r) {
+            Ok(m) => {
+                run.spec = OwnerSpec {
+                    uid: Some(m.uid()),
+                    gid: Some(m.gid()),
+                    user: Some(uid_label(m.uid())),
+                    group: Some(gid_label(m.gid())),
+                };
+            }
+            Err(e) => {
+                eprintln!(
+                    "chown: failed to get attributes of {}: {}",
+                    qa(r),
+                    gnu_io_error(&e)
+                );
+                return Ok(1);
+            }
+        }
     } else {
-        let c_name = CString::new(u_part)?;
-        let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
-        if pw.is_null() {
-            return Err(anyhow!("chown: invalid user: '{}'", u_part));
+        if files.is_empty() {
+            return Ok(usage_error("chown", "missing operand"));
         }
-        Some(unsafe { (*pw).pw_uid })
-    };
-
-    let gid = match g_part {
-        Some(g) if !g.is_empty() => {
-            if let Ok(id) = g.parse::<u32>() {
-                Some(id)
-            } else {
-                let c_name = CString::new(g)?;
-                let gr = unsafe { libc::getgrnam(c_name.as_ptr()) };
-                if gr.is_null() {
-                    return Err(anyhow!("chown: invalid group: '{}'", g));
-                }
-                Some(unsafe { (*gr).gr_gid })
+        let spec = files.remove(0);
+        match parse_owner_spec(&spec) {
+            Ok(s) => run.spec = s,
+            Err(msg) => {
+                eprintln!("chown: {msg}");
+                return Ok(1);
             }
         }
-        _ => None,
-    };
-    Ok((uid, gid))
+        if files.is_empty() {
+            return Ok(usage_error(
+                "chown",
+                &format!("missing operand after {}", quote_locale(&spec)),
+            ));
+        }
+    }
+    if let Some(f) = &from {
+        match parse_owner_spec(f) {
+            Ok(s) => {
+                run.from_uid = s.uid;
+                run.from_gid = s.gid;
+            }
+            Err(msg) => {
+                eprintln!("chown: {msg}");
+                return Ok(1);
+            }
+        }
+    }
+
+    let mut ok = true;
+    for f in &files {
+        if run.recursive && preserve_root && is_root_dir(Path::new(f)) {
+            refuse_root("chown", f);
+            ok = false;
+            continue;
+        }
+        ok &= chown_path(Path::new(f), true, &run, ctx);
+    }
+    Ok(if ok { 0 } else { 1 })
 }
 
-fn chown_path(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())?;
-    let u = uid.unwrap_or(u32::MAX);
-    let g = gid.unwrap_or(u32::MAX);
-    let ret = unsafe { libc::chown(c_path.as_ptr(), u, g) };
-    if ret != 0 {
-        return Err(io::Error::last_os_error().into());
+fn uid_label(uid: u32) -> String {
+    get_username_by_uid(uid).unwrap_or_else(|| uid.to_string())
+}
+
+fn gid_label(gid: u32) -> String {
+    get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string())
+}
+
+/// `getpwnam`: (uid, login gid) of a user name.
+fn lookup_user(name: &str) -> Option<(u32, u32)> {
+    let c = CString::new(name).ok()?;
+    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    (!pw.is_null()).then(|| unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
+}
+
+fn lookup_group(name: &str) -> Option<u32> {
+    let c = CString::new(name).ok()?;
+    let gr = unsafe { libc::getgrnam(c.as_ptr()) };
+    (!gr.is_null()).then(|| unsafe { (*gr).gr_gid })
+}
+
+/// A numeric id as GNU accepts it (`-1` is reserved).
+fn parse_id(s: &str) -> Option<u32> {
+    s.parse::<u32>().ok().filter(|&id| id != u32::MAX)
+}
+
+/// Parses `[OWNER][:[GROUP]]` (GNU `parse_user_spec`); `.` is accepted as the
+/// separator, with a warning, when the whole spec is not a user name.
+fn parse_owner_spec(spec: &str) -> std::result::Result<OwnerSpec, String> {
+    if let Some(i) = spec.find(':') {
+        return parse_owner_parts(spec, &spec[..i], Some(&spec[i + 1..]));
     }
-    Ok(())
+    let whole = parse_owner_parts(spec, spec, None);
+    if whole.is_err()
+        && let Some(i) = spec.find('.')
+        && let Ok(s) = parse_owner_parts(spec, &spec[..i], Some(&spec[i + 1..]))
+    {
+        eprintln!("chown: warning: '.' should be ':': {}", quote_locale(spec));
+        return Ok(s);
+    }
+    whole
+}
+
+fn parse_owner_parts(
+    spec: &str,
+    user: &str,
+    group: Option<&str>,
+) -> std::result::Result<OwnerSpec, String> {
+    let mut s = OwnerSpec::default();
+    let invalid = |what: &str| format!("invalid {what}: {}", quote_locale(spec));
+    if !user.is_empty() {
+        match lookup_user(user) {
+            Some((uid, login_gid)) => {
+                s.uid = Some(uid);
+                if group == Some("") {
+                    s.gid = Some(login_gid);
+                    s.group = Some(gid_label(login_gid));
+                }
+            }
+            None => {
+                s.uid = Some(parse_id(user).ok_or_else(|| invalid("user"))?);
+                if group == Some("") {
+                    return Err(invalid("user"));
+                }
+            }
+        }
+        s.user = Some(user.to_string());
+    }
+    if let Some(g) = group.filter(|g| !g.is_empty()) {
+        let by_name = lookup_group(g);
+        s.gid = Some(
+            by_name
+                .or_else(|| parse_id(g))
+                .ok_or_else(|| invalid("group"))?,
+        );
+        s.group = Some(g.to_string());
+        if by_name.is_some() && s.user.is_none() {
+            // GNU reports `:GROUP` (by name) as an ownership change.
+            s.user = Some(String::new());
+        }
+    }
+    Ok(s)
+}
+
+fn user_group_str(user: Option<&str>, group: Option<&str>) -> Option<String> {
+    match (user, group) {
+        (Some(u), Some(g)) => Some(format!("{u}:{g}")),
+        (Some(u), None) => Some(u.to_string()),
+        (None, Some(g)) => Some(g.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn chown_path(path: &Path, top_level: bool, run: &ChownRun, ctx: &DogfishContext) -> bool {
+    let spec = &run.spec;
+    let new_spec = user_group_str(spec.user.as_deref(), spec.group.as_deref());
+    let describe_failure_without_old = || {
+        if run.verbose {
+            let what = if spec.user.is_some() {
+                "ownership"
+            } else {
+                "group"
+            };
+            match &new_spec {
+                Some(s) => println!("failed to change {what} of {} to {s}", qa(path)),
+                None => println!("failed to change ownership of {}", qa(path)),
+            }
+        }
+    };
+    let lmeta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            if !run.quiet {
+                eprintln!("chown: cannot access {}: {}", qa(path), gnu_io_error(&e));
+            }
+            describe_failure_without_old();
+            return false;
+        }
+    };
+    let follow = lmeta.is_symlink() && run.affect_referent;
+    let meta = if follow {
+        match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                if !run.quiet {
+                    eprintln!(
+                        "chown: cannot dereference {}: {}",
+                        qa(path),
+                        gnu_io_error(&e)
+                    );
+                }
+                describe_failure_without_old();
+                return false;
+            }
+        }
+    } else {
+        lmeta.clone()
+    };
+
+    let traverse_dir = run.recursive
+        && meta.is_dir()
+        && (!lmeta.is_symlink()
+            || run.traverse == Traverse::All
+            || (top_level && run.traverse == Traverse::CommandLine));
+    let mut ok = true;
+    // Like GNU (fts post-order), a directory's contents are changed before it.
+    if traverse_dir {
+        match dir_names(path, false) {
+            Ok(names) => {
+                for name in names {
+                    ok &= chown_path(&path.join(name), false, run, ctx);
+                }
+            }
+            Err(e) => {
+                if !run.quiet {
+                    eprintln!(
+                        "chown: cannot read directory {}: {}",
+                        qa(path),
+                        gnu_io_error(&e)
+                    );
+                }
+                ok = false;
+            }
+        }
+    }
+
+    let (old_uid, old_gid) = (meta.uid(), meta.gid());
+    let matches =
+        run.from_uid.is_none_or(|u| u == old_uid) && run.from_gid.is_none_or(|g| g == old_gid);
+    let old_spec = user_group_str(
+        spec.user.as_ref().map(|_| uid_label(old_uid)).as_deref(),
+        spec.group.as_ref().map(|_| gid_label(old_gid)).as_deref(),
+    );
+    let mut status_changed = false;
+    let mut failed = false;
+    if matches && (spec.uid.is_some() || spec.gid.is_some()) {
+        let res = if follow || !lmeta.is_symlink() {
+            std::os::unix::fs::chown(path, spec.uid, spec.gid)
+        } else {
+            std::os::unix::fs::lchown(path, spec.uid, spec.gid)
+        };
+        match res {
+            Ok(()) => {
+                ctx.telemetry.add_items(1);
+                status_changed = spec.uid.is_some_and(|u| u != old_uid)
+                    || spec.gid.is_some_and(|g| g != old_gid);
+            }
+            Err(e) => {
+                failed = true;
+                ok = false;
+                if !run.quiet {
+                    let what = if spec.uid.is_some() {
+                        "ownership"
+                    } else {
+                        "group"
+                    };
+                    eprintln!(
+                        "chown: changing {what} of {}: {}",
+                        qa(path),
+                        gnu_io_error(&e)
+                    );
+                }
+            }
+        }
+    }
+    if run.verbose || (run.report_changes && status_changed) {
+        let what = if spec.user.is_some() {
+            "ownership"
+        } else if spec.group.is_some() {
+            "group"
+        } else {
+            ""
+        };
+        let file = qa(path);
+        let (old_s, new_s) = (old_spec.unwrap_or_default(), new_spec.unwrap_or_default());
+        if failed {
+            if what.is_empty() {
+                println!("failed to change ownership of {file}");
+            } else {
+                println!("failed to change {what} of {file} from {old_s} to {new_s}");
+            }
+        } else if status_changed {
+            println!("changed {what} of {file} from {old_s} to {new_s}");
+        } else if what.is_empty() {
+            println!("ownership of {file} retained");
+        } else {
+            println!("{what} of {file} retained as {old_s}");
+        }
+    }
+    ok
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,40 +3998,67 @@ fn stat_card(files: &[String], dereference: bool, json: bool, ctx: &DogfishConte
 }
 
 // ---------------------------------------------------------------------------
-// 7. rm — Supports `--safe` (or `--undoable`) trash staging + parallel `-r`
+// 7. rm — GNU semantics plus `--safe` (or `--trash`) undoable trash staging
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(
-    name = "rm",
-    about = "Remove files or directories (supports --safe undoable trash staging)"
-)]
-struct RmArgs {
-    /// Ignore nonexistent files and arguments, never prompt
-    #[arg(short = 'f', long = "force")]
+const RM_HELP: &str = "\
+Usage: rm [OPTION]... [FILE]...
+Remove (unlink) the FILE(s).
+
+  -f, --force           ignore nonexistent files and arguments, never prompt
+  -i                    prompt before every removal
+  -I                    prompt once before removing more than three files, or
+                          when removing recursively
+      --interactive[=WHEN]  prompt according to WHEN: never, once (-I), or
+                          always (-i); without WHEN, prompt always
+      --one-file-system  when removing a hierarchy recursively, skip any
+                          directory that is on a file system different from
+                          that of the corresponding command line argument
+      --no-preserve-root  do not treat '/' specially
+      --preserve-root[=all]  do not remove '/' (default);
+                              with 'all', reject any command line argument
+                              on a separate device from its parent
+  -r, -R, --recursive   remove directories and their contents recursively
+  -d, --dir             remove empty directories
+  -v, --verbose         explain what is being done
+      --safe, --trash   move files to Dogfish's trash instead (undo with
+                          `dogfish undo`)
+      --help        display this help and exit
+      --version     output version information and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RmOpt {
+    Dir,
+    Force,
+    EveryFile,
+    Once,
+    InteractiveWhen,
+    OneFileSystem,
+    NoPreserveRoot,
+    PreserveRoot,
+    Recursive,
+    Verbose,
+    Safe,
+}
+
+struct RmRun {
     force: bool,
-
-    /// Remove directories and their contents recursively
-    #[arg(short = 'r', visible_short_alias = 'R', long = "recursive")]
+    interactive: Interactive,
     recursive: bool,
-
-    /// Remove empty directories
-    #[arg(short = 'd', long = "dir")]
     dir: bool,
-
-    /// Explain what is being done
-    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
+    one_file_system: bool,
+    stdin_tty: bool,
+}
 
-    /// Stage removed items to Dogfish's undoable trash (`dogfish undo` to restore!)
-    #[arg(long = "safe", visible_alias = "trash")]
-    safe: bool,
-
-    /// Do not treat '/' specially (dangerous)
-    #[arg(long = "no-preserve-root")]
-    no_preserve_root: bool,
-
-    #[arg(required = true)]
-    files: Vec<String>,
+/// Outcome of removing one file or tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RmStatus {
+    Removed,
+    Declined,
+    /// Declined to descend: the directory stays, so its ancestors are left alone.
+    Kept,
+    Failed,
 }
 
 /// True when `p` names the root directory itself (`/`, `//`, `/.`, `/usr/..`, a bind
@@ -1468,199 +4068,1726 @@ fn is_root_dir(p: &Path) -> bool {
     p.symlink_metadata().is_ok_and(|m| m.is_dir()) && same_file(p, Path::new("/"))
 }
 
+/// True when the last component of `f` is `.` or `..` (`d/.`, `./`, `..//`).
+fn is_dot_or_dotdot(f: &str) -> bool {
+    let last = last_component(f.as_bytes());
+    let name = &last[..last.iter().position(|&b| b == b'/').unwrap_or(last.len())];
+    name == b"." || name == b".."
+}
+
 pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = RmArgs::try_parse_from(args)?;
-    let journal = if parsed.safe {
+    use RmOpt::*;
+    const SPECS: &[ToolOpt<RmOpt>] = &[
+        opt("d", "dir", HasArg::No, Dir),
+        opt("f", "force", HasArg::No, Force),
+        opt("i", "", HasArg::No, EveryFile),
+        opt("I", "", HasArg::No, Once),
+        opt("", "interactive", HasArg::Optional, InteractiveWhen),
+        opt("", "one-file-system", HasArg::No, OneFileSystem),
+        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
+        opt("", "preserve-root", HasArg::Optional, PreserveRoot),
+        opt("rR", "recursive", HasArg::No, Recursive),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("", "safe", HasArg::No, Safe),
+        opt("", "trash", HasArg::No, Safe),
+    ];
+    let parsed = match parse_tool_args("rm", &args, SPECS, RM_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let mut run = RmRun {
+        force: false,
+        interactive: Interactive::Sometimes,
+        recursive: false,
+        dir: false,
+        verbose: false,
+        one_file_system: false,
+        stdin_tty: io::stdin().is_terminal(),
+    };
+    let (mut prompt_once, mut preserve_root, mut preserve_all, mut safe) =
+        (false, true, false, false);
+    for (o, v) in parsed.opts {
+        match o {
+            Dir => run.dir = true,
+            Force => {
+                run.force = true;
+                run.interactive = Interactive::Never;
+                prompt_once = false;
+            }
+            EveryFile => {
+                run.force = false;
+                run.interactive = Interactive::Always;
+                prompt_once = false;
+            }
+            Once => {
+                run.force = false;
+                run.interactive = Interactive::Sometimes;
+                prompt_once = true;
+            }
+            InteractiveWhen => {
+                #[derive(Clone, Copy, PartialEq)]
+                enum When {
+                    Never,
+                    Once,
+                    Always,
+                }
+                const WHEN: &[(&str, When)] = &[
+                    ("never", When::Never),
+                    ("no", When::Never),
+                    ("none", When::Never),
+                    ("once", When::Once),
+                    ("always", When::Always),
+                    ("yes", When::Always),
+                ];
+                let when = match v {
+                    Some(w) => match argmatch("rm", "--interactive", &w, WHEN) {
+                        Ok(w) => w,
+                        Err(code) => return Ok(code),
+                    },
+                    None => When::Always,
+                };
+                match when {
+                    When::Never => {
+                        run.interactive = Interactive::Never;
+                        prompt_once = false;
+                    }
+                    When::Once => {
+                        run.force = false;
+                        run.interactive = Interactive::Sometimes;
+                        prompt_once = true;
+                    }
+                    When::Always => {
+                        run.force = false;
+                        run.interactive = Interactive::Always;
+                        prompt_once = false;
+                    }
+                }
+            }
+            OneFileSystem => run.one_file_system = true,
+            NoPreserveRoot => preserve_root = false,
+            PreserveRoot => {
+                match v.as_deref() {
+                    None => {}
+                    Some("all") => preserve_all = true,
+                    Some(other) => {
+                        eprintln!(
+                            "rm: unrecognized --preserve-root argument: {}",
+                            quote_locale(other)
+                        );
+                        return Ok(1);
+                    }
+                }
+                preserve_root = true;
+            }
+            Recursive => run.recursive = true,
+            Verbose => run.verbose = true,
+            Safe => safe = true,
+        }
+    }
+    let files = parsed.operands;
+    if files.is_empty() {
+        return Ok(if run.force {
+            0
+        } else {
+            usage_error("rm", "missing operand")
+        });
+    }
+    if prompt_once && (files.len() > 3 || run.recursive) {
+        let n = files.len();
+        let question = format!(
+            "remove {n} argument{}{}? ",
+            if n == 1 { "" } else { "s" },
+            if run.recursive { " recursively" } else { "" }
+        );
+        if !ask("rm", &question) {
+            return Ok(0);
+        }
+    }
+
+    let journal = if safe {
         Some(UndoJournal::open()?)
     } else {
         None
     };
-
-    ctx.telemetry.set_strategy(if parsed.safe {
+    ctx.telemetry.set_strategy(if safe {
         "journaled trash staging (undoable via `dogfish undo`)"
     } else {
         "direct unlink"
     });
 
     let mut exit_code = 0;
-    let st = ctx.style();
-
-    for f in &parsed.files {
+    for f in &files {
         let p = Path::new(f);
-        if !p.exists() && p.symlink_metadata().is_err() {
-            if !parsed.force {
-                eprintln!("rm: cannot remove '{}': No such file or directory", f);
-                exit_code = 1;
+        let meta = match p.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                let missing = matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR));
+                if !(run.force && missing) {
+                    eprintln!("rm: cannot remove {}: {}", qa(f), gnu_io_error(&e));
+                    exit_code = 1;
+                }
+                continue;
             }
-            continue;
-        }
-
-        if matches!(
-            f.trim_end_matches('/').rsplit('/').next(),
-            Some(".") | Some("..")
-        ) {
-            eprintln!(
-                "rm: refusing to remove '.' or '..' directory: skipping '{}'",
-                f
-            );
-            exit_code = 1;
-            continue;
-        }
-        if parsed.recursive && !parsed.no_preserve_root && is_root_dir(p) {
-            if f == "/" {
-                eprintln!("rm: it is dangerous to operate recursively on '/'");
-            } else {
-                eprintln!(
-                    "rm: it is dangerous to operate recursively on '{}' (same as '/')",
-                    f
-                );
-            }
-            eprintln!("rm: use --no-preserve-root to override this failsafe");
-            exit_code = 1;
-            continue;
-        }
-        // `--safe` must refuse exactly what plain `rm` refuses.
-        if !parsed.recursive && p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        };
+        // GNU checks, in this order: directory without -r, `.`/`..`, then `/`.
+        if meta.is_dir() && !run.recursive {
             let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
-            if !parsed.dir || !empty {
-                eprintln!(
-                    "rm: cannot remove '{}': {}",
-                    f,
-                    if parsed.dir {
-                        "Directory not empty"
-                    } else {
-                        "Is a directory"
-                    }
-                );
+            if !run.dir || !empty {
+                let why = if run.dir {
+                    "Directory not empty"
+                } else {
+                    "Is a directory"
+                };
+                eprintln!("rm: cannot remove {}: {why}", qa(f));
                 exit_code = 1;
                 continue;
             }
         }
+        if is_dot_or_dotdot(f) {
+            eprintln!(
+                "rm: refusing to remove '.' or '..' directory: skipping {}",
+                qa(f)
+            );
+            exit_code = 1;
+            continue;
+        }
+        if run.recursive && preserve_root && is_root_dir(p) {
+            refuse_root("rm", f);
+            exit_code = 1;
+            continue;
+        }
+        if preserve_all
+            && meta.is_dir()
+            && let Ok(parent) = fs::metadata(p.join(".."))
+            && parent.dev() != meta.dev()
+        {
+            eprintln!("rm: skipping {}, since it's on a different device", qa(f));
+            eprintln!("rm: and --preserve-root=all is in effect");
+            exit_code = 1;
+            continue;
+        }
 
-        if let Some(ref j) = journal {
+        if let Some(j) = &journal {
+            // `--safe` refuses exactly what plain `rm` refuses, then moves the whole
+            // operand to the trash in one undoable step.
+            if run.interactive == Interactive::Always
+                && !ask(
+                    "rm",
+                    &format!("remove {} {}? ", file_type_description(&meta), qa(f)),
+                )
+            {
+                continue;
+            }
             match j.stage_to_trash(p) {
                 Ok(entry) => {
                     ctx.telemetry.add_items(1);
-                    if parsed.verbose {
+                    if run.verbose {
+                        let st = ctx.style();
                         println!(
-                            "{} '{}' (undo id #{}: run `{}` to restore)",
+                            "{} {} (undo id #{}: run `{}` to restore)",
                             st.yellow("trashed"),
-                            f,
+                            qa(f),
                             entry.id,
                             st.bold_cyan("dogfish undo")
                         );
                     }
                 }
                 Err(e) => {
-                    eprintln!("rm: failed to stage '{}' to trash: {}", f, e);
+                    eprintln!(
+                        "rm: failed to stage {} to trash: {}",
+                        qa(f),
+                        gnu_io_error(&e)
+                    );
                     exit_code = 1;
                 }
             }
             continue;
         }
 
-        let meta = match p.symlink_metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                if !parsed.force {
-                    eprintln!("rm: cannot remove '{}': {}", f, e);
-                    exit_code = 1;
-                }
-                continue;
-            }
-        };
-
-        let res = if meta.is_dir() {
-            if parsed.recursive {
-                fs::remove_dir_all(p)
-            } else if parsed.dir {
-                fs::remove_dir(p)
+        let status = if meta.is_dir() {
+            if run.recursive {
+                rm_tree(p, &meta, meta.dev(), &run, ctx)
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::IsADirectory,
-                    "is a directory (use -r to remove recursively)",
-                ))
+                rm_empty_dir(p, &meta, &run, ctx)
             }
         } else {
-            fs::remove_file(p)
+            rm_file(p, &meta, &run, ctx)
         };
-
-        match res {
-            Ok(()) => {
-                ctx.telemetry.add_items(1);
-                if parsed.verbose {
-                    println!("removed '{}'", f);
-                }
-            }
-            Err(e) => {
-                if !parsed.force {
-                    eprintln!("rm: cannot remove '{}': {}", f, e);
-                    exit_code = 1;
-                }
-            }
-        }
-    }
-    Ok(exit_code)
-}
-
-// ---------------------------------------------------------------------------
-// 8. cp — APFS `clonefile` zero-copy CoW + UndoJournal recording
-// ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(
-    name = "cp",
-    about = "Copy files and directories (uses zero-copy CoW clonefile when supported)"
-)]
-struct CpArgs {
-    /// Copy directories recursively
-    #[arg(short = 'r', visible_short_alias = 'R', long = "recursive")]
-    recursive: bool,
-
-    /// Do not overwrite an existing file
-    #[arg(short = 'n', long = "no-clobber")]
-    no_clobber: bool,
-
-    /// Explain what is being done
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-
-    #[arg(required = true)]
-    paths: Vec<String>,
-}
-
-pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = CpArgs::try_parse_from(args)?;
-    if parsed.paths.len() < 2 {
-        return Err(anyhow!("cp: missing destination file operand"));
-    }
-    let dst = Path::new(parsed.paths.last().unwrap());
-    let sources = &parsed.paths[..parsed.paths.len() - 1];
-    let dst_is_dir = dst.is_dir();
-
-    if sources.len() > 1 && !dst_is_dir {
-        return Err(anyhow!("cp: target '{}' is not a directory", dst.display()));
-    }
-
-    let journal = UndoJournal::open().ok();
-    let mut exit_code = 0;
-
-    for src_str in sources {
-        let src = Path::new(src_str);
-        let target = if dst_is_dir {
-            dst.join(src.file_name().ok_or_else(|| anyhow!("invalid source"))?)
-        } else {
-            dst.to_path_buf()
-        };
-        if let Err(e) = cp_one(src, &target, &parsed, journal.as_ref(), ctx) {
-            eprintln!("cp: {}", e);
+        if status == RmStatus::Failed {
             exit_code = 1;
         }
     }
     Ok(exit_code)
 }
 
-fn exists_no_follow(p: &Path) -> bool {
-    p.symlink_metadata().is_ok()
+/// Whether to ask before removing `p`: always with `-i`, and for write-protected
+/// files when stdin is a terminal (unless `-f`). Returns the write-protected flag.
+fn rm_prompt_needed(p: &Path, meta: &fs::Metadata, run: &RmRun) -> Option<bool> {
+    if run.interactive == Interactive::Never {
+        return None;
+    }
+    let protected = !meta.is_symlink() && write_protected(p);
+    (run.interactive == Interactive::Always || (protected && run.stdin_tty)).then_some(protected)
+}
+
+fn protected_prefix(protected: bool) -> &'static str {
+    if protected { "write-protected " } else { "" }
+}
+
+fn rm_file(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> RmStatus {
+    if let Some(protected) = rm_prompt_needed(p, meta, run) {
+        let q = format!(
+            "remove {}{} {}? ",
+            protected_prefix(protected),
+            file_type_description(meta),
+            qa(p)
+        );
+        if !ask("rm", &q) {
+            return RmStatus::Declined;
+        }
+    }
+    match fs::remove_file(p) {
+        Ok(()) => {
+            ctx.telemetry.add_items(1);
+            if run.verbose {
+                println!("removed {}", qa(p));
+            }
+            RmStatus::Removed
+        }
+        Err(e) => {
+            eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+            RmStatus::Failed
+        }
+    }
+}
+
+fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> RmStatus {
+    if let Some(protected) = rm_prompt_needed(p, meta, run)
+        && !ask(
+            "rm",
+            &format!(
+                "remove {}directory {}? ",
+                protected_prefix(protected),
+                qa(p)
+            ),
+        )
+    {
+        return RmStatus::Declined;
+    }
+    match fs::remove_dir(p) {
+        Ok(()) => {
+            ctx.telemetry.add_items(1);
+            if run.verbose {
+                println!("removed directory {}", qa(p));
+            }
+            RmStatus::Removed
+        }
+        // `-f` ignores a directory that vanished (or a `link/` that is no directory).
+        Err(e) if run.force && matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            RmStatus::Removed
+        }
+        Err(e) => {
+            eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+            RmStatus::Failed
+        }
+    }
+}
+
+/// Removes a directory tree depth-first in `readdir` order, like GNU's `fts`
+/// traversal. Symbolic links are removed, never followed. After an error inside
+/// a directory, its ancestors are left alone (GNU reports only the first error).
+fn rm_tree(
+    p: &Path,
+    meta: &fs::Metadata,
+    top_dev: u64,
+    run: &RmRun,
+    ctx: &DogfishContext,
+) -> RmStatus {
+    let empty = fs::read_dir(p).is_ok_and(|mut d| d.next().is_none());
+    if !empty {
+        if let Some(protected) = rm_prompt_needed(p, meta, run)
+            && !ask(
+                "rm",
+                &format!(
+                    "descend into {}directory {}? ",
+                    protected_prefix(protected),
+                    qa(p)
+                ),
+            )
+        {
+            return RmStatus::Kept;
+        }
+        let names = match dir_names(p, false) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("rm: cannot remove {}: {}", qa(p), gnu_io_error(&e));
+                return RmStatus::Failed;
+            }
+        };
+        let (mut failed, mut kept) = (false, false);
+        for name in names {
+            let child = p.join(name);
+            let cmeta = match child.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("rm: cannot remove {}: {}", qa(&child), gnu_io_error(&e));
+                    failed = true;
+                    continue;
+                }
+            };
+            let status = if cmeta.is_dir() {
+                if run.one_file_system && cmeta.dev() != top_dev {
+                    eprintln!(
+                        "rm: skipping {}, since it's on a different device",
+                        qa(&child)
+                    );
+                    RmStatus::Failed
+                } else {
+                    rm_tree(&child, &cmeta, top_dev, run, ctx)
+                }
+            } else {
+                rm_file(&child, &cmeta, run, ctx)
+            };
+            failed |= status == RmStatus::Failed;
+            kept |= status == RmStatus::Kept;
+        }
+        if failed {
+            return RmStatus::Failed;
+        }
+        if kept {
+            return RmStatus::Kept;
+        }
+    }
+    rm_empty_dir(p, meta, run, ctx)
+}
+
+// ---------------------------------------------------------------------------
+// 8. cp — GNU semantics, CoW reflinks (FICLONE / APFS clonefile) and UndoJournal
+// ---------------------------------------------------------------------------
+const CP_HELP: &str = "\
+Usage: cp [OPTION]... [-T] SOURCE DEST
+  or:  cp [OPTION]... SOURCE... DIRECTORY
+  or:  cp [OPTION]... -t DIRECTORY SOURCE...
+Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.
+Copies use copy-on-write reflinks where the file system supports them, and
+are recorded so that `dogfish undo` can reverse them.
+
+  -a, --archive                same as -dR --preserve=all
+      --attributes-only        don't copy the file data, just the attributes
+      --backup[=CONTROL]       make a backup of each existing destination file
+  -b                           like --backup but does not accept an argument
+  -d                           same as --no-dereference --preserve=links
+  -f, --force                  if an existing destination file cannot be
+                                 opened, remove it and try again
+  -i, --interactive            prompt before overwrite (overrides a previous -n
+                                  option)
+  -H                           follow command-line symbolic links in SOURCE
+  -l, --link                   hard link files instead of copying
+  -L, --dereference            always follow symbolic links in SOURCE
+  -n, --no-clobber             do not overwrite an existing file (overrides a
+                                 previous -i option)
+  -P, --no-dereference         never follow symbolic links in SOURCE
+  -p                           same as --preserve=mode,ownership,timestamps
+      --preserve[=ATTR_LIST]   preserve the specified attributes
+      --no-preserve=ATTR_LIST  don't preserve the specified attributes
+      --parents                use full source file name under DIRECTORY
+  -R, -r, --recursive          copy directories recursively
+      --remove-destination     remove each existing destination file before
+                                 attempting to open it (contrast with --force)
+  -s, --symbolic-link          make symbolic links instead of copying
+  -S, --suffix=SUFFIX          override the usual backup suffix
+  -t, --target-directory=DIRECTORY  copy all SOURCE arguments into DIRECTORY
+  -T, --no-target-directory    treat DEST as a normal file
+      --update[=UPDATE]        control which existing files are updated;
+                                 UPDATE={all,none,older(default)}
+  -u                           equivalent to --update[=older]
+  -v, --verbose                explain what is being done
+  -x, --one-file-system        stay on this file system
+      --help        display this help and exit
+      --version     output version information and exit
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpOpt {
+    Archive,
+    AttributesOnly,
+    Backup,
+    BackupArg,
+    CopyContents,
+    Debug,
+    NoDerefLinks,
+    Dereference,
+    Force,
+    Interactive,
+    CmdlineDeref,
+    Link,
+    NoClobber,
+    NoDereference,
+    PreserveDefault,
+    Preserve,
+    NoPreserve,
+    Parents,
+    KeepDirSymlink,
+    Recursive,
+    RemoveDestination,
+    Reflink,
+    Sparse,
+    StripSlashes,
+    Suffix,
+    Symbolic,
+    TargetDir,
+    NoTargetDir,
+    UpdateOlder,
+    Update,
+    Verbose,
+    OneFileSystem,
+    Context,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Deref {
+    Never,
+    CommandLine,
+    Always,
+}
+
+/// What to do when the destination exists (GNU's `interactive` setting).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clobber {
+    /// Overwrite (the default).
+    Yes,
+    /// Ask first (`-i`).
+    Ask,
+    /// Skip silently (`cp -n`), or with a diagnostic and failure (`mv -n`).
+    No,
+    /// Skip silently and successfully (`--update=none`).
+    Skip,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreserveAttr {
+    Mode,
+    Timestamps,
+    Ownership,
+    Links,
+    Context,
+    Xattr,
+    All,
+}
+
+const PRESERVE_ARGS: &[(&str, PreserveAttr)] = &[
+    ("mode", PreserveAttr::Mode),
+    ("timestamps", PreserveAttr::Timestamps),
+    ("ownership", PreserveAttr::Ownership),
+    ("links", PreserveAttr::Links),
+    ("context", PreserveAttr::Context),
+    ("xattr", PreserveAttr::Xattr),
+    ("all", PreserveAttr::All),
+];
+
+struct CpOpts {
+    recursive: bool,
+    deref: Deref,
+    preserve_mode: bool,
+    preserve_ownership: bool,
+    preserve_timestamps: bool,
+    preserve_links: bool,
+    /// `--no-preserve=mode`: new files get default permissions, not the source's.
+    no_preserve_mode: bool,
+    clobber: Clobber,
+    update_older: bool,
+    backup: BackupMode,
+    suffix: String,
+    force: bool,
+    remove_destination: bool,
+    hard_link: bool,
+    symbolic_link: bool,
+    parents: bool,
+    one_file_system: bool,
+    verbose: bool,
+    attributes_only: bool,
+    keep_dir_symlink: bool,
+}
+
+/// What the undo journal needs to restore an overwritten destination.
+struct UndoPlan {
+    created: PathBuf,
+    backup: Option<String>,
+}
+
+/// State for one `cp` invocation.
+struct Copier<'a> {
+    o: CpOpts,
+    journal: Option<UndoJournal>,
+    umask: u32,
+    ctx: &'a DogfishContext,
+    /// Command-line sources already copied, by name and inode (GNU warns about repeats).
+    seen_sources: HashSet<(OsString, u64, u64)>,
+    /// Destination of each multiply-linked source inode, for `--preserve=links`.
+    linked: HashMap<(u64, u64), PathBuf>,
+    top_dev: u64,
+}
+
+fn apply_preserve(o: &mut CpOpts, list: &str, on: bool) -> std::result::Result<(), i32> {
+    for item in list.split(',') {
+        let attr = argmatch(
+            "cp",
+            if on { "--preserve" } else { "--no-preserve" },
+            item,
+            PRESERVE_ARGS,
+        )?;
+        if matches!(attr, PreserveAttr::Mode | PreserveAttr::All) {
+            o.no_preserve_mode = !on;
+        }
+        match attr {
+            PreserveAttr::Mode => o.preserve_mode = on,
+            PreserveAttr::Timestamps => o.preserve_timestamps = on,
+            PreserveAttr::Ownership => o.preserve_ownership = on,
+            PreserveAttr::Links => o.preserve_links = on,
+            PreserveAttr::Context | PreserveAttr::Xattr => {}
+            PreserveAttr::All => {
+                o.preserve_mode = on;
+                o.preserve_timestamps = on;
+                o.preserve_ownership = on;
+                o.preserve_links = on;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splits operands into sources and a destination the way GNU `cp` and `mv` do.
+/// `Ok(None)` means each source goes into the returned directory.
+enum Targets {
+    Into(String, Vec<String>),
+    Single(String, String),
+}
+
+fn resolve_targets(
+    tool: &str,
+    mut files: Vec<String>,
+    target_dir: Option<String>,
+    no_target_dir: bool,
+) -> std::result::Result<Targets, i32> {
+    if let Some(dir) = target_dir {
+        if no_target_dir {
+            eprintln!(
+                "{tool}: cannot combine --target-directory (-t) and --no-target-directory (-T)"
+            );
+            return Err(1);
+        }
+        let check = fs::metadata(&dir).and_then(|m| {
+            if m.is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOTDIR))
+            }
+        });
+        if let Err(e) = check {
+            eprintln!(
+                "{tool}: target directory {}: {}",
+                qa(&dir),
+                gnu_io_error(&e)
+            );
+            return Err(1);
+        }
+        if files.is_empty() {
+            return Err(usage_error(tool, "missing file operand"));
+        }
+        return Ok(Targets::Into(dir, files));
+    }
+    match files.len() {
+        0 => return Err(usage_error(tool, "missing file operand")),
+        1 => {
+            return Err(usage_error(
+                tool,
+                &format!("missing destination file operand after {}", qa(&files[0])),
+            ));
+        }
+        _ => {}
+    }
+    if no_target_dir {
+        if files.len() > 2 {
+            return Err(usage_error(
+                tool,
+                &format!("extra operand {}", qa(&files[2])),
+            ));
+        }
+        let dst = files.pop().unwrap_or_default();
+        return Ok(Targets::Single(files.remove(0), dst));
+    }
+    let last = files.last().cloned().unwrap_or_default();
+    match fs::metadata(&last) {
+        Ok(m) if m.is_dir() => {
+            files.pop();
+            Ok(Targets::Into(last, files))
+        }
+        res if files.len() > 2 => {
+            let err = res
+                .err()
+                .unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOTDIR));
+            eprintln!("{tool}: target {}: {}", qa(&last), gnu_io_error(&err));
+            Err(1)
+        }
+        _ => {
+            let dst = files.pop().unwrap_or_default();
+            Ok(Targets::Single(files.remove(0), dst))
+        }
+    }
+}
+
+pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    use CpOpt::*;
+    const SPECS: &[ToolOpt<CpOpt>] = &[
+        opt("a", "archive", HasArg::No, Archive),
+        opt("", "attributes-only", HasArg::No, AttributesOnly),
+        opt("b", "", HasArg::No, Backup),
+        opt("", "backup", HasArg::Optional, BackupArg),
+        opt("", "copy-contents", HasArg::No, CopyContents),
+        opt("", "debug", HasArg::No, Debug),
+        opt("d", "", HasArg::No, NoDerefLinks),
+        opt("L", "dereference", HasArg::No, Dereference),
+        opt("f", "force", HasArg::No, Force),
+        opt("i", "interactive", HasArg::No, Interactive),
+        opt("H", "", HasArg::No, CmdlineDeref),
+        opt("l", "link", HasArg::No, Link),
+        opt("n", "no-clobber", HasArg::No, NoClobber),
+        opt("P", "no-dereference", HasArg::No, NoDereference),
+        opt("", "no-preserve", HasArg::Required, NoPreserve),
+        opt("", "no-target-directory", HasArg::No, NoTargetDir),
+        opt("x", "one-file-system", HasArg::No, OneFileSystem),
+        opt("", "parents", HasArg::No, Parents),
+        opt("", "path", HasArg::No, Parents),
+        opt("", "keep-directory-symlink", HasArg::No, KeepDirSymlink),
+        opt("p", "", HasArg::No, PreserveDefault),
+        opt("", "preserve", HasArg::Optional, Preserve),
+        opt("rR", "recursive", HasArg::No, Recursive),
+        opt("", "remove-destination", HasArg::No, RemoveDestination),
+        opt("", "reflink", HasArg::Optional, Reflink),
+        opt("", "sparse", HasArg::Required, Sparse),
+        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
+        opt("S", "suffix", HasArg::Required, Suffix),
+        opt("s", "symbolic-link", HasArg::No, Symbolic),
+        opt("t", "target-directory", HasArg::Required, TargetDir),
+        opt("T", "", HasArg::No, NoTargetDir),
+        opt("u", "", HasArg::No, UpdateOlder),
+        opt("", "update", HasArg::Optional, Update),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("Z", "", HasArg::No, Context),
+        opt("", "context", HasArg::Optional, Context),
+    ];
+    let parsed = match parse_tool_args("cp", &args, SPECS, CP_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let mut o = CpOpts {
+        recursive: false,
+        deref: Deref::Always,
+        preserve_mode: false,
+        preserve_ownership: false,
+        preserve_timestamps: false,
+        preserve_links: false,
+        no_preserve_mode: false,
+        clobber: Clobber::Yes,
+        update_older: false,
+        backup: BackupMode::None,
+        suffix: String::new(),
+        force: false,
+        remove_destination: false,
+        hard_link: false,
+        symbolic_link: false,
+        parents: false,
+        one_file_system: false,
+        verbose: false,
+        attributes_only: false,
+        keep_dir_symlink: false,
+    };
+    let mut deref = None;
+    let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
+    let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
+    for (opt, v) in parsed.opts {
+        let v = v.unwrap_or_default();
+        match opt {
+            Archive => {
+                deref = Some(Deref::Never);
+                o.recursive = true;
+                let _ = apply_preserve(&mut o, "all", true);
+            }
+            AttributesOnly => o.attributes_only = true,
+            Backup => want_backup = true,
+            BackupArg => {
+                want_backup = true;
+                backup_arg = (!v.is_empty()).then_some(v);
+            }
+            CopyContents | Debug | Reflink | Context => {}
+            Sparse => {
+                const SPARSE: &[(&str, ())] = &[("never", ()), ("auto", ()), ("always", ())];
+                if let Err(code) = argmatch("cp", "--sparse", &v, SPARSE) {
+                    return Ok(code);
+                }
+            }
+            NoDerefLinks => {
+                deref = Some(Deref::Never);
+                o.preserve_links = true;
+            }
+            Dereference => deref = Some(Deref::Always),
+            NoDereference => deref = Some(Deref::Never),
+            CmdlineDeref => deref = Some(Deref::CommandLine),
+            Force => o.force = true,
+            Interactive => o.clobber = Clobber::Ask,
+            NoClobber => {
+                o.clobber = Clobber::No;
+                eprintln!(
+                    "cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead"
+                );
+            }
+            Link => o.hard_link = true,
+            PreserveDefault => {
+                o.preserve_mode = true;
+                o.preserve_ownership = true;
+                o.preserve_timestamps = true;
+            }
+            Preserve => {
+                let list = if v.is_empty() {
+                    "mode,ownership,timestamps"
+                } else {
+                    &v
+                };
+                if let Err(code) = apply_preserve(&mut o, list, true) {
+                    return Ok(code);
+                }
+            }
+            NoPreserve => {
+                if let Err(code) = apply_preserve(&mut o, &v, false) {
+                    return Ok(code);
+                }
+            }
+            Parents => o.parents = true,
+            KeepDirSymlink => o.keep_dir_symlink = true,
+            Recursive => o.recursive = true,
+            RemoveDestination => o.remove_destination = true,
+            StripSlashes => strip_slashes = true,
+            Suffix => {
+                want_backup = true;
+                suffix = Some(v);
+            }
+            Symbolic => o.symbolic_link = true,
+            TargetDir => target_dir = Some(v),
+            NoTargetDir => no_target_dir = true,
+            UpdateOlder => o.update_older = true,
+            Update => {
+                #[derive(Clone, Copy, PartialEq)]
+                enum Upd {
+                    All,
+                    None,
+                    Older,
+                }
+                const UPDATE: &[(&str, Upd)] = &[
+                    ("all", Upd::All),
+                    ("none", Upd::None),
+                    ("older", Upd::Older),
+                ];
+                let which = if v.is_empty() {
+                    Upd::Older
+                } else {
+                    match argmatch("cp", "--update", &v, UPDATE) {
+                        Ok(u) => u,
+                        Err(code) => return Ok(code),
+                    }
+                };
+                o.update_older = which == Upd::Older;
+                if which == Upd::None {
+                    o.clobber = Clobber::Skip;
+                }
+            }
+            Verbose => o.verbose = true,
+            OneFileSystem => o.one_file_system = true,
+        }
+    }
+    if o.hard_link && o.symbolic_link {
+        return Ok(usage_error(
+            "cp",
+            "cannot make both hard and symbolic links",
+        ));
+    }
+    if want_backup {
+        o.backup = match backup_mode("cp", backup_arg.as_deref()) {
+            Ok(m) => m,
+            Err(code) => return Ok(code),
+        };
+    }
+    o.suffix = backup_suffix(suffix);
+    o.deref = deref.unwrap_or(if o.recursive && !o.hard_link {
+        Deref::Never
+    } else {
+        Deref::Always
+    });
+    let targets = match resolve_targets("cp", parsed.operands, target_dir, no_target_dir) {
+        Ok(t) => t,
+        Err(code) => return Ok(code),
+    };
+    if o.parents && matches!(targets, Targets::Single(..)) {
+        return Ok(usage_error(
+            "cp",
+            "with --parents, the destination must be a directory",
+        ));
+    }
+    let mut copier = Copier {
+        o,
+        journal: UndoJournal::open().ok(),
+        umask: process_umask(),
+        ctx,
+        seen_sources: HashSet::new(),
+        linked: HashMap::new(),
+        top_dev: 0,
+    };
+    let strip = |s: &str| {
+        if strip_slashes {
+            strip_trailing_slashes(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let mut ok = true;
+    match targets {
+        Targets::Into(dir, sources) => {
+            for src in &sources {
+                let src = strip(src);
+                let dst = if copier.o.parents {
+                    let rel = src.trim_start_matches('/');
+                    if !copier.make_parent_dirs(&dir, rel) {
+                        ok = false;
+                        continue;
+                    }
+                    concat_path(&dir, OsStr::new(rel))
+                } else {
+                    concat_path(&dir, &operand_base(&src))
+                };
+                ok &= copier.copy_top(Path::new(&src), &dst, true);
+            }
+        }
+        Targets::Single(src, dst) => {
+            // Like GNU, --strip-trailing-slashes only shapes names formed in a directory.
+            ok &= copier.copy_top(Path::new(&src), Path::new(&dst), false);
+        }
+    }
+    Ok(if ok { 0 } else { 1 })
+}
+
+impl Copier<'_> {
+    /// `--parents`: creates the directories leading to `rel` under `dir`, copying
+    /// the source directories' modes; prints `src -> dst` for each one created.
+    fn make_parent_dirs(&mut self, dir: &str, rel: &str) -> bool {
+        let ends = ancestor_ends(rel);
+        for end in ends {
+            let src_dir = &rel[..end];
+            let dst_dir = concat_path(dir, OsStr::new(src_dir));
+            match fs::metadata(&dst_dir) {
+                Ok(m) if m.is_dir() => continue,
+                Ok(_) => {
+                    eprintln!("cp: {} exists but is not a directory", qa(&dst_dir));
+                    return false;
+                }
+                Err(_) => {}
+            }
+            let src_meta = match fs::metadata(src_dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "cp: failed to get attributes of {}: {}",
+                        qa(src_dir),
+                        gnu_io_error(&e)
+                    );
+                    return false;
+                }
+            };
+            let mode = if self.o.preserve_mode {
+                src_meta.mode() & CHMOD_MODE_BITS
+            } else {
+                src_meta.mode() & S_IRWXUGO & !self.umask
+            };
+            if let Err(e) = fs::create_dir(&dst_dir) {
+                eprintln!(
+                    "cp: cannot make directory {}: {}",
+                    qa(&dst_dir),
+                    gnu_io_error(&e)
+                );
+                return false;
+            }
+            let _ = fs::set_permissions(&dst_dir, fs::Permissions::from_mode(mode));
+            if self.o.verbose {
+                println!("{src_dir} -> {}", dst_dir.display());
+            }
+        }
+        true
+    }
+
+    fn src_metadata(&self, src: &Path, command_line: bool) -> io::Result<fs::Metadata> {
+        let follow = match self.o.deref {
+            Deref::Always => true,
+            Deref::CommandLine => command_line,
+            Deref::Never => false,
+        };
+        if follow {
+            fs::metadata(src)
+        } else {
+            fs::symlink_metadata(src)
+        }
+    }
+
+    /// Copies one command-line operand; `into_dir` is set when the destination was
+    /// formed inside a target directory.
+    fn copy_top(&mut self, src: &Path, dst: &Path, into_dir: bool) -> bool {
+        let src_meta = match self.src_metadata(src, true) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("cp: cannot stat {}: {}", qa(src), gnu_io_error(&e));
+                return false;
+            }
+        };
+        if src_meta.is_dir() {
+            if !self.o.recursive {
+                eprintln!("cp: -r not specified; omitting directory {}", qa(src));
+                return false;
+            }
+            let dst_lmeta = fs::symlink_metadata(dst).ok();
+            if let Some(dm) = &dst_lmeta
+                && same_inode(&src_meta, dm)
+            {
+                eprintln!("cp: {} and {} are the same file", qa(src), qa(dst));
+                return false;
+            }
+            // Refuse up front (GNU notices only once it has copied part of the tree).
+            // An existing non-directory is reported by `copy_entry` instead.
+            if dst_lmeta.as_ref().is_none_or(|m| m.is_dir())
+                && let Ok(abs_src) = fs::canonicalize(src)
+                && resolve_for_containment(dst).starts_with(&abs_src)
+            {
+                eprintln!(
+                    "cp: cannot copy a directory, {}, into itself, {}",
+                    qa(src),
+                    qa(dst)
+                );
+                return false;
+            }
+        } else if into_dir && self.o.backup == BackupMode::None {
+            let key = (
+                src.as_os_str().to_os_string(),
+                src_meta.dev(),
+                src_meta.ino(),
+            );
+            if !self.seen_sources.insert(key) {
+                eprintln!(
+                    "cp: warning: source file {} specified more than once",
+                    qa(src)
+                );
+                return true;
+            }
+        }
+        self.top_dev = src_meta.dev();
+        self.copy_entry(src, dst, &src_meta, false, true)
+    }
+
+    /// Saves what `created` currently holds so `dogfish undo` can restore it.
+    /// `by_copy` keeps it in place (it is written into, not replaced).
+    fn journal_prepare(&self, created: &Path, by_copy: bool) -> std::result::Result<UndoPlan, ()> {
+        let backup = match &self.journal {
+            Some(j) => j.backup_existing(created, by_copy).map_err(|e| {
+                eprintln!(
+                    "cp: cannot back up {} before overwriting: {}",
+                    qa(created),
+                    gnu_io_error(&e)
+                );
+            })?,
+            None => None,
+        };
+        Ok(UndoPlan {
+            created: created.to_path_buf(),
+            backup,
+        })
+    }
+
+    fn journal_commit(&self, src: &Path, plan: UndoPlan) {
+        if let Some(j) = &self.journal {
+            let _ = j.record(
+                "cp",
+                JournalAction::CopyCreate {
+                    src: absolute_lossy(src),
+                    created_path: absolute_lossy(&plan.created),
+                    backup_path: plan.backup,
+                },
+            );
+        }
+    }
+
+    /// Removes an existing destination before it is replaced; with a journal it is
+    /// moved to the trash instead, so the replacement can be undone.
+    fn remove_existing(
+        &self,
+        dst: &Path,
+        plan: &mut Option<UndoPlan>,
+        top: bool,
+    ) -> io::Result<()> {
+        if top && self.journal.is_some() && plan.as_ref().is_none_or(|p| p.backup.is_none()) {
+            if let Some(j) = &self.journal
+                && let Some(b) = j.backup_existing(dst, false)?
+            {
+                *plan = Some(UndoPlan {
+                    created: dst.to_path_buf(),
+                    backup: Some(b),
+                });
+            }
+            return Ok(());
+        }
+        match fs::remove_file(dst) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    fn emit_verbose(&self, src: &Path, dst: &Path, backup: Option<&Path>) {
+        if !self.o.verbose {
+            return;
+        }
+        match backup {
+            Some(b) => println!("{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
+            None => println!("{} -> {}", qa(src), qa(dst)),
+        }
+    }
+
+    /// Copies `src` (already stat'ed as `src_meta`) to `dst`, printing GNU's
+    /// diagnostics. `new_dst` means `dst` is known not to exist (inside a freshly
+    /// created directory); `top` marks a command-line operand.
+    fn copy_entry(
+        &mut self,
+        src: &Path,
+        dst: &Path,
+        src_meta: &fs::Metadata,
+        new_dst: bool,
+        top: bool,
+    ) -> bool {
+        let src_is_dir = src_meta.is_dir();
+        let src_is_link = src_meta.is_symlink();
+        let dst_lmeta = if new_dst {
+            None
+        } else {
+            match fs::symlink_metadata(dst) {
+                Ok(m) => Some(m),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    eprintln!("cp: cannot stat {}: {}", qa(dst), gnu_io_error(&e));
+                    return false;
+                }
+            }
+        };
+        let dst_meta = dst_lmeta.as_ref().and_then(|_| fs::metadata(dst).ok());
+        let mut backup_made: Option<PathBuf> = None;
+        let mut plan: Option<UndoPlan> = None;
+
+        if let Some(dl) = &dst_lmeta {
+            // GNU skips with -n / --update=none before any other check.
+            let exists = src_is_link || dst_meta.is_some();
+            if !src_is_dir && exists && matches!(self.o.clobber, Clobber::No | Clobber::Skip) {
+                return true;
+            }
+            // Same-file check: never truncate or unlink the source itself.
+            let same = if src_is_link {
+                same_inode(src_meta, dl)
+            } else {
+                dst_meta.as_ref().is_some_and(|dm| same_inode(src_meta, dm))
+            };
+            // Removing a destination symlink first is fine (`--remove-destination`).
+            if self.o.hard_link && !src_is_dir && same_inode(src_meta, dl) {
+                // Already a link to the source: nothing to do.
+                return true;
+            }
+            if same && !(dl.is_symlink() && self.o.remove_destination) {
+                eprintln!("cp: {} and {} are the same file", qa(src), qa(dst));
+                return false;
+            }
+            // A symlink to a directory only counts as one with --keep-directory-symlink.
+            let dst_is_dir = dl.is_dir()
+                || (dl.is_symlink()
+                    && dst_meta.as_ref().is_some_and(|m| m.is_dir())
+                    && (self.o.keep_dir_symlink || !src_is_dir));
+            if src_is_dir {
+                if !dst_is_dir {
+                    eprintln!(
+                        "cp: cannot overwrite non-directory {} with directory {}",
+                        qa(dst),
+                        qa(src)
+                    );
+                    return false;
+                }
+            } else {
+                if dst_is_dir {
+                    eprintln!(
+                        "cp: cannot overwrite directory {} with non-directory",
+                        qa(dst)
+                    );
+                    return false;
+                }
+                if self.o.update_older
+                    && let Some(dm) = dst_meta.as_ref().or(src_is_link.then_some(dl))
+                    && (dm.mtime(), dm.mtime_nsec()) >= (src_meta.mtime(), src_meta.mtime_nsec())
+                {
+                    return true;
+                }
+                match self.o.clobber {
+                    Clobber::No | Clobber::Skip => return true,
+                    Clobber::Ask => {
+                        let protected = !dl.is_symlink() && write_protected(dst);
+                        let q = if protected {
+                            let m = dl.mode() & CHMOD_MODE_BITS;
+                            format!(
+                                "replace {}, overriding mode {m:04o} ({})? ",
+                                qa(dst),
+                                strmode9(m)
+                            )
+                        } else {
+                            format!("overwrite {}? ", qa(dst))
+                        };
+                        if !ask("cp", &q) {
+                            return false;
+                        }
+                    }
+                    Clobber::Yes => {}
+                }
+                if self.o.backup != BackupMode::None {
+                    match make_backup(
+                        dst,
+                        self.o.backup,
+                        &self.o.suffix,
+                        self.journal.as_ref(),
+                        "cp",
+                    ) {
+                        Ok(b) => backup_made = Some(b),
+                        Err(e) => {
+                            eprintln!("cp: cannot backup {}: {}", qa(dst), gnu_io_error(&e));
+                            return false;
+                        }
+                    }
+                } else if self.o.remove_destination
+                    || (self.o.preserve_links && dl.nlink() > 1)
+                    || (self.o.deref == Deref::Never && !src_meta.is_file())
+                {
+                    if let Err(e) = self.remove_existing(dst, &mut plan, top) {
+                        eprintln!("cp: cannot remove {}: {}", qa(dst), gnu_io_error(&e));
+                        return false;
+                    }
+                    if self.o.verbose {
+                        println!("removed {}", qa(dst));
+                    }
+                }
+            }
+        }
+        // Whatever still exists at `dst` now is about to be written to.
+        let dst_exists = backup_made.is_none() && fs::symlink_metadata(dst).is_ok();
+
+        if !src_is_dir
+            && !(self.ctx.stdout_is_tty
+                && src_meta.is_file()
+                && !self.o.hard_link
+                && !self.o.symbolic_link)
+        {
+            self.emit_verbose(src, dst, backup_made.as_deref());
+        }
+
+        // --preserve=links: a source inode seen before becomes a hard link.
+        if self.o.preserve_links && !src_is_dir && src_meta.nlink() > 1 {
+            let key = (src_meta.dev(), src_meta.ino());
+            if let Some(first) = self.linked.get(&key).cloned() {
+                if dst_exists && let Err(e) = self.remove_existing(dst, &mut plan, top) {
+                    eprintln!("cp: cannot remove {}: {}", qa(dst), gnu_io_error(&e));
+                    return false;
+                }
+                return match fs::hard_link(&first, dst) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "cp: cannot create hard link {} to {}: {}",
+                            qa(dst),
+                            qa(&first),
+                            gnu_io_error(&e)
+                        );
+                        false
+                    }
+                };
+            }
+            self.linked.insert(key, dst.to_path_buf());
+        }
+
+        if self.o.symbolic_link && !src_is_dir {
+            return self.make_link(src, dst, dst_exists, top, &mut plan, true);
+        }
+        if self.o.hard_link && !src_is_dir {
+            return self.make_link(src, dst, dst_exists, top, &mut plan, false);
+        }
+        if src_is_dir {
+            return self.copy_dir(src, dst, src_meta, dst_lmeta.is_some(), top);
+        }
+        if src_is_link {
+            let target = match fs::read_link(src) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "cp: cannot read symbolic link {}: {}",
+                        qa(src),
+                        gnu_io_error(&e)
+                    );
+                    return false;
+                }
+            };
+            if top && plan.is_none() {
+                plan = Some(UndoPlan {
+                    created: dst.to_path_buf(),
+                    backup: None,
+                });
+            }
+            if let Err(e) = symlink(&target, dst) {
+                eprintln!(
+                    "cp: cannot create symbolic link {}: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                );
+                return false;
+            }
+            self.preserve_attrs(dst, src_meta, true);
+            if let Some(p) = plan {
+                self.journal_commit(src, p);
+            }
+            return true;
+        }
+        self.copy_file(src, dst, src_meta, dst_exists, top, plan)
+    }
+
+    /// `cp -s` / `cp -l`.
+    fn make_link(
+        &self,
+        src: &Path,
+        dst: &Path,
+        dst_exists: bool,
+        top: bool,
+        plan: &mut Option<UndoPlan>,
+        symbolic: bool,
+    ) -> bool {
+        if symbolic && !src.is_absolute() {
+            let parent = match dst.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            if !same_file(parent, Path::new(".")) {
+                eprintln!(
+                    "cp: {}: can make relative symbolic links only in current directory",
+                    qf(dst)
+                );
+                return false;
+            }
+        }
+        let create = || {
+            if symbolic {
+                symlink(src, dst)
+            } else if self.o.deref == Deref::Always {
+                fs::canonicalize(src).and_then(|real| fs::hard_link(real, dst))
+            } else {
+                fs::hard_link(src, dst)
+            }
+        };
+        let mut res = create();
+        if dst_exists
+            && self.o.force
+            && res
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::AlreadyExists)
+        {
+            res = self.remove_existing(dst, plan, top).and_then(|()| create());
+        }
+        match res {
+            Ok(()) => {
+                if let Some(p) = plan.take() {
+                    self.journal_commit(src, p);
+                }
+                true
+            }
+            Err(e) => {
+                let kind = if symbolic { "symbolic" } else { "hard" };
+                eprintln!(
+                    "cp: cannot create {kind} link {} to {}: {}",
+                    qa(dst),
+                    qa(src),
+                    gnu_io_error(&e)
+                );
+                false
+            }
+        }
+    }
+
+    fn copy_dir(
+        &mut self,
+        src: &Path,
+        dst: &Path,
+        src_meta: &fs::Metadata,
+        dst_existed: bool,
+        top: bool,
+    ) -> bool {
+        let mut plan = None;
+        let created = !dst_existed;
+        if created {
+            if let Err(e) = fs::DirBuilder::new().mode(0o700).create(dst) {
+                eprintln!(
+                    "cp: cannot create directory {}: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                );
+                return false;
+            }
+            if self.o.verbose {
+                println!("{} -> {}", qa(src), qa(dst));
+            }
+            if top {
+                plan = Some(UndoPlan {
+                    created: dst.to_path_buf(),
+                    backup: None,
+                });
+            }
+        } else if top {
+            // Merging into an existing tree: keep a copy of it for `dogfish undo`.
+            match self.journal_prepare(dst, true) {
+                Ok(p) => plan = Some(p),
+                Err(()) => return false,
+            }
+        }
+
+        let mut ok = true;
+        let descend = !(self.o.one_file_system && !top && src_meta.dev() != self.top_dev);
+        if descend {
+            match dir_names(src, true) {
+                Ok(names) => {
+                    for name in names {
+                        let (s, d) = (src.join(&name), dst.join(&name));
+                        match self.src_metadata(&s, false) {
+                            Ok(m) => ok &= self.copy_entry(&s, &d, &m, created, false),
+                            Err(e) => {
+                                eprintln!("cp: cannot stat {}: {}", qa(&s), gnu_io_error(&e));
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("cp: cannot access {}: {}", qa(src), gnu_io_error(&e));
+                    ok = false;
+                }
+            }
+        }
+
+        if created || self.o.preserve_mode {
+            let mode = if self.o.preserve_mode {
+                src_meta.mode() & CHMOD_MODE_BITS
+            } else if self.o.no_preserve_mode {
+                S_IRWXUGO & !self.umask
+            } else {
+                src_meta.mode() & (S_IRWXUGO | S_ISVTX) & !self.umask
+            };
+            if let Err(e) = fs::set_permissions(dst, fs::Permissions::from_mode(mode)) {
+                eprintln!(
+                    "cp: setting permissions for {}: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                );
+                ok = false;
+            }
+        }
+        self.preserve_attrs(dst, src_meta, false);
+        if let Some(p) = plan {
+            // Recorded even after a partial failure, so undo can restore the tree.
+            self.journal_commit(src, p);
+        }
+        ok
+    }
+
+    fn copy_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        src_meta: &fs::Metadata,
+        dst_exists: bool,
+        top: bool,
+        mut plan: Option<UndoPlan>,
+    ) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        if !src_meta.is_file() && !(src_meta.file_type().is_fifo() && !self.o.recursive) {
+            return self.copy_special(dst, src_meta, dst_exists);
+        }
+        let mut input = match fs::File::open(src) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "cp: cannot open {} for reading: {}",
+                    qa(src),
+                    gnu_io_error(&e)
+                );
+                return false;
+            }
+        };
+        // Writing through a symlink changes its referent: that is what to back up.
+        let dangling = dst_exists
+            && fs::symlink_metadata(dst).is_ok_and(|m| m.is_symlink())
+            && fs::metadata(dst).is_err();
+        let mut existing = dst_exists;
+        if dangling {
+            if !self.o.force {
+                eprintln!("cp: not writing through dangling symlink {}", qa(dst));
+                return false;
+            }
+            if let Err(e) = self.remove_existing(dst, &mut plan, top) {
+                eprintln!("cp: cannot remove {}: {}", qa(dst), gnu_io_error(&e));
+                return false;
+            }
+            existing = false;
+        }
+        if top && existing && plan.is_none() {
+            let real = fs::canonicalize(dst).unwrap_or_else(|_| dst.to_path_buf());
+            match self.journal_prepare(&real, true) {
+                Ok(p) => plan = Some(p),
+                Err(()) => return false,
+            }
+        }
+
+        // APFS: a new file can be a zero-copy clone.
+        #[cfg(target_os = "macos")]
+        if !existing && !self.o.attributes_only && clone_new_file(src, dst) {
+            if !self.o.preserve_timestamps {
+                // clonefile(2) copies the source's times, but a copy is a new file.
+                let _ = set_file_times(dst, Stamp::Now, Stamp::Now, false);
+            }
+            let len = src_meta.len();
+            return self.finish_copy(
+                src,
+                dst,
+                src_meta,
+                (top, existing),
+                plan,
+                (len, CopyMethod::ClonefileCoW),
+            );
+        }
+
+        let opened = if existing {
+            let truncate = !self.o.attributes_only;
+            match fs::OpenOptions::new()
+                .write(true)
+                .truncate(truncate)
+                .open(dst)
+            {
+                Ok(f) => Ok(f),
+                Err(e) if self.o.force => match self.remove_existing(dst, &mut plan, top) {
+                    Ok(()) => {
+                        if self.o.verbose {
+                            println!("removed {}", qa(dst));
+                        }
+                        existing = false;
+                        self.create_new(dst, src_meta)
+                    }
+                    Err(_) => Err(format!(
+                        "cannot create regular file {}: {}",
+                        qa(dst),
+                        gnu_io_error(&e)
+                    )),
+                },
+                Err(e) => Err(format!(
+                    "cannot create regular file {}: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                )),
+            }
+        } else {
+            self.create_new(dst, src_meta)
+        };
+        let output = match opened {
+            Ok(f) => f,
+            Err(msg) => {
+                eprintln!("cp: {msg}");
+                return false;
+            }
+        };
+        let copied = if self.o.attributes_only {
+            Ok((0, CopyMethod::StandardCopy))
+        } else {
+            copy_data(&mut input, &output)
+        };
+        match copied {
+            Ok(stats) => {
+                drop(output);
+                self.finish_copy(src, dst, src_meta, (top, existing), plan, stats)
+            }
+            Err(e) => {
+                eprintln!(
+                    "cp: error copying {} to {}: {}",
+                    qa(src),
+                    qa(dst),
+                    gnu_io_error(&e)
+                );
+                drop(output);
+                // Put the saved original back so a failed copy never loses it.
+                if let Some(UndoPlan {
+                    created,
+                    backup: Some(b),
+                }) = &plan
+                {
+                    let _ = fs::remove_file(created);
+                    let _ = move_path(Path::new(b), created);
+                }
+                false
+            }
+        }
+    }
+
+    /// After the data of a regular file is in place: telemetry, permissions,
+    /// preserved attributes and the undo journal. `(top, existing)` says whether
+    /// `dst` is a command-line operand and whether it existed before.
+    fn finish_copy(
+        &self,
+        src: &Path,
+        dst: &Path,
+        src_meta: &fs::Metadata,
+        (top, existing): (bool, bool),
+        plan: Option<UndoPlan>,
+        (bytes, method): (u64, CopyMethod),
+    ) -> bool {
+        let t = &self.ctx.telemetry;
+        t.set_strategy(method.as_str());
+        t.add_read(bytes);
+        t.add_written(bytes);
+        t.add_items(1);
+        if self.o.verbose && self.ctx.stdout_is_tty {
+            // Dogfish extra, only on a terminal: how the data was copied.
+            println!("{} -> {} ({})", qa(src), qa(dst), method.as_str());
+        }
+        if !existing && !self.o.preserve_mode {
+            // New files get the source's permissions minus the umask (as with open(2)).
+            let base = if self.o.no_preserve_mode {
+                0o666
+            } else {
+                src_meta.mode() & S_IRWXUGO
+            };
+            let _ = fs::set_permissions(dst, fs::Permissions::from_mode(base & !self.umask));
+        }
+        self.preserve_attrs(dst, src_meta, false);
+        let plan = plan.or_else(|| {
+            top.then(|| UndoPlan {
+                created: dst.to_path_buf(),
+                backup: None,
+            })
+        });
+        if let Some(p) = plan {
+            self.journal_commit(src, p);
+        }
+        true
+    }
+
+    fn create_new(
+        &self,
+        dst: &Path,
+        src_meta: &fs::Metadata,
+    ) -> std::result::Result<fs::File, String> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(src_meta.mode() & S_IRWXUGO)
+            .open(dst)
+            .map_err(|e| {
+                format!(
+                    "cannot create regular file {}: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                )
+            })
+    }
+
+    /// FIFOs (with -R); other special files are not supported.
+    fn copy_special(&self, dst: &Path, src_meta: &fs::Metadata, dst_exists: bool) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        if dst_exists && let Err(e) = fs::remove_file(dst) {
+            eprintln!("cp: cannot remove {}: {}", qa(dst), gnu_io_error(&e));
+            return false;
+        }
+        let res = if src_meta.file_type().is_fifo() {
+            c_path(dst).and_then(|c| {
+                let mode = u32_to_mode_t(src_meta.mode() & S_IRWXUGO);
+                if unsafe { libc::mkfifo(c.as_ptr(), mode) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        };
+        match res {
+            Ok(()) => {
+                self.preserve_attrs(dst, src_meta, false);
+                true
+            }
+            Err(e) => {
+                let what = if src_meta.file_type().is_fifo() {
+                    "fifo"
+                } else {
+                    "special file"
+                };
+                eprintln!("cp: cannot create {what} {}: {}", qa(dst), gnu_io_error(&e));
+                false
+            }
+        }
+    }
+
+    /// Applies `-p` / `--preserve` attributes (ownership, then mode, then times).
+    fn preserve_attrs(&self, dst: &Path, src_meta: &fs::Metadata, is_link: bool) {
+        if self.o.preserve_ownership {
+            // Like GNU, failing to change ownership as a regular user is not an error.
+            let _ = std::os::unix::fs::lchown(dst, Some(src_meta.uid()), Some(src_meta.gid()));
+        }
+        if self.o.preserve_mode && !is_link {
+            let _ = fs::set_permissions(
+                dst,
+                fs::Permissions::from_mode(src_meta.mode() & CHMOD_MODE_BITS),
+            );
+        }
+        if self.o.preserve_timestamps {
+            let ns = |n: i64| u32::try_from(n).unwrap_or(0);
+            let _ = set_file_times(
+                dst,
+                Stamp::At(src_meta.atime(), ns(src_meta.atime_nsec())),
+                Stamp::At(src_meta.mtime(), ns(src_meta.mtime_nsec())),
+                false,
+            );
+        }
+    }
+}
+
+/// `clonefile(2)`: an instant copy-on-write clone on APFS (`dst` must not exist).
+#[cfg(target_os = "macos")]
+fn clone_new_file(src: &Path, dst: &Path) -> bool {
+    match (c_path(src), c_path(dst)) {
+        (Ok(s), Ok(d)) => unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) == 0 },
+        _ => false,
+    }
+}
+
+/// Copies all of `src` into the empty `dst`, as a CoW reflink where the file
+/// system supports it.
+fn copy_data(src: &mut fs::File, dst: &fs::File) -> io::Result<(u64, CopyMethod)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE: instant copy-on-write on Btrfs, XFS, bcachefs.
+        const FICLONE: libc::c_ulong = 0x40049409;
+        if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) } == 0 {
+            return Ok((src.metadata()?.len(), CopyMethod::FicloneCoW));
+        }
+    }
+    // std specializes File-to-File `io::copy` to copy_file_range(2) / fcopyfile(3).
+    let bytes = io::copy(src, &mut &*dst)?;
+    Ok((bytes, CopyMethod::StandardCopy))
 }
 
 /// Absolute form of `target` with its parent resolved through symlinks, for
@@ -1676,295 +5803,329 @@ fn resolve_for_containment(target: &Path) -> PathBuf {
     }
 }
 
-fn cp_one(
-    src: &Path,
-    target: &Path,
-    parsed: &CpArgs,
-    journal: Option<&UndoJournal>,
-    ctx: &DogfishContext,
-) -> Result<()> {
-    let src_meta = fs::metadata(src)
-        .map_err(|e| anyhow!("cannot stat '{}': {}", src.display(), gnu_io_error(&e)))?;
-    if same_file(src, target) {
-        return Err(anyhow!(
-            "'{}' and '{}' are the same file",
-            src.display(),
-            target.display()
-        ));
-    }
-    if parsed.no_clobber && exists_no_follow(target) {
-        return Ok(());
-    }
+// ---------------------------------------------------------------------------
+// 9. mv — GNU semantics, recorded to the UndoJournal (`dogfish undo` reverses it)
+// ---------------------------------------------------------------------------
+const MV_HELP: &str = "\
+Usage: mv [OPTION]... [-T] SOURCE DEST
+  or:  mv [OPTION]... SOURCE... DIRECTORY
+  or:  mv [OPTION]... -t DIRECTORY SOURCE...
+Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.
+Moves are recorded so that `dogfish undo` can reverse them.
 
-    let target_is_dir = target.is_dir();
-    if src_meta.is_dir() {
-        if !parsed.recursive {
-            return Err(anyhow!(
-                "-r not specified; omitting directory '{}'",
-                src.display()
-            ));
-        }
-        if exists_no_follow(target) && !target_is_dir {
-            return Err(anyhow!(
-                "cannot overwrite non-directory '{}' with directory '{}'",
-                target.display(),
-                src.display()
-            ));
-        }
-        let abs_src = fs::canonicalize(src)?;
-        if resolve_for_containment(target).starts_with(&abs_src) {
-            return Err(anyhow!(
-                "cannot copy a directory, '{}', into itself, '{}'",
-                src.display(),
-                target.display()
-            ));
-        }
-    } else if target_is_dir {
-        return Err(anyhow!(
-            "cannot overwrite directory '{}' with non-directory",
-            target.display()
-        ));
-    }
+      --backup[=CONTROL]       make a backup of each existing destination file
+  -b                           like --backup but does not accept an argument
+  -f, --force                  do not prompt before overwriting
+  -i, --interactive            prompt before overwrite
+  -n, --no-clobber             do not overwrite an existing file
+If you specify more than one of -i, -f, -n, only the final one takes effect.
+      --strip-trailing-slashes  remove any trailing slashes from each SOURCE
+                                 argument
+  -S, --suffix=SUFFIX          override the usual backup suffix
+  -t, --target-directory=DIRECTORY  move all SOURCE arguments into DIRECTORY
+  -T, --no-target-directory    treat DEST as a normal file
+      --update[=UPDATE]        control which existing files are updated;
+                                 UPDATE={all,none,older(default)}
+  -u                           equivalent to --update[=older]
+  -v, --verbose                explain what is being done
+      --help        display this help and exit
+      --version     output version information and exit
+";
 
-    // Preserve whatever we are about to overwrite so `dogfish undo` can bring it back.
-    // A directory copy merges into the existing tree, so it is backed up by copy;
-    // a file is moved aside (cheap rename) and then recreated.
-    let backup = match journal {
-        Some(j) => j
-            .backup_existing(target, src_meta.is_dir())
-            .with_context(|| format!("cannot back up '{}' before overwriting", target.display()))?,
-        None => None,
-    };
-
-    let result = if src_meta.is_dir() {
-        copy_dir_cow(src, target, parsed.verbose, ctx)
-    } else {
-        copy_file_fast(src, target)
-            .map(|(bytes, method)| {
-                ctx.telemetry.set_strategy(method.as_str());
-                ctx.telemetry.add_read(bytes);
-                ctx.telemetry.add_written(bytes);
-                ctx.telemetry.add_items(1);
-                if parsed.verbose {
-                    println!(
-                        "'{}' -> '{}' ({})",
-                        src.display(),
-                        target.display(),
-                        method.as_str()
-                    );
-                }
-            })
-            .map_err(|e| {
-                anyhow!(
-                    "cannot create regular file '{}': {}",
-                    target.display(),
-                    gnu_io_error(&e)
-                )
-            })
-    };
-
-    if let Err(e) = result {
-        // Put a moved-aside file back so a failed copy never loses the original.
-        if let (Some(b), false) = (&backup, src_meta.is_dir()) {
-            let _ = fs::remove_file(target);
-            let _ = move_path(Path::new(b), target);
-        }
-        return Err(e);
-    }
-
-    if let Some(j) = journal {
-        let _ = j.record(
-            "cp",
-            JournalAction::CopyCreate {
-                src: std::path::absolute(src)?.to_string_lossy().into_owned(),
-                created_path: std::path::absolute(target)?.to_string_lossy().into_owned(),
-                backup_path: backup,
-            },
-        );
-    }
-    Ok(())
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MvOpt {
+    Backup,
+    BackupArg,
+    Force,
+    Interactive,
+    NoClobber,
+    NoCopy,
+    StripSlashes,
+    Suffix,
+    TargetDir,
+    NoTargetDir,
+    UpdateOlder,
+    Update,
+    Verbose,
+    Context,
 }
 
-fn copy_dir_cow(src: &Path, dst: &Path, verbose: bool, ctx: &DogfishContext) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let sub_dst = dst.join(entry.file_name());
-        if ty.is_symlink() {
-            // Like GNU `cp -R`: copy symlinks as symlinks, never follow them.
-            if exists_no_follow(&sub_dst) {
-                fs::remove_file(&sub_dst)?;
-            }
-            symlink(fs::read_link(entry.path())?, &sub_dst)?;
-        } else if ty.is_dir() {
-            copy_dir_cow(&entry.path(), &sub_dst, verbose, ctx)?;
-        } else {
-            let (bytes, method) = copy_file_fast(&entry.path(), &sub_dst)?;
-            ctx.telemetry.set_strategy(method.as_str());
-            ctx.telemetry.add_read(bytes);
-            ctx.telemetry.add_written(bytes);
-            ctx.telemetry.add_items(1);
-            if verbose {
-                println!("'{}' -> '{}'", entry.path().display(), sub_dst.display());
-            }
-        }
-    }
-    fs::set_permissions(dst, fs::metadata(src)?.permissions())?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 9. mv — With UndoJournal recording (`dogfish undo` reverses `mv`!)
-// ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(
-    name = "mv",
-    about = "Move (rename) files (undoable via `dogfish undo`)"
-)]
-struct MvArgs {
-    /// Do not overwrite an existing file
-    #[arg(short = 'n', long = "no-clobber")]
-    no_clobber: bool,
-
-    /// Do not prompt before overwriting
-    #[arg(short = 'f', long = "force")]
-    force: bool,
-
-    /// Explain what is being done
-    #[arg(short = 'v', long = "verbose")]
+struct MvOpts {
+    clobber: Clobber,
+    update_older: bool,
+    backup: BackupMode,
+    suffix: String,
     verbose: bool,
-
-    #[arg(required = true)]
-    paths: Vec<String>,
+    stdin_tty: bool,
 }
 
 pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = MvArgs::try_parse_from(args)?;
-    if parsed.paths.len() < 2 {
-        return Err(anyhow!("mv: missing destination file operand"));
-    }
-    let dst = Path::new(parsed.paths.last().unwrap());
-    let sources = &parsed.paths[..parsed.paths.len() - 1];
-    let dst_is_dir = dst.is_dir();
-
-    if sources.len() > 1 && !dst_is_dir {
-        return Err(anyhow!("mv: target '{}' is not a directory", dst.display()));
-    }
-
-    let journal = UndoJournal::open().ok();
-    let mut exit_code = 0;
-
-    for src_str in sources {
-        let src = Path::new(src_str);
-        let target = if dst_is_dir {
-            dst.join(src.file_name().ok_or_else(|| anyhow!("invalid source"))?)
-        } else {
-            dst.to_path_buf()
-        };
-        match mv_one(src, &target, &parsed, journal.as_ref()) {
-            Ok(true) => {
-                ctx.telemetry.add_items(1);
-                if parsed.verbose {
-                    println!("renamed '{}' -> '{}'", src.display(), target.display());
+    use MvOpt::*;
+    const SPECS: &[ToolOpt<MvOpt>] = &[
+        opt("b", "", HasArg::No, Backup),
+        opt("", "backup", HasArg::Optional, BackupArg),
+        opt("f", "force", HasArg::No, Force),
+        opt("i", "interactive", HasArg::No, Interactive),
+        opt("n", "no-clobber", HasArg::No, NoClobber),
+        opt("", "no-copy", HasArg::No, NoCopy),
+        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
+        opt("S", "suffix", HasArg::Required, Suffix),
+        opt("t", "target-directory", HasArg::Required, TargetDir),
+        opt("T", "no-target-directory", HasArg::No, NoTargetDir),
+        opt("u", "", HasArg::No, UpdateOlder),
+        opt("", "update", HasArg::Optional, Update),
+        opt("v", "verbose", HasArg::No, Verbose),
+        opt("Z", "", HasArg::No, Context),
+        opt("", "context", HasArg::No, Context),
+    ];
+    let parsed = match parse_tool_args("mv", &args, SPECS, MV_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let mut o = MvOpts {
+        clobber: Clobber::Yes,
+        update_older: false,
+        backup: BackupMode::None,
+        suffix: String::new(),
+        verbose: false,
+        stdin_tty: io::stdin().is_terminal(),
+    };
+    let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
+    let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
+    for (opt, v) in parsed.opts {
+        match opt {
+            Backup => want_backup = true,
+            BackupArg => {
+                want_backup = true;
+                backup_arg = v;
+            }
+            Force => o.clobber = Clobber::Yes,
+            Interactive => o.clobber = Clobber::Ask,
+            NoClobber => o.clobber = Clobber::No,
+            NoCopy | Context => {}
+            StripSlashes => strip_slashes = true,
+            Suffix => {
+                want_backup = true;
+                suffix = v;
+            }
+            TargetDir => target_dir = v,
+            NoTargetDir => no_target_dir = true,
+            UpdateOlder => o.update_older = true,
+            Update => {
+                const UPDATE: &[(&str, u8)] = &[("all", 0), ("none", 1), ("older", 2)];
+                let which = match v {
+                    None => 2,
+                    Some(w) => match argmatch("mv", "--update", &w, UPDATE) {
+                        Ok(u) => u,
+                        Err(code) => return Ok(code),
+                    },
+                };
+                o.update_older = which == 2;
+                if which == 1 && o.clobber != Clobber::No {
+                    o.clobber = Clobber::Skip;
                 }
             }
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("mv: {}", e);
-                exit_code = 1;
-            }
+            Verbose => o.verbose = true,
         }
     }
-    Ok(exit_code)
+    if want_backup {
+        o.backup = match backup_mode("mv", backup_arg.as_deref()) {
+            Ok(m) => m,
+            Err(code) => return Ok(code),
+        };
+    }
+    o.suffix = backup_suffix(suffix);
+
+    let targets = match resolve_targets("mv", parsed.operands, target_dir, no_target_dir) {
+        Ok(t) => t,
+        Err(code) => return Ok(code),
+    };
+    if want_backup && o.clobber == Clobber::No {
+        return Ok(usage_error(
+            "mv",
+            "options --backup and --no-clobber are mutually exclusive",
+        ));
+    }
+    let journal = UndoJournal::open().ok();
+    let strip = |s: &str| {
+        if strip_slashes {
+            strip_trailing_slashes(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let pairs: Vec<(String, PathBuf)> = match targets {
+        Targets::Into(dir, sources) => sources
+            .iter()
+            .map(|s| {
+                let s = strip(s);
+                let d = concat_path(&dir, &operand_base(&s));
+                (s, d)
+            })
+            .collect(),
+        Targets::Single(s, d) => vec![(strip(&s), PathBuf::from(d))],
+    };
+    let mut ok = true;
+    for (src, dst) in &pairs {
+        ok &= mv_one(Path::new(src), dst, &o, journal.as_ref(), ctx);
+    }
+    Ok(if ok { 0 } else { 1 })
 }
 
-/// Moves one source; returns `Ok(false)` when skipped by `--no-clobber`.
 fn mv_one(
     src: &Path,
-    target: &Path,
-    parsed: &MvArgs,
+    dst: &Path,
+    o: &MvOpts,
     journal: Option<&UndoJournal>,
-) -> Result<bool> {
-    let src_meta = src
-        .symlink_metadata()
-        .map_err(|e| anyhow!("cannot stat '{}': {}", src.display(), gnu_io_error(&e)))?;
-    if exists_no_follow(target) && same_file(src, target) {
-        return Err(anyhow!(
-            "'{}' and '{}' are the same file",
-            src.display(),
-            target.display()
-        ));
-    }
-    if parsed.no_clobber && exists_no_follow(target) {
-        return Ok(false);
-    }
-    if src_meta.is_dir() {
-        let abs_src = fs::canonicalize(src)?;
-        if resolve_for_containment(target).starts_with(&abs_src) {
-            return Err(anyhow!(
-                "cannot move '{}' to a subdirectory of itself, '{}'",
-                src.display(),
-                target.display()
-            ));
+    ctx: &DogfishContext,
+) -> bool {
+    let src_meta = match src.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("mv: cannot stat {}: {}", qa(src), gnu_io_error(&e));
+            return false;
+        }
+    };
+    let mut backup_made = None;
+    let dst_meta = match dst.symlink_metadata() {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("mv: cannot stat {}: {}", qa(dst), gnu_io_error(&e));
+            return false;
+        }
+    };
+    // GNU's order: the no-clobber and update checks come first, then same-file
+    // and prompts; type conflicts only matter when no backup is made.
+    if let Some(dm) = &dst_meta {
+        match o.clobber {
+            Clobber::No => {
+                eprintln!("mv: not replacing {}", qa(dst));
+                return false;
+            }
+            Clobber::Skip => return true,
+            _ => {}
+        }
+        if same_inode(&src_meta, dm) {
+            eprintln!("mv: {} and {} are the same file", qa(src), qa(dst));
+            return false;
+        }
+        // -u only ever skips non-directories.
+        if o.update_older
+            && !src_meta.is_dir()
+            && (dm.mtime(), dm.mtime_nsec()) >= (src_meta.mtime(), src_meta.mtime_nsec())
+        {
+            return true;
+        }
+        let question = match o.clobber {
+            Clobber::Ask => Some(format!("overwrite {}? ", qa(dst))),
+            _ if o.stdin_tty && !dm.is_symlink() && write_protected(dst) => {
+                let m = dm.mode() & CHMOD_MODE_BITS;
+                Some(format!(
+                    "replace {}, overriding mode {m:04o} ({})? ",
+                    qa(dst),
+                    strmode9(m)
+                ))
+            }
+            _ => None,
+        };
+        if let Some(q) = question
+            && !ask("mv", &q)
+        {
+            return false;
+        }
+        if o.backup == BackupMode::None {
+            if src_meta.is_dir() && !dm.is_dir() {
+                eprintln!(
+                    "mv: cannot overwrite non-directory {} with directory {}",
+                    qa(dst),
+                    qa(src)
+                );
+                return false;
+            }
+            if !src_meta.is_dir() && dm.is_dir() {
+                eprintln!(
+                    "mv: cannot overwrite directory {} with non-directory",
+                    qa(dst)
+                );
+                return false;
+            }
         }
     }
-    if let Ok(tm) = target.symlink_metadata() {
-        if tm.is_dir() {
-            if !src_meta.is_dir() {
-                return Err(anyhow!(
-                    "cannot overwrite directory '{}' with non-directory",
-                    target.display()
-                ));
+    if src_meta.is_dir()
+        && let Ok(abs_src) = fs::canonicalize(src)
+        && resolve_for_containment(dst).starts_with(&abs_src)
+    {
+        eprintln!(
+            "mv: cannot move {} to a subdirectory of itself, {}",
+            qa(src),
+            qa(dst)
+        );
+        return false;
+    }
+    if let Some(dm) = &dst_meta {
+        if o.backup != BackupMode::None {
+            match make_backup(dst, o.backup, &o.suffix, journal, "mv") {
+                Ok(b) => backup_made = Some(b),
+                Err(e) => {
+                    eprintln!("mv: cannot backup {}: {}", qa(dst), gnu_io_error(&e));
+                    return false;
+                }
             }
-            if fs::read_dir(target)?.next().is_some() {
-                return Err(anyhow!(
-                    "cannot move '{}' to '{}': Directory not empty",
-                    src.display(),
-                    target.display()
-                ));
-            }
-        } else if src_meta.is_dir() {
-            return Err(anyhow!(
-                "cannot overwrite non-directory '{}' with directory '{}'",
-                target.display(),
-                src.display()
-            ));
+        } else if dm.is_dir() && fs::read_dir(dst).is_ok_and(|mut d| d.next().is_some()) {
+            // Checked up front: the journal moves the old target aside before the
+            // rename, which must never make a non-empty directory replaceable.
+            eprintln!("mv: cannot overwrite {}: Directory not empty", qa(dst));
+            return false;
         }
     }
 
-    let abs_src = std::path::absolute(src)?;
+    let abs_src = absolute_lossy(src);
     // Move an existing target aside first so `dogfish undo` can restore it.
-    let backup = match journal {
-        Some(j) => j
-            .backup_existing(target, false)
-            .with_context(|| format!("cannot back up '{}' before overwriting", target.display()))?,
+    let saved = match journal {
+        Some(j) => match j.backup_existing(dst, false) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "mv: cannot back up {} before overwriting: {}",
+                    qa(dst),
+                    gnu_io_error(&e)
+                );
+                return false;
+            }
+        },
         None => None,
     };
-
-    if let Err(e) = move_path(src, target) {
-        if let Some(b) = &backup {
-            let _ = move_path(Path::new(b), target);
+    if let Err(e) = move_path(src, dst) {
+        if let Some(b) = &saved {
+            let _ = move_path(Path::new(b), dst);
         }
-        return Err(anyhow!(
-            "cannot move '{}' to '{}': {}",
-            src.display(),
-            target.display(),
+        eprintln!(
+            "mv: cannot move {} to {}: {}",
+            qa(src),
+            qa(dst),
             gnu_io_error(&e)
-        ));
+        );
+        return false;
     }
-
     if let Some(j) = journal {
         let _ = j.record(
             "mv",
             JournalAction::Move {
-                src: abs_src.to_string_lossy().into_owned(),
-                dst: std::path::absolute(target)?.to_string_lossy().into_owned(),
-                backup_path: backup,
+                src: abs_src,
+                dst: absolute_lossy(dst),
+                backup_path: saved,
             },
         );
     }
-    Ok(true)
+    ctx.telemetry.add_items(1);
+    if o.verbose {
+        match &backup_made {
+            Some(b) => println!("renamed {} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
+            None => println!("renamed {} -> {}", qa(src), qa(dst)),
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -7090,53 +11251,306 @@ fn bytes_path(b: &[u8]) -> &Path {
 // ---------------------------------------------------------------------------
 // 13. realpath
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "realpath", about = "Print the resolved absolute file path")]
-struct RealpathArgs {
-    /// Do not strip symlinks or require all components to exist (-m)
-    #[arg(short = 's', long = "strip", visible_short_alias = 'm')]
-    no_symlinks: bool,
+const REALPATH_HELP: &str = "\
+Usage: realpath [OPTION]... FILE...
+Print the resolved absolute file name;
+all but the last component must exist
 
-    #[arg(short = 'J', long = "json")]
-    json: bool,
+  -e, --canonicalize-existing  all components of the path must exist
+  -m, --canonicalize-missing   no path components need exist or be a directory
+  -L, --logical                resolve '..' components before symlinks
+  -P, --physical               resolve symlinks as encountered (default)
+  -q, --quiet                  suppress most error messages
+      --relative-to=DIR        print the resolved path relative to DIR
+      --relative-base=DIR      print absolute paths unless paths below DIR
+  -s, --strip, --no-symlinks   don't expand symlinks
+  -z, --zero                   end each output line with NUL, not newline
+  -J, --json                   emit {input, realpath} objects (Dogfish)
+      --help        display this help and exit
+      --version     output version information and exit
+";
 
-    #[arg(required = true)]
-    paths: Vec<String>,
+/// How much of a path must exist (gnulib `canonicalize_filename_mode`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanMode {
+    Existing,
+    AllButLast,
+    Missing,
+}
+
+/// Makes `path` absolute, resolving `.`, `..` and (unless `nolinks`) symbolic
+/// links, requiring components to exist as `mode` says. A port of gnulib's
+/// `canonicalize_filename_mode`, quirks included: without symlink resolution,
+/// only the last component, or one followed by `/..`, a final `/.` or a
+/// trailing slash, is checked.
+fn canonicalize_mode(path: &Path, mode: CanMode, nolinks: bool) -> io::Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let mut resolved = if bytes[0] == b'/' {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir()?
+    };
+    let split = |b: &[u8]| -> VecDeque<OsString> {
+        b.split(|&c| c == b'/')
+            .filter(|c| !c.is_empty())
+            .map(|c| OsString::from_vec(c.to_vec()))
+            .collect()
+    };
+    let trailing_slash = bytes.len() > 1 && bytes.ends_with(b"/");
+    // gnulib `suffix_requires_dir_check`: must the path so far be a directory?
+    let needs_dir = |rest: &VecDeque<OsString>| {
+        for (i, c) in rest.iter().enumerate() {
+            match c.as_bytes() {
+                b".." => return true,
+                b"." if i + 1 == rest.len() => return true,
+                b"." => {}
+                _ => return false,
+            }
+        }
+        trailing_slash
+    };
+    let errno = |e: &io::Error| e.raw_os_error().unwrap_or(0);
+    let mut pending = split(bytes);
+    let mut seen: HashSet<(PathBuf, Vec<u8>)> = HashSet::new();
+    let mut links = 0;
+    while let Some(comp) = pending.pop_front() {
+        if comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&comp);
+        if mode == CanMode::Missing && nolinks {
+            resolved = candidate;
+            continue;
+        }
+        let mut link_err = None;
+        if !nolinks {
+            match fs::read_link(&candidate) {
+                Ok(target) => {
+                    links += 1;
+                    // The same link reached with the same remaining path is a loop.
+                    let mut rest = comp.as_bytes().to_vec();
+                    for c in &pending {
+                        rest.push(b'/');
+                        rest.extend_from_slice(c.as_bytes());
+                    }
+                    if links > MAX_LINKS || !seen.insert((resolved.clone(), rest)) {
+                        if mode == CanMode::Missing {
+                            resolved = candidate;
+                            continue;
+                        }
+                        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                    }
+                    let tb = target.as_os_str().as_bytes();
+                    if tb.first() == Some(&b'/') {
+                        resolved = PathBuf::from("/");
+                    }
+                    for c in split(tb).into_iter().rev() {
+                        pending.push_front(c);
+                    }
+                    continue;
+                }
+                Err(e) => link_err = Some(e),
+            }
+        }
+        if mode != CanMode::Missing {
+            let check = if needs_dir(&pending) {
+                match fs::metadata(&candidate) {
+                    Ok(m) if m.is_dir() => Ok(()),
+                    Ok(_) => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+                    Err(e) => Err(e),
+                }
+            } else if let Some(e) = link_err {
+                // readlink(2) fails with EINVAL on anything that is not a symlink.
+                if errno(&e) == libc::EINVAL {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            } else if !pending.is_empty() {
+                Ok(())
+            } else {
+                fs::metadata(&candidate).map(|_| ())
+            };
+            if let Err(e) = check
+                && !(mode == CanMode::AllButLast && errno(&e) == libc::ENOENT && pending.is_empty())
+            {
+                return Err(e);
+            }
+        }
+        resolved = candidate;
+    }
+    Ok(resolved)
+}
+
+/// `path` relative to the directory `base` (both absolute and canonical).
+fn relpath(path: &Path, base: &Path) -> PathBuf {
+    let p: Vec<_> = path.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut out = PathBuf::new();
+    for _ in common..b.len() {
+        out.push("..");
+    }
+    for c in &p[common..] {
+        out.push(c);
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// True if `prefix` is `path` or one of its ancestors (component-wise).
+fn path_prefix(prefix: &Path, path: &Path) -> bool {
+    path.starts_with(prefix)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RealpathOpt {
+    Existing,
+    Missing,
+    Logical,
+    Physical,
+    Quiet,
+    RelativeTo,
+    RelativeBase,
+    Strip,
+    Zero,
+    Json,
 }
 
 pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = RealpathArgs::try_parse_from(args)?;
-    let mut exit_code = 0;
-    let mut results = Vec::new();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    for p_str in &parsed.paths {
-        let p = Path::new(p_str);
-        let resolved = if parsed.no_symlinks {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
+    use RealpathOpt::*;
+    const SPECS: &[ToolOpt<RealpathOpt>] = &[
+        opt("e", "canonicalize-existing", HasArg::No, Existing),
+        opt("m", "canonicalize-missing", HasArg::No, Missing),
+        opt("L", "logical", HasArg::No, Logical),
+        opt("P", "physical", HasArg::No, Physical),
+        opt("q", "quiet", HasArg::No, Quiet),
+        opt("", "relative-to", HasArg::Required, RelativeTo),
+        opt("", "relative-base", HasArg::Required, RelativeBase),
+        opt("s", "strip", HasArg::No, Strip),
+        opt("", "no-symlinks", HasArg::No, Strip),
+        opt("z", "zero", HasArg::No, Zero),
+        opt("J", "json", HasArg::No, Json),
+    ];
+    let parsed = match parse_tool_args("realpath", &args, SPECS, REALPATH_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let (mut mode, mut nolinks, mut logical, mut quiet, mut zero, mut json) =
+        (CanMode::AllButLast, false, false, false, false, false);
+    let (mut relative_to, mut relative_base) = (None, None);
+    for (o, v) in parsed.opts {
+        match o {
+            Existing => mode = CanMode::Existing,
+            Missing => mode = CanMode::Missing,
+            Logical => {
+                logical = true;
+                nolinks = true;
             }
-        } else {
-            match fs::canonicalize(p) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("realpath: {}: {}", p_str, e);
-                    exit_code = 1;
-                    continue;
-                }
+            Physical => {
+                logical = false;
+                nolinks = false;
             }
-        };
-        ctx.telemetry.add_items(1);
-        let r_str = resolved.to_string_lossy().into_owned();
-        if parsed.json {
-            results.push(serde_json::json!({ "input": p_str, "realpath": r_str }));
-        } else {
-            println!("{}", r_str);
+            Strip => {
+                nolinks = true;
+                logical = false;
+            }
+            Quiet => quiet = true,
+            RelativeTo => relative_to = v,
+            RelativeBase => relative_base = v,
+            Zero => zero = true,
+            Json => json = true,
         }
     }
-    if parsed.json {
+    if parsed.operands.is_empty() {
+        return Ok(usage_error("realpath", "missing operand"));
+    }
+    let canon = |p: &Path| -> io::Result<PathBuf> {
+        let first = canonicalize_mode(p, mode, nolinks)?;
+        if logical {
+            // -L: '..' was resolved lexically; now resolve the symlinks.
+            canonicalize_mode(&first, mode, false)
+        } else {
+            Ok(first)
+        }
+    };
+    let canon_dir = |d: &str| -> std::result::Result<PathBuf, i32> {
+        match canon(Path::new(d)) {
+            Ok(p) if mode == CanMode::Existing && !p.is_dir() => {
+                eprintln!("realpath: {}: Not a directory", qf(d));
+                Err(1)
+            }
+            Ok(p) => Ok(p),
+            Err(e) => {
+                eprintln!("realpath: {}: {}", qf(d), gnu_io_error(&e));
+                Err(1)
+            }
+        }
+    };
+    if relative_base.is_some() && relative_to.is_none() {
+        relative_to = relative_base.clone();
+    }
+    let mut rel_to = match &relative_to {
+        Some(d) => match canon_dir(d) {
+            Ok(p) => Some(p),
+            Err(code) => return Ok(code),
+        },
+        None => None,
+    };
+    let rel_base = match &relative_base {
+        Some(b) if Some(b) == relative_to.as_ref() => rel_to.clone(),
+        Some(b) => match canon_dir(b) {
+            // --relative-to is a no-op unless --relative-base is a prefix of it.
+            Ok(base) if rel_to.as_ref().is_some_and(|to| path_prefix(&base, to)) => Some(base),
+            Ok(_) => rel_to.take(),
+            Err(code) => return Ok(code),
+        },
+        None => None,
+    };
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut exit_code = 0;
+    let mut results = Vec::new();
+    for arg in &parsed.operands {
+        let resolved = match canon(Path::new(arg)) {
+            Ok(p) => p,
+            Err(e) => {
+                if !quiet {
+                    out.flush()?;
+                    eprintln!("realpath: {}: {}", qf(arg), gnu_io_error(&e));
+                }
+                exit_code = 1;
+                continue;
+            }
+        };
+        let shown = match (&rel_to, &rel_base) {
+            (Some(to), base) if base.as_ref().is_none_or(|b| path_prefix(b, &resolved)) => {
+                relpath(&resolved, to)
+            }
+            _ => resolved,
+        };
+        ctx.telemetry.add_items(1);
+        if json {
+            results.push(serde_json::json!({ "input": arg, "realpath": shown.to_string_lossy() }));
+        } else {
+            out.write_all(shown.as_os_str().as_bytes())?;
+            out.write_all(if zero { b"\0" } else { b"\n" })?;
+        }
+    }
+    ignore_broken_pipe(out.flush())?;
+    drop(out);
+    if json {
         emit_objects_or_table(&results, ctx, true, false)?;
     }
     Ok(exit_code)
@@ -7145,175 +11559,347 @@ pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 // ---------------------------------------------------------------------------
 // 14. basename
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "basename", about = "Strip directory and suffix from filenames")]
-struct BasenameArgs {
-    /// Support multiple arguments and treat each as a NAME
-    #[arg(short = 'a', long = "multiple")]
-    multiple: bool,
+const BASENAME_HELP: &str = "\
+Usage: basename NAME [SUFFIX]
+  or:  basename OPTION... NAME...
+Print NAME with any leading directory components removed.
+If specified, also remove a trailing SUFFIX.
 
-    /// Remove a trailing SUFFIX; implies -a
-    #[arg(short = 's', long = "suffix")]
-    suffix: Option<String>,
+  -a, --multiple       support multiple arguments and treat each as a NAME
+  -s, --suffix=SUFFIX  remove a trailing SUFFIX; implies -a
+  -z, --zero           end each output line with NUL, not newline
+      --help        display this help and exit
+      --version     output version information and exit
+";
 
-    #[arg(required = true)]
-    names: Vec<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BasenameOpt {
+    Multiple,
+    Suffix,
+    Zero,
 }
 
 pub fn run_basename(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = BasenameArgs::try_parse_from(args)?;
-    if !parsed.multiple && parsed.suffix.is_none() {
-        let name = &parsed.names[0];
-        let suf = parsed.names.get(1).map(|s| s.as_str());
-        println!("{}", compute_basename(name, suf));
-        ctx.telemetry.add_items(1);
-    } else {
-        let suf = parsed.suffix.as_deref();
-        for name in &parsed.names {
-            println!("{}", compute_basename(name, suf));
-            ctx.telemetry.add_items(1);
+    use BasenameOpt::*;
+    const SPECS: &[ToolOpt<BasenameOpt>] = &[
+        opt("a", "multiple", HasArg::No, Multiple),
+        opt("s", "suffix", HasArg::Required, Suffix),
+        opt("z", "zero", HasArg::No, Zero),
+    ];
+    let parsed = match parse_tool_args_posix("basename", &args, SPECS, BASENAME_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let (mut multiple, mut suffix, mut zero) = (false, None, false);
+    for (o, v) in parsed.opts {
+        match o {
+            Multiple => multiple = true,
+            Suffix => {
+                multiple = true;
+                suffix = v;
+            }
+            Zero => zero = true,
         }
     }
+    let names = parsed.operands;
+    if names.is_empty() {
+        return Ok(usage_error("basename", "missing operand"));
+    }
+    let (names, suffix) = if multiple {
+        (&names[..], suffix)
+    } else {
+        if names.len() > 2 {
+            return Ok(usage_error(
+                "basename",
+                &format!("extra operand {}", quote_locale(&names[2])),
+            ));
+        }
+        (&names[..1], names.get(1).cloned())
+    };
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for name in names {
+        out.write_all(&compute_basename(
+            name.as_bytes(),
+            suffix.as_deref().map(str::as_bytes),
+        ))?;
+        out.write_all(if zero { b"\0" } else { b"\n" })?;
+        ctx.telemetry.add_items(1);
+    }
+    ignore_broken_pipe(out.flush())?;
     Ok(0)
 }
 
-fn compute_basename(path: &str, suffix: Option<&str>) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".to_string();
-    }
-    let base = Path::new(trimmed)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| trimmed.to_string());
+/// GNU `basename`: the last component without trailing slashes, minus `suffix`
+/// unless that would leave nothing.
+fn compute_basename(path: &[u8], suffix: Option<&[u8]>) -> Vec<u8> {
+    let base = last_component(path);
+    let mut name = if base.is_empty() {
+        path[..base_len(path)].to_vec()
+    } else {
+        let mut len = base_len(base);
+        if base.get(len) == Some(&b'/') {
+            len += 1;
+        }
+        base[..len].to_vec()
+    };
+    let keep = base_len(&name);
+    name.truncate(keep);
     if let Some(suf) = suffix
-        && base != suf
-        && base.ends_with(suf)
+        && name.first() != Some(&b'/')
+        && name.len() > suf.len()
+        && name.ends_with(suf)
     {
-        return base[..base.len() - suf.len()].to_string();
+        name.truncate(name.len() - suf.len());
     }
-    base
+    name
 }
 
 // ---------------------------------------------------------------------------
 // 15. dirname
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "dirname", about = "Strip last component from file name")]
-struct DirnameArgs {
-    #[arg(required = true)]
-    names: Vec<String>,
-}
+const DIRNAME_HELP: &str = "\
+Usage: dirname [OPTION] NAME...
+Output each NAME with its last non-slash component and trailing slashes
+removed; if NAME contains no /'s, output '.' (meaning the current directory).
+
+  -z, --zero     end each output line with NUL, not newline
+      --help     display this help and exit
+      --version  output version information and exit
+";
 
 pub fn run_dirname(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = DirnameArgs::try_parse_from(args)?;
-    for name in &parsed.names {
-        let trimmed = name.trim_end_matches('/');
-        if trimmed.is_empty() {
-            println!("/");
-        } else {
-            let parent = Path::new(trimmed)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string());
-            if parent.is_empty() {
-                println!(".");
-            } else {
-                println!("{}", parent);
-            }
-        }
+    const SPECS: &[ToolOpt<()>] = &[opt("z", "zero", HasArg::No, ())];
+    let parsed = match parse_tool_args("dirname", &args, SPECS, DIRNAME_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let zero = !parsed.opts.is_empty();
+    if parsed.operands.is_empty() {
+        return Ok(usage_error("dirname", "missing operand"));
+    }
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for name in &parsed.operands {
+        out.write_all(compute_dirname(name.as_bytes()))?;
+        out.write_all(if zero { b"\0" } else { b"\n" })?;
         ctx.telemetry.add_items(1);
     }
+    ignore_broken_pipe(out.flush())?;
     Ok(0)
+}
+
+/// GNU `dirname` (gnulib `dir_len`).
+fn compute_dirname(path: &[u8]) -> &[u8] {
+    let prefix = usize::from(path.first() == Some(&b'/'));
+    let mut len = path.len() - last_component(path).len();
+    while len > prefix && path[len - 1] == b'/' {
+        len -= 1;
+    }
+    if len == 0 { b"." } else { &path[..len] }
 }
 
 // ---------------------------------------------------------------------------
 // 16. mktemp
 // ---------------------------------------------------------------------------
-#[derive(Parser)]
-#[command(name = "mktemp", about = "Create a temporary file or directory safely")]
-struct MktempArgs {
-    /// Create a directory, not a file
-    #[arg(short = 'd', long = "directory")]
-    directory: bool,
+const MKTEMP_HELP: &str = "\
+Usage: mktemp [OPTION]... [TEMPLATE]
+Create a temporary file or directory, safely, and print its name.
+TEMPLATE must contain at least 3 consecutive 'X's in last component.
+If TEMPLATE is not specified, use tmp.XXXXXXXXXX, and --tmpdir is implied.
+Files are created u+rw, and directories u+rwx, minus umask restrictions.
 
-    /// Interpret TEMPLATE relative to DIR
-    #[arg(short = 'p', long = "tmpdir")]
-    tmpdir: Option<String>,
+  -d, --directory     create a directory, not a file
+  -u, --dry-run       do not create anything; merely print a name (unsafe)
+  -q, --quiet         suppress diagnostics about file/dir-creation failure
+      --suffix=SUFF   append SUFF to TEMPLATE; SUFF must not contain a slash.
+                        This option is implied if TEMPLATE does not end in X
+  -p DIR, --tmpdir[=DIR]  interpret TEMPLATE relative to DIR; if DIR is not
+                        specified, use $TMPDIR if set, else /tmp.  With
+                        this option, TEMPLATE must not be an absolute name;
+                        unlike with -t, TEMPLATE may contain slashes, but
+                        mktemp creates only the final component
+  -t                  interpret TEMPLATE as a single file name component,
+                        relative to a directory: $TMPDIR, if set; else the
+                        directory specified via -p; else /tmp [deprecated]
+      --help        display this help and exit
+      --version     output version information and exit
+";
 
-    /// Optional template (e.g. tmp.XXXXXX)
-    template: Option<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MktempOpt {
+    Directory,
+    DryRun,
+    Quiet,
+    TmpDir,
+    Deprecated,
+    Suffix,
 }
 
 pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+    use MktempOpt::*;
     use std::io::Read;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
-    let parsed = MktempArgs::try_parse_from(args)?;
-    // Like GNU: an explicit TEMPLATE is relative to the current directory unless
-    // -p is given; with no template, use $TMPDIR (or /tmp).
-    let base_dir = match (&parsed.tmpdir, &parsed.template) {
-        (Some(dir), _) => PathBuf::from(dir),
-        (None, Some(_)) => PathBuf::new(),
-        (None, None) => std::env::temp_dir(),
+    const SPECS: &[ToolOpt<MktempOpt>] = &[
+        opt("d", "directory", HasArg::No, Directory),
+        opt("u", "dry-run", HasArg::No, DryRun),
+        opt("q", "quiet", HasArg::No, Quiet),
+        opt("p", "", HasArg::Required, TmpDir),
+        opt("", "tmpdir", HasArg::Optional, TmpDir),
+        opt("t", "", HasArg::No, Deprecated),
+        opt("", "suffix", HasArg::Required, Suffix),
+    ];
+    let parsed = match parse_tool_args("mktemp", &args, SPECS, MKTEMP_HELP) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let (mut directory, mut dry_run, mut quiet, mut use_dest_dir, mut deprecated_t) =
+        (false, false, false, false, false);
+    let (mut dest_dir_arg, mut suffix_opt) = (None, None);
+    for (o, v) in parsed.opts {
+        match o {
+            Directory => directory = true,
+            DryRun => dry_run = true,
+            Quiet => quiet = true,
+            TmpDir => {
+                use_dest_dir = true;
+                dest_dir_arg = v;
+            }
+            Deprecated => {
+                use_dest_dir = true;
+                deprecated_t = true;
+            }
+            Suffix => suffix_opt = v,
+        }
+    }
+    let fail = |msg: String| {
+        if !quiet {
+            eprintln!("mktemp: {msg}");
+        }
+        Ok(1)
+    };
+    let template = match parsed.operands.len() {
+        0 => {
+            use_dest_dir = true;
+            "tmp.XXXXXXXXXX".to_string()
+        }
+        1 => parsed.operands[0].clone(),
+        _ => return Ok(usage_error("mktemp", "too many templates")),
     };
 
-    let tmpl = parsed
-        .template
-        .unwrap_or_else(|| "tmp.XXXXXXXXXX".to_string());
-    let prefix = tmpl.trim_end_matches('X');
-    let x_count = tmpl.len() - prefix.len();
+    // The suffix is --suffix, or whatever follows the last X of the template.
+    let (template, suffix) = match &suffix_opt {
+        Some(s) => {
+            if !template.ends_with('X') {
+                let mut shown = template.clone();
+                shown.push_str(s);
+                return fail(format!(
+                    "with --suffix, template {} must end in X",
+                    quote_locale(&shown)
+                ));
+            }
+            (template.clone() + s, s.clone())
+        }
+        None => {
+            let cut = template.rfind('X').map_or(template.len(), |i| i + 1);
+            (template.clone(), template[cut..].to_string())
+        }
+    };
+    if suffix.contains('/') {
+        return fail(format!(
+            "invalid suffix {}, contains directory separator",
+            quote_locale(&suffix)
+        ));
+    }
+    let stem = &template[..template.len() - suffix.len()];
+    let x_count = stem.len() - stem.trim_end_matches('X').len();
     if x_count < 3 {
-        return Err(anyhow!("mktemp: too few X's in template '{}'", tmpl));
+        return fail(format!(
+            "too few X's in template {}",
+            quote_locale(&template)
+        ));
     }
 
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut urandom = fs::File::open("/dev/urandom").context("mktemp: cannot open /dev/urandom")?;
-    let mut bytes = vec![0u8; x_count];
+    let full_template = if use_dest_dir {
+        let env_tmpdir = std::env::var("TMPDIR").ok().filter(|t| !t.is_empty());
+        let given = dest_dir_arg.filter(|d| !d.is_empty());
+        let dir = if deprecated_t {
+            if last_component(template.as_bytes()).len() != template.len() {
+                return fail(format!(
+                    "invalid template, {}, contains directory separator",
+                    quote_locale(&template)
+                ));
+            }
+            env_tmpdir.or(given)
+        } else {
+            if template.starts_with('/') {
+                return fail(format!(
+                    "invalid template, {}; with --tmpdir, it may not be absolute",
+                    quote_locale(&template)
+                ));
+            }
+            given.or(env_tmpdir)
+        }
+        .unwrap_or_else(|| "/tmp".to_string());
+        concat_path(&dir, OsStr::new(&template))
+    } else {
+        PathBuf::from(&template)
+    };
+    let full = full_template.as_os_str().as_bytes().to_vec();
+    let x_start = full.len() - suffix.len() - x_count;
 
-    // Names must be unpredictable and creation exclusive (O_EXCL, never following an
-    // existing symlink), with restrictive permissions applied atomically at creation.
-    for _ in 0..100 {
-        urandom.read_exact(&mut bytes)?;
-        let suffix: String = bytes
-            .iter()
-            .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-            .collect();
-        let final_path = base_dir.join(format!("{}{}", prefix, suffix));
-        let res = if parsed.directory {
-            fs::DirBuilder::new().mode(0o700).create(&final_path)
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut urandom = match fs::File::open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => return fail(format!("cannot open /dev/urandom: {}", gnu_io_error(&e))),
+    };
+    let mut random = vec![0u8; x_count];
+    let kind = if directory { "directory" } else { "file" };
+    // Names are unpredictable and creation exclusive (O_EXCL, never following an
+    // existing symlink), with restrictive permissions applied atomically.
+    for _ in 0..10_000 {
+        urandom.read_exact(&mut random)?;
+        let mut name = full.clone();
+        for (slot, b) in name[x_start..x_start + x_count].iter_mut().zip(&random) {
+            *slot = ALPHABET[usize::from(*b) % ALPHABET.len()];
+        }
+        let path = PathBuf::from(OsString::from_vec(name));
+        let res = if dry_run {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else if directory {
+            fs::DirBuilder::new().mode(0o700).create(&path)
         } else {
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&final_path)
+                .open(&path)
                 .map(|_| ())
         };
         match res {
             Ok(()) => {
                 ctx.telemetry.add_items(1);
-                println!("{}", final_path.display());
+                let mut out = io::stdout().lock();
+                out.write_all(path.as_os_str().as_bytes())?;
+                out.write_all(b"\n")?;
                 return Ok(0);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(anyhow!(
-                    "mktemp: failed to create {} via template '{}': {}",
-                    if parsed.directory {
-                        "directory"
-                    } else {
-                        "file"
-                    },
-                    base_dir.join(&tmpl).display(),
+                return fail(format!(
+                    "failed to create {kind} via template {}: {}",
+                    quote_locale(&full_template),
                     gnu_io_error(&e)
                 ));
             }
         }
     }
-    Err(anyhow!(
-        "mktemp: failed to create a unique name from template '{}'",
-        tmpl
+    fail(format!(
+        "failed to create {kind} via template {}: File exists",
+        quote_locale(&full_template)
     ))
 }
 
