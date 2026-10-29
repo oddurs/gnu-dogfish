@@ -65,6 +65,18 @@ for link in "$links"/*; do
 done
 echo "gnu-tests: Dogfish provides $(wc -l <"$tools_file") GNU programs"
 
+# Every swapped program must really be Dogfish; otherwise the run would quietly
+# test GNU against itself and report a perfect score.
+assert_swapped() {
+  local tool bad=""
+  while read -r tool; do
+    [ -L "$src/src/$tool" ] && "$src/src/$tool" --version 2>/dev/null | grep -q 'GNU/Dogfish' \
+      || bad="$bad $tool"
+  done <"$tools_file"
+  [ -z "$bad" ] || die "$1: not Dogfish:$bad"
+}
+assert_swapped "before the run"
+
 helper="$repo/util/gnu_tests.py"
 mapping="$work/selection.json"
 python3 -I "$helper" select "$src" "$tools_file" "$mapping"
@@ -74,11 +86,17 @@ echo "gnu-tests: running $(wc -w <<<"$selected") tests with $jobs jobs"
 # check-TESTS runs the harness without `all`, so make never relinks the
 # programs we replaced. Old logs are removed so results are from this run.
 (cd "$src" && find tests -name '*.log' -o -name '*.trs' | xargs rm -f)
-(cd "$src" && make -k -j"$jobs" check-TESTS \
+# The swapped programs look out of date to make (GNU's objects are newer than
+# the Dogfish binary), so mark each one "old" or make relinks GNU's over them.
+keep_old=()
+while read -r tool; do keep_old+=(-o "src/$tool"); done <"$tools_file"
+(cd "$src" && make -k -j"$jobs" "${keep_old[@]}" check-TESTS \
     TESTS="$selected" VERBOSE=no \
     SH_LOG_COMPILER="$sys_timeout -k 10 $per_test_timeout \$(SHELL)" \
     PL_LOG_COMPILER="$sys_timeout -k 10 $per_test_timeout \$(TESTSUITE_PERL) \$(TESTSUITE_PERL_OPTIONS)" \
     >"$work/check.log" 2>&1) || true
+grep -q 'CCLD' "$work/check.log" && echo "gnu-tests: warning: make relinked something; see check.log" >&2
+assert_swapped "after the run"
 
 report_args=("$src" "$mapping" "$work/gnu-results.json" --summary "$work/gnu-summary.md"
              --baseline "$repo/util/gnu-baseline.json")
