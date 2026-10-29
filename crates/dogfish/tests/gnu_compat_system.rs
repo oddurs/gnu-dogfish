@@ -856,6 +856,7 @@ fn yes_long_line() {
 // ----------------------------------------------------------------- --help
 //
 // Help text differs by design; GNU's exit status for `--help` must match.
+// These checks need no fixtures, so they run anywhere.
 
 #[test]
 fn help_exits_like_gnu() {
@@ -885,7 +886,7 @@ fn help_exits_like_gnu() {
     for tool in tools {
         let mut ours = Command::new(dogfish_bin());
         ours.args([tool, "--help"]);
-        let ours = exec(ours, fixtures(), None, "C");
+        let ours = exec(ours, &std::env::temp_dir(), None, "C");
         assert!(!ours.stdout.is_empty(), "{tool} --help printed nothing");
         assert!(ours.stderr.is_empty(), "{tool} --help wrote to stderr");
         let Some(gnu) = gnu_tool(tool) else {
@@ -898,7 +899,7 @@ fn help_exits_like_gnu() {
         };
         let mut theirs = Command::new(gnu);
         theirs.arg0(tool).arg("--help");
-        let theirs = exec(theirs, fixtures(), None, "C");
+        let theirs = exec(theirs, &std::env::temp_dir(), None, "C");
         assert_eq!(
             ours.status.code(),
             theirs.status.code(),
@@ -916,7 +917,7 @@ fn hostname_matches_uname_nodename() {
     let run = |args: &[&str]| {
         let mut cmd = Command::new(dogfish_bin());
         cmd.args(args);
-        exec(cmd, fixtures(), None, "C")
+        exec(cmd, &std::env::temp_dir(), None, "C")
     };
     let host = run(&["hostname"]);
     assert!(host.status.success());
@@ -936,7 +937,7 @@ fn hostname_matches_uname_nodename() {
 fn watch_runs_the_command_count_times() {
     let mut cmd = Command::new(dogfish_bin());
     cmd.args(["watch", "-n", "0.01", "-c", "2", "echo", "tick"]);
-    let out = exec(cmd, fixtures(), None, "C");
+    let out = exec(cmd, &std::env::temp_dir(), None, "C");
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(text.lines().filter(|l| *l == "tick").count(), 2, "{text}");
@@ -951,7 +952,7 @@ fn timeout_kills_grandchildren() {
     let start = std::time::Instant::now();
     let mut cmd = Command::new(dogfish_bin());
     cmd.args(["timeout", "0.2", "sh", "-c", "sleep 5 & sleep 5; wait"]);
-    let out = exec(cmd, fixtures(), None, "C");
+    let out = exec(cmd, &std::env::temp_dir(), None, "C");
     assert_eq!(out.status.code(), Some(124));
     assert!(
         start.elapsed() < Duration::from_secs(4),
