@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     ColumnAlign, DogfishContext, FastReader, InputSource, Table, emit_objects_or_table,
-    gnu_io_error, io::ignore_broken_pipe, sparkline_bar,
+    gnu_io_error, io::ignore_broken_pipe, sparkline_bar, stdout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -326,8 +326,7 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 sparkline_bar(ratio, 10, st),
             ]);
         }
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
+        let mut out = stdout::stdout();
         tbl.render(&mut out, st)?;
         return Ok(exit_code);
     }
@@ -348,9 +347,8 @@ pub fn run_wc(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         wc_number_width(&sources)
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    let print_row = |out: &mut io::BufWriter<io::StdoutLock<'_>>,
+    let mut out = io::BufWriter::new(stdout::stdout());
+    let print_row = |out: &mut io::BufWriter<stdout::Stdout>,
                      r: &WcRecord,
                      name: Option<&str>|
      -> io::Result<()> {

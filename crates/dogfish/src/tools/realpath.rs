@@ -1,15 +1,20 @@
 //! `realpath`
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe};
+use dogfish_core::{
+    DogfishContext, emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, stdout,
+};
 
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
+};
 use crate::common::quote::qf;
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 
 const REALPATH_HELP: &str = "\
 Usage: realpath [OPTION]... FILE...
@@ -47,32 +52,51 @@ enum RealpathOpt {
     Strip,
     Zero,
     Json,
+    Help,
+    Version,
 }
 
-pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// GNU's `longopts` and `"eLmPqsz"`, plus the Dogfish `-J, --json`.
+const SPECS: &[OptSpec<RealpathOpt>] = &[
+    OptSpec::both(
+        b'e',
+        "canonicalize-existing",
+        HasArg::No,
+        RealpathOpt::Existing,
+    ),
+    OptSpec::both(
+        b'm',
+        "canonicalize-missing",
+        HasArg::No,
+        RealpathOpt::Missing,
+    ),
+    OptSpec::long("relative-to", HasArg::Required, RealpathOpt::RelativeTo),
+    OptSpec::long("relative-base", HasArg::Required, RealpathOpt::RelativeBase),
+    OptSpec::both(b'q', "quiet", HasArg::No, RealpathOpt::Quiet),
+    OptSpec::both(b's', "strip", HasArg::No, RealpathOpt::Strip),
+    OptSpec::long("no-symlinks", HasArg::No, RealpathOpt::Strip),
+    OptSpec::both(b'z', "zero", HasArg::No, RealpathOpt::Zero),
+    OptSpec::both(b'L', "logical", HasArg::No, RealpathOpt::Logical),
+    OptSpec::both(b'P', "physical", HasArg::No, RealpathOpt::Physical),
+    OptSpec::long("help", HasArg::No, RealpathOpt::Help),
+    OptSpec::long("version", HasArg::No, RealpathOpt::Version),
+    OptSpec::both(b'J', "json", HasArg::No, RealpathOpt::Json),
+];
+
+pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use RealpathOpt::*;
-    const SPECS: &[ToolOpt<RealpathOpt>] = &[
-        opt("e", "canonicalize-existing", HasArg::No, Existing),
-        opt("m", "canonicalize-missing", HasArg::No, Missing),
-        opt("L", "logical", HasArg::No, Logical),
-        opt("P", "physical", HasArg::No, Physical),
-        opt("q", "quiet", HasArg::No, Quiet),
-        opt("", "relative-to", HasArg::Required, RelativeTo),
-        opt("", "relative-base", HasArg::Required, RelativeBase),
-        opt("s", "strip", HasArg::No, Strip),
-        opt("", "no-symlinks", HasArg::No, Strip),
-        opt("z", "zero", HasArg::No, Zero),
-        opt("J", "json", HasArg::No, Json),
-    ];
-    let parsed = match parse_tool_args("realpath", &args, SPECS, REALPATH_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let (mut mode, mut nolinks, mut logical, mut quiet, mut zero, mut json) =
         (CanMode::AllButLast, false, false, false, false, false);
-    let (mut relative_to, mut relative_base) = (None, None);
-    for (o, v) in parsed.opts {
+    let (mut relative_to, mut relative_base): (Option<OsString>, Option<OsString>) = (None, None);
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("realpath", &e)),
+        };
         match o {
+            Help => return Ok(print_help(REALPATH_HELP)),
+            Version => return Ok(print_version("realpath")),
             Existing => mode = CanMode::Existing,
             Missing => mode = CanMode::Missing,
             Logical => {
@@ -94,7 +118,8 @@ pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Json => json = true,
         }
     }
-    if parsed.operands.is_empty() {
+    let operands = opts.operands();
+    if operands.is_empty() {
         return Ok(usage_error("realpath", "missing operand"));
     }
     let canon = |p: &Path| -> io::Result<PathBuf> {
@@ -106,7 +131,7 @@ pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Ok(first)
         }
     };
-    let canon_dir = |d: &str| -> std::result::Result<PathBuf, i32> {
+    let canon_dir = |d: &OsStr| -> std::result::Result<PathBuf, i32> {
         match canon(Path::new(d)) {
             Ok(p) if mode == CanMode::Existing && !p.is_dir() => {
                 eprintln!("realpath: {}: Not a directory", qf(d));
@@ -140,11 +165,10 @@ pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         None => None,
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let mut exit_code = 0;
     let mut results = Vec::new();
-    for arg in &parsed.operands {
+    for arg in &operands {
         let resolved = match canon(Path::new(arg)) {
             Ok(p) => p,
             Err(e) => {
@@ -164,7 +188,9 @@ pub fn run_realpath(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         };
         ctx.telemetry.add_items(1);
         if json {
-            results.push(serde_json::json!({ "input": arg, "realpath": shown.to_string_lossy() }));
+            results.push(
+                serde_json::json!({ "input": arg.to_string_lossy(), "realpath": shown.to_string_lossy() }),
+            );
         } else {
             out.write_all(shown.as_os_str().as_bytes())?;
             out.write_all(if zero { b"\0" } else { b"\n" })?;

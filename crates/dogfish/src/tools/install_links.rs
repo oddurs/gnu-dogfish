@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
 #[derive(Parser)]
 #[command(
@@ -51,7 +51,7 @@ pub fn run_install_links(
     }
 
     ctx.telemetry.add_items(count);
-    println!(
+    outln!(
         "{} Installed {} utility symlinks in '{}' -> '{}'",
         st.bold_green("✔"),
         st.bold_cyan(&count.to_string()),

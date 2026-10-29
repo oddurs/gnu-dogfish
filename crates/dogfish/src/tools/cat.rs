@@ -5,7 +5,8 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 
 #[derive(Parser)]
@@ -95,8 +96,7 @@ pub fn run_cat(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     });
 
     let sources = InputSource::from_args(&p.files);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let mut state = CatState {
         newlines: 0,
         line_num: 0,

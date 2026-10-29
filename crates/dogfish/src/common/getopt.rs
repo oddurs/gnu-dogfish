@@ -104,6 +104,15 @@ impl fmt::Debug for GetoptError {
     }
 }
 
+/// One option as text, for tools whose option handling works on `str`: the
+/// argument converted with [`lossy`], and the option as GNU names it in
+/// diagnostics ([`Getopt::last_spelling`]).
+pub(crate) struct TextOpt<K> {
+    pub(crate) key: K,
+    pub(crate) value: Option<String>,
+    pub(crate) spelled: String,
+}
+
 /// One step of a [`Order::InPlace`] parse.
 pub(crate) enum Arg<K> {
     Opt(K, Option<OsString>),
@@ -135,6 +144,8 @@ pub(crate) struct Getopt<'a, K> {
     /// Index into `specs` of the option last returned, and whether it was
     /// spelled long.
     last: Option<(usize, bool)>,
+    /// Index into `args` of the word that option came from.
+    last_word: Option<usize>,
 }
 
 impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
@@ -158,6 +169,7 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             operands: Vec::new(),
             done: false,
             last: None,
+            last_word: None,
         }
     }
 
@@ -172,6 +184,15 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
                 Err(e) => return Some(Err(e)),
             }
         }
+    }
+
+    /// Like [`Getopt::next`], with the option as a [`TextOpt`].
+    pub(crate) fn next_text(&mut self) -> Option<Result<TextOpt<K>, GetoptError>> {
+        Some(self.next()?.map(|(key, value)| TextOpt {
+            key,
+            value: value.as_deref().map(lossy),
+            spelled: self.last_spelling(),
+        }))
     }
 
     /// Like [`Getopt::next`], but operands come back in place
@@ -203,6 +224,7 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
         self.args.extend(rest);
         self.idx = 0;
         self.cluster = 0;
+        self.last_word = None;
     }
 
     /// How GNU names the option last returned in diagnostics: its full long
@@ -218,6 +240,15 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
     /// Whether the option last returned was spelled long.
     pub(crate) fn last_was_long(&self) -> bool {
         matches!(self.last, Some((_, true)))
+    }
+
+    /// The command-line word the option last returned was taken from
+    /// (`--no-pres` for `--no-preserve-root`), for tools that refuse an
+    /// abbreviation.
+    pub(crate) fn last_word(&self) -> Option<&OsStr> {
+        self.last_word
+            .and_then(|i| self.args.get(i))
+            .map(OsString::as_os_str)
     }
 
     fn step(&mut self) -> Option<Result<Arg<K>, GetoptError>> {
@@ -254,6 +285,7 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
     }
 
     fn long_opt(&mut self) -> Result<Arg<K>, GetoptError> {
+        let word = self.idx;
         let arg = self.args[self.idx].as_bytes();
         self.idx += 1;
         let body = &arg[2..];
@@ -336,10 +368,12 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             },
         };
         self.last = Some((found, true));
+        self.last_word = Some(word);
         Ok(Arg::Opt(spec.key, value))
     }
 
     fn short_opt(&mut self) -> Result<Arg<K>, GetoptError> {
+        let word = self.idx;
         let arg = self.args[self.idx].as_bytes();
         let c = arg[self.cluster];
         self.cluster += 1;
@@ -398,6 +432,7 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
             }
         };
         self.last = Some((found, false));
+        self.last_word = Some(word);
         Ok(Arg::Opt(spec.key, value))
     }
 }
@@ -472,7 +507,7 @@ pub(crate) fn argmatch<V: Copy + PartialEq>(
     }
     let matches: Vec<V> = table
         .iter()
-        .filter(|(name, _)| !bytes.is_empty() && name.as_bytes().starts_with(bytes))
+        .filter(|(name, _)| name.as_bytes().starts_with(bytes))
         .map(|(_, v)| *v)
         .collect();
     if let Some(first) = matches.first()

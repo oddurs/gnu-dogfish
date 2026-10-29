@@ -1,19 +1,23 @@
 //! rm — GNU semantics plus `--safe` (or `--trash`) undoable trash staging
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
+use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
 use crate::common::file_info::file_type_description;
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, print_help, print_version, try_help, usage_error,
+};
 use crate::common::path::{dir_names, last_component};
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::prompt::{Interactive, ask, write_protected};
-use crate::common::quote::{qa, quote_locale};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
+use crate::common::quote::{Quoting, qa, quote_bytes};
 
 const RM_HELP: &str = "\
 Usage: rm [OPTION]... [FILE]...
@@ -51,10 +55,35 @@ enum RmOpt {
     OneFileSystem,
     NoPreserveRoot,
     PreserveRoot,
+    PresumeInputTty,
     Recursive,
     Verbose,
     Safe,
+    Help,
+    Version,
 }
+
+/// GNU's `long_opts` (in its order: it decides ambiguity diagnostics) and
+/// `"dfirvIR"`, plus the Dogfish `--safe`/`--trash`. `---presume-input-tty`
+/// is GNU's hidden test option: prompt as if standard input were a terminal.
+const SPECS: &[OptSpec<RmOpt>] = &[
+    OptSpec::both(b'f', "force", HasArg::No, RmOpt::Force),
+    OptSpec::long("interactive", HasArg::Optional, RmOpt::InteractiveWhen),
+    OptSpec::long("one-file-system", HasArg::No, RmOpt::OneFileSystem),
+    OptSpec::long("no-preserve-root", HasArg::No, RmOpt::NoPreserveRoot),
+    OptSpec::long("preserve-root", HasArg::Optional, RmOpt::PreserveRoot),
+    OptSpec::long("-presume-input-tty", HasArg::No, RmOpt::PresumeInputTty),
+    OptSpec::both(b'r', "recursive", HasArg::No, RmOpt::Recursive),
+    OptSpec::both(b'd', "dir", HasArg::No, RmOpt::Dir),
+    OptSpec::both(b'v', "verbose", HasArg::No, RmOpt::Verbose),
+    OptSpec::long("help", HasArg::No, RmOpt::Help),
+    OptSpec::long("version", HasArg::No, RmOpt::Version),
+    OptSpec::long("safe", HasArg::No, RmOpt::Safe),
+    OptSpec::long("trash", HasArg::No, RmOpt::Safe),
+    OptSpec::short(b'i', HasArg::No, RmOpt::EveryFile),
+    OptSpec::short(b'I', HasArg::No, RmOpt::Once),
+    OptSpec::short(b'R', HasArg::No, RmOpt::Recursive),
+];
 
 struct RmRun {
     force: bool,
@@ -77,32 +106,32 @@ enum RmStatus {
 }
 
 /// True when the last component of `f` is `.` or `..` (`d/.`, `./`, `..//`).
-fn is_dot_or_dotdot(f: &str) -> bool {
+fn is_dot_or_dotdot(f: &OsStr) -> bool {
     let last = last_component(f.as_bytes());
     let name = &last[..last.iter().position(|&b| b == b'/').unwrap_or(last.len())];
     name == b"." || name == b".."
 }
 
-pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// After a usage error, GNU's hint for removing a file whose name looks like
+/// an option: `Try 'rm ./-f' to remove the file '-f'.`
+fn diagnose_leading_hyphen(args: &[OsString]) {
+    for arg in args {
+        let b = arg.as_bytes();
+        if b.len() > 1 && b[0] == b'-' && Path::new(arg).symlink_metadata().is_ok() {
+            eprintln!(
+                "Try 'rm ./{}' to remove the file {}.",
+                quote_bytes(b, Quoting::ShellEscape),
+                qa(arg)
+            );
+            break;
+        }
+    }
+}
+
+pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use RmOpt::*;
-    const SPECS: &[ToolOpt<RmOpt>] = &[
-        opt("d", "dir", HasArg::No, Dir),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "", HasArg::No, EveryFile),
-        opt("I", "", HasArg::No, Once),
-        opt("", "interactive", HasArg::Optional, InteractiveWhen),
-        opt("", "one-file-system", HasArg::No, OneFileSystem),
-        opt("", "no-preserve-root", HasArg::No, NoPreserveRoot),
-        opt("", "preserve-root", HasArg::Optional, PreserveRoot),
-        opt("rR", "recursive", HasArg::No, Recursive),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("", "safe", HasArg::No, Safe),
-        opt("", "trash", HasArg::No, Safe),
-    ];
-    let parsed = match parse_tool_args("rm", &args, SPECS, RM_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let args: Vec<OsString> = args.into_iter().skip(1).collect();
+    let mut opts = Getopt::new(args.clone(), SPECS);
     let mut run = RmRun {
         force: false,
         interactive: Interactive::Sometimes,
@@ -114,7 +143,15 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let (mut prompt_once, mut preserve_root, mut preserve_all, mut safe) =
         (false, true, false, false);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => {
+                crate::common::getopt::error_bytes("rm", e.as_bytes());
+                diagnose_leading_hyphen(&args);
+                return Ok(try_help("rm"));
+            }
+        };
         match o {
             Dir => run.dir = true,
             Force => {
@@ -148,7 +185,7 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ("yes", When::Always),
                 ];
                 let when = match v {
-                    Some(w) => match argmatch("rm", "--interactive", &w, WHEN) {
+                    Some(w) => match argmatch("rm", "--interactive", w, WHEN) {
                         Ok(w) => w,
                         Err(code) => return Ok(code),
                     },
@@ -172,27 +209,36 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 }
             }
             OneFileSystem => run.one_file_system = true,
-            NoPreserveRoot => preserve_root = false,
+            NoPreserveRoot => {
+                if opts.last_word() != Some(OsStr::new("--no-preserve-root")) {
+                    eprintln!("rm: you may not abbreviate the --no-preserve-root option");
+                    return Ok(1);
+                }
+                preserve_root = false;
+            }
             PreserveRoot => {
-                match v.as_deref() {
+                match v.as_deref().map(OsStr::as_bytes) {
                     None => {}
-                    Some("all") => preserve_all = true,
+                    Some(b"all") => preserve_all = true,
                     Some(other) => {
                         eprintln!(
                             "rm: unrecognized --preserve-root argument: {}",
-                            quote_locale(other)
+                            qa(OsStr::from_bytes(other))
                         );
                         return Ok(1);
                     }
                 }
                 preserve_root = true;
             }
+            PresumeInputTty => run.stdin_tty = true,
             Recursive => run.recursive = true,
             Verbose => run.verbose = true,
             Safe => safe = true,
+            Help => return Ok(print_help(RM_HELP)),
+            Version => return Ok(print_version("rm")),
         }
     }
-    let files = parsed.operands;
+    let files = opts.operands();
     if files.is_empty() {
         return Ok(if run.force {
             0
@@ -291,7 +337,7 @@ pub fn run_rm(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                     ctx.telemetry.add_items(1);
                     if run.verbose {
                         let st = ctx.style();
-                        println!(
+                        outln!(
                             "{} {} (undo id #{}: run `{}` to restore)",
                             st.yellow("trashed"),
                             qa(f),
@@ -358,7 +404,7 @@ fn rm_file(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext) -> 
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                println!("removed {}", qa(p));
+                outln!("removed {}", qa(p));
             }
             RmStatus::Removed
         }
@@ -386,7 +432,7 @@ fn rm_empty_dir(p: &Path, meta: &fs::Metadata, run: &RmRun, ctx: &DogfishContext
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                println!("removed directory {}", qa(p));
+                outln!("removed directory {}", qa(p));
             }
             RmStatus::Removed
         }

@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin, table::compare_json_field,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout, table::compare_json_field,
 };
 use serde_json::Value;
 
@@ -146,7 +146,7 @@ pub fn run_uniq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         .set_strategy("O(1) memory streaming deduplicator");
     let sink: Box<dyn Write> = match parsed.output.as_deref() {
         Some(path) if path != "-" => Box::new(std::fs::File::create(path)?),
-        _ => Box::new(io::stdout().lock()),
+        _ => Box::new(stdout::stdout()),
     };
     let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, sink);
     let mut prev = chomp(&first_line).to_vec();

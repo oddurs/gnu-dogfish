@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
 
 use crate::common::legacy_getopt::{GetOpt, HasArg, OptSpec, opt, print_help, usage_error};
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
@@ -412,8 +412,7 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let out_of_range = |x: f64| {
         if step.value < 0.0 {
             x < last.value

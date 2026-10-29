@@ -6,7 +6,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, io::ignore_broken_pipe,
+    ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, io::ignore_broken_pipe, outln,
+    stdout,
 };
 use serde::Serialize;
 
@@ -414,7 +415,7 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "list-signal-handling" => list_signals = true,
             "help" => return print_help(ENV_HELP),
             "version" => {
-                println!("env (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
+                outln!("env (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
                 return Ok(0);
             }
             "split-string" => {
@@ -528,7 +529,7 @@ pub fn run_env(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             eprintln!("   arg[{i}]= {}", gnu_quote(a));
         }
     }
-    let _ = io::stdout().flush();
+    let _ = stdout::flush();
     let err = exec_with_env(command, &env);
     let status = if err.raw_os_error() == Some(libc::ENOENT) {
         EXIT_ENOENT
@@ -570,14 +571,12 @@ fn print_env(
             for r in &records {
                 tbl.add_row(vec![st.bold_cyan(&r.key), r.value.clone()]);
             }
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
+            let mut out = stdout::stdout();
             tbl.render(&mut out, st)?;
         }
         return Ok(0);
     }
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let term: &[u8] = if null { b"\0" } else { b"\n" };
     for e in &env.0 {
         out.write_all(e)?;

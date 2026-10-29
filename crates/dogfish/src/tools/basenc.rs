@@ -7,7 +7,7 @@ use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use data_encoding::{BASE32, BASE32HEX, HEXUPPER};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, gnu_quote,
-    gnu_quote_file, io::ignore_broken_pipe,
+    gnu_quote_file, io::ignore_broken_pipe, stdout,
 };
 
 use crate::common::arg_order::last_index;
@@ -281,8 +281,7 @@ fn run_codec(
         }
     };
     ctx.telemetry.add_read(input.len() as u64);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let error = if opts.decode {
         let (bytes, err) = encoding.decode(&input, opts.ignore_garbage);
         ignore_broken_pipe(out.write_all(&bytes))?;

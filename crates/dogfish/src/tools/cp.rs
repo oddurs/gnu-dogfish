@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use dogfish_core::{
-    CopyMethod, DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path, same_file,
+    CopyMethod, DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path, outln,
+    same_file,
 };
 
 use crate::common::backup::{BackupMode, backup_mode, backup_suffix, make_backup};
 use crate::common::file_times::{Stamp, set_file_times};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+    utf8_operands,
+};
 use crate::common::mode::{
     CHMOD_MODE_BITS, S_IRWXUGO, S_ISVTX, process_umask, strmode9, u32_to_mode_t,
 };
@@ -26,7 +31,6 @@ use crate::common::quote::{qa, qf};
 use crate::common::targets::{
     Clobber, SameFileOpts, Targets, resolve_for_containment, resolve_targets, same_file_ok,
 };
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const CP_HELP: &str = "\
 Usage: cp [OPTION]... [-T] SOURCE DEST
@@ -106,7 +110,52 @@ enum CpOpt {
     Verbose,
     OneFileSystem,
     Context,
+    Help,
+    Version,
 }
+
+/// GNU's `long_opts` (in its order: it decides ambiguity diagnostics) and
+/// `"abdfHilLnprst:uvxPRS:TZ"`, plus the Dogfish `--keep-directory-symlink`.
+const SPECS: &[OptSpec<CpOpt>] = &[
+    OptSpec::both(b'a', "archive", HasArg::No, CpOpt::Archive),
+    OptSpec::long("attributes-only", HasArg::No, CpOpt::AttributesOnly),
+    OptSpec::long("backup", HasArg::Optional, CpOpt::BackupArg),
+    OptSpec::long("copy-contents", HasArg::No, CpOpt::CopyContents),
+    OptSpec::long("debug", HasArg::No, CpOpt::Debug),
+    OptSpec::both(b'L', "dereference", HasArg::No, CpOpt::Dereference),
+    OptSpec::both(b'f', "force", HasArg::No, CpOpt::Force),
+    OptSpec::both(b'i', "interactive", HasArg::No, CpOpt::Interactive),
+    OptSpec::both(b'l', "link", HasArg::No, CpOpt::Link),
+    OptSpec::both(b'n', "no-clobber", HasArg::No, CpOpt::NoClobber),
+    OptSpec::both(b'P', "no-dereference", HasArg::No, CpOpt::NoDereference),
+    OptSpec::long("no-preserve", HasArg::Required, CpOpt::NoPreserve),
+    OptSpec::both(b'T', "no-target-directory", HasArg::No, CpOpt::NoTargetDir),
+    OptSpec::both(b'x', "one-file-system", HasArg::No, CpOpt::OneFileSystem),
+    OptSpec::long("parents", HasArg::No, CpOpt::Parents),
+    OptSpec::long("path", HasArg::No, CpOpt::Parents),
+    OptSpec::long("preserve", HasArg::Optional, CpOpt::Preserve),
+    OptSpec::both(b'R', "recursive", HasArg::No, CpOpt::Recursive),
+    OptSpec::long("remove-destination", HasArg::No, CpOpt::RemoveDestination),
+    OptSpec::long("sparse", HasArg::Required, CpOpt::Sparse),
+    OptSpec::long("reflink", HasArg::Optional, CpOpt::Reflink),
+    OptSpec::long("strip-trailing-slashes", HasArg::No, CpOpt::StripSlashes),
+    OptSpec::both(b'S', "suffix", HasArg::Required, CpOpt::Suffix),
+    OptSpec::both(b's', "symbolic-link", HasArg::No, CpOpt::Symbolic),
+    OptSpec::both(b't', "target-directory", HasArg::Required, CpOpt::TargetDir),
+    OptSpec::long("update", HasArg::Optional, CpOpt::Update),
+    OptSpec::both(b'v', "verbose", HasArg::No, CpOpt::Verbose),
+    OptSpec::long("context", HasArg::Optional, CpOpt::Context),
+    OptSpec::long("help", HasArg::No, CpOpt::Help),
+    OptSpec::long("version", HasArg::No, CpOpt::Version),
+    OptSpec::long("keep-directory-symlink", HasArg::No, CpOpt::KeepDirSymlink),
+    OptSpec::short(b'b', HasArg::No, CpOpt::Backup),
+    OptSpec::short(b'd', HasArg::No, CpOpt::NoDerefLinks),
+    OptSpec::short(b'H', HasArg::No, CpOpt::CmdlineDeref),
+    OptSpec::short(b'p', HasArg::No, CpOpt::PreserveDefault),
+    OptSpec::short(b'r', HasArg::No, CpOpt::Recursive),
+    OptSpec::short(b'u', HasArg::No, CpOpt::UpdateOlder),
+    OptSpec::short(b'Z', HasArg::No, CpOpt::Context),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreserveAttr {
@@ -200,50 +249,9 @@ fn apply_preserve(o: &mut CpOpts, list: &str, on: bool) -> std::result::Result<(
     Ok(())
 }
 
-pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use CpOpt::*;
-    const SPECS: &[ToolOpt<CpOpt>] = &[
-        opt("a", "archive", HasArg::No, Archive),
-        opt("", "attributes-only", HasArg::No, AttributesOnly),
-        opt("b", "", HasArg::No, Backup),
-        opt("", "backup", HasArg::Optional, BackupArg),
-        opt("", "copy-contents", HasArg::No, CopyContents),
-        opt("", "debug", HasArg::No, Debug),
-        opt("d", "", HasArg::No, NoDerefLinks),
-        opt("L", "dereference", HasArg::No, Dereference),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "interactive", HasArg::No, Interactive),
-        opt("H", "", HasArg::No, CmdlineDeref),
-        opt("l", "link", HasArg::No, Link),
-        opt("n", "no-clobber", HasArg::No, NoClobber),
-        opt("P", "no-dereference", HasArg::No, NoDereference),
-        opt("", "no-preserve", HasArg::Required, NoPreserve),
-        opt("", "no-target-directory", HasArg::No, NoTargetDir),
-        opt("x", "one-file-system", HasArg::No, OneFileSystem),
-        opt("", "parents", HasArg::No, Parents),
-        opt("", "path", HasArg::No, Parents),
-        opt("", "keep-directory-symlink", HasArg::No, KeepDirSymlink),
-        opt("p", "", HasArg::No, PreserveDefault),
-        opt("", "preserve", HasArg::Optional, Preserve),
-        opt("rR", "recursive", HasArg::No, Recursive),
-        opt("", "remove-destination", HasArg::No, RemoveDestination),
-        opt("", "reflink", HasArg::Optional, Reflink),
-        opt("", "sparse", HasArg::Required, Sparse),
-        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
-        opt("S", "suffix", HasArg::Required, Suffix),
-        opt("s", "symbolic-link", HasArg::No, Symbolic),
-        opt("t", "target-directory", HasArg::Required, TargetDir),
-        opt("T", "", HasArg::No, NoTargetDir),
-        opt("u", "", HasArg::No, UpdateOlder),
-        opt("", "update", HasArg::Optional, Update),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("Z", "", HasArg::No, Context),
-        opt("", "context", HasArg::Optional, Context),
-    ];
-    let parsed = match parse_tool_args("cp", &args, SPECS, CP_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut o = CpOpts {
         recursive: false,
         deref: Deref::Always,
@@ -269,9 +277,15 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut deref = None;
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
     let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
-    for (opt, v) in parsed.opts {
-        let v = v.unwrap_or_default();
+    while let Some(opt) = opts.next() {
+        let (opt, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("cp", &e)),
+        };
+        let v = v.as_deref().map(lossy).unwrap_or_default();
         match opt {
+            Help => return Ok(print_help(CP_HELP)),
+            Version => return Ok(print_version("cp")),
             Archive => {
                 deref = Some(Deref::Never);
                 o.recursive = true;
@@ -386,7 +400,11 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     } else {
         Deref::Always
     });
-    let targets = match resolve_targets("cp", parsed.operands, target_dir, no_target_dir) {
+    let operands = match utf8_operands("cp", opts.operands()) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    let targets = match resolve_targets("cp", operands, target_dir, no_target_dir) {
         Ok(t) => t,
         Err(code) => return Ok(code),
     };
@@ -480,7 +498,7 @@ impl Copier<'_> {
             }
             let _ = fs::set_permissions(&dst_dir, fs::Permissions::from_mode(mode));
             if self.o.verbose {
-                println!("{src_dir} -> {}", dst_dir.display());
+                outln!("{src_dir} -> {}", dst_dir.display());
             }
         }
         true
@@ -614,8 +632,8 @@ impl Copier<'_> {
             return;
         }
         match backup {
-            Some(b) => println!("{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
-            None => println!("{} -> {}", qa(src), qa(dst)),
+            Some(b) => outln!("{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
+            None => outln!("{} -> {}", qa(src), qa(dst)),
         }
     }
 
@@ -761,7 +779,7 @@ impl Copier<'_> {
                         return false;
                     }
                     if self.o.verbose {
-                        println!("removed {}", qa(dst));
+                        outln!("removed {}", qa(dst));
                     }
                 }
             }
@@ -927,7 +945,7 @@ impl Copier<'_> {
                 return false;
             }
             if self.o.verbose {
-                println!("{} -> {}", qa(src), qa(dst));
+                outln!("{} -> {}", qa(src), qa(dst));
             }
             if top {
                 plan = Some(UndoPlan {
@@ -1068,7 +1086,7 @@ impl Copier<'_> {
                 Err(e) if self.o.force => match self.remove_existing(dst, &mut plan, top) {
                     Ok(()) => {
                         if self.o.verbose {
-                            println!("removed {}", qa(dst));
+                            outln!("removed {}", qa(dst));
                         }
                         existing = false;
                         self.create_new(dst, src_meta)
@@ -1146,7 +1164,7 @@ impl Copier<'_> {
         t.add_items(1);
         if self.o.verbose && self.ctx.stdout_is_tty {
             // Dogfish extra, only on a terminal: how the data was copied.
-            println!("{} -> {} ({})", qa(src), qa(dst), method.as_str());
+            outln!("{} -> {} ({})", qa(src), qa(dst), method.as_str());
         }
         if !existing && !self.o.preserve_mode {
             // New files get the source's permissions minus the umask (as with open(2)).

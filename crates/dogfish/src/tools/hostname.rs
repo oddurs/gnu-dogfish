@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
 use crate::common::uname_info::get_uname_info;
 
@@ -31,6 +31,6 @@ pub fn run_hostname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
     } else {
         &info.nodename
     };
-    println!("{}", name);
+    outln!("{}", name);
     Ok(0)
 }

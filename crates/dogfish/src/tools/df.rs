@@ -11,13 +11,13 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{
     ColumnAlign, DogfishContext, Style, Table, emit_objects_or_table, format_size, gnu_io_error,
-    io::ignore_broken_pipe, sparkline_bar,
+    io::ignore_broken_pipe, sparkline_bar, stdout,
 };
 use serde::Serialize;
 
 use crate::common::file_info::find_mount_point;
-use crate::common::gnu_getopt::{
-    OptArg, OptSpec, gnu_getopt, gnu_usage_error, print_help_text, print_tool_version,
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, usage_error,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_B, HUMAN_BASE_1024, HUMAN_SI, HUMAN_SUPPRESS_POINT_ZERO, env_block_size,
@@ -25,43 +25,30 @@ use crate::common::human::{
 };
 use crate::common::quote::{Quoting, display_width, quote_bytes, quote_f};
 
-const DF_OPTIONS: &[OptSpec] = &[
-    OptSpec::new("all", Some('a'), Some("all"), OptArg::No),
-    OptSpec::new(
-        "block-size",
-        Some('B'),
-        Some("block-size"),
-        OptArg::Required,
-    ),
-    OptSpec::new(
-        "human-readable",
-        Some('h'),
-        Some("human-readable"),
-        OptArg::No,
-    ),
-    OptSpec::new("si", Some('H'), Some("si"), OptArg::No),
-    OptSpec::new("inodes", Some('i'), Some("inodes"), OptArg::No),
-    OptSpec::new("kilobytes", Some('k'), None, OptArg::No),
-    OptSpec::new("megabytes", Some('m'), None, OptArg::No),
-    OptSpec::new("type", Some('F'), None, OptArg::Required),
-    OptSpec::new("local", Some('l'), Some("local"), OptArg::No),
-    OptSpec::new("no-sync", None, Some("no-sync"), OptArg::No),
-    OptSpec::new("output", None, Some("output"), OptArg::Optional),
-    OptSpec::new("portability", Some('P'), Some("portability"), OptArg::No),
-    OptSpec::new("sync", None, Some("sync"), OptArg::No),
-    OptSpec::new("total", None, Some("total"), OptArg::No),
-    OptSpec::new("type", Some('t'), Some("type"), OptArg::Required),
-    OptSpec::new("print-type", Some('T'), Some("print-type"), OptArg::No),
-    OptSpec::new(
-        "exclude-type",
-        Some('x'),
-        Some("exclude-type"),
-        OptArg::Required,
-    ),
-    OptSpec::new("ignored", Some('v'), None, OptArg::No),
-    OptSpec::new("json", Some('J'), Some("json"), OptArg::No),
-    OptSpec::new("help", None, Some("help"), OptArg::No),
-    OptSpec::new("version", None, Some("version"), OptArg::No),
+const DF_OPTIONS: &[OptSpec<&str>] = &[
+    OptSpec::both(b'a', "all", HasArg::No, "all"),
+    OptSpec::both(b'B', "block-size", HasArg::Required, "block-size"),
+    OptSpec::both(b'i', "inodes", HasArg::No, "inodes"),
+    OptSpec::both(b'h', "human-readable", HasArg::No, "human-readable"),
+    OptSpec::both(b'H', "si", HasArg::No, "si"),
+    OptSpec::both(b'l', "local", HasArg::No, "local"),
+    OptSpec::long("output", HasArg::Optional, "output"),
+    OptSpec::both(b'P', "portability", HasArg::No, "portability"),
+    OptSpec::both(b'T', "print-type", HasArg::No, "print-type"),
+    OptSpec::long("sync", HasArg::No, "sync"),
+    OptSpec::long("no-sync", HasArg::No, "no-sync"),
+    OptSpec::long("total", HasArg::No, "total"),
+    OptSpec::both(b't', "type", HasArg::Required, "type"),
+    OptSpec::both(b'x', "exclude-type", HasArg::Required, "exclude-type"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
+    // Dogfish extensions.
+    OptSpec::both(b'J', "json", HasArg::No, "json"),
+    // Short-only options.
+    OptSpec::short(b'k', HasArg::No, "kilobytes"),
+    OptSpec::short(b'm', HasArg::No, "megabytes"),
+    OptSpec::short(b'F', HasArg::Required, "type"),
+    OptSpec::short(b'v', HasArg::No, "ignored"),
 ];
 
 const DF_HELP: &str = "\
@@ -420,11 +407,8 @@ struct DfRow {
     unknown: bool,
 }
 
-pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
-    let parsed = match gnu_getopt(DF_OPTIONS, &args[1..]) {
-        Ok(p) => p,
-        Err(msg) => return Ok(gnu_usage_error("df", &msg, 1)),
-    };
+pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    let mut parsed = Getopt::new(args.into_iter().skip(1).collect(), DF_OPTIONS);
     let (mut human_opts, mut block_size) = env_block_size("DF_BLOCK_SIZE");
     let mut cfg = DfConfig {
         show_all: false,
@@ -442,7 +426,11 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut print_type = false;
     let mut total = false;
     let mut json = false;
-    for opt in parsed.opts {
+    while let Some(item) = parsed.next_text() {
+        let opt = match item {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("df", &e)),
+        };
         match opt.key {
             "all" => cfg.show_all = true,
             "block-size" => {
@@ -511,14 +499,14 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                             "option --output: field {} unknown",
                             quote_bytes(name.as_bytes(), Quoting::Locale)
                         );
-                        return Ok(gnu_usage_error("df", &msg, 1));
+                        return Ok(usage_error("df", &msg));
                     };
                     if cfg.fields.contains(field) {
                         let msg = format!(
                             "option --output: field {} used more than once",
                             quote_bytes(name.as_bytes(), Quoting::Locale)
                         );
-                        return Ok(gnu_usage_error("df", &msg, 1));
+                        return Ok(usage_error("df", &msg));
                     }
                     cfg.fields.push(*field);
                 }
@@ -529,11 +517,8 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "exclude-type" => cfg.exclude_types.push(opt.value.unwrap_or_default()),
             "json" => json = true,
             "sync" | "no-sync" | "ignored" => {}
-            "help" => return print_help_text(DF_HELP),
-            "version" => {
-                print_tool_version("df");
-                return Ok(0);
-            }
+            "help" => return Ok(print_help(DF_HELP)),
+            "version" => return Ok(print_version("df")),
             _ => unreachable!("unhandled df option"),
         }
     }
@@ -564,10 +549,11 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mounts = read_mount_table();
     let mut status = 0;
     let mut rows = Vec::new();
-    if parsed.operands.is_empty() {
+    let operands = lossy_all(parsed.operands());
+    if operands.is_empty() {
         df_all_rows(&mounts, &cfg, &mut rows, &mut status);
     } else {
-        for name in &parsed.operands {
+        for name in &operands {
             df_file_row(name, &mounts, &cfg, &mut rows, &mut status);
         }
     }
@@ -607,8 +593,7 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         emit_objects_or_table(&records, ctx, true, false)?;
         return Ok(status);
     }
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     if ctx.stdout_is_tty && !cfg.posix && !cfg.inodes && !cfg.output_mode {
         df_render_rich(&rows, &cfg, &mut out, ctx.style())?;
     } else {
@@ -620,7 +605,7 @@ pub fn run_df(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
 fn df_output_conflict(option: &str) -> i32 {
     let msg = format!("options {option} and --output are mutually exclusive");
-    gnu_usage_error("df", &msg, 1)
+    usage_error("df", &msg)
 }
 
 /// The columns of each GNU header mode (`get_field_list`).

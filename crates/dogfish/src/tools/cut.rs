@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table,
-    eval_json_where, gnu_io_error, io::ignore_broken_pipe, read_ndjson_stdin,
+    eval_json_where, gnu_io_error, io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::memmem;
 use serde_json::{Map, Value};
@@ -309,8 +309,7 @@ pub fn run_cut(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         only_delimited: parsed.only_delimited,
     };
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let mut exit_code = 0;
     if let Some(all) = all_stdin {
         ignore_broken_pipe(cut_buffer(&all, &spec, &mut out))?;

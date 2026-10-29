@@ -1,9 +1,9 @@
 //! printf — GNU-compatible format engine
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::legacy_getopt::print_help;
@@ -414,8 +414,7 @@ pub fn run_printf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     ignore_broken_pipe(out.write_all(&output))?;
     ctx.telemetry.add_written(output.len() as u64);
     Ok(if ok && !run.failed { 0 } else { 1 })

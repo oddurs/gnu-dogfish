@@ -5,7 +5,8 @@ use std::io::{self, Write};
 use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 use memchr::memrchr_iter;
 
@@ -24,8 +25,7 @@ pub fn run_tac(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("mmap + memrchr reverse SIMD line scan");
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let mut exit_code = 0;
 
     for src in &sources {

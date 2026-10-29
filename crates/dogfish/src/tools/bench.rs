@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, sparkline_bar};
+use dogfish_core::{ColumnAlign, DogfishContext, Table, outln, sparkline_bar, stdout};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -212,7 +212,7 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        outln!("{}", serde_json::to_string_pretty(&results)?);
         return Ok(0);
     }
 
@@ -242,11 +242,10 @@ pub fn run_bench(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         ]);
     }
 
-    println!();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    outln!();
+    let mut out = stdout::stdout();
     tbl.render(&mut out, st)?;
-    println!();
+    outln!();
     Ok(0)
 }
 

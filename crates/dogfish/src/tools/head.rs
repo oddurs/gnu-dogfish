@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::memchr_iter;
 
@@ -137,8 +137,7 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 
     ctx.telemetry.set_strategy("64KiB chunk + memchr SIMD");
     let show_headers = parsed.verbose || (!parsed.quiet && sources.len() > 1);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let mut first_header = true;
     let mut exit_code = 0;
 
@@ -206,8 +205,7 @@ pub fn run_head(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
 fn head_stdin_adaptive(count: u64, json: bool, ctx: &DogfishContext) -> Result<i32> {
     let stdin = io::stdin();
     let mut reader = io::BufReader::with_capacity(DEFAULT_BUF_SIZE, stdin.lock());
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
 
     // Peek the first line to see if it starts with '{' or '[' before reading all of stdin!
     let mut first_line = Vec::new();

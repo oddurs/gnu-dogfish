@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
 use crate::common::users::get_username_by_uid;
 
@@ -31,12 +31,12 @@ pub fn run_whoami(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         return Ok(1);
     };
     if parsed.json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({ "uid": uid, "username": username })
         );
     } else {
-        println!("{}", username);
+        outln!("{}", username);
     }
     Ok(0)
 }

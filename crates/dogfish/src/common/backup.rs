@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::{JournalAction, UndoJournal, move_path};
 
+use crate::common::getopt::argmatch;
 use crate::common::path::absolute_lossy;
-use crate::common::tool_args::argmatch;
 
 /// `--backup` version control, as in GNU `backupfile`.
 #[derive(Clone, Copy, PartialEq, Eq)]

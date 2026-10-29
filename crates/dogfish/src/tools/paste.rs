@@ -5,7 +5,9 @@ use std::io::{self, BufRead, Write};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use dogfish_core::{DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe};
+use dogfish_core::{
+    DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe, stdout,
+};
 
 #[derive(Parser)]
 #[command(name = "paste", about = "Merge lines of files")]
@@ -45,8 +47,7 @@ pub fn run_paste(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         file_lines.push(q);
     }
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
 
     if parsed.serial {
         for q in &file_lines {

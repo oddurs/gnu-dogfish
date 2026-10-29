@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::{DogfishContext, gnu_quote};
+use dogfish_core::{DogfishContext, gnu_quote, outln};
 
 #[derive(Parser)]
 #[command(
@@ -109,12 +109,12 @@ pub fn run_nproc(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         1
     };
     if parsed.json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({ "available_cpus": count, "total_cpus": online_processors(true) })
         );
     } else {
-        println!("{}", count);
+        outln!("{}", count);
     }
     Ok(0)
 }

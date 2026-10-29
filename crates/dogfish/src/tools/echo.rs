@@ -1,9 +1,9 @@
 //! echo
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::legacy_getopt::print_help;
@@ -65,8 +65,7 @@ pub fn run_echo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let payload = args[idx..].join(" ");
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
 
     let (rendered, stop) = if interpret_escapes {
         unescape_echo_bytes(payload.as_bytes(), false)

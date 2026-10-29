@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 use memchr::memchr_iter;
 
@@ -99,8 +99,7 @@ pub fn run_tail(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let sources = InputSource::from_args(&parsed.files);
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
 
     if sources.len() == 1
         && matches!(sources[0], InputSource::Stdin)

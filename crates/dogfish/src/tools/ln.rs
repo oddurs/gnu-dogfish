@@ -7,14 +7,17 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, same_file};
+use dogfish_core::{DogfishContext, gnu_io_error, outln, same_file};
 
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
+    utf8_operands,
+};
 use crate::common::path::{concat_path, operand_base, same_inode, same_name};
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf};
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 
 const LN_HELP: &str = "\
 Usage: ln [OPTION]... [-T] TARGET LINK_NAME
@@ -59,7 +62,30 @@ enum LnOpt {
     TargetDir,
     NoTargetDir,
     Verbose,
+    Help,
+    Version,
 }
+
+/// GNU's `long_options` and `"bdfinrst:vFLPS:T"`.
+const SPECS: &[OptSpec<LnOpt>] = &[
+    OptSpec::long("backup", HasArg::Optional, LnOpt::BackupArg),
+    OptSpec::both(b'F', "directory", HasArg::No, LnOpt::Directory),
+    OptSpec::both(b'n', "no-dereference", HasArg::No, LnOpt::NoDeref),
+    OptSpec::both(b'T', "no-target-directory", HasArg::No, LnOpt::NoTargetDir),
+    OptSpec::both(b'f', "force", HasArg::No, LnOpt::Force),
+    OptSpec::both(b'i', "interactive", HasArg::No, LnOpt::Interactive),
+    OptSpec::both(b'S', "suffix", HasArg::Required, LnOpt::Suffix),
+    OptSpec::both(b't', "target-directory", HasArg::Required, LnOpt::TargetDir),
+    OptSpec::both(b'L', "logical", HasArg::No, LnOpt::Logical),
+    OptSpec::both(b'P', "physical", HasArg::No, LnOpt::Physical),
+    OptSpec::both(b'r', "relative", HasArg::No, LnOpt::Relative),
+    OptSpec::both(b's', "symbolic", HasArg::No, LnOpt::Symbolic),
+    OptSpec::both(b'v', "verbose", HasArg::No, LnOpt::Verbose),
+    OptSpec::long("help", HasArg::No, LnOpt::Help),
+    OptSpec::long("version", HasArg::No, LnOpt::Version),
+    OptSpec::short(b'b', HasArg::No, LnOpt::Backup),
+    OptSpec::short(b'd', HasArg::No, LnOpt::Directory),
+];
 
 struct LnOpts {
     backup: BackupMode,
@@ -72,28 +98,9 @@ struct LnOpts {
     verbose: bool,
 }
 
-pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use LnOpt::*;
-    const SPECS: &[ToolOpt<LnOpt>] = &[
-        opt("b", "", HasArg::No, Backup),
-        opt("", "backup", HasArg::Optional, BackupArg),
-        opt("dF", "directory", HasArg::No, Directory),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "interactive", HasArg::No, Interactive),
-        opt("L", "logical", HasArg::No, Logical),
-        opt("n", "no-dereference", HasArg::No, NoDeref),
-        opt("P", "physical", HasArg::No, Physical),
-        opt("r", "relative", HasArg::No, Relative),
-        opt("s", "symbolic", HasArg::No, Symbolic),
-        opt("S", "suffix", HasArg::Required, Suffix),
-        opt("t", "target-directory", HasArg::Required, TargetDir),
-        opt("T", "no-target-directory", HasArg::No, NoTargetDir),
-        opt("v", "verbose", HasArg::No, Verbose),
-    ];
-    let parsed = match parse_tool_args("ln", &args, SPECS, LN_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut o = LnOpts {
         backup: BackupMode::None,
         suffix: String::new(),
@@ -106,8 +113,15 @@ pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
     let (mut no_deref, mut target_dir, mut no_target_dir) = (false, None, false);
-    for (opt, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (opt, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("ln", &e)),
+        };
+        let v = v.as_deref().map(lossy);
         match opt {
+            Help => return Ok(print_help(LN_HELP)),
+            Version => return Ok(print_version("ln")),
             Backup => want_backup = true,
             BackupArg => {
                 want_backup = true;
@@ -148,7 +162,10 @@ pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(1);
     }
 
-    let mut files = parsed.operands;
+    let mut files = match utf8_operands("ln", opts.operands()) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
     let is_dir = |p: &str| {
         let m = if no_deref {
             fs::symlink_metadata(p)
@@ -184,14 +201,14 @@ pub fn run_ln(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 1 => {
                     return Ok(usage_error(
                         "ln",
-                        &format!("missing destination file operand after {}", qa(&files[0])),
+                        format!("missing destination file operand after {}", qa(&files[0])),
                     ));
                 }
                 2 => {}
                 _ => {
                     return Ok(usage_error(
                         "ln",
-                        &format!("extra operand {}", qa(&files[2])),
+                        format!("extra operand {}", qa(&files[2])),
                     ));
                 }
             }
@@ -346,8 +363,8 @@ fn ln_one(src: &str, dest: &Path, o: &LnOpts, ctx: &DogfishContext) -> bool {
             ctx.telemetry.add_items(1);
             if o.verbose {
                 match &backup {
-                    Some(b) => println!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&target)),
-                    None => println!("{} {arrow} {}", qa(dest), qa(&target)),
+                    Some(b) => outln!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&target)),
+                    None => outln!("{} {arrow} {}", qa(dest), qa(&target)),
                 }
             }
             true

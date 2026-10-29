@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, stdout};
 
 #[derive(Parser)]
 #[command(
@@ -37,8 +37,7 @@ pub fn run_yes(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         buf.extend_from_slice(line_bytes);
     }
 
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
+    let mut handle = stdout::stdout();
     loop {
         match handle.write_all(&buf) {
             Ok(()) => ctx.telemetry.add_written(buf.len() as u64),

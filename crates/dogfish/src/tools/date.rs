@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::Result;
 use dogfish_core::{
-    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe,
+    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, outln, stdout,
 };
 
 use crate::common::date_format::{LocalTime, MONTHS, Stamp, WEEKDAYS, format_time, local_time};
@@ -980,7 +980,7 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
             }
             "help" => return print_help(DATE_HELP),
             _ => {
-                println!("date (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
+                outln!("date (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
                 return Ok(0);
             }
         }
@@ -1035,9 +1035,8 @@ pub fn run_date(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         .unwrap_or_else(|| "%a %b %e %H:%M:%S %Z %Y".to_string());
 
     let now = Stamp::now();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let emit = |out: &mut io::StdoutLock<'_>, stamp: Stamp| -> Result<bool> {
+    let mut out = stdout::stdout();
+    let emit = |out: &mut stdout::Stdout, stamp: Stamp| -> Result<bool> {
         if json {
             let iso = |s: Stamp| {
                 render_date(s, "%Y-%m-%dT%H:%M:%S%:z")

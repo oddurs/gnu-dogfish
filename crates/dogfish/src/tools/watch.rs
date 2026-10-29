@@ -6,7 +6,7 @@ use std::thread;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use dogfish_core::{DogfishContext, gnu_quote};
+use dogfish_core::{DogfishContext, gnu_quote, out, outln, stdout};
 
 use crate::common::date_format::{Stamp, format_time, local_time};
 use crate::common::interval::{duration_from_secs, parse_interval};
@@ -45,13 +45,13 @@ pub fn run_watch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         let elapsed = start.elapsed();
 
         if ctx.stdout_is_tty {
-            print!("\x1b[2J\x1b[H"); // Clear screen & home cursor
+            out!("\x1b[2J\x1b[H"); // Clear screen & home cursor
         }
         let now = Stamp::now();
         let clock = local_time(now.sec)
             .map(|lt| format_time(b"%H:%M:%S", &lt, now.ns, now.sec, false))
             .unwrap_or_default();
-        println!(
+        outln!(
             "{} {}   {}   {}",
             st.bold_cyan(&format!("Every {:?}:", interval)),
             st.bold(&cmd_str),
@@ -61,10 +61,10 @@ pub fn run_watch(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             )),
             st.yellow(&String::from_utf8_lossy(&clock))
         );
-        println!("{}", st.dim(&"─".repeat(72)));
-        io::stdout().write_all(&output.stdout)?;
+        outln!("{}", st.dim(&"─".repeat(72)));
+        stdout::stdout().write_all(&output.stdout)?;
         io::stderr().write_all(&output.stderr)?;
-        io::stdout().flush()?;
+        stdout::flush()?;
 
         if parsed.count > 0 && iter >= parsed.count {
             break;

@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use dogfish_core::gnu_io_error;
 
+use crate::common::getopt::usage_error;
 use crate::common::path::{same_inode, same_name};
 use crate::common::quote::qa;
-use crate::common::tool_args::usage_error;
 
 /// What to do when the destination exists (GNU's `interactive` setting).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub(crate) fn resolve_targets(
         1 => {
             return Err(usage_error(
                 tool,
-                &format!("missing destination file operand after {}", qa(&files[0])),
+                format!("missing destination file operand after {}", qa(&files[0])),
             ));
         }
         _ => {}
@@ -78,7 +78,7 @@ pub(crate) fn resolve_targets(
         if files.len() > 2 {
             return Err(usage_error(
                 tool,
-                &format!("extra operand {}", qa(&files[2])),
+                format!("extra operand {}", qa(&files[2])),
             ));
         }
         let dst = files.pop().unwrap_or_default();

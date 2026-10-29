@@ -18,7 +18,7 @@ use dogfish_core::{
     out, outln, stdout, strip_os_error_suffix,
 };
 
-use crate::common::getopt::exit_failure;
+use crate::common::getopt::{exit_failure, lossy_all};
 
 pub const ALL_TOOLS: &[(&str, &str, &str)] = &[
     // Tier 1: File & Directory
@@ -481,7 +481,6 @@ fn is_known_tool(name: &str) -> bool {
 }
 
 fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
-    let args = crate::common::getopt::lossy_all(args);
     let tool_names: Vec<&str> = ALL_TOOLS.iter().map(|(n, _, _)| *n).collect();
     match tool {
         // Tier 1: File & Directory
@@ -503,53 +502,55 @@ fn dispatch(tool: &str, args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32
         "mktemp" => tools::mktemp::run_mktemp(args, ctx),
 
         // Tier 2: Text & Streaming
-        "cat" => tools::cat::run_cat(args, ctx),
-        "tac" => tools::tac::run_tac(args, ctx),
-        "head" => tools::head::run_head(args, ctx),
-        "tail" => tools::tail::run_tail(args, ctx),
-        "wc" => tools::wc::run_wc(args, ctx),
-        "sort" => tools::sort::run_sort(args, ctx),
-        "uniq" => tools::uniq::run_uniq(args, ctx),
-        "cut" => tools::cut::run_cut(args, ctx),
-        "tr" => tools::tr::run_tr(args, ctx),
-        "paste" => tools::paste::run_paste(args, ctx),
-        "nl" => tools::nl::run_nl(args, ctx),
-        "shuf" => tools::shuf::run_shuf(args, ctx),
-        "query" | "filter" => tools::query::run_query(args, ctx),
+        "cat" => tools::cat::run_cat(lossy_all(args), ctx),
+        "tac" => tools::tac::run_tac(lossy_all(args), ctx),
+        "head" => tools::head::run_head(lossy_all(args), ctx),
+        "tail" => tools::tail::run_tail(lossy_all(args), ctx),
+        "wc" => tools::wc::run_wc(lossy_all(args), ctx),
+        "sort" => tools::sort::run_sort(lossy_all(args), ctx),
+        "uniq" => tools::uniq::run_uniq(lossy_all(args), ctx),
+        "cut" => tools::cut::run_cut(lossy_all(args), ctx),
+        "tr" => tools::tr::run_tr(lossy_all(args), ctx),
+        "paste" => tools::paste::run_paste(lossy_all(args), ctx),
+        "nl" => tools::nl::run_nl(lossy_all(args), ctx),
+        "shuf" => tools::shuf::run_shuf(lossy_all(args), ctx),
+        "query" | "filter" => tools::query::run_query(lossy_all(args), ctx),
 
         // Tier 3: Hashing & Encoding
-        "b2sum" => tools::checksum::run_b2sum(args, ctx),
-        "sha256sum" => tools::checksum::run_sha256sum(args, ctx),
-        "md5sum" => tools::checksum::run_md5sum(args, ctx),
-        "base64" => tools::basenc::run_base64(args, ctx),
-        "basenc" => tools::basenc::run_basenc(args, ctx),
+        "b2sum" => tools::checksum::run_b2sum(lossy_all(args), ctx),
+        "sha256sum" => tools::checksum::run_sha256sum(lossy_all(args), ctx),
+        "md5sum" => tools::checksum::run_md5sum(lossy_all(args), ctx),
+        "base64" => tools::basenc::run_base64(lossy_all(args), ctx),
+        "basenc" => tools::basenc::run_basenc(lossy_all(args), ctx),
 
         // Tier 4: Shell & System
-        "echo" => tools::echo::run_echo(args, ctx),
-        "printf" => tools::printf::run_printf(args, ctx),
-        "env" => tools::env::run_env(args, ctx),
-        "printenv" => tools::printenv::run_printenv(args, ctx),
-        "id" => tools::id::run_id(args, ctx),
-        "uname" => tools::uname::run_uname(args, ctx),
-        "hostname" => tools::hostname::run_hostname(args, ctx),
-        "nproc" => tools::nproc::run_nproc(args, ctx),
-        "whoami" => tools::whoami::run_whoami(args, ctx),
-        "yes" => tools::yes::run_yes(args, ctx),
-        "true" => tools::true_false::run_true(args, ctx),
-        "false" => tools::true_false::run_false(args, ctx),
-        "sleep" => tools::sleep::run_sleep(args, ctx),
-        "timeout" => tools::timeout::run_timeout(args, ctx),
-        "watch" => tools::watch::run_watch(args, ctx),
-        "seq" => tools::seq::run_seq(args, ctx),
-        "date" => tools::date::run_date(args, ctx),
-        "tee" => tools::tee::run_tee(args, ctx),
+        "echo" => tools::echo::run_echo(lossy_all(args), ctx),
+        "printf" => tools::printf::run_printf(lossy_all(args), ctx),
+        "env" => tools::env::run_env(lossy_all(args), ctx),
+        "printenv" => tools::printenv::run_printenv(lossy_all(args), ctx),
+        "id" => tools::id::run_id(lossy_all(args), ctx),
+        "uname" => tools::uname::run_uname(lossy_all(args), ctx),
+        "hostname" => tools::hostname::run_hostname(lossy_all(args), ctx),
+        "nproc" => tools::nproc::run_nproc(lossy_all(args), ctx),
+        "whoami" => tools::whoami::run_whoami(lossy_all(args), ctx),
+        "yes" => tools::yes::run_yes(lossy_all(args), ctx),
+        "true" => tools::true_false::run_true(lossy_all(args), ctx),
+        "false" => tools::true_false::run_false(lossy_all(args), ctx),
+        "sleep" => tools::sleep::run_sleep(lossy_all(args), ctx),
+        "timeout" => tools::timeout::run_timeout(lossy_all(args), ctx),
+        "watch" => tools::watch::run_watch(lossy_all(args), ctx),
+        "seq" => tools::seq::run_seq(lossy_all(args), ctx),
+        "date" => tools::date::run_date(lossy_all(args), ctx),
+        "tee" => tools::tee::run_tee(lossy_all(args), ctx),
 
         // Meta-Tools
-        "bench" => tools::bench::run_bench(args, ctx),
-        "undo" => tools::undo::run_undo(args, ctx),
-        "history" => tools::history::run_history(args, ctx),
-        "init" => tools::init::run_init(args, &tool_names, ctx),
-        "install-links" => tools::install_links::run_install_links(args, &tool_names, ctx),
+        "bench" => tools::bench::run_bench(lossy_all(args), ctx),
+        "undo" => tools::undo::run_undo(lossy_all(args), ctx),
+        "history" => tools::history::run_history(lossy_all(args), ctx),
+        "init" => tools::init::run_init(lossy_all(args), &tool_names, ctx),
+        "install-links" => {
+            tools::install_links::run_install_links(lossy_all(args), &tool_names, ctx)
+        }
 
         other => Err(anyhow::anyhow!(
             "unknown utility '{}'. Run `dogfish --help` to see all 44 utilities.",

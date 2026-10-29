@@ -8,7 +8,7 @@ use clap::{ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser};
 use digest::{Digest, Update, VariableOutput};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    gnu_quote, gnu_quote_file, io::ignore_broken_pipe,
+    gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
 };
 use md5::Md5;
 use rayon::prelude::*;
@@ -363,8 +363,7 @@ fn run_sum(algo: Algo, args: &HashArgs, m: &ArgMatches, ctx: &DogfishContext) ->
 
     let mut exit_code = 0;
     let mut records = Vec::with_capacity(results.len());
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     for (src, res) in sources.iter().zip(results) {
         match res {
             Ok(rec) => {
@@ -636,8 +635,7 @@ fn verify_checksums(
     ctx: &DogfishContext,
 ) -> Result<i32> {
     let tool = ctx.tool_name.as_str();
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
     let mut json_results = Vec::new();
     let mut all_ok = true;
     let mut style = LineStyle::Unknown;

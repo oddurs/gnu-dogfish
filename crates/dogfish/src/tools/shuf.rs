@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
 };
 
 #[derive(Parser)]
@@ -72,8 +72,7 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             let j = i + (next_u64() as usize) % (len - i);
             nums.swap(i, j);
         }
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+        let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
         let mut itoa_buf = itoa::Buffer::new();
         for &n in &nums[..count] {
             ignore_broken_pipe(out.write_all(itoa_buf.format(n).as_bytes()))?;
@@ -120,8 +119,7 @@ pub fn run_shuf(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         lines.swap(i, j);
     }
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     for line in &lines[..count] {
         ignore_broken_pipe(writeln!(out, "{}", line))?;
     }

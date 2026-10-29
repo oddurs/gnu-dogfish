@@ -6,18 +6,21 @@ mod options;
 mod rich;
 mod version_sort;
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, emit_objects_or_table, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, emit_objects_or_table, io::ignore_broken_pipe, stdout};
+
+use crate::common::getopt::lossy_all;
 
 use crate::tools::ls::colors::{C_EXEC, C_MISSING, C_ORPHAN, LsColors};
 use crate::tools::ls::lister::Lister;
 use crate::tools::ls::options::{LsFormat, LsIgnore, ls_args, parse_ls_args};
 use crate::tools::ls::rich::render_tree;
 
-pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let args = ls_args(ctx, args);
     let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty) {
         Ok(v) => v,
@@ -26,14 +29,13 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let targets = if operands.is_empty() {
         vec![".".to_string()]
     } else {
-        operands
+        lossy_all(operands)
     };
     let st = ctx.style();
 
     if opts.tree {
         ctx.telemetry.set_strategy("recursive visual tree renderer");
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::new(stdout.lock());
+        let mut out = io::BufWriter::new(stdout::stdout());
         for t in &targets {
             writeln!(out, "{}", st.bold_blue(t))?;
             render_tree(
@@ -69,10 +71,9 @@ pub fn run_ls(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             || (c.is_colored(C_MISSING) && opts.format == LsFormat::Long);
     }
     opts.check_symlink_mode |= opts.dirs_first;
-    let stdout = io::stdout();
     let mut lister = Lister {
         opts: &opts,
-        out: io::BufWriter::new(stdout.lock()),
+        out: io::BufWriter::new(stdout::stdout()),
         status: 0,
         first_header: true,
         rich: rich.then_some(st),

@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file, stdout};
 
 use crate::common::legacy_getopt::argmatch;
 
@@ -94,7 +94,7 @@ pub fn run_tee(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let mut status = 0;
     let mut outputs = vec![TeeOutput {
         name: "standard output".to_string(),
-        sink: Some(Box::new(io::stdout())),
+        sink: Some(Box::new(stdout::stdout())),
     }];
     for path in &parsed.files {
         let opened = OpenOptions::new()

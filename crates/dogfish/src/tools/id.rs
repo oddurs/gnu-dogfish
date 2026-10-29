@@ -1,11 +1,11 @@
 //! id — With `--json` and colorized interactive output
 
 use std::ffi::{CStr, CString};
-use std::io::{self, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::{DogfishContext, gnu_quote, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
 use serde::Serialize;
 
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
@@ -276,8 +276,7 @@ pub fn run_id(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     let st = ctx.style();
     let term = if parsed.zero { b'\0' } else { b'\n' };
     for who in targets.into_iter().flatten() {

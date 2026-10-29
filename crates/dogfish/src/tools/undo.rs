@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{DogfishContext, UndoJournal};
+use dogfish_core::{DogfishContext, UndoJournal, outln};
 
 #[derive(Parser)]
 #[command(
@@ -23,7 +23,7 @@ pub fn run_undo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     for _ in 0..parsed.count {
         match journal.undo_last()? {
             Some((entry, summary)) => {
-                println!(
+                outln!(
                     "{} [id #{}, tool: {}] {}",
                     st.bold_green("✔ Undone:"),
                     entry.id,
@@ -33,7 +33,7 @@ pub fn run_undo(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 ctx.telemetry.add_items(1);
             }
             None => {
-                println!(
+                outln!(
                     "{}",
                     st.yellow("No more operations in Dogfish undo journal.")
                 );

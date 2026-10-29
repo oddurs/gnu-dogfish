@@ -10,7 +10,7 @@ use clap::{ArgAction, Parser};
 use digest::Digest;
 use dogfish_core::{
     DogfishContext, FastReader, InputSource, emit_objects_or_table, eval_json_where, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin, table::compare_json_field,
+    io::ignore_broken_pipe, read_ndjson_stdin, stdout, table::compare_json_field,
 };
 use md5::Md5;
 use rayon::prelude::*;
@@ -1022,7 +1022,7 @@ pub fn run_sort(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 return Ok(2);
             }
         },
-        _ => Box::new(io::stdout().lock()),
+        _ => Box::new(stdout::stdout()),
     };
     let mut out = io::BufWriter::with_capacity(256 * 1024, sink);
     let mut written = 0u64;

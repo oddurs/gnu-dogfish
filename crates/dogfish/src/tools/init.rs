@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
 #[derive(Parser)]
 #[command(
@@ -25,9 +25,9 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
     let exe_str = exe.display();
     let is_fish = parsed.shell.eq_ignore_ascii_case("fish");
 
-    println!("# Dogfish shell integration for {}", parsed.shell);
+    outln!("# Dogfish shell integration for {}", parsed.shell);
     if is_fish {
-        println!("# Usage in fish: ./target/release/dogfish init fish --safe-rm | source");
+        outln!("# Usage in fish: ./target/release/dogfish init fish --safe-rm | source");
         for &tool in tool_names {
             // In fish, `true`, `false`, `echo`, and `printf` are core builtins that shouldn't be clobbered
             // unless desired, and `alias` syntax or `function --wraps` is used.
@@ -38,23 +38,24 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
                 continue;
             }
             if tool == "rm" && parsed.safe_rm {
-                println!(
+                outln!(
                     "function rm --wraps=rm; \"{}\" rm --safe $argv; end",
                     exe_str
                 );
             } else {
-                println!(
+                outln!(
                     "function {0} --wraps={0}; \"{1}\" {0} $argv; end",
-                    tool, exe_str
+                    tool,
+                    exe_str
                 );
             }
         }
-        println!("function undo; \"{}\" undo $argv; end", exe_str);
-        println!("function dogfish; \"{}\" $argv; end", exe_str);
-        println!("function gnu-dogfish; \"{}\" $argv; end", exe_str);
-        println!("function 'gnu/dogfish'; \"{}\" $argv; end", exe_str);
+        outln!("function undo; \"{}\" undo $argv; end", exe_str);
+        outln!("function dogfish; \"{}\" $argv; end", exe_str);
+        outln!("function gnu-dogfish; \"{}\" $argv; end", exe_str);
+        outln!("function 'gnu/dogfish'; \"{}\" $argv; end", exe_str);
     } else {
-        println!(
+        outln!(
             "# Usage in zsh/bash: eval \"$(./target/release/dogfish init {} --safe-rm)\"",
             parsed.shell
         );
@@ -66,15 +67,15 @@ pub fn run_init(args: Vec<String>, tool_names: &[&str], _ctx: &DogfishContext) -
                 continue;
             }
             if tool == "rm" && parsed.safe_rm {
-                println!("alias rm='\"{}\" rm --safe'", exe_str);
+                outln!("alias rm='\"{}\" rm --safe'", exe_str);
             } else {
-                println!("alias {}='\"{}\" {}'", tool, exe_str, tool);
+                outln!("alias {}='\"{}\" {}'", tool, exe_str, tool);
             }
         }
-        println!("alias undo='\"{}\" undo'", exe_str);
-        println!("alias dogfish='\"{}\"'", exe_str);
-        println!("alias gnu-dogfish='\"{}\"'", exe_str);
-        println!("alias 'gnu/dogfish'='\"{}\"'", exe_str);
+        outln!("alias undo='\"{}\" undo'", exe_str);
+        outln!("alias dogfish='\"{}\"'", exe_str);
+        outln!("alias gnu-dogfish='\"{}\"'", exe_str);
+        outln!("alias 'gnu/dogfish'='\"{}\"'", exe_str);
     }
     Ok(0)
 }

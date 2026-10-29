@@ -1,14 +1,19 @@
 //! mv — GNU semantics, recorded to the UndoJournal (`dogfish undo` reverses it)
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path};
+use dogfish_core::{DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path, outln};
 
 use crate::common::backup::{BackupMode, backup_mode, backup_suffix, make_backup};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+    utf8_operands,
+};
 use crate::common::mode::{CHMOD_MODE_BITS, strmode9};
 use crate::common::path::{absolute_lossy, concat_path, operand_base, strip_trailing_slashes};
 use crate::common::prompt::{ask, write_protected};
@@ -16,7 +21,6 @@ use crate::common::quote::qa;
 use crate::common::targets::{
     Clobber, SameFileOpts, Targets, resolve_for_containment, resolve_targets, same_file_ok,
 };
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const MV_HELP: &str = "\
 Usage: mv [OPTION]... [-T] SOURCE DEST
@@ -60,7 +64,31 @@ enum MvOpt {
     Update,
     Verbose,
     Context,
+    Debug,
+    Help,
+    Version,
 }
+
+/// GNU's `long_options` and `"bfint:uvS:TZ"`.
+const SPECS: &[OptSpec<MvOpt>] = &[
+    OptSpec::long("backup", HasArg::Optional, MvOpt::BackupArg),
+    OptSpec::both(b'Z', "context", HasArg::No, MvOpt::Context),
+    OptSpec::long("debug", HasArg::No, MvOpt::Debug),
+    OptSpec::both(b'f', "force", HasArg::No, MvOpt::Force),
+    OptSpec::both(b'i', "interactive", HasArg::No, MvOpt::Interactive),
+    OptSpec::both(b'n', "no-clobber", HasArg::No, MvOpt::NoClobber),
+    OptSpec::long("no-copy", HasArg::No, MvOpt::NoCopy),
+    OptSpec::both(b'T', "no-target-directory", HasArg::No, MvOpt::NoTargetDir),
+    OptSpec::long("strip-trailing-slashes", HasArg::No, MvOpt::StripSlashes),
+    OptSpec::both(b'S', "suffix", HasArg::Required, MvOpt::Suffix),
+    OptSpec::both(b't', "target-directory", HasArg::Required, MvOpt::TargetDir),
+    OptSpec::long("update", HasArg::Optional, MvOpt::Update),
+    OptSpec::both(b'v', "verbose", HasArg::No, MvOpt::Verbose),
+    OptSpec::long("help", HasArg::No, MvOpt::Help),
+    OptSpec::long("version", HasArg::No, MvOpt::Version),
+    OptSpec::short(b'b', HasArg::No, MvOpt::Backup),
+    OptSpec::short(b'u', HasArg::No, MvOpt::UpdateOlder),
+];
 
 struct MvOpts {
     clobber: Clobber,
@@ -71,29 +99,9 @@ struct MvOpts {
     stdin_tty: bool,
 }
 
-pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use MvOpt::*;
-    const SPECS: &[ToolOpt<MvOpt>] = &[
-        opt("b", "", HasArg::No, Backup),
-        opt("", "backup", HasArg::Optional, BackupArg),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "interactive", HasArg::No, Interactive),
-        opt("n", "no-clobber", HasArg::No, NoClobber),
-        opt("", "no-copy", HasArg::No, NoCopy),
-        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
-        opt("S", "suffix", HasArg::Required, Suffix),
-        opt("t", "target-directory", HasArg::Required, TargetDir),
-        opt("T", "no-target-directory", HasArg::No, NoTargetDir),
-        opt("u", "", HasArg::No, UpdateOlder),
-        opt("", "update", HasArg::Optional, Update),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("Z", "", HasArg::No, Context),
-        opt("", "context", HasArg::No, Context),
-    ];
-    let parsed = match parse_tool_args("mv", &args, SPECS, MV_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut o = MvOpts {
         clobber: Clobber::Yes,
         update_older: false,
@@ -104,8 +112,15 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     };
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
     let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
-    for (opt, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (opt, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("mv", &e)),
+        };
+        let v = v.as_deref().map(lossy);
         match opt {
+            Help => return Ok(print_help(MV_HELP)),
+            Version => return Ok(print_version("mv")),
             Backup => want_backup = true,
             BackupArg => {
                 want_backup = true;
@@ -115,6 +130,8 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Interactive => o.clobber = Clobber::Ask,
             NoClobber => o.clobber = Clobber::No,
             NoCopy | Context => {}
+            // GNU: `--debug` implies `--verbose`.
+            Debug => o.verbose = true,
             StripSlashes => strip_slashes = true,
             Suffix => {
                 want_backup = true;
@@ -148,7 +165,11 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     }
     o.suffix = backup_suffix(suffix);
 
-    let targets = match resolve_targets("mv", parsed.operands, target_dir, no_target_dir) {
+    let operands = match utf8_operands("mv", opts.operands()) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    let targets = match resolve_targets("mv", operands, target_dir, no_target_dir) {
         Ok(t) => t,
         Err(code) => return Ok(code),
     };
@@ -339,8 +360,8 @@ fn mv_one(
     ctx.telemetry.add_items(1);
     if o.verbose {
         match &backup_made {
-            Some(b) => println!("renamed {} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
-            None => println!("renamed {} -> {}", qa(src), qa(dst)),
+            Some(b) => outln!("renamed {} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
+            None => outln!("renamed {} -> {}", qa(src), qa(dst)),
         }
     }
     true

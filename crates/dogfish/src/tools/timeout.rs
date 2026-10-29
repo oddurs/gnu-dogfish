@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote};
+use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, outln};
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
 use crate::common::interval::{duration_from_secs, parse_interval};
@@ -181,7 +181,7 @@ pub fn run_timeout(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             "preserve-status" => preserve_status = true,
             "help" => return print_help(TIMEOUT_HELP),
             _ => {
-                println!("timeout (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
+                outln!("timeout (GNU/Dogfish) {}", env!("CARGO_PKG_VERSION"));
                 return Ok(0);
             }
         }

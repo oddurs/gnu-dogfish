@@ -1,10 +1,8 @@
 //! history — Inspect the Dogfish undo journal
 
-use std::io;
-
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{ColumnAlign, DogfishContext, JournalAction, Table, UndoJournal};
+use dogfish_core::{ColumnAlign, DogfishContext, JournalAction, Table, UndoJournal, outln, stdout};
 
 #[derive(Parser)]
 #[command(
@@ -22,13 +20,13 @@ pub fn run_history(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     let entries = journal.load_entries()?;
 
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        outln!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(0);
     }
 
     let st = ctx.style();
     if entries.is_empty() {
-        println!("{}", st.dim("Undo journal is empty. Use `rm --safe`, `mv`, or `cp` to record reversible actions."));
+        outln!("{}", st.dim("Undo journal is empty. Use `rm --safe`, `mv`, or `cp` to record reversible actions."));
         return Ok(0);
     }
 
@@ -58,8 +56,7 @@ pub fn run_history(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         ]);
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     tbl.render(&mut out, st)?;
     Ok(0)
 }

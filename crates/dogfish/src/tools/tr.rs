@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::Result;
 use clap::Parser;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, io::ignore_broken_pipe};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, io::ignore_broken_pipe, stdout};
 use memchr::memmem;
 
 #[derive(Parser)]
@@ -274,8 +274,7 @@ pub fn run_tr(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry.set_strategy("256-byte O(1) LUT stream");
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout::stdout();
     let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
     let mut obuf = Vec::with_capacity(DEFAULT_BUF_SIZE);
     let mut last: Option<u8> = None;

@@ -2,9 +2,11 @@
 
 use dogfish_core::DogfishContext;
 
-use crate::common::gnu_getopt::{
-    OptArg, OptSpec, gnu_argmatch, gnu_getopt, gnu_usage_error, print_help_text,
-    print_tool_version, try_help,
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, try_help,
 };
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, parse_block_size,
@@ -15,137 +17,108 @@ use crate::tools::ls::colors::LsColors;
 
 /// GNU `ls` options. `-L` means `--dereference`, except with `--tree`, where it
 /// keeps its Dogfish meaning of `--level` (see [`ls_option_table`]).
-const LS_OPTIONS: &[OptSpec] = &[
+const LS_OPTIONS: &[OptSpec<&str>] = &[
     // Long options in GNU's table order (it decides ambiguity diagnostics).
-    OptSpec::new("all", Some('a'), Some("all"), OptArg::No),
-    OptSpec::new("escape", Some('b'), Some("escape"), OptArg::No),
-    OptSpec::new("directory", Some('d'), Some("directory"), OptArg::No),
-    OptSpec::new("full-time", None, Some("full-time"), OptArg::No),
-    OptSpec::new(
+    OptSpec::both(b'a', "all", HasArg::No, "all"),
+    OptSpec::both(b'b', "escape", HasArg::No, "escape"),
+    OptSpec::both(b'd', "directory", HasArg::No, "directory"),
+    OptSpec::long("full-time", HasArg::No, "full-time"),
+    OptSpec::long(
         "group-directories-first",
-        None,
-        Some("group-directories-first"),
-        OptArg::No,
+        HasArg::No,
+        "group-directories-first",
     ),
-    OptSpec::new(
-        "human-readable",
-        Some('h'),
-        Some("human-readable"),
-        OptArg::No,
-    ),
-    OptSpec::new("inode", Some('i'), Some("inode"), OptArg::No),
-    OptSpec::new("kibibytes", Some('k'), Some("kibibytes"), OptArg::No),
-    OptSpec::new(
-        "numeric-uid-gid",
-        Some('n'),
-        Some("numeric-uid-gid"),
-        OptArg::No,
-    ),
-    OptSpec::new("no-group", Some('G'), Some("no-group"), OptArg::No),
-    OptSpec::new(
-        "hide-control-chars",
-        Some('q'),
-        Some("hide-control-chars"),
-        OptArg::No,
-    ),
-    OptSpec::new("reverse", Some('r'), Some("reverse"), OptArg::No),
-    OptSpec::new("size", Some('s'), Some("size"), OptArg::No),
-    OptSpec::new("width", Some('w'), Some("width"), OptArg::Required),
-    OptSpec::new("almost-all", Some('A'), Some("almost-all"), OptArg::No),
-    OptSpec::new(
-        "ignore-backups",
-        Some('B'),
-        Some("ignore-backups"),
-        OptArg::No,
-    ),
-    OptSpec::new("classify", Some('F'), Some("classify"), OptArg::Optional),
-    OptSpec::new("file-type", None, Some("file-type"), OptArg::No),
-    OptSpec::new("si", None, Some("si"), OptArg::No),
-    OptSpec::new(
+    OptSpec::both(b'h', "human-readable", HasArg::No, "human-readable"),
+    OptSpec::both(b'i', "inode", HasArg::No, "inode"),
+    OptSpec::both(b'k', "kibibytes", HasArg::No, "kibibytes"),
+    OptSpec::both(b'n', "numeric-uid-gid", HasArg::No, "numeric-uid-gid"),
+    OptSpec::both(b'G', "no-group", HasArg::No, "no-group"),
+    OptSpec::both(b'q', "hide-control-chars", HasArg::No, "hide-control-chars"),
+    OptSpec::both(b'r', "reverse", HasArg::No, "reverse"),
+    OptSpec::both(b's', "size", HasArg::No, "size"),
+    OptSpec::both(b'w', "width", HasArg::Required, "width"),
+    OptSpec::both(b'A', "almost-all", HasArg::No, "almost-all"),
+    OptSpec::both(b'B', "ignore-backups", HasArg::No, "ignore-backups"),
+    OptSpec::long("classify", HasArg::Optional, "classify"),
+    OptSpec::long("file-type", HasArg::No, "file-type"),
+    OptSpec::long("si", HasArg::No, "si"),
+    OptSpec::both(
+        b'H',
         "dereference-command-line",
-        Some('H'),
-        Some("dereference-command-line"),
-        OptArg::No,
+        HasArg::No,
+        "dereference-command-line",
     ),
-    OptSpec::new(
+    OptSpec::long(
         "dereference-command-line-symlink-to-dir",
-        None,
-        Some("dereference-command-line-symlink-to-dir"),
-        OptArg::No,
+        HasArg::No,
+        "dereference-command-line-symlink-to-dir",
     ),
-    OptSpec::new("hide", None, Some("hide"), OptArg::Required),
-    OptSpec::new("ignore", Some('I'), Some("ignore"), OptArg::Required),
-    OptSpec::new(
-        "indicator-style",
-        None,
-        Some("indicator-style"),
-        OptArg::Required,
-    ),
-    OptSpec::new("dereference", Some('L'), Some("dereference"), OptArg::No),
-    OptSpec::new("literal", Some('N'), Some("literal"), OptArg::No),
-    OptSpec::new("quote-name", Some('Q'), Some("quote-name"), OptArg::No),
-    OptSpec::new(
-        "quoting-style",
-        None,
-        Some("quoting-style"),
-        OptArg::Required,
-    ),
-    OptSpec::new("recursive", Some('R'), Some("recursive"), OptArg::No),
-    OptSpec::new("format", None, Some("format"), OptArg::Required),
-    OptSpec::new(
-        "show-control-chars",
-        None,
-        Some("show-control-chars"),
-        OptArg::No,
-    ),
-    OptSpec::new("sort", None, Some("sort"), OptArg::Required),
-    OptSpec::new("tabsize", Some('T'), Some("tabsize"), OptArg::Required),
-    OptSpec::new("time", None, Some("time"), OptArg::Required),
-    OptSpec::new("time-style", None, Some("time-style"), OptArg::Required),
-    OptSpec::new("zero", None, Some("zero"), OptArg::No),
-    OptSpec::new("color", None, Some("color"), OptArg::Optional),
-    OptSpec::new("hyperlink", None, Some("hyperlink"), OptArg::Optional),
-    OptSpec::new("block-size", None, Some("block-size"), OptArg::Required),
-    OptSpec::new("context", Some('Z'), Some("context"), OptArg::No),
-    OptSpec::new("author", None, Some("author"), OptArg::No),
-    OptSpec::new("help", None, Some("help"), OptArg::No),
-    OptSpec::new("version", None, Some("version"), OptArg::No),
+    OptSpec::long("hide", HasArg::Required, "hide"),
+    OptSpec::both(b'I', "ignore", HasArg::Required, "ignore"),
+    OptSpec::long("indicator-style", HasArg::Required, "indicator-style"),
+    OptSpec::both(b'L', "dereference", HasArg::No, "dereference"),
+    OptSpec::both(b'N', "literal", HasArg::No, "literal"),
+    OptSpec::both(b'Q', "quote-name", HasArg::No, "quote-name"),
+    OptSpec::long("quoting-style", HasArg::Required, "quoting-style"),
+    OptSpec::both(b'R', "recursive", HasArg::No, "recursive"),
+    OptSpec::long("format", HasArg::Required, "format"),
+    OptSpec::long("show-control-chars", HasArg::No, "show-control-chars"),
+    OptSpec::long("sort", HasArg::Required, "sort"),
+    OptSpec::both(b'T', "tabsize", HasArg::Required, "tabsize"),
+    OptSpec::long("time", HasArg::Required, "time"),
+    OptSpec::long("time-style", HasArg::Required, "time-style"),
+    OptSpec::long("zero", HasArg::No, "zero"),
+    OptSpec::long("color", HasArg::Optional, "color"),
+    OptSpec::long("hyperlink", HasArg::Optional, "hyperlink"),
+    OptSpec::long("block-size", HasArg::Required, "block-size"),
+    OptSpec::both(b'Z', "context", HasArg::No, "context"),
+    OptSpec::long("author", HasArg::No, "author"),
+    OptSpec::long("help", HasArg::No, "help"),
+    OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::new("tree", None, Some("tree"), OptArg::No),
-    OptSpec::new("level", None, Some("level"), OptArg::Required),
-    OptSpec::new("json", Some('J'), Some("json"), OptArg::No),
+    OptSpec::long("tree", HasArg::No, "tree"),
+    OptSpec::long("level", HasArg::Required, "level"),
+    OptSpec::both(b'J', "json", HasArg::No, "json"),
     // Short-only options.
-    OptSpec::new("ctime", Some('c'), None, OptArg::No),
-    OptSpec::new("vertical", Some('C'), None, OptArg::No),
-    OptSpec::new("unsorted-all", Some('f'), None, OptArg::No),
-    OptSpec::new("no-owner", Some('g'), None, OptArg::No),
-    OptSpec::new("long", Some('l'), None, OptArg::No),
-    OptSpec::new("commas", Some('m'), None, OptArg::No),
-    OptSpec::new("long-no-group", Some('o'), None, OptArg::No),
-    OptSpec::new("slash", Some('p'), None, OptArg::No),
-    OptSpec::new("sort-size", Some('S'), None, OptArg::No),
-    OptSpec::new("sort-time", Some('t'), None, OptArg::No),
-    OptSpec::new("atime", Some('u'), None, OptArg::No),
-    OptSpec::new("unsorted", Some('U'), None, OptArg::No),
-    OptSpec::new("sort-version", Some('v'), None, OptArg::No),
-    OptSpec::new("across", Some('x'), None, OptArg::No),
-    OptSpec::new("sort-extension", Some('X'), None, OptArg::No),
-    OptSpec::new("one-per-line", Some('1'), None, OptArg::No),
+    OptSpec::short(b'c', HasArg::No, "ctime"),
+    OptSpec::short(b'C', HasArg::No, "vertical"),
+    OptSpec::short(b'f', HasArg::No, "unsorted-all"),
+    OptSpec::short(b'g', HasArg::No, "no-owner"),
+    OptSpec::short(b'l', HasArg::No, "long"),
+    OptSpec::short(b'm', HasArg::No, "commas"),
+    OptSpec::short(b'o', HasArg::No, "long-no-group"),
+    OptSpec::short(b'p', HasArg::No, "slash"),
+    OptSpec::short(b'S', HasArg::No, "sort-size"),
+    OptSpec::short(b't', HasArg::No, "sort-time"),
+    OptSpec::short(b'u', HasArg::No, "atime"),
+    OptSpec::short(b'U', HasArg::No, "unsorted"),
+    OptSpec::short(b'v', HasArg::No, "sort-version"),
+    OptSpec::short(b'x', HasArg::No, "across"),
+    OptSpec::short(b'X', HasArg::No, "sort-extension"),
+    OptSpec::short(b'1', HasArg::No, "one-per-line"),
+    // `-F` takes no argument; only `--classify[=WHEN]` does.
+    OptSpec::short(b'F', HasArg::No, "classify"),
 ];
 
 /// With `--tree`, `-L N` is the tree depth (`dogfish ls --tree -L 2`).
-fn ls_option_table(args: &[String]) -> Vec<OptSpec> {
+fn ls_option_table(args: &[OsString]) -> Vec<OptSpec<&'static str>> {
     let tree = args
         .iter()
-        .take_while(|a| *a != "--")
-        .any(|a| a == "--tree" || (a.len() > 3 && "--tree".starts_with(a.as_str())));
+        .map(|a| a.as_bytes())
+        .take_while(|a| *a != b"--")
+        .any(|a| a == b"--tree" || (a.len() > 3 && b"--tree".starts_with(a)));
     LS_OPTIONS
         .iter()
         .map(|s| {
             if tree && s.key == "dereference" {
-                OptSpec::new("level", Some('L'), None, OptArg::Required)
+                OptSpec::short(b'L', HasArg::Required, "level")
             } else {
-                OptSpec::new(s.key, s.short, s.long, s.arg)
+                OptSpec {
+                    short: s.short,
+                    long: s.long,
+                    arg: s.arg,
+                    key: s.key,
+                }
             }
         })
         .collect()
@@ -363,7 +336,7 @@ fn ls_time_formats(style: &str) -> std::result::Result<[String; 2], i32> {
                  - [posix-]locale\n  - +FORMAT (e.g., +%H:%M) for a 'date'-style format",
                 quote_bytes(style.as_bytes(), Quoting::Locale)
             );
-            Err(try_help("ls", 2))
+            Err(try_help("ls"))
         }
     }
 }
@@ -371,11 +344,11 @@ fn ls_time_formats(style: &str) -> std::result::Result<[String; 2], i32> {
 /// Parses `ls` arguments; `Err` carries the exit status after a diagnostic.
 /// Like GNU, the default format is columns on a terminal, one per line otherwise.
 pub(crate) fn parse_ls_args(
-    args: &[String],
+    args: &[OsString],
     stdout_is_tty: bool,
-) -> std::result::Result<(LsOpts, Vec<String>), i32> {
+) -> std::result::Result<(LsOpts, Vec<OsString>), i32> {
     let specs = ls_option_table(args);
-    let parsed = gnu_getopt(&specs, args).map_err(|msg| gnu_usage_error("ls", &msg, 2))?;
+    let mut parsed = Getopt::new(args.to_vec(), &specs);
 
     let (env_opts, env_size) = env_block_size("LS_BLOCK_SIZE");
     let env_sizes_files =
@@ -446,9 +419,11 @@ pub(crate) fn parse_ls_args(
             2
         })
     };
-    for opt in parsed.opts {
-        let value = opt.value.clone().unwrap_or_default();
-        match opt.key {
+    while let Some(item) = parsed.next() {
+        let (key, raw) = item.map_err(|e| getopt_error("ls", &e))?;
+        let spelled = parsed.last_spelling();
+        let value = raw.as_deref().map(lossy).unwrap_or_default();
+        match key {
             "all" => o.ignore = LsIgnore::Minimal,
             "almost-all" => o.ignore = LsIgnore::DotAndDotDot,
             "author" => o.author = true,
@@ -460,7 +435,7 @@ pub(crate) fn parse_ls_args(
                     explicit_sizes = true;
                 }
                 Err(e) => {
-                    eprintln!("ls: {}", e.message(&opt.spelled, &value));
+                    eprintln!("ls: {}", e.message(&spelled, &value));
                     return Err(2);
                 }
             },
@@ -492,13 +467,12 @@ pub(crate) fn parse_ls_args(
                     ("tty", "auto"),
                     ("if-tty", "auto"),
                 ];
-                let when = match &opt.value {
+                let when = match &raw {
                     None => "always",
-                    Some(v) => gnu_argmatch("ls", &format!("--{}", opt.key), v, &when)
-                        .ok_or_else(|| try_help("ls", 1))?,
+                    Some(v) => argmatch("ls", &format!("--{key}"), v, &when)?,
                 };
                 // Hyperlinks are accepted but not emitted.
-                if opt.key == "color" {
+                if key == "color" {
                     o.color = when == "always" || (when == "auto" && stdout_is_tty);
                 }
             }
@@ -521,10 +495,9 @@ pub(crate) fn parse_ls_args(
                     ("tty", "auto"),
                     ("if-tty", "auto"),
                 ];
-                let when = match &opt.value {
+                let when = match &raw {
                     None => "always",
-                    Some(v) => gnu_argmatch("ls", "--classify", v, &when)
-                        .ok_or_else(|| try_help("ls", 1))?,
+                    Some(v) => argmatch("ls", "--classify", v, &when)?,
                 };
                 // Output is not a terminal here, so `auto` means no indicators.
                 if when == "always" {
@@ -542,12 +515,11 @@ pub(crate) fn parse_ls_args(
                     ("file-type", "file-type"),
                     ("classify", "classify"),
                 ];
-                o.indicator = match gnu_argmatch("ls", "--indicator-style", &value, &choices) {
-                    Some("none") => Indicator::None,
-                    Some("slash") => Indicator::Slash,
-                    Some("file-type") => Indicator::FileType,
-                    Some(_) => Indicator::Classify,
-                    None => return Err(try_help("ls", 1)),
+                o.indicator = match argmatch("ls", "--indicator-style", &value, &choices)? {
+                    "none" => Indicator::None,
+                    "slash" => Indicator::Slash,
+                    "file-type" => Indicator::FileType,
+                    _ => Indicator::Classify,
                 };
             }
             "format" => {
@@ -560,13 +532,12 @@ pub(crate) fn parse_ls_args(
                     ("vertical", "vertical"),
                     ("single-column", "single-column"),
                 ];
-                o.format = match gnu_argmatch("ls", "--format", &value, &choices) {
-                    Some("long") => LsFormat::Long,
-                    Some("commas") => LsFormat::Commas,
-                    Some("across") => LsFormat::Across,
-                    Some("vertical") => LsFormat::Columns,
-                    Some(_) => LsFormat::OnePerLine,
-                    None => return Err(try_help("ls", 1)),
+                o.format = match argmatch("ls", "--format", &value, &choices)? {
+                    "long" => LsFormat::Long,
+                    "commas" => LsFormat::Commas,
+                    "across" => LsFormat::Across,
+                    "vertical" => LsFormat::Columns,
+                    _ => LsFormat::OnePerLine,
                 };
             }
             "full-time" => {
@@ -588,7 +559,7 @@ pub(crate) fn parse_ls_args(
             }
             "group-directories-first" => o.dirs_first = true,
             "human-readable" | "si" => {
-                let opts = if opt.key == "si" {
+                let opts = if key == "si" {
                     HUMAN_AUTOSCALE | HUMAN_SI
                 } else {
                     HUMAN_AUTOSCALE | HUMAN_SI | HUMAN_BASE_1024
@@ -602,8 +573,8 @@ pub(crate) fn parse_ls_args(
                 deref = Some(LsDeref::CommandLineSymlinkToDir)
             }
             "dereference" => deref = Some(LsDeref::Always),
-            "hide" => o.hide_patterns.push(value.into_bytes()),
-            "ignore" => o.ignore_patterns.push(value.into_bytes()),
+            "hide" => o.hide_patterns.push(raw.unwrap_or_default().into_vec()),
+            "ignore" => o.ignore_patterns.push(raw.unwrap_or_default().into_vec()),
             "inode" => o.inode = true,
             "kibibytes" => kibibytes = true,
             "literal" => quoting = Some(Quoting::Literal),
@@ -612,8 +583,7 @@ pub(crate) fn parse_ls_args(
             "quote-name" => quoting = Some(Quoting::C),
             "quoting-style" => {
                 let choices: Vec<(&str, &str)> = Quoting::NAMES.iter().map(|n| (*n, *n)).collect();
-                let name = gnu_argmatch("ls", "--quoting-style", &value, &choices)
-                    .ok_or_else(|| try_help("ls", 1))?;
+                let name = argmatch("ls", "--quoting-style", &value, &choices)?;
                 quoting = Quoting::from_name(name);
             }
             "reverse" => o.reverse = true,
@@ -648,14 +618,13 @@ pub(crate) fn parse_ls_args(
                     ("version", "version"),
                     ("width", "width"),
                 ];
-                o.sort = match gnu_argmatch("ls", "--sort", &value, &choices) {
-                    Some("none") => LsSort::None,
-                    Some("time") => LsSort::Time,
-                    Some("size") => LsSort::Size,
-                    Some("extension") => LsSort::Extension,
-                    Some("version") => LsSort::Version,
-                    Some(_) => LsSort::Width,
-                    None => return Err(try_help("ls", 1)),
+                o.sort = match argmatch("ls", "--sort", &value, &choices)? {
+                    "none" => LsSort::None,
+                    "time" => LsSort::Time,
+                    "size" => LsSort::Size,
+                    "extension" => LsSort::Extension,
+                    "version" => LsSort::Version,
+                    _ => LsSort::Width,
                 };
                 sort_specified = true;
             }
@@ -671,12 +640,11 @@ pub(crate) fn parse_ls_args(
                     ("birth", "birth"),
                     ("creation", "birth"),
                 ];
-                o.time = match gnu_argmatch("ls", "--time", &value, &choices) {
-                    Some("atime") => LsTime::Atime,
-                    Some("ctime") => LsTime::Ctime,
-                    Some("mtime") => LsTime::Mtime,
-                    Some(_) => LsTime::Birth,
-                    None => return Err(try_help("ls", 1)),
+                o.time = match argmatch("ls", "--time", &value, &choices)? {
+                    "atime" => LsTime::Atime,
+                    "ctime" => LsTime::Ctime,
+                    "mtime" => LsTime::Mtime,
+                    _ => LsTime::Birth,
                 };
                 time_explicit = o.time != LsTime::Mtime;
             }
@@ -708,14 +676,8 @@ pub(crate) fn parse_ls_args(
                 })?
             }
             "json" => o.json = true,
-            "help" => {
-                let _ = print_help_text(LS_HELP);
-                return Err(0);
-            }
-            "version" => {
-                print_tool_version("ls");
-                return Err(0);
-            }
+            "help" => return Err(print_help(LS_HELP)),
+            "version" => return Err(print_version("ls")),
             _ => unreachable!("unhandled ls option"),
         }
     }
@@ -767,34 +729,31 @@ pub(crate) fn parse_ls_args(
             .unwrap_or(Quoting::Literal)
     });
     o.hide_control = hide_control.unwrap_or(false);
-    Ok((o, parsed.operands))
+    Ok((o, parsed.operands()))
 }
 
 /// `ls` parses `--color[=WHEN]` itself, like GNU (in argument order, so `-f`
 /// and `--zero` can turn it off again, and with GNU's diagnostics), so it takes
 /// its arguments from before the global-flag filtering, dropping only
 /// `--stats`; the Dogfish `--no-color` means `--color=never`.
-pub(crate) fn ls_args(ctx: &DogfishContext, filtered: Vec<String>) -> Vec<String> {
+pub(crate) fn ls_args(ctx: &DogfishContext, filtered: Vec<OsString>) -> Vec<OsString> {
     if ctx.raw_args.is_empty() {
         return filtered;
     }
     let mut args = Vec::with_capacity(ctx.raw_args.len());
     let mut operands_only = false;
-    for (i, arg) in crate::common::getopt::lossy_all(ctx.raw_args.clone())
-        .iter()
-        .enumerate()
-    {
+    for (i, arg) in ctx.raw_args.iter().enumerate() {
         if i == 0 || operands_only {
             args.push(arg.clone());
             continue;
         }
-        match arg.as_str() {
-            "--" => {
+        match arg.as_bytes() {
+            b"--" => {
                 operands_only = true;
                 args.push(arg.clone());
             }
-            "--stats" => {}
-            "--no-color" => args.push("--color=never".into()),
+            b"--stats" => {}
+            b"--no-color" => args.push("--color=never".into()),
             _ => args.push(arg.clone()),
         }
     }

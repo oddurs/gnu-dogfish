@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
 
 #[derive(Parser)]
 #[command(
@@ -33,8 +33,7 @@ struct PrintenvArgs {
 pub fn run_printenv(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
     let parsed = PrintenvArgs::try_parse_from(args)?;
     let term: &[u8] = if parsed.null { b"\0" } else { b"\n" };
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
 
     if parsed.vars.is_empty() {
         if parsed.json {

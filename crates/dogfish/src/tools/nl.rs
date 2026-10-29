@@ -5,7 +5,8 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use clap::Parser;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error, io::ignore_broken_pipe,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
+    io::ignore_broken_pipe, stdout,
 };
 
 use crate::common::lines::chomp;
@@ -78,8 +79,7 @@ pub fn run_nl(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(1);
     }
     let sources = InputSource::from_args(&parsed.files);
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout.lock());
+    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, stdout::stdout());
     let st = ctx.style();
     let sep = parsed.separator.as_bytes();
     let blank_pad = vec![b' '; width + sep.len()];

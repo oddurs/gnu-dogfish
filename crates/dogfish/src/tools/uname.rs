@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use dogfish_core::DogfishContext;
+use dogfish_core::{DogfishContext, outln};
 
 use crate::common::uname_info::{UNKNOWN, get_uname_info};
 
@@ -54,7 +54,7 @@ pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
     let info = get_uname_info()?;
 
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&info)?);
+        outln!("{}", serde_json::to_string_pretty(&info)?);
         return Ok(0);
     }
 
@@ -91,6 +91,6 @@ pub fn run_uname(args: Vec<String>, _ctx: &DogfishContext) -> Result<i32> {
         .filter(|(wanted, _)| *wanted)
         .map(|(_, v)| v.as_str())
         .collect();
-    println!("{}", parts.join(" "));
+    outln!("{}", parts.join(" "));
     Ok(0)
 }
