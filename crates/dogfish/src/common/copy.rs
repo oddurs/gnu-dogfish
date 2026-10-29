@@ -16,6 +16,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 
+use dogfish_core::outln;
 use dogfish_core::{
     CopyMethod, DogfishContext, JournalAction, UndoJournal, gnu_io_error, move_path,
 };
@@ -23,8 +24,8 @@ use dogfish_core::{
 use crate::common::backup::{BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
-    Deref, absolute_lossy, c_path, dir_name, dir_names, last_component, rename_noreplace,
-    same_inode, same_name,
+    Deref, absolute, c_path, dir_name, dir_names, last_component, rename_noreplace, same_inode,
+    same_name,
 };
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf, quote_locale};
@@ -189,7 +190,7 @@ struct UndoPlan {
     /// The path the operation created or rewrote.
     created: PathBuf,
     /// Where the journal saved what `created` held before.
-    backup: Option<String>,
+    backup: Option<PathBuf>,
     /// Whether `created` existed before the operation.
     existed: bool,
 }
@@ -680,8 +681,8 @@ impl<'a> Copier<'a> {
 
     fn emit_verbose(&self, prefix: &str, src: &Path, dst: &Path, backup: Option<&Path>) {
         match backup {
-            Some(b) => println!("{prefix}{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
-            None => println!("{prefix}{} -> {}", qa(src), qa(dst)),
+            Some(b) => outln!("{prefix}{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
+            None => outln!("{prefix}{} -> {}", qa(src), qa(dst)),
         }
     }
 
@@ -784,13 +785,13 @@ impl<'a> Copier<'a> {
         let exists = fs::symlink_metadata(&plan.created).is_ok();
         let action = match moved_from {
             Some(from) if exists && fs::symlink_metadata(from).is_err() => JournalAction::Move {
-                src: absolute_lossy(from),
-                dst: absolute_lossy(&plan.created),
+                src: absolute(from),
+                dst: absolute(&plan.created),
                 backup_path: plan.backup,
             },
             _ if plan.backup.is_some() || (!plan.existed && exists) => JournalAction::CopyCreate {
-                src: absolute_lossy(src),
-                created_path: absolute_lossy(&plan.created),
+                src: absolute(src),
+                created_path: absolute(&plan.created),
                 backup_path: plan.backup,
             },
             _ => return,
@@ -867,7 +868,7 @@ impl<'a> Copier<'a> {
         match force_linkat(src, dst, dereference, replace, None) {
             Ok(linked) => {
                 if (linked == Linked::Replaced || saved) && verbose {
-                    println!("removed {}", qa(dst));
+                    outln!("removed {}", qa(dst));
                 }
                 true
             }
@@ -1362,7 +1363,7 @@ impl<'a> Copier<'a> {
                         }
                         new_dst = true;
                         if self.x.verbose {
-                            println!("removed {}", qa(dst));
+                            outln!("removed {}", qa(dst));
                         }
                     }
                 }
@@ -1667,7 +1668,7 @@ impl<'a> Copier<'a> {
                 }
                 if self.x.verbose {
                     if x_move {
-                        println!("created directory {}", qa(dst));
+                        outln!("created directory {}", qa(dst));
                     } else {
                         self.emit_verbose("", src, dst, None);
                     }
@@ -1749,14 +1750,14 @@ impl<'a> Copier<'a> {
             if verbose_pending {
                 let method = self.method;
                 match &dst_backup {
-                    Some(b) => println!(
+                    Some(b) => outln!(
                         "{} -> {} (backup: {}) ({})",
                         qa(src),
                         qa(dst),
                         qa(b),
                         method.as_str()
                     ),
-                    None => println!("{} -> {} ({})", qa(src), qa(dst), method.as_str()),
+                    None => outln!("{} -> {} ({})", qa(src), qa(dst), method.as_str()),
                 }
             }
         } else if is_type(src_mode, S_IFIFO) {
@@ -1925,7 +1926,7 @@ impl<'a> Copier<'a> {
                 Err(e) => self.diag_err(&format!("cannot un-backup {}", qa(dst)), &e),
                 Ok(()) => {
                     if self.x.verbose {
-                        println!("{} -> {} (unbackup)", qa(b), qa(dst));
+                        outln!("{} -> {} (unbackup)", qa(b), qa(dst));
                     }
                 }
             }
@@ -2075,7 +2076,7 @@ impl<'a> Copier<'a> {
                 match self.remove_dst(dst, false, top) {
                     Ok(()) => {
                         if self.x.verbose {
-                            println!("removed {}", qa(dst));
+                            outln!("removed {}", qa(dst));
                         }
                     }
                     Err(e) if errno(&e) == libc::ENOENT => {}

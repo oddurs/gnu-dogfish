@@ -8,11 +8,13 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error};
+use dogfish_core::{DogfishContext, gnu_io_error, stdout};
 
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
+};
 use crate::common::path::{concat_path, last_component};
 use crate::common::quote::quote_locale;
-use crate::common::tool_args::{HasArg, ToolOpt, opt, parse_tool_args, usage_error};
 
 const MKTEMP_HELP: &str = "\
 Usage: mktemp [OPTION]... [TEMPLATE]
@@ -46,29 +48,40 @@ enum MktempOpt {
     TmpDir,
     Deprecated,
     Suffix,
+    Help,
+    Version,
 }
 
-pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// GNU's `longopts` and `"dp:qtuV"` (`-p` requires its argument, `--tmpdir`
+/// takes an optional one; `-V` is an undocumented `--version`).
+const SPECS: &[OptSpec<MktempOpt>] = &[
+    OptSpec::both(b'd', "directory", HasArg::No, MktempOpt::Directory),
+    OptSpec::both(b'q', "quiet", HasArg::No, MktempOpt::Quiet),
+    OptSpec::both(b'u', "dry-run", HasArg::No, MktempOpt::DryRun),
+    OptSpec::long("suffix", HasArg::Required, MktempOpt::Suffix),
+    OptSpec::long("tmpdir", HasArg::Optional, MktempOpt::TmpDir),
+    OptSpec::long("help", HasArg::No, MktempOpt::Help),
+    OptSpec::long("version", HasArg::No, MktempOpt::Version),
+    OptSpec::short(b'p', HasArg::Required, MktempOpt::TmpDir),
+    OptSpec::short(b't', HasArg::No, MktempOpt::Deprecated),
+    OptSpec::short(b'V', HasArg::No, MktempOpt::Version),
+];
+
+pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use MktempOpt::*;
     use std::io::Read;
-    const SPECS: &[ToolOpt<MktempOpt>] = &[
-        opt("d", "directory", HasArg::No, Directory),
-        opt("u", "dry-run", HasArg::No, DryRun),
-        opt("q", "quiet", HasArg::No, Quiet),
-        opt("p", "", HasArg::Required, TmpDir),
-        opt("", "tmpdir", HasArg::Optional, TmpDir),
-        opt("t", "", HasArg::No, Deprecated),
-        opt("", "suffix", HasArg::Required, Suffix),
-    ];
-    let parsed = match parse_tool_args("mktemp", &args, SPECS, MKTEMP_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let (mut directory, mut dry_run, mut quiet, mut use_dest_dir, mut deprecated_t) =
         (false, false, false, false, false);
     let (mut dest_dir_arg, mut suffix_opt) = (None, None);
-    for (o, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (o, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("mktemp", &e)),
+        };
         match o {
+            Help => return Ok(print_help(MKTEMP_HELP)),
+            Version => return Ok(print_version("mktemp")),
             Directory => directory = true,
             DryRun => dry_run = true,
             Quiet => quiet = true,
@@ -80,7 +93,7 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 use_dest_dir = true;
                 deprecated_t = true;
             }
-            Suffix => suffix_opt = v,
+            Suffix => suffix_opt = v.map(OsString::into_vec),
         }
     }
     let fail = |msg: String| {
@@ -89,72 +102,74 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         }
         Ok(1)
     };
-    let template = match parsed.operands.len() {
+    // Names are bytes, as in GNU: any of them may be outside UTF-8.
+    let operands = opts.operands();
+    let template: Vec<u8> = match operands.len() {
         0 => {
             use_dest_dir = true;
-            "tmp.XXXXXXXXXX".to_string()
+            b"tmp.XXXXXXXXXX".to_vec()
         }
-        1 => parsed.operands[0].clone(),
+        1 => operands[0].as_bytes().to_vec(),
         _ => return Ok(usage_error("mktemp", "too many templates")),
     };
+    let q = |b: &[u8]| quote_locale(OsStr::from_bytes(b));
 
     // The suffix is --suffix, or whatever follows the last X of the template.
     let (template, suffix) = match &suffix_opt {
         Some(s) => {
-            if !template.ends_with('X') {
-                let mut shown = template.clone();
-                shown.push_str(s);
+            if template.last() != Some(&b'X') {
                 return fail(format!(
                     "with --suffix, template {} must end in X",
-                    quote_locale(&shown)
+                    q(&[&template[..], s].concat())
                 ));
             }
-            (template.clone() + s, s.clone())
+            ([&template[..], s].concat(), s.clone())
         }
         None => {
-            let cut = template.rfind('X').map_or(template.len(), |i| i + 1);
-            (template.clone(), template[cut..].to_string())
+            let cut = template
+                .iter()
+                .rposition(|&b| b == b'X')
+                .map_or(template.len(), |i| i + 1);
+            let suffix = template[cut..].to_vec();
+            (template, suffix)
         }
     };
-    if suffix.contains('/') {
+    if suffix.contains(&b'/') {
         return fail(format!(
             "invalid suffix {}, contains directory separator",
-            quote_locale(&suffix)
+            q(&suffix)
         ));
     }
     let stem = &template[..template.len() - suffix.len()];
-    let x_count = stem.len() - stem.trim_end_matches('X').len();
+    let x_count = stem.iter().rev().take_while(|&&b| b == b'X').count();
     if x_count < 3 {
-        return fail(format!(
-            "too few X's in template {}",
-            quote_locale(&template)
-        ));
+        return fail(format!("too few X's in template {}", q(&template)));
     }
 
     let full_template = if use_dest_dir {
-        let env_tmpdir = std::env::var("TMPDIR").ok().filter(|t| !t.is_empty());
+        let env_tmpdir = std::env::var_os("TMPDIR").filter(|t| !t.is_empty());
         let given = dest_dir_arg.filter(|d| !d.is_empty());
         let dir = if deprecated_t {
-            if last_component(template.as_bytes()).len() != template.len() {
+            if last_component(&template).len() != template.len() {
                 return fail(format!(
                     "invalid template, {}, contains directory separator",
-                    quote_locale(&template)
+                    q(&template)
                 ));
             }
             env_tmpdir.or(given)
         } else {
-            if template.starts_with('/') {
+            if template.first() == Some(&b'/') {
                 return fail(format!(
                     "invalid template, {}; with --tmpdir, it may not be absolute",
-                    quote_locale(&template)
+                    q(&template)
                 ));
             }
             given.or(env_tmpdir)
         }
-        .unwrap_or_else(|| "/tmp".to_string());
-        concat_path(&dir, OsStr::new(&template))
+        .unwrap_or_else(|| "/tmp".into());
+        concat_path(&dir, OsStr::from_bytes(&template))
     } else {
-        PathBuf::from(&template)
+        PathBuf::from(OsStr::from_bytes(&template))
     };
     let full = full_template.as_os_str().as_bytes().to_vec();
     let x_start = full.len() - suffix.len() - x_count;
@@ -194,9 +209,26 @@ pub fn run_mktemp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         match res {
             Ok(()) => {
                 ctx.telemetry.add_items(1);
-                let mut out = io::stdout().lock();
-                out.write_all(path.as_os_str().as_bytes())?;
-                out.write_all(b"\n")?;
+                let mut out = stdout::stdout();
+                let mut line = path.as_os_str().as_bytes().to_vec();
+                line.push(b'\n');
+                let written = out.write_all(&line).and_then(|()| out.flush());
+                // As in GNU: if the name cannot be written out, nobody will
+                // ever know of the file, so remove it again and fail.
+                if let Err(e) = written
+                    && !dry_run
+                {
+                    stdout::mark_reported();
+                    if directory {
+                        let _ = fs::remove_dir(&path);
+                    } else {
+                        let _ = fs::remove_file(&path);
+                    }
+                    if !quiet {
+                        eprintln!("mktemp: write error: {}", gnu_io_error(&e));
+                    }
+                    return Ok(1);
+                }
                 return Ok(0);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,

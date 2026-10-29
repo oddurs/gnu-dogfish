@@ -1,23 +1,26 @@
 //! mv — GNU semantics (rename, or copy and remove across file systems, as
 //! GNU's copy.c does), recorded to the UndoJournal (`dogfish undo` reverses it)
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
+use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
 use crate::common::backup::{backup_mode, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::mode::process_umask;
 use crate::common::path::{
     base_len, dir_names, file_name_concat, last_component, rename_noreplace, strip_trailing_slashes,
 };
 use crate::common::quote::qa;
 use crate::common::targets::{Targets, resolve_targets};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const MV_HELP: &str = "\
 Usage: mv [OPTION]... [-T] SOURCE DEST
@@ -61,36 +64,50 @@ enum MvOpt {
     Update,
     Verbose,
     Context,
+    Debug,
+    Help,
+    Version,
 }
 
-pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+/// GNU's `long_options` and `"bfint:uvS:TZ"`.
+const SPECS: &[OptSpec<MvOpt>] = &[
+    OptSpec::long("backup", HasArg::Optional, MvOpt::BackupArg),
+    OptSpec::both(b'Z', "context", HasArg::No, MvOpt::Context),
+    OptSpec::long("debug", HasArg::No, MvOpt::Debug),
+    OptSpec::both(b'f', "force", HasArg::No, MvOpt::Force),
+    OptSpec::both(b'i', "interactive", HasArg::No, MvOpt::Interactive),
+    OptSpec::both(b'n', "no-clobber", HasArg::No, MvOpt::NoClobber),
+    OptSpec::long("no-copy", HasArg::No, MvOpt::NoCopy),
+    OptSpec::both(b'T', "no-target-directory", HasArg::No, MvOpt::NoTargetDir),
+    OptSpec::long("strip-trailing-slashes", HasArg::No, MvOpt::StripSlashes),
+    OptSpec::both(b'S', "suffix", HasArg::Required, MvOpt::Suffix),
+    OptSpec::both(b't', "target-directory", HasArg::Required, MvOpt::TargetDir),
+    OptSpec::long("update", HasArg::Optional, MvOpt::Update),
+    OptSpec::both(b'v', "verbose", HasArg::No, MvOpt::Verbose),
+    OptSpec::long("help", HasArg::No, MvOpt::Help),
+    OptSpec::long("version", HasArg::No, MvOpt::Version),
+    OptSpec::short(b'b', HasArg::No, MvOpt::Backup),
+    OptSpec::short(b'u', HasArg::No, MvOpt::UpdateOlder),
+];
+
+pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use MvOpt::*;
-    const SPECS: &[ToolOpt<MvOpt>] = &[
-        opt("b", "", HasArg::No, Backup),
-        opt("", "backup", HasArg::Optional, BackupArg),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "interactive", HasArg::No, Interactive),
-        opt("n", "no-clobber", HasArg::No, NoClobber),
-        opt("", "no-copy", HasArg::No, NoCopy),
-        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
-        opt("S", "suffix", HasArg::Required, Suffix),
-        opt("t", "target-directory", HasArg::Required, TargetDir),
-        opt("T", "no-target-directory", HasArg::No, NoTargetDir),
-        opt("u", "", HasArg::No, UpdateOlder),
-        opt("", "update", HasArg::Optional, Update),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("Z", "", HasArg::No, Context),
-        opt("", "context", HasArg::No, Context),
-    ];
-    let parsed = match parse_tool_args("mv", &args, SPECS, MV_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut x = CopyOptions::for_mv(io::stdin().is_terminal());
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
     let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
-    for (opt, v) in parsed.opts {
+    while let Some(opt) = opts.next() {
+        let (opt, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("mv", &e)),
+        };
+        let raw = v.clone();
+        let v = v.as_deref().map(lossy);
         match opt {
+            Help => return Ok(print_help(MV_HELP)),
+            Version => return Ok(print_version("mv")),
+            // GNU: `--debug` implies `--verbose`.
+            Debug => x.verbose = true,
             Backup => want_backup = true,
             BackupArg => {
                 want_backup = true;
@@ -106,7 +123,13 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 want_backup = true;
                 suffix = v;
             }
-            TargetDir => target_dir = v,
+            TargetDir => {
+                if target_dir.is_some() {
+                    eprintln!("mv: multiple target directories specified");
+                    return Ok(1);
+                }
+                target_dir = raw;
+            }
             NoTargetDir => no_target_dir = true,
             UpdateOlder => x.update = true,
             Update => {
@@ -136,7 +159,7 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     // With two operands GNU first tries the rename itself, and only then
     // looks at whether DEST is a directory. (Not with `-b -n`, which GNU 9.4
     // rejects only after that rename; Dogfish rejects it without moving.)
-    let mut operands = parsed.operands;
+    let mut operands = opts.operands();
     let backup_no_clobber =
         want_backup && x.interactive == crate::common::copy::Interactive::AlwaysNo;
     if target_dir.is_none() && !no_target_dir && operands.len() == 2 && !backup_no_clobber {
@@ -156,7 +179,7 @@ pub fn run_mv(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
             Err(code) => return Ok(code),
         }
     };
-    let strip = |s: String| {
+    let strip = |s: OsString| {
         if strip_slashes {
             strip_trailing_slashes(&s)
         } else {
@@ -249,7 +272,7 @@ fn remove_tree(p: &Path, verbose: bool) -> bool {
             return fail(&e);
         }
         if verbose {
-            println!("removed {}", qa(p));
+            outln!("removed {}", qa(p));
         }
         return true;
     }
@@ -269,7 +292,7 @@ fn remove_tree(p: &Path, verbose: bool) -> bool {
         return fail(&e);
     }
     if verbose {
-        println!("removed directory {}", qa(p));
+        outln!("removed directory {}", qa(p));
     }
     true
 }

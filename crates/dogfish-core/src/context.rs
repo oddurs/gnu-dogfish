@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,6 +18,16 @@ impl ColorMode {
             Some("always") | Some("yes") | Some("force") => Self::Always,
             Some("never") | Some("no") | Some("none") => Self::Never,
             _ => Self::Auto,
+        }
+    }
+
+    /// GNU's `--color` arguments (`ls`), or `None` for anything else.
+    pub fn from_when(when: &str) -> Option<Self> {
+        match when {
+            "always" | "yes" | "force" => Some(Self::Always),
+            "never" | "no" | "none" => Some(Self::Never),
+            "auto" | "tty" | "if-tty" => Some(Self::Auto),
+            _ => None,
         }
     }
 
@@ -62,6 +72,43 @@ impl Telemetry {
     }
 }
 
+/// The Dogfish switches a utility's options may set while it parses them
+/// (`--stats`, `--color`, `--no-color`), shared by every clone of a context.
+#[derive(Debug)]
+pub struct Switches {
+    stats: AtomicBool,
+    color: AtomicU8,
+}
+
+impl Switches {
+    fn new(stats: bool) -> Self {
+        Self {
+            stats: AtomicBool::new(stats),
+            color: AtomicU8::new(ColorMode::Auto as u8),
+        }
+    }
+
+    pub fn set_stats(&self, on: bool) {
+        self.stats.store(on, Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> bool {
+        self.stats.load(Ordering::Relaxed)
+    }
+
+    pub fn set_color(&self, mode: ColorMode) {
+        self.color.store(mode as u8, Ordering::Relaxed);
+    }
+
+    pub fn color(&self) -> ColorMode {
+        match self.color.load(Ordering::Relaxed) {
+            x if x == ColorMode::Always as u8 => ColorMode::Always,
+            x if x == ColorMode::Never as u8 => ColorMode::Never,
+            _ => ColorMode::Auto,
+        }
+    }
+}
+
 /// Shared execution context passed to every Dogfish utility.
 #[derive(Clone)]
 pub struct DogfishContext {
@@ -70,89 +117,45 @@ pub struct DogfishContext {
     pub stdin_is_tty: bool,
     pub stdout_is_tty: bool,
     pub stderr_is_tty: bool,
-    pub show_stats: bool,
     pub force_json: bool,
-    pub color_mode: ColorMode,
-    /// The utility's arguments as given, before the global flags were taken
-    /// out (`raw_args[0]` is the tool name). A utility with GNU semantics for
-    /// `--color[=WHEN]` (where its position and validity matter, as in `ls`)
-    /// parses it from here; empty when the context was built without arguments.
-    pub raw_args: Vec<String>,
+    /// `--stats` and the colour mode: off and automatic until the utility's
+    /// own option parser sees a Dogfish switch it accepts (`DOGFISH_STATS`
+    /// in the environment turns `--stats` on for every utility).
+    pub switches: Arc<Switches>,
     pub telemetry: Arc<Telemetry>,
 }
 
 impl DogfishContext {
-    /// Intercepts global Dogfish flags (`--stats`, `--color=...`) while preserving remaining args
-    /// for the individual utility's `clap` parser.
-    pub fn from_raw_args(
-        tool_name: impl Into<String>,
-        raw_args: Vec<String>,
-    ) -> (Self, Vec<String>) {
-        let stdin_is_tty = io::stdin().is_terminal();
-        let stdout_is_tty = io::stdout().is_terminal();
-        let stderr_is_tty = io::stderr().is_terminal();
-
-        let mut show_stats = std::env::var_os("DOGFISH_STATS").is_some();
-        let mut color_mode = ColorMode::Auto;
-        let mut filtered = Vec::with_capacity(raw_args.len());
-        let mut passthrough_rest = false;
-        let unfiltered = raw_args.clone();
-
-        for (idx, arg) in raw_args.into_iter().enumerate() {
-            if idx == 0 {
-                filtered.push(arg);
-                continue;
-            }
-            if passthrough_rest {
-                filtered.push(arg);
-                continue;
-            }
-            if arg == "--" {
-                passthrough_rest = true;
-                filtered.push(arg);
-                continue;
-            }
-            if arg == "--stats" {
-                show_stats = true;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--color=") {
-                color_mode = ColorMode::from_str_opt(Some(val));
-                continue;
-            }
-            if arg == "--color" {
-                color_mode = ColorMode::Always;
-                continue;
-            }
-            if arg == "--no-color" {
-                color_mode = ColorMode::Never;
-                continue;
-            }
-            filtered.push(arg);
-        }
-
-        let ctx = Self {
+    /// The context for one run of `tool_name`. Arguments are left alone:
+    /// each utility parses its own, Dogfish switches included, so a utility
+    /// GNU gives no such options (`echo --color`) keeps GNU's behaviour.
+    pub fn new(tool_name: impl Into<String>) -> Self {
+        Self {
             tool_name: tool_name.into(),
             start_time: Instant::now(),
-            stdin_is_tty,
-            stdout_is_tty,
-            stderr_is_tty,
-            show_stats,
+            stdin_is_tty: io::stdin().is_terminal(),
+            stdout_is_tty: io::stdout().is_terminal(),
+            stderr_is_tty: io::stderr().is_terminal(),
             force_json: false,
-            color_mode,
-            raw_args: unfiltered,
+            switches: Arc::new(Switches::new(std::env::var_os("DOGFISH_STATS").is_some())),
             telemetry: Arc::new(Telemetry::default()),
-        };
+        }
+    }
 
-        (ctx, filtered)
+    pub fn color_mode(&self) -> ColorMode {
+        self.switches.color()
+    }
+
+    pub fn show_stats(&self) -> bool {
+        self.switches.stats()
     }
 
     pub fn use_color(&self) -> bool {
-        self.color_mode.should_color(self.stdout_is_tty)
+        self.color_mode().should_color(self.stdout_is_tty)
     }
 
     pub fn use_stderr_color(&self) -> bool {
-        self.color_mode.should_color(self.stderr_is_tty)
+        self.color_mode().should_color(self.stderr_is_tty)
     }
 
     pub fn style(&self) -> Style {
@@ -165,7 +168,7 @@ impl DogfishContext {
 
     /// Emits the `--stats` telemetry footer to stderr if enabled.
     pub fn finish(&self) {
-        if !self.show_stats {
+        if !self.show_stats() {
             return;
         }
         let elapsed = self.start_time.elapsed();

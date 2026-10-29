@@ -1,7 +1,7 @@
 //! cp — GNU semantics (a port of GNU's copy.c), CoW reflinks (FICLONE /
 //! APFS clonefile) and the UndoJournal
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -14,13 +14,15 @@ use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions, Interactive, Reflink, Sparse};
 use crate::common::file_times::{Stamp, set_file_times};
+use crate::common::getopt::{
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
+};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, process_umask};
 use crate::common::path::{
     Deref, base_len, file_name_concat, last_component, strip_trailing_slashes,
 };
 use crate::common::quote::{qa, quote_locale};
 use crate::common::targets::{Targets, resolve_targets};
-use crate::common::tool_args::{HasArg, ToolOpt, argmatch, opt, parse_tool_args, usage_error};
 
 const S_IRWXU: u32 = 0o700;
 const S_IRWXG: u32 = 0o070;
@@ -91,7 +93,6 @@ enum CpOpt {
     Preserve,
     NoPreserve,
     Parents,
-    KeepDirSymlink,
     Recursive,
     RemoveDestination,
     Reflink,
@@ -106,7 +107,51 @@ enum CpOpt {
     Verbose,
     OneFileSystem,
     Context,
+    Help,
+    Version,
 }
+
+/// GNU 9.4's `long_opts` (in its order: it decides ambiguity diagnostics) and
+/// `"abdfHilLnprst:uvxPRS:TZ"`.
+const SPECS: &[OptSpec<CpOpt>] = &[
+    OptSpec::both(b'a', "archive", HasArg::No, CpOpt::Archive),
+    OptSpec::long("attributes-only", HasArg::No, CpOpt::AttributesOnly),
+    OptSpec::long("backup", HasArg::Optional, CpOpt::BackupArg),
+    OptSpec::long("copy-contents", HasArg::No, CpOpt::CopyContents),
+    OptSpec::long("debug", HasArg::No, CpOpt::Debug),
+    OptSpec::both(b'L', "dereference", HasArg::No, CpOpt::Dereference),
+    OptSpec::both(b'f', "force", HasArg::No, CpOpt::Force),
+    OptSpec::both(b'i', "interactive", HasArg::No, CpOpt::Interactive),
+    OptSpec::both(b'l', "link", HasArg::No, CpOpt::Link),
+    OptSpec::both(b'n', "no-clobber", HasArg::No, CpOpt::NoClobber),
+    OptSpec::both(b'P', "no-dereference", HasArg::No, CpOpt::NoDereference),
+    OptSpec::long("no-preserve", HasArg::Required, CpOpt::NoPreserve),
+    OptSpec::both(b'T', "no-target-directory", HasArg::No, CpOpt::NoTargetDir),
+    OptSpec::both(b'x', "one-file-system", HasArg::No, CpOpt::OneFileSystem),
+    OptSpec::long("parents", HasArg::No, CpOpt::Parents),
+    OptSpec::long("path", HasArg::No, CpOpt::Parents),
+    OptSpec::long("preserve", HasArg::Optional, CpOpt::Preserve),
+    OptSpec::both(b'R', "recursive", HasArg::No, CpOpt::Recursive),
+    OptSpec::long("remove-destination", HasArg::No, CpOpt::RemoveDestination),
+    OptSpec::long("sparse", HasArg::Required, CpOpt::Sparse),
+    OptSpec::long("reflink", HasArg::Optional, CpOpt::Reflink),
+    OptSpec::long("strip-trailing-slashes", HasArg::No, CpOpt::StripSlashes),
+    OptSpec::both(b'S', "suffix", HasArg::Required, CpOpt::Suffix),
+    OptSpec::both(b's', "symbolic-link", HasArg::No, CpOpt::Symbolic),
+    OptSpec::both(b't', "target-directory", HasArg::Required, CpOpt::TargetDir),
+    OptSpec::long("update", HasArg::Optional, CpOpt::Update),
+    OptSpec::both(b'v', "verbose", HasArg::No, CpOpt::Verbose),
+    OptSpec::long("context", HasArg::Optional, CpOpt::Context),
+    OptSpec::long("help", HasArg::No, CpOpt::Help),
+    OptSpec::long("version", HasArg::No, CpOpt::Version),
+    OptSpec::short(b'b', HasArg::No, CpOpt::Backup),
+    OptSpec::short(b'd', HasArg::No, CpOpt::NoDerefLinks),
+    OptSpec::short(b'H', HasArg::No, CpOpt::CmdlineDeref),
+    OptSpec::short(b'p', HasArg::No, CpOpt::PreserveDefault),
+    OptSpec::short(b'r', HasArg::No, CpOpt::Recursive),
+    OptSpec::short(b'u', HasArg::No, CpOpt::UpdateOlder),
+    OptSpec::short(b'Z', HasArg::No, CpOpt::Context),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreserveAttr {
@@ -151,7 +196,6 @@ struct CpOpts {
     verbose: bool,
     attributes_only: bool,
     copy_contents: bool,
-    keep_directory_symlink: bool,
     sparse: Sparse,
     reflink: Reflink,
 }
@@ -184,50 +228,9 @@ fn apply_preserve(o: &mut CpOpts, list: &str, on: bool) -> std::result::Result<(
     Ok(())
 }
 
-pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     use CpOpt::*;
-    const SPECS: &[ToolOpt<CpOpt>] = &[
-        opt("a", "archive", HasArg::No, Archive),
-        opt("", "attributes-only", HasArg::No, AttributesOnly),
-        opt("b", "", HasArg::No, Backup),
-        opt("", "backup", HasArg::Optional, BackupArg),
-        opt("", "copy-contents", HasArg::No, CopyContents),
-        opt("", "debug", HasArg::No, Debug),
-        opt("d", "", HasArg::No, NoDerefLinks),
-        opt("L", "dereference", HasArg::No, Dereference),
-        opt("f", "force", HasArg::No, Force),
-        opt("i", "interactive", HasArg::No, Interactive),
-        opt("H", "", HasArg::No, CmdlineDeref),
-        opt("l", "link", HasArg::No, Link),
-        opt("n", "no-clobber", HasArg::No, NoClobber),
-        opt("P", "no-dereference", HasArg::No, NoDereference),
-        opt("", "no-preserve", HasArg::Required, NoPreserve),
-        opt("", "no-target-directory", HasArg::No, NoTargetDir),
-        opt("x", "one-file-system", HasArg::No, OneFileSystem),
-        opt("", "parents", HasArg::No, Parents),
-        opt("", "path", HasArg::No, Parents),
-        opt("", "keep-directory-symlink", HasArg::No, KeepDirSymlink),
-        opt("p", "", HasArg::No, PreserveDefault),
-        opt("", "preserve", HasArg::Optional, Preserve),
-        opt("rR", "recursive", HasArg::No, Recursive),
-        opt("", "remove-destination", HasArg::No, RemoveDestination),
-        opt("", "reflink", HasArg::Optional, Reflink),
-        opt("", "sparse", HasArg::Required, Sparse),
-        opt("", "strip-trailing-slashes", HasArg::No, StripSlashes),
-        opt("S", "suffix", HasArg::Required, Suffix),
-        opt("s", "symbolic-link", HasArg::No, Symbolic),
-        opt("t", "target-directory", HasArg::Required, TargetDir),
-        opt("T", "", HasArg::No, NoTargetDir),
-        opt("u", "", HasArg::No, UpdateOlder),
-        opt("", "update", HasArg::Optional, Update),
-        opt("v", "verbose", HasArg::No, Verbose),
-        opt("Z", "", HasArg::No, Context),
-        opt("", "context", HasArg::Optional, Context),
-    ];
-    let parsed = match parse_tool_args("cp", &args, SPECS, CP_HELP) {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let mut o = CpOpts {
         recursive: false,
         deref: None,
@@ -248,15 +251,21 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         verbose: false,
         attributes_only: false,
         copy_contents: false,
-        keep_directory_symlink: false,
         sparse: crate::common::copy::Sparse::Auto,
         reflink: crate::common::copy::Reflink::Auto,
     };
     let (mut want_backup, mut backup_arg, mut suffix) = (false, None, None);
     let (mut target_dir, mut no_target_dir, mut strip_slashes) = (None, false, false);
-    for (opt, v) in parsed.opts {
-        let v = v.unwrap_or_default();
+    while let Some(opt) = opts.next() {
+        let (opt, v) = match opt {
+            Ok(o) => o,
+            Err(e) => return Ok(getopt_error("cp", &e)),
+        };
+        let raw = v.clone().unwrap_or_default();
+        let v = v.as_deref().map(lossy).unwrap_or_default();
         match opt {
+            Help => return Ok(print_help(CP_HELP)),
+            Version => return Ok(print_version("cp")),
             Archive => {
                 o.deref = Some(Deref::Never);
                 o.recursive = true;
@@ -270,7 +279,6 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 backup_arg = (!v.is_empty()).then_some(v);
             }
             CopyContents => o.copy_contents = true,
-            KeepDirSymlink => o.keep_directory_symlink = true,
             Debug | Context => {}
             Reflink => {
                 const REFLINK: &[(&str, crate::common::copy::Reflink)] = &[
@@ -340,7 +348,13 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
                 suffix = Some(v);
             }
             Symbolic => o.symbolic_link = true,
-            TargetDir => target_dir = Some(v),
+            TargetDir => {
+                if target_dir.is_some() {
+                    eprintln!("cp: multiple target directories specified");
+                    return Ok(1);
+                }
+                target_dir = Some(raw);
+            }
             NoTargetDir => no_target_dir = true,
             UpdateOlder => o.update_older = true,
             Update => {
@@ -414,7 +428,7 @@ pub fn run_cp(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
         BackupMode::None
     };
     let x = copy_options(&o, backup, backup_suffix(suffix));
-    let targets = match resolve_targets("cp", parsed.operands, target_dir, no_target_dir) {
+    let targets = match resolve_targets("cp", opts.operands(), target_dir, no_target_dir) {
         Ok(t) => t,
         Err(code) => return Ok(code),
     };
@@ -470,13 +484,12 @@ fn copy_options(o: &CpOpts, backup: BackupMode, suffix: String) -> CopyOptions {
     x.recursive = o.recursive;
     x.update = o.update_older;
     x.verbose = o.verbose;
-    x.keep_directory_symlink = o.keep_directory_symlink;
     x
 }
 
 /// `cp SOURCE DEST`. As a special case, `cp --force --backup F F` backs up
 /// the regular file F by copying it to its backup name.
-fn copy_single(copier: &mut Copier<'_>, src: &str, dst: &str, no_target_dir: bool) -> bool {
+fn copy_single(copier: &mut Copier<'_>, src: &OsStr, dst: &OsStr, no_target_dir: bool) -> bool {
     // GNU knows DEST is missing (or a dangling symlink) from trying to open it
     // as the target directory, which it does not do with -T.
     let new_dst =
@@ -502,8 +515,8 @@ fn copy_single(copier: &mut Copier<'_>, src: &str, dst: &str, no_target_dir: boo
 /// lead to each SOURCE.
 fn copy_into(
     copier: &mut Copier<'_>,
-    dir: &str,
-    sources: Vec<String>,
+    dir: &OsStr,
+    sources: Vec<OsString>,
     parents: bool,
     strip_slashes: bool,
 ) -> bool {
@@ -669,7 +682,12 @@ fn make_dir_parents(
                     return false;
                 }
                 if x.verbose {
-                    println!("{} -> {}", src.display(), dir.display());
+                    // GNU prints both names as they are, unquoted.
+                    let mut line = src.as_os_str().as_bytes().to_vec();
+                    line.extend_from_slice(b" -> ");
+                    line.extend_from_slice(dir.as_os_str().as_bytes());
+                    line.push(b'\n');
+                    let _ = io::Write::write_all(&mut dogfish_core::stdout::stdout(), &line);
                 }
                 let made = match fs::symlink_metadata(&dir) {
                     Ok(m) => m.mode(),
