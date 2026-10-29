@@ -1702,18 +1702,35 @@ pub fn run_seq(args: Vec<String>, ctx: &DogfishContext) -> Result<i32> {
     {
         let inc = step.value as u32;
         let mut count = 0u64;
+        // Like GNU's seq_fast: append to a local block and hand whole blocks to the
+        // writer, instead of two small writes per number.
+        let mut block: Vec<u8> = Vec::with_capacity(DEFAULT_BUF_SIZE + 64);
         while decimal_le(&cur, &end) {
-            if count > 0 && !write_or_pipe(&mut out, sep)? {
-                return Ok(0);
+            if count > 0 {
+                block.extend_from_slice(sep);
             }
-            if !write_or_pipe(&mut out, &cur)? {
-                return Ok(0);
-            }
+            block.extend_from_slice(&cur);
             count += 1;
-            decimal_add(&mut cur, inc);
+            // Most increments touch only the last digit; carry the rest.
+            let last = cur.len() - 1;
+            let digit = u32::from(cur[last] - b'0') + inc;
+            if digit < 10 {
+                cur[last] = b'0' + digit as u8;
+            } else {
+                decimal_add(&mut cur, inc);
+            }
+            if block.len() >= DEFAULT_BUF_SIZE {
+                if !write_or_pipe(&mut out, &block)? {
+                    return Ok(0);
+                }
+                block.clear();
+            }
         }
         ctx.telemetry.add_items(count);
-        if count > 0 && !write_or_pipe(&mut out, b"\n")? {
+        if count > 0 {
+            block.push(b'\n');
+        }
+        if !write_or_pipe(&mut out, &block)? {
             return Ok(0);
         }
         ignore_broken_pipe(out.flush())?;
