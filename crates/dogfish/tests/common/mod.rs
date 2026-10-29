@@ -56,17 +56,42 @@ pub fn gnu_path(tool: &str) -> Option<PathBuf> {
 pub fn gnu_tool(tool: &str) -> Option<PathBuf> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap();
-    guard
+    if let Some(known) = cache.lock().unwrap().get(tool) {
+        return known.clone();
+    }
+    // Probe without holding the lock: one slow probe must not stall every test.
+    let found = gnu_path(tool).filter(|path| is_gnu_coreutils(path));
+    cache
+        .lock()
+        .unwrap()
         .entry(tool.to_string())
-        .or_insert_with(|| {
-            let path = gnu_path(tool)?;
-            let out = Command::new(&path).arg("--version").output().ok()?;
-            String::from_utf8_lossy(&out.stdout)
-                .contains("GNU coreutils")
-                .then_some(path)
-        })
+        .or_insert(found)
         .clone()
+}
+
+/// Runs `path --version` and checks for GNU's banner, reading only the first few
+/// KiB: BSD `yes` (macOS) treats `--version` as the text to repeat and never stops.
+fn is_gnu_coreutils(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut child) = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let mut banner = Vec::new();
+    let _ = child
+        .stdout
+        .take()
+        .unwrap()
+        .take(4096)
+        .read_to_end(&mut banner);
+    let _ = child.kill();
+    let _ = child.wait();
+    String::from_utf8_lossy(&banner).contains("GNU coreutils")
 }
 
 /// Runs `cmd` in `dir` with a pinned, colorless locale environment.
@@ -83,6 +108,7 @@ pub fn exec(mut cmd: Command, dir: &Path, stdin: Option<&[u8]>, locale: &str) ->
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let what = format!("{cmd:?}");
     let mut child = cmd.spawn().expect("spawn");
     if let Some(input) = stdin {
         let mut pipe = child.stdin.take().unwrap();
@@ -92,7 +118,57 @@ pub fn exec(mut cmd: Command, dir: &Path, stdin: Option<&[u8]>, locale: &str) ->
             let _ = pipe.write_all(&input);
         });
     }
-    child.wait_with_output().expect("wait")
+    wait_bounded(child, &what)
+}
+
+/// `wait_with_output`, but a command that hangs or floods its output fails the
+/// test with its command line instead of stalling (or OOM-killing) the whole run.
+fn wait_bounded(mut child: std::process::Child, what: &str) -> Output {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const MAX_OUTPUT: u64 = 64 << 20;
+    const DEADLINE: Duration = Duration::from_secs(60);
+
+    // Each reader stops (closing its end, so the child gets SIGPIPE) past the cap.
+    fn drain(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.take(MAX_OUTPUT + 1).read_to_end(&mut buf);
+            buf
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    let status = match rx.recv_timeout(DEADLINE) {
+        Ok(status) => status.expect("wait"),
+        Err(_) => {
+            // SAFETY: signalling our own child, which has not been reaped yet.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            panic!("{what} did not finish within {DEADLINE:?}");
+        }
+    };
+    let (stdout, stderr) = (stdout.join().unwrap(), stderr.join().unwrap());
+    for (name, buf) in [("stdout", &stdout), ("stderr", &stderr)] {
+        assert!(
+            buf.len() as u64 <= MAX_OUTPUT,
+            "{what} wrote more than {MAX_OUTPUT} bytes to {name}"
+        );
+    }
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 pub struct Case<'a> {
