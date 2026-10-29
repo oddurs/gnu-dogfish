@@ -2,7 +2,14 @@
 name = "dogfish"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Dogfish: Modern, high-performance, object-aware coreutils in Rust"
 
 [[bin]]
@@ -10,7 +17,7 @@ name = "dogfish"
 path = "src/main.rs"
 
 [dependencies]
-dogfish-core = { path = "../dogfish-core" }
+dogfish-core = { path = "../dogfish-core", version = "0.1.0" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

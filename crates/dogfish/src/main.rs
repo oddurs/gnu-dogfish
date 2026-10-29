@@ -1,3 +1,9 @@
+//! `dogfish`: the GNU/Dogfish multicall binary.
+
+// Doc comments on clap structs are the `--help` text, where usage syntax such as
+// `COMMAND [ARGS]...` is literal; escaping it for rustdoc would show in `--help`.
+#![allow(rustdoc::broken_intra_doc_links)]
+
 mod fs_ops;
 mod hash;
 mod meta;
@@ -322,6 +328,12 @@ fn main() -> ExitCode {
 
     install_sigbus_handler(&tool_name);
     let (ctx, filtered_args) = DogfishContext::from_raw_args(&tool_name, tool_args);
+    // Like every GNU utility (scripts probe `tool --version`), a lone `--version`
+    // prints the version instead of being parsed as an operand or rejected.
+    if filtered_args.len() == 2 && filtered_args[1] == "--version" {
+        println!("{} (GNU/Dogfish) {}", tool_name, env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let res = dispatch(&tool_name, filtered_args, &ctx);
     ctx.finish();
 

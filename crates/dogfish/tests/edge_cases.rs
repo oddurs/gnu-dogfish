@@ -53,3 +53,17 @@ fn sigbus_from_truncated_mmap_is_a_clean_error() {
         "sleep: input file was truncated while being read\n"
     );
 }
+
+#[test]
+fn every_tool_answers_version() {
+    for tool in ["ls", "cp", "sort", "wc", "echo", "yes", "true", "sha256sum"] {
+        let (out, code) = run(&[tool, "--version"]);
+        assert_eq!(code, Some(0), "{tool}");
+        assert_eq!(
+            out,
+            format!("{tool} (GNU/Dogfish) {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+    // Only a lone `--version` is special; elsewhere it is ordinary data.
+    assert_eq!(run(&["echo", "a", "--version"]).0, "a --version\n");
+}
