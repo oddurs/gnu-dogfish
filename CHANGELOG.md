@@ -4,29 +4,60 @@ All notable changes to **GNU/Dogfish** are documented in this file.
 
 ## [Unreleased]
 
-### Fixed — data safety
-- `cp` onto the same file (`cp a a`, `cp a ./a`, hard links, symlinks) truncated or deleted the source; it is now refused like GNU. Same for `mv` and `ln -f`.
-- `dogfish undo` of a `cp`/`mv` that overwrote an existing file deleted the original; overwritten targets are now backed up to the trash and restored on undo.
-- `undo` never overwrites a path that has since been recreated, moves undone copies to trash instead of deleting them, and restores trashed symlinks as symlinks.
-- The undo journal is written atomically under `flock`, so concurrent `dogfish` processes no longer lose entries, and a corrupt journal is reported instead of silently discarded.
-- `cp -r`/`mv` refuse to copy or move a directory into itself; `cp -r` copies symlinks as symlinks; `mv` works across filesystems.
-- `rm` refuses `.`/`..` and recursive removal of `/` (`--no-preserve-root` to override); `rm --safe` no longer trashes directories without `-r`.
-- `mktemp` uses OS randomness and exclusive creation with `0600`/`0700` set atomically (previously a predictable name and a symlink-following create).
-- `touch` never truncates an existing file.
-- `seq` no longer loops forever (release) or panics (debug) near `i64::MAX`, and keeps full precision for integers above 2^53.
+This release makes Dogfish safe to use on real data and a drop-in for GNU coreutils 9.4 in scripts. Every tool now prints GNU's exact output, messages and exit codes when output is not a terminal. Remaining differences are listed in [ROADMAP.md](./ROADMAP.md).
 
-### Fixed — correctness & compatibility
-- `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds (`-h` clashed with clap's help flag).
-- GNU-compatible behaviour for `cat` (`-A -v -E -T -e -t`), `head`/`tail` (`-n -N`, `-n +N`, `-c` forms), `wc` column widths, `sort` keys and `-n`/`-g`/`-h` semantics, `nl`, `uniq`, `cut`, `tr`, `tac`, `echo -e`, `printf`, `base64`, and GNU-style error messages (no `(os error N)` suffix, no duplicated tool prefix).
+### Fixed — data safety
+- `cp` onto the same file (`cp a a`, `cp a ./a`, hard links, symlinks) truncated or deleted the source. It is now refused like GNU, and so are the same cases for `mv` and `ln -f`.
+- `dogfish undo` of a `cp`/`mv` that overwrote a file deleted the original. Overwritten contents are now kept and restored on undo, and `cp` overwrites in place, as GNU does.
+- `undo` never overwrites a path that has since reappeared, moves undone copies to the trash instead of deleting them, and restores trashed symlinks as symlinks.
+- The undo journal is append-only NDJSON written under `flock`, so concurrent processes don't lose entries, recording no longer slows down as history grows, and a crash mid-write is repaired. A corrupt journal is reported instead of being silently discarded, and 0.1.0 journals are migrated automatically.
+- The trash is bounded. `DOGFISH_JOURNAL_MAX` (500) entries are kept, and dropped entries take their trash payloads with them. `DOGFISH_BACKUP_LIMIT` (1G) caps overwrite backups, never the newest one and never `rm --safe` files. Orphaned trash is swept after 7 days. `dogfish bench` no longer writes to your journal.
+- `cp -r`/`mv` refuse to copy or move a directory into itself. `cp -r` copies symlinks as symlinks, and `mv` works across filesystems.
+- `rm` refuses `.`/`..` and recursive removal of `/` (`--no-preserve-root` overrides). `rm --safe` refuses directories without `-r`, like plain `rm`.
+- `mktemp` used a predictable name and a symlink-following create. It now uses OS randomness and exclusive creation, with `0600`/`0700` applied at creation.
+- `touch` no longer truncates existing files.
+- `seq` no longer loops forever (release builds) or panics (debug builds) near `i64::MAX`, and keeps full precision above 2^53.
+- A file truncated while being read (SIGBUS on mmapped input) now produces a clean error instead of a crash.
+
+### Fixed — GNU compatibility
+- `sort`, `ls`, `df` and `du` panicked on every invocation in debug builds, because `-h` clashed with clap's help flag.
+- `ls`, `du`, `df` and `stat` printed decorated tables even when piped. They now produce GNU output when not on a terminal:
+  - **`ls`**: every sort and layout mode, `-l` with every `--time-style`, all quoting styles, `-R`.
+  - **`du`**: block-based sizes with hard links counted once, every unit and depth option, GNU's traversal order.
+  - **`df`**: FILE operands, `--output`, `-i`, `-T`, `--total`.
+  - **`stat`**: the default, terse and `-f` formats, and every format directive.
+- The file tools follow GNU option for option: `cp` (`-a`, `-p`, `--preserve`, `-i`, `-u`, `-t`, `-T`, `-L/-P/-H`, `-l`, `-s`, `-b`), `mv`, `rm` (`-i`, `-I`, `-v`), `ln`, `chmod` (gnulib mode parsing), `chown`, `mkdir -m`, `touch` (`-d`, `-t`, `-r`, `-a`, `-m`, `-h`), `realpath` (gnulib canonicalisation), `basename`, `dirname` and `mktemp`.
+- The text tools follow GNU too:
+  - **`cat`**: `-A`, `-v`, `-E`, `-T`, `-e`, `-t`.
+  - **`head`/`tail`**: `-n -N`, `-n +N` and the `-c` forms.
+  - **`wc`**: column widths, plus UTF-8-aware `-m` and `-L`.
+  - **`sort`**: keys and every ordering option, including `-M`, `-V`, `-R` and `--sort`.
+  - **`cut`**: `-c` counts bytes, as in GNU, plus `--complement`.
+  - **`tr`**: classes and repeats; options stop at the first set.
+  - **`nl`, `uniq`, `tac`, `paste`.**
+- `printf`, `echo`, `env` (`-S`, `-C`, signal options, exit 125/126/127), `timeout` (process groups, `-k`, `--preserve-status`), `seq` (`-f`, `-w`, exact big integers), `date` (`-d`, every `+FORMAT` flag, `-I`, `-R`, `--rfc-3339`), `id`, `uname -a`, `tee`, `sleep`, `nproc`.
+- Hash tools: `-c` with `--quiet`, `--status`, `--strict`, `--warn` and `--ignore-missing`, BSD `--tag`, `-z`, file-name escaping, and `b2sum -l`. `base64`/`basenc` support all eight encodings and GNU's handling of invalid input.
+- Error messages are GNU's. There is no `(os error N)` suffix and no duplicated tool prefix. Unknown options get GNU's wording and per-tool exit status. Every tool answers a lone `--version`.
+
+### Performance
+- `sha256sum` now uses `ring`, which carries OpenSSL's SHA-256 assembly, and is about 1.5× faster on CPUs without SHA extensions. It now matches GNU.
+- `seq` batches its integer fast path like GNU's `seq_fast`, cutting 10M lines from 178 ms to 79 ms.
+- `du` reads directories in parallel and still keeps GNU's output order.
+- `cp` opens each file once to attempt FICLONE and fall back to `copy_file_range`. Set `DOGFISH_UNDO=off` to skip undo backups on overwrite.
 
 ### Changed
-- Release binaries target the baseline CPU instead of `target-cpu=native`, so they run on any machine of the architecture; native tuning is opt-in via `RUSTFLAGS`.
-- `LICENSE-GPL` (full GPL-3.0 text) and `LICENSE-MIT` (previously missing its liability clause) are now included.
-- CI runs `cargo fmt --check`, `clippy -D warnings`, and the test suite in both debug and release.
+- `ls -T` is now GNU's tab size; the tree view is `ls --tree [-L DEPTH]`.
+- Release binaries target the baseline CPU instead of `target-cpu=native`, so they run on any machine of the architecture. Native tuning is opt-in via `RUSTFLAGS`.
+- Added `LICENSE-GPL` (the full GPL-3.0 text, previously missing) and `LICENSE-MIT` (previously missing its liability clause). Both crates ship them.
+- Minimum supported Rust version is 1.88.
 
-### Added
-- `tests/gnu_compat.rs`: 264 differential cases checked byte-for-byte against GNU coreutils on Linux.
-- `tests/fs_safety.rs` and `tests/edge_cases.rs`: data-safety and numeric boundary regressions.
+### Infrastructure
+- CI: fmt, pinned Clippy (Linux and macOS), rustdoc and `cargo package` checks; tests in debug and release on Linux and macOS; an MSRV job.
+- Releases are automated with release-please. Merging the release PR tags the version and publishes Linux and macOS archives with SHA-256 sums.
+- Conventional-commit PR titles are enforced; pushed branches open draft PRs automatically; Dependabot patch and minor updates auto-merge behind CI.
+
+### Tests
+- 1,700+ differential cases compared byte for byte against GNU coreutils (`tests/gnu_compat*.rs`), plus data-safety (`tests/fs_safety.rs`) and boundary (`tests/edge_cases.rs`) regressions. All suites also pass as an unprivileged user.
 
 ## [0.1.0] - 2026-10-24
 
