@@ -411,8 +411,10 @@ impl<'a, K: Copy + PartialEq> Getopt<'a, K> {
                         .ok_or_else(|| {
                             let mut m = b"invalid argument ".to_vec();
                             m.extend_from_slice(quote_locale(OsStr::from_bytes(w)).as_bytes());
+                            m.extend_from_slice(b" for ");
+                            m.extend_from_slice(quote_locale(OsStr::new("--color")).as_bytes());
                             m.extend_from_slice(
-                                b" for '--color'\nValid arguments are:\n  \
+                                b"\nValid arguments are:\n  \
                                   - 'always', 'yes', 'force'\n  \
                                   - 'never', 'no', 'none'\n  \
                                   - 'auto', 'tty', 'if-tty'",
@@ -1085,11 +1087,14 @@ mod tests {
         let (res, sw) = parse_switches(&["--color=never", "--color"], SPECS, all);
         assert!(res.is_ok());
         assert_eq!(sw.color(), ColorMode::Always);
+        // Quoted by locale, as GNU's quote() does: 'x' in C, curly quotes in UTF-8.
         let (res, _) = parse_switches(&["--color=sometimes"], SPECS, all);
-        assert!(
-            res.unwrap_err()
-                .starts_with("invalid argument 'sometimes' for '--color'\n")
+        let want = format!(
+            "invalid argument {} for {}\n",
+            quote_locale(OsStr::new("sometimes")),
+            quote_locale(OsStr::new("--color"))
         );
+        assert!(res.unwrap_err().starts_with(&want));
     }
 
     #[test]
