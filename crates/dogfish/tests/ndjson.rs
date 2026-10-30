@@ -40,7 +40,12 @@ fn fixture() -> &'static Path {
         fs::create_dir_all(dir.join("d/sub")).unwrap();
         fs::write(dir.join("d/a.txt"), "hello world\nsecond line\n").unwrap();
         fs::write(dir.join("d/sub/b.txt"), "x".repeat(5000)).unwrap();
-        fs::write(dir.join("d").join(OsStr::from_bytes(BAD)), "odd\n").unwrap();
+        // Some file systems (APFS) refuse names that are not UTF-8 (EILSEQ):
+        // the tests that need one check `has_bad_name` first.
+        // `DOGFISH_TEST_NO_BAD_NAMES` runs them as such a file system would.
+        if std::env::var_os("DOGFISH_TEST_NO_BAD_NAMES").is_none() {
+            let _ = fs::write(dir.join("d").join(OsStr::from_bytes(BAD)), "odd\n");
+        }
         std::os::unix::fs::symlink("a.txt", dir.join("d/link")).unwrap();
         let sums = run_in(&dir, &["md5sum", "d/a.txt", "d/sub/b.txt"], b"");
         fs::write(dir.join("sums.md5"), &sums.stdout).unwrap();
@@ -55,6 +60,11 @@ fn fixture() -> &'static Path {
         }
         dir
     })
+}
+
+/// Whether the fixture holds the non-UTF-8 name.
+fn has_bad_name() -> bool {
+    fixture().join("d").join(OsStr::from_bytes(BAD)).exists()
 }
 
 fn run_in(dir: &Path, args: &[&str], stdin: &[u8]) -> Output {
@@ -264,6 +274,10 @@ fn single_record_tools_write_one_line() {
 
 #[test]
 fn names_that_are_not_utf8_carry_their_bytes() {
+    if !has_bad_name() {
+        eprintln!("skipped: this file system refuses names that are not UTF-8");
+        return;
+    }
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
     let mut path = b"d/".to_vec();
     path.extend_from_slice(BAD);
@@ -401,8 +415,11 @@ fn consumers_keep_raw_bytes_twins_and_filter_on_new_fields() {
         &ls.stdout,
     );
     let recs = records(&[b"query"], &q);
-    assert_eq!(recs.len(), 2);
-    assert!(recs.iter().any(|r| r.get("name_bytes").is_some()));
+    assert_eq!(recs.len(), 1 + usize::from(has_bad_name()));
+    assert_eq!(
+        recs.iter().any(|r| r.get("name_bytes").is_some()),
+        has_bad_name()
+    );
     // Integer nanoseconds compare exactly.
     let du = run_in(fixture(), &["du", "-aJ", "--time", "d"], b"");
     let sorted = run_in(fixture(), &["sort", "-J", "--by", "mtime_ns"], &du.stdout);
