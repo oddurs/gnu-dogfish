@@ -25,8 +25,8 @@ use dogfish_core::{
 use crate::common::backup::{Backup, BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
-    Deref, absolute, c_path, dir_name, dir_names, last_component, rename_noreplace, same_inode,
-    same_name, stable_path,
+    Deref, absolute, c_path, check_rename_slashes, dir_name, dir_names, last_component,
+    rename_noreplace, same_inode, same_name, stable_path,
 };
 use crate::common::prompt::ask;
 use crate::common::quote::{qa, qf, quote_locale};
@@ -1810,10 +1810,11 @@ impl<'a> Copier<'a> {
                     .and_then(|b| self.backups.get(b))
                     .map_or(dst, |b| b.real_dst.as_path());
                 crash_point();
-                rename_errno = match fs::rename(src, to) {
-                    Ok(()) => 0,
-                    Err(e) => errno(&e),
-                };
+                rename_errno =
+                    match check_rename_slashes(src, to).and_then(|()| fs::rename(src, to)) {
+                        Ok(()) => 0,
+                        Err(e) => errno(&e),
+                    };
                 if rename_errno != 0 && rename_errno != libc::EXDEV && saved {
                     self.journal_untake(dst);
                 }

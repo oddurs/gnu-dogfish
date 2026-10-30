@@ -161,10 +161,33 @@ pub(crate) enum Deref {
     Always,
 }
 
+/// gnulib `rename`'s trailing-slash rule, which some kernels (macOS) lack: when
+/// either name ends in `/`, the source must be a directory, and an existing
+/// destination must be one too; otherwise `ENOTDIR`. Without it macOS renames
+/// `a` onto the target of a dangling symlink `b` for `b/`.
+pub(crate) fn check_rename_slashes(src: &Path, dst: &Path) -> io::Result<()> {
+    let slash = |p: &Path| p.as_os_str().as_encoded_bytes().last() == Some(&b'/');
+    if !slash(src) && !slash(dst) {
+        return Ok(());
+    }
+    let src_dir =
+        fs::symlink_metadata(Path::new(&strip_trailing_slashes(src.as_os_str())))?.is_dir();
+    let dst_not_dir = match fs::metadata(dst) {
+        Ok(m) => !m.is_dir(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    if !src_dir || dst_not_dir {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    Ok(())
+}
+
 /// `renameat2(RENAME_NOREPLACE)`, as gnulib's `renameatu`: fails with `EEXIST`
 /// when `dst` exists (even as a dangling symlink). Where the kernel or file
 /// system lacks the flag, an `lstat` check stands in for it.
 pub(crate) fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    check_rename_slashes(src, dst)?;
     let (s, d) = (c_path(src)?, c_path(dst)?);
     #[cfg(target_os = "linux")]
     {
@@ -217,4 +240,35 @@ pub(crate) fn file_name_concat(dir: &[u8], base: &[u8]) -> (PathBuf, usize) {
     let offset = s.len();
     s.extend_from_slice(base);
     (PathBuf::from(OsString::from_vec(s)), offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enotdir(r: io::Result<()>) -> bool {
+        r.is_err_and(|e| e.raw_os_error() == Some(libc::ENOTDIR))
+    }
+
+    /// The rule macOS's own `rename` lacks: there, `mv a b/` with `b` a dangling
+    /// symlink renamed `a` onto the symlink's target.
+    #[test]
+    fn a_trailing_slash_needs_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        fs::write(p("a"), "").unwrap();
+        fs::create_dir(p("d")).unwrap();
+        std::os::unix::fs::symlink("../nowhere", p("dangling")).unwrap();
+        std::os::unix::fs::symlink("d", p("to-dir")).unwrap();
+        let slash = |n: &str| PathBuf::from(format!("{}/", p(n).display()));
+
+        assert!(check_rename_slashes(&p("a"), &p("b")).is_ok());
+        assert!(enotdir(check_rename_slashes(&p("a"), &slash("dangling"))));
+        assert!(enotdir(check_rename_slashes(&p("a"), &slash("new"))));
+        assert!(enotdir(check_rename_slashes(&slash("a"), &p("new"))));
+        assert!(enotdir(check_rename_slashes(&p("d"), &slash("a"))));
+        assert!(check_rename_slashes(&p("d"), &slash("new")).is_ok());
+        assert!(check_rename_slashes(&slash("d"), &slash("to-dir")).is_ok());
+        assert!(check_rename_slashes(&p("missing"), &slash("x")).is_err());
+    }
 }
