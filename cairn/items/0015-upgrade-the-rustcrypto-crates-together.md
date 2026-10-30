@@ -3,7 +3,8 @@ id: 15
 uid: da50d0db-cc2e-40ee-ad31-e5089b393e0d
 title: "Upgrade the RustCrypto crates together"
 type: chore
-status: doing
+status: done
+closed_at: 2026-10-30
 assignee: claude
 claimed: 2026-10-30
 milestone: "v0.3"
@@ -29,7 +30,7 @@ Port `hash.rs` to the 0.11 APIs in one change; check `b2sum -l`, the md5/sha
 
 ## Acceptance criteria
 
-- [ ] The grouped Dependabot PR (or a manual one) merges with the full suite green.
+- [x] The grouped Dependabot PR (or a manual one) merges with the full suite green.
 
 ## 2026-10-29
 
@@ -77,3 +78,4 @@ md5-asm direct 1.00/1.01, 1.01/1.01, 1.00/1.02. Back at parity, so the
 README's table is restored.
 
 Criterion left unticked until the PR merges with the full suite green.
+- 2026-10-30: merged as #55 with the full suite green; md5sum stays at parity through md5-asm called directly.
