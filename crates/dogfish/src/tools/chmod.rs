@@ -8,10 +8,12 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath, fts_root_name};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::mode::{
     CHMOD_MODE_BITS, ModeChange, mode_adjust, mode_compile, process_umask, strmode9,
 };
@@ -32,6 +34,8 @@ With --reference, change the mode of each FILE to that of RFILE.
       --preserve-root    fail to operate recursively on '/'
       --reference=RFILE  use RFILE's mode instead of specifying MODE values
   -R, --recursive        change files and directories recursively
+  -J, --json[=VERSION]   Dogfish: one NDJSON record per file processed (what -v,
+                           or with -c what -c, reports), instead of the text
       --help        display this help and exit
       --version     output version information and exit
 
@@ -49,6 +53,7 @@ enum ChmodOpt {
     Recursive,
     /// A mode that looks like an option (`-w`, `-rx`, `-0`).
     Mode,
+    Json,
     Help,
     Version,
 }
@@ -72,6 +77,8 @@ const SPECS: &[OptSpec<ChmodOpt>] = &[
     OptSpec::both(b'v', "verbose", HasArg::No, ChmodOpt::Verbose),
     OptSpec::long("help", HasArg::No, ChmodOpt::Help),
     OptSpec::long("version", HasArg::No, ChmodOpt::Version),
+    json_short(ChmodOpt::Json),
+    json_long(ChmodOpt::Json),
     mode_char(b'r'),
     mode_char(b'w'),
     mode_char(b'x'),
@@ -122,7 +129,7 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         diagnose_surprises: false,
         root_dev_ino: None,
     };
-    let (mut preserve_root, mut reference) = (false, None);
+    let (mut preserve_root, mut reference, mut json) = (false, None, false);
     // Raw bytes, so a diagnostic quotes the mode exactly as given.
     let mut mode_pieces: Vec<OsString> = Vec::new();
     while let Some(opt) = opts.next() {
@@ -144,9 +151,20 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 mode_pieces.push(opts.last_word().unwrap_or_default().to_os_string());
                 run.diagnose_surprises = true;
             }
+            Json => {
+                if let Err(code) = check_json_version("chmod", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             Help => return Ok(print_help(CHMOD_HELP)),
             Version => return Ok(print_version("chmod")),
         }
+    }
+    if json {
+        // A record wherever -v (or, with -c alone, -c) would print a line.
+        run.verbose |= !run.report_changes;
+        actions::start();
     }
     let mut files = opts.operands();
     let mut mode = (!mode_pieces.is_empty()).then(|| mode_pieces.join(OsStr::new(",")));
@@ -221,6 +239,19 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
+/// With `-v`, what is reported for a file that could not be accessed.
+fn inaccessible(path: &WalkPath) {
+    if actions::on() {
+        actions::record("chmod", |r| {
+            r.os_str("path", path.as_path())
+                .str("status", "inaccessible")
+                .bool("changed", false);
+        });
+    } else {
+        outln!("{} could not be accessed", qa(path.as_path()));
+    }
+}
+
 /// Changes the mode of `name` in `parent` (printed as `path`), then with `-R`
 /// of everything below it, each entry relative to its open directory. `depth`
 /// 0 is an operand, whose symlinks are followed; below, symlinks are left
@@ -246,7 +277,7 @@ fn chmod_path(
                 );
             }
             if run.verbose {
-                outln!("{} could not be accessed", qa(path.as_path()));
+                inaccessible(path);
             }
             return Ok(false);
         }
@@ -255,10 +286,18 @@ fn chmod_path(
         if !top_level {
             // During -R traversal, symbolic links are not followed or changed.
             if run.verbose {
-                outln!(
-                    "neither symbolic link {} nor referent has been changed",
-                    qa(path.as_path())
-                );
+                if actions::on() {
+                    actions::record("chmod", |r| {
+                        r.os_str("path", path.as_path())
+                            .str("status", "skipped")
+                            .bool("changed", false);
+                    });
+                } else {
+                    outln!(
+                        "neither symbolic link {} nor referent has been changed",
+                        qa(path.as_path())
+                    );
+                }
             }
             return Ok(true);
         }
@@ -272,7 +311,7 @@ fn chmod_path(
                     );
                 }
                 if run.verbose {
-                    outln!("{} could not be accessed", qa(path.as_path()));
+                    inaccessible(path);
                 }
                 return Ok(false);
             }
@@ -314,7 +353,24 @@ fn chmod_path(
         }
     };
     let changed = applied && old != new;
-    if run.verbose || (run.report_changes && changed) {
+    if actions::on() {
+        if run.verbose || (run.report_changes && changed) {
+            #[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
+            let kind = st.st_mode as u32 & !CHMOD_MODE_BITS;
+            let status = match (applied, changed) {
+                (false, _) => "failed",
+                (true, true) => "changed",
+                (true, false) => "retained",
+            };
+            actions::record("chmod", |r| {
+                r.os_str("path", path.as_path())
+                    .str("status", status)
+                    .bool("changed", changed)
+                    .mode_as("mode_before", kind | old)
+                    .mode(kind | new);
+            });
+        }
+    } else if run.verbose || (run.report_changes && changed) {
         let (o, n) = (strmode9(old), strmode9(new));
         let p = qa(path.as_path());
         if !applied {

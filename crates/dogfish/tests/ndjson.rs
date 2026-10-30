@@ -12,9 +12,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -60,6 +62,42 @@ fn fixture() -> &'static Path {
         }
         dir
     })
+}
+
+/// The tools that change files: each of their runs gets a tree of its own
+/// ([`action_tree`]).
+const ACTION_TOOLS: &[&str] = &["cp", "mv", "rm", "mkdir", "ln", "chmod", "chown", "touch"];
+
+/// A new directory for one run of a tool that changes files: `a` (a file),
+/// `d/` with `f`, `l` (a symlink to `f`), `sub/g` and, where the file system
+/// takes it, the non-UTF-8 name; and `e/`, an empty directory. Its journal
+/// is its own (`DOGFISH_HOME` is under it, see [`run_os`]).
+fn action_tree() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("ndjson-actions")
+        .join(N.fetch_add(1, Ordering::Relaxed).to_string());
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("d/sub")).unwrap();
+    fs::create_dir_all(dir.join("e")).unwrap();
+    fs::write(dir.join("a"), "hello\n").unwrap();
+    fs::write(dir.join("d/f"), "x".repeat(3000)).unwrap();
+    fs::write(dir.join("d/sub/g"), "g\n").unwrap();
+    std::os::unix::fs::symlink("f", dir.join("d/l")).unwrap();
+    if std::env::var_os("DOGFISH_TEST_NO_BAD_NAMES").is_none() {
+        let _ = fs::write(dir.join("d").join(OsStr::from_bytes(BAD)), "odd\n");
+    }
+    dir
+}
+
+/// Runs one of `tool`'s command lines from [`producers`]: in a tree of its
+/// own if the tool changes files, else in the shared fixture.
+fn run_producer(tool: &str, args: &[&[u8]]) -> Output {
+    if ACTION_TOOLS.contains(&tool) {
+        run_os(&action_tree(), &os_args(args), b"")
+    } else {
+        run_os(fixture(), &os_args(args), b"")
+    }
 }
 
 /// Whether the fixture holds the non-UTF-8 name.
@@ -156,6 +194,67 @@ fn producers() -> Vec<(&'static str, Vec<Vec<&'static [u8]>>)> {
             "bench",
             vec![c(&["bench", "-J", "-n", "1", "--size-mb", "1"])],
         ),
+        // The tools that change files (each run in its own `action_tree`),
+        // every one with a failing operand, for its error record.
+        (
+            "cp",
+            vec![
+                c(&["cp", "-rJ", "d", "missing", "e"]),
+                c(&["cp", "-J", "-b", "a", "d/f"]),
+                c(&["cp", "-sJ", "a", "s"]),
+                c(&["cp", "-rlJ", "d", "h"]),
+                c(&["cp", "-J", "--parents", "d/f", "e"]),
+            ],
+        ),
+        (
+            "mv",
+            vec![
+                c(&["mv", "-J", "d", "a", "missing", "e"]),
+                c(&["mv", "-J", "-b", "a", "d/f"]),
+                c(&["mv", "-J", "a", "b"]),
+            ],
+        ),
+        (
+            "rm",
+            vec![
+                c(&["rm", "-rJ", "d", "missing", "a"]),
+                c(&["rm", "-J", "--safe", "a", "missing"]),
+                c(&["rm", "-dJ", "e", "d"]),
+            ],
+        ),
+        (
+            "mkdir",
+            vec![
+                c(&["mkdir", "-pJ", "x/y", "a/z"]),
+                c(&["mkdir", "-J", "n", "e"]),
+            ],
+        ),
+        (
+            "ln",
+            vec![
+                c(&["ln", "-sJ", "a", "s"]),
+                c(&["ln", "-J", "-b", "a", "d/f"]),
+                c(&["ln", "-J", "a", "missing", "e"]),
+            ],
+        ),
+        (
+            "chmod",
+            vec![
+                c(&["chmod", "-RJ", "u+x", "d", "missing"]),
+                c(&["chmod", "-cJ", "700", "a", "e"]),
+            ],
+        ),
+        ("chown", vec![c(&["chown", "-RJ", "", "d", "missing"])]),
+        ("touch", vec![c(&["touch", "-J", "a", "new", "missing/x"])]),
+        // Only error records.
+        (
+            "error",
+            vec![
+                c(&["ls", "-J", "missing"]),
+                c(&["stat", "-J", "missing", "nope"]),
+                c(&["wc", "-J", "missing"]),
+            ],
+        ),
     ]
 }
 
@@ -241,7 +340,7 @@ fn every_producer_writes_ndjson_that_its_schema_accepts() {
     for (tool, runs) in producers() {
         let schema = schema(tool);
         for args in runs {
-            let out = run_os(fixture(), &os_args(&args), b"");
+            let out = run_producer(tool, &args);
             let recs = records(&args, &out);
             assert!(!recs.is_empty(), "{tool} {args:?}: no records");
             for r in &recs {
@@ -334,7 +433,7 @@ fn json_takes_version_1_only() {
 fn consumers_take_every_producers_records() {
     for (tool, runs) in producers() {
         let args = &runs[0];
-        let produced = run_os(fixture(), &os_args(args), b"");
+        let produced = run_producer(tool, args);
         let lines: Vec<&[u8]> = produced
             .stdout
             .split(|&b| b == b'\n')
@@ -442,4 +541,469 @@ fn without_json_output_is_unchanged_text() {
     assert_eq!(out.stdout, b"1\n2\n");
     let out = run_in(fixture(), &["wc", "-l", "d/a.txt"], b"");
     assert_eq!(out.stdout, b"2 d/a.txt\n");
+}
+
+// ----------------------------------------------------------- action records
+
+/// Runs a tool that changes files in `dir`; returns its records (each
+/// checked against the tool's schema) and the run.
+fn act(dir: &Path, args: &[&str]) -> (Vec<Value>, Output) {
+    let out = run_in(dir, args, b"");
+    let bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+    let recs = records(&bytes, &out);
+    let schema = schema(args[0]);
+    for r in &recs {
+        let errs = validator::validate(&schema, r, true);
+        assert!(errs.is_empty(), "{args:?}: {r}: {errs:#?}");
+    }
+    (recs, out)
+}
+
+/// A record in short: its action (or `error`) and its names.
+fn brief(r: &Value) -> String {
+    let field = |k: &str| r[k].as_str().unwrap_or("").to_string();
+    match r["action"].as_str() {
+        None => format!("error {}", field("path")),
+        Some(a) if r.get("source").is_some() => {
+            format!("{a} {} {}", field("source"), field("dest"))
+        }
+        Some(a) => format!("{a} {}", field("path")),
+    }
+}
+
+fn briefs(recs: &[Value]) -> Vec<String> {
+    recs.iter().map(brief).collect()
+}
+
+/// The names a record is about, which its `-v` line names too.
+fn names(r: &Value) -> Vec<String> {
+    ["path", "source", "dest", "backup"]
+        .iter()
+        .filter_map(|k| r[*k].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The device of `p`.
+fn dev(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).ok().map(|m| m.dev())
+}
+
+/// A directory on another file system than the test trees (`/dev/shm` on
+/// Linux), for moves across file systems; `None` if there is none.
+fn other_fs_dir() -> Option<PathBuf> {
+    let shm = Path::new("/dev/shm");
+    if dev(shm)? == dev(Path::new(env!("CARGO_TARGET_TMPDIR")))? {
+        return None;
+    }
+    let dir = shm.join(format!("dogfish-ndjson-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir).ok()?;
+    Some(dir)
+}
+
+/// The command lines whose `-J` records are compared with `-v`'s lines.
+const PARITY: &[&[&str]] = &[
+    &["cp", "-r", "d", "missing", "e"],
+    &["cp", "-b", "a", "d/f"],
+    &["cp", "-rb", "d", "e"],
+    &["cp", "-rl", "d", "h"],
+    &["cp", "-s", "a", "s"],
+    &["cp", "-a", "d", "h"],
+    &["cp", "--parents", "d/f", "d/sub/g", "e"],
+    &["cp", "--remove-destination", "a", "d/f"],
+    &["mv", "d", "a", "missing", "e"],
+    &["mv", "-b", "a", "d/f"],
+    &["mv", "--backup=numbered", "a", "d/f"],
+    &["rm", "-r", "d", "missing", "a"],
+    &["rm", "-d", "e", "d"],
+    &["rm", "--safe", "a", "d"],
+    &["mkdir", "-p", "x/y/z", "a/q", "e"],
+    &["ln", "-s", "a", "s"],
+    &["ln", "-b", "a", "d/f"],
+    &["ln", "-sf", "a", "d/sub/g", "missing", "e"],
+    &["chmod", "-R", "go-r", "d", "missing"],
+    &["chmod", "-c", "u+x", "a", "e", "missing"],
+    &["chmod", "-R", "-c", "u+x", "d"],
+    &["chown", "-R", "", "d", "missing"],
+    &["chown", "-c", "", "a"],
+];
+
+/// `args` with `flag` after the tool's name.
+fn with(args: &[&str], flag: &str) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = args
+        .iter()
+        .map(|a| &*Box::leak(a.to_string().into_boxed_str()))
+        .collect();
+    v.insert(1, Box::leak(flag.to_string().into_boxed_str()));
+    v
+}
+
+/// Empties `dir` (the other file system's directory) before a run.
+fn renew(dir: Option<&PathBuf>) {
+    if let Some(o) = dir {
+        let _ = fs::remove_dir_all(o);
+        fs::create_dir(o).unwrap();
+    }
+}
+
+#[test]
+fn action_records_are_the_lines_of_v_in_order() {
+    let other = other_fs_dir();
+    let mut runs: Vec<Vec<&str>> = PARITY.iter().map(|a| a.to_vec()).collect();
+    if let Some(o) = &other {
+        let o: &'static str = Box::leak(o.to_string_lossy().into_owned().into_boxed_str());
+        runs.push(vec!["mv", "d", "a", "missing", o]);
+    }
+    for args in runs {
+        // -v (or -c) prints a line per action; -J writes a record instead.
+        let verbose = if args.contains(&"-c") {
+            args.clone()
+        } else {
+            with(&args, "-v")
+        };
+        let (vdir, jdir) = (action_tree(), action_tree());
+        renew(other.as_ref());
+        let v = run_in(&vdir, &verbose, b"");
+        let vtree = other.as_ref().map(|o| listing(o));
+        renew(other.as_ref());
+        let (recs, j) = act(&jdir, &with(&args, "-J"));
+        assert_eq!(v.status.code(), j.status.code(), "{args:?}");
+        let vlines: Vec<String> = String::from_utf8_lossy(&v.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // One record per -v line, naming what the line names; a
+        // --backup has a record of its own, before the action's, whose line
+        // names it. Diagnostics are error records.
+        let actions: Vec<&Value> = recs
+            .iter()
+            .filter(|r| r.get("action").is_some() && r["action"] != "backup")
+            .collect();
+        assert_eq!(
+            vlines.len(),
+            actions.len(),
+            "{args:?}:\n{vlines:#?}\n{:#?}",
+            briefs(&recs)
+        );
+        // Each record names what one of the lines names. They are matched by
+        // name, not position: the two runs use two trees, and siblings come
+        // in inode order, which the file system need not repeat (ext4 puts a
+        // new directory in another block group).
+        let mut unmatched: Vec<&String> = vlines.iter().collect();
+        for r in &actions {
+            let wanted: Vec<String> = names(r)
+                .into_iter()
+                .filter(|n| !n.contains('\u{fffd}'))
+                .collect();
+            let hit = unmatched
+                .iter()
+                .position(|line| wanted.iter().all(|n| line.contains(n.as_str())));
+            let Some(i) = hit else {
+                panic!("{args:?}: no line for {r} in {unmatched:#?}");
+            };
+            unmatched.remove(i);
+        }
+        for (i, r) in recs.iter().enumerate() {
+            if r["action"] == "backup" {
+                let next = &recs[i + 1];
+                assert_eq!(next["backup"], r["dest"], "{args:?}");
+                assert_eq!(next["dest"], r["source"], "{args:?}");
+            }
+        }
+        let errors = recs.iter().filter(|r| r.get("error").is_some()).count();
+        let diagnostics = String::from_utf8_lossy(&j.stderr)
+            .lines()
+            .filter(|l| l.starts_with(&format!("{}: ", args[0])))
+            .count();
+        assert_eq!(errors, diagnostics, "{args:?}");
+        // And both runs did the same.
+        assert_eq!(listing(&vdir), listing(&jdir), "{args:?}");
+        assert_eq!(vtree, other.as_ref().map(|o| listing(o)), "{args:?}");
+    }
+    if let Some(o) = other {
+        let _ = fs::remove_dir_all(o);
+    }
+}
+
+/// The names under `dir` with their modes (the journal left out), sorted.
+fn listing(dir: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if rel.is_empty() && name == ".dogfish" {
+                continue;
+            }
+            let path = format!("{rel}/{name}");
+            let m = e.path().symlink_metadata().unwrap();
+            out.push(format!("{path} {:o}", m.mode()));
+            if m.is_dir() {
+                walk(&e.path(), &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn an_error_record_comes_where_its_diagnostic_does() {
+    let dir = action_tree();
+    let (recs, out) = act(&dir, &["rm", "-rJ", "d", "missing", "a"]);
+    assert!(!out.status.success());
+    let b = briefs(&recs);
+    let at = b.iter().position(|r| r == "error missing").unwrap();
+    // Everything under d first, then the failing operand, then a.
+    assert!(b[..at].iter().all(|r| r.contains(" d")), "{b:#?}");
+    assert_eq!(b[at - 1], "rmdir d");
+    assert_eq!(b[at + 1..], ["remove a".to_string()], "{b:#?}");
+    let err = &recs[at];
+    assert_eq!(
+        err["error"],
+        "cannot remove 'missing': No such file or directory"
+    );
+    assert_eq!(err["errno"], 2);
+    assert_eq!(
+        out.stderr,
+        b"rm: cannot remove 'missing': No such file or directory\n"
+    );
+
+    // Phase-1 producers too: the error record is in order with the others.
+    let dir = action_tree();
+    for args in [
+        &["wc", "-J", "a", "missing", "d/f"][..],
+        &["md5sum", "-J", "a", "missing", "d/f"],
+        &["sha256sum", "-J", "a", "missing", "d/f"],
+        &["realpath", "-J", "a", "missing/x", "d/f"],
+        &["du", "-J", "a", "missing", "d/f"],
+        &["stat", "-J", "a", "missing", "d/f"],
+    ] {
+        let out = run_in(&dir, args, b"");
+        let recs = records(&[args[0].as_bytes()], &out);
+        let kinds: Vec<bool> = recs.iter().map(|r| r.get("error").is_some()).collect();
+        assert_eq!(kinds, [false, true, false], "{args:?}: {recs:#?}");
+        assert_eq!(recs[1]["errno"], 2, "{args:?}");
+        assert!(recs[1]["path"].as_str().unwrap().starts_with("missing"));
+        let schema = schema(args[0]);
+        for r in &recs {
+            assert!(validator::validate(&schema, r, true).is_empty(), "{r}");
+        }
+    }
+    // ls and df report missing operands first, as GNU does.
+    let out = run_in(&dir, &["df", "-J", "a", "missing"], b"");
+    let recs = records(&[b"df"], &out);
+    assert_eq!(recs[0]["path"], "missing");
+    assert_eq!(recs[1]["path"], "a");
+    let out = run_in(&dir, &["ls", "-J", "a", "missing"], b"");
+    let recs = records(&[b"ls"], &out);
+    assert_eq!(recs[0]["path"], "missing");
+    assert_eq!(recs[1]["path"], "a");
+    // A name that is not UTF-8 is given as bytes in the error record too.
+    if has_bad_name() {
+        let mut missing = b"nope".to_vec();
+        missing.extend_from_slice(BAD);
+        let args: Vec<&[u8]> = vec![b"rm", b"-J", &missing];
+        let out = run_os(&dir, &os_args(&args), b"");
+        let recs = records(&args, &out);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&missing);
+        assert_eq!(recs[0]["path_bytes"], b64.as_str());
+    }
+}
+
+#[test]
+fn action_records_of_each_tool() {
+    let dir = action_tree();
+    let (recs, _) = act(&dir, &["cp", "-J", "-b", "a", "d/f"]);
+    assert_eq!(briefs(&recs), ["backup d/f d/f~", "copy a d/f"]);
+    assert_eq!(recs[1]["bytes"], 6);
+    assert_eq!(recs[1]["type"], "file");
+    assert_eq!(recs[1]["backup"], "d/f~");
+    let (recs, _) = act(&dir, &["mv", "-J", "a", "b"]);
+    assert_eq!(briefs(&recs), ["move a b"]);
+    assert_eq!(recs[0]["type"], "file");
+    let (recs, _) = act(&dir, &["ln", "-sJ", "b", "c"]);
+    assert_eq!(briefs(&recs), ["symlink b c"]);
+    let (recs, _) = act(&dir, &["ln", "-J", "b", "e"]);
+    assert_eq!(briefs(&recs), ["link b e/b"]);
+    let (recs, _) = act(&dir, &["mkdir", "-pJ", "x/y", "e"]);
+    assert_eq!(briefs(&recs), ["mkdir x", "mkdir x/y"]);
+    let (recs, out) = act(&dir, &["mkdir", "-J", "e"]);
+    assert_eq!(briefs(&recs), ["error e"]);
+    assert_eq!(recs[0]["errno"], 17);
+    assert_eq!(out.status.code(), Some(1));
+    let (recs, _) = act(&dir, &["touch", "-J", "b", "t", "nodir/t"]);
+    assert_eq!(briefs(&recs), ["touch b", "touch t", "error nodir/t"]);
+    assert_eq!(recs[0]["created"], false);
+    assert_eq!(recs[1]["created"], true);
+
+    // chmod: changed and retained, with both modes.
+    let (recs, _) = act(&dir, &["chmod", "-J", "0644", "b", "t"]);
+    assert_eq!(recs[0]["status"], "retained");
+    assert_eq!(recs[0]["changed"], false);
+    let (recs, _) = act(&dir, &["chmod", "-J", "0600", "t"]);
+    assert_eq!(recs[0]["status"], "changed");
+    assert_eq!(recs[0]["changed"], true);
+    assert_eq!(recs[0]["mode_before"], "0644");
+    assert_eq!(recs[0]["mode_before_symbolic"], "-rw-r--r--");
+    assert_eq!(recs[0]["mode"], "0600");
+    assert_eq!(recs[0]["mode_symbolic"], "-rw-------");
+    // -c: only the changes.
+    let (recs, _) = act(&dir, &["chmod", "-cJ", "0600", "b", "t", "nope"]);
+    assert_eq!(briefs(&recs), ["chmod b", "error nope"]);
+
+    // chown to the owner the file has: retained, with the ids.
+    let uid = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(dir.join("b")).unwrap().uid()
+    };
+    let spec: &'static str = Box::leak(uid.to_string().into_boxed_str());
+    let (recs, _) = act(&dir, &["chown", "-J", spec, "b"]);
+    assert_eq!(recs[0]["status"], "retained");
+    assert_eq!(recs[0]["uid_before"], u64::from(uid));
+    assert_eq!(recs[0]["uid"], u64::from(uid));
+    let (recs, _) = act(&dir, &["chown", "-cJ", spec, "b"]);
+    assert!(recs.is_empty());
+
+    // rm: files and directories.
+    let (recs, _) = act(&dir, &["rm", "-rJ", "x"]);
+    assert_eq!(briefs(&recs), ["rmdir x/y", "rmdir x"]);
+    let (recs, _) = act(&dir, &["rm", "-J", "c"]);
+    assert_eq!(briefs(&recs), ["remove c"]);
+}
+
+#[test]
+fn undo_ids_name_the_journal_entry() {
+    let dir = action_tree();
+    let (recs, _) = act(&dir, &["rm", "-J", "--safe", "a"]);
+    assert_eq!(briefs(&recs), ["trash a"]);
+    let id = recs[0]["undo_id"].as_u64().unwrap();
+    let hist = run_in(&dir, &["history", "-J"], b"");
+    let hist = records(&[b"history"], &hist);
+    assert!(hist.iter().any(|h| h["id"] == id), "{hist:#?}");
+    assert!(run_in(&dir, &["undo"], b"").status.success());
+    assert!(dir.join("a").exists());
+
+    // Every record of one cp operand has its entry's id; undo removes the copy.
+    let (recs, _) = act(&dir, &["cp", "-rJ", "d", "copy"]);
+    let ids: Vec<&Value> = recs.iter().map(|r| &r["undo_id"]).collect();
+    assert!(ids.iter().all(|i| i.as_u64().is_some() && *i == ids[0]));
+    assert!(run_in(&dir, &["undo"], b"").status.success());
+    assert!(!dir.join("copy").exists());
+    let (recs, _) = act(&dir, &["mv", "-J", "a", "moved"]);
+    assert!(recs[0]["undo_id"].as_u64().is_some());
+}
+
+/// The system's GNU coreutils `tool`, if there is one.
+fn gnu_tool(tool: &str) -> Option<PathBuf> {
+    let path = Path::new("/usr/bin").join(tool);
+    let out = Command::new(&path).arg("--version").output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .contains("GNU coreutils")
+        .then_some(path)
+}
+
+#[test]
+fn json_keeps_gnu_stderr_and_writes_records_only() {
+    // With -J, standard error is exactly what the tool prints without it,
+    // which is GNU's (the gnu_compat suites hold that); here it is also
+    // checked against the system's GNU coreutils, when there is one.
+    for args in [
+        &["cp", "-r", "d", "missing", "e"][..],
+        &["cp", "d", "e"],
+        &["mv", "missing", "a", "e/nodir/x"],
+        &["rm", "-r", "missing", "d", "e/"],
+        &["rm", "e", "."],
+        &["mkdir", "e", "a/b"],
+        &["ln", "-s", "a", "e", "missing"],
+        &["ln", "a", "d/f"],
+        &["chmod", "u+x", "missing", "a"],
+        &["chmod", "-R", "u+x", "d", "nope"],
+        &["chown", "", "missing", "a"],
+        &["touch", "nodir/x", "a"],
+        &["ls", "missing", "a"],
+        &["stat", "missing"],
+        &["du", "missing"],
+        &["wc", "missing", "a"],
+        &["md5sum", "missing"],
+        &["realpath", "missing/x"],
+    ] {
+        let plain = run_in(&action_tree(), args, b"");
+        let json = run_in(&action_tree(), &with(args, "-J"), b"");
+        assert_eq!(
+            String::from_utf8_lossy(&json.stderr),
+            String::from_utf8_lossy(&plain.stderr),
+            "{args:?}"
+        );
+        assert_eq!(json.status.code(), plain.status.code(), "{args:?}");
+        if let Some(gnu) = gnu_tool(args[0]) {
+            let out = Command::new(gnu)
+                .arg0(args[0])
+                .args(&args[1..])
+                .current_dir(action_tree())
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&json.stderr),
+                String::from_utf8_lossy(&out.stderr),
+                "{args:?} vs GNU"
+            );
+            assert_eq!(json.status.code(), out.status.code(), "{args:?} vs GNU");
+        }
+        // Standard output holds records only: one error record per
+        // diagnostic.
+        let recs = records(&[args[0].as_bytes()], &json);
+        let errors = recs.iter().filter(|r| r.get("error").is_some()).count();
+        let diagnostics = String::from_utf8_lossy(&json.stderr)
+            .lines()
+            .filter(|l| l.starts_with(&format!("{}: ", args[0])))
+            .count();
+        assert!(diagnostics > 0, "{args:?}");
+        assert_eq!(errors, diagnostics, "{args:?}");
+    }
+    // Nor --debug's text.
+    let out = run_in(&action_tree(), &["cp", "-J", "--debug", "a", "b"], b"");
+    assert_eq!(briefs(&records(&[b"cp"], &out)), ["copy a b"]);
+}
+
+#[test]
+fn query_reads_action_and_error_records() {
+    let dir = action_tree();
+    let (_, cp) = act(&dir, &["cp", "-rJ", "d", "missing", "e"]);
+    let copies = run_in(&dir, &["query", "-J", "-w", "action == copy"], &cp.stdout);
+    let copies = records(&[b"query"], &copies);
+    assert!(copies.len() >= 4, "{copies:#?}");
+    assert!(copies.iter().all(|r| r["action"] == "copy"));
+    let files = run_in(
+        &dir,
+        &[
+            "query",
+            "-J",
+            "-w",
+            "type=file",
+            "-s",
+            "bytes",
+            "-f",
+            "dest,bytes",
+        ],
+        &cp.stdout,
+    );
+    let files = records(&[b"query"], &files);
+    assert!(
+        files
+            .windows(2)
+            .all(|w| w[0]["bytes"].as_u64() <= w[1]["bytes"].as_u64())
+    );
+    let errors = run_in(&dir, &["query", "-J", "-w", "errno=2"], &cp.stdout);
+    assert_eq!(briefs(&records(&[b"query"], &errors)), ["error missing"]);
+    let (_, chmod) = act(&dir, &["chmod", "-RJ", "u+x", "e"]);
+    let changed = run_in(&dir, &["query", "-J", "-w", "changed=true"], &chmod.stdout);
+    let changed = records(&[b"query"], &changed);
+    assert!(!changed.is_empty());
+    assert!(changed.iter().all(|r| r["status"] == "changed"));
 }

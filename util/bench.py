@@ -170,6 +170,11 @@ def benchmarks(p, scratch):
         # Dogfish's -J records, against GNU's text for the same listing.
         ("ls -lR -J 30k files", "ls", {"gnu": ["-lR", T], "dogfish": ["-lR", "-J", T]}, None, None, 1),
         ("du -a -J 30k files", "du", {"gnu": ["-a", T], "dogfish": ["-a", "-J", T]}, None, None, 1),
+        # An action record per file, against GNU's -v line per file.
+        ("cp -r -J 30k files", "cp", {"gnu": ["-rv", T, out], "dogfish": ["-rJ", T, out]},
+         None, fresh(out), 1),
+        ("rm -r -J 30k files", "rm", {"gnu": ["-rv", out], "dogfish": ["-rJ", out]},
+         None, tree_copy, 1),
         ("chmod -R 30k files", "chmod", ["-R", "u+w", T], None, None, 1),
         ("stat 100 files", "stat", [os.path.join(T, "d000/s000/f%03d.txt" % i) for i in range(100)], None, None, 1),
     ]

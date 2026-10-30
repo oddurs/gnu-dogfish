@@ -2,88 +2,129 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/df.v1.json",
   "title": "df -J record",
-  "description": "One file system reported by `df -J`. A file system df cannot read has no numbers. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
-  "type": "object",
-  "properties": {
-    "filesystem": {
-      "type": "string",
-      "description": "The source: the device or remote file system, as the mount table names it (`total` for the --total row)."
+  "description": "One file system reported by `df -J`. A file system df cannot read has no numbers. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "filesystem": {
+          "type": "string",
+          "description": "The source: the device or remote file system, as the mount table names it (`total` for the --total row)."
+        },
+        "fs_type": {
+          "type": "string",
+          "description": "The file system type."
+        },
+        "mount": {
+          "type": "string",
+          "description": "The mount point."
+        },
+        "mount_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `mount`, base64, present only when they are not UTF-8 (`mount` then holds the lossy form)."
+        },
+        "path": {
+          "type": "string",
+          "description": "The operand that selected this file system, when one did."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "total": {
+          "type": "boolean",
+          "description": "Present (true) only on the --total row."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total size in bytes."
+        },
+        "used": {
+          "type": "integer",
+          "description": "Bytes used (negative when the reserved space is over-committed)."
+        },
+        "available": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes available to unprivileged users."
+        },
+        "use_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "GNU's Use%: used / (used + available), rounded up."
+        },
+        "inodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total inodes."
+        },
+        "inodes_used": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inodes in use."
+        },
+        "inodes_available": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Free inodes."
+        },
+        "inodes_use_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "GNU's IUse%, rounded up."
+        }
+      },
+      "required": [
+        "filesystem"
+      ],
+      "dependentRequired": {
+        "mount_bytes": [
+          "mount"
+        ],
+        "path_bytes": [
+          "path"
+        ]
+      }
     },
-    "fs_type": {
-      "type": "string",
-      "description": "The file system type."
-    },
-    "mount": {
-      "type": "string",
-      "description": "The mount point."
-    },
-    "mount_bytes": {
-      "type": "string",
-      "contentEncoding": "base64",
-      "description": "The bytes of `mount`, base64, present only when they are not UTF-8 (`mount` then holds the lossy form)."
-    },
-    "path": {
-      "type": "string",
-      "description": "The operand that selected this file system, when one did."
-    },
-    "path_bytes": {
-      "type": "string",
-      "contentEncoding": "base64",
-      "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
-    },
-    "total": {
-      "type": "boolean",
-      "description": "Present (true) only on the --total row."
-    },
-    "size": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total size in bytes."
-    },
-    "used": {
-      "type": "integer",
-      "description": "Bytes used (negative when the reserved space is over-committed)."
-    },
-    "available": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Bytes available to unprivileged users."
-    },
-    "use_percent": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "GNU's Use%: used / (used + available), rounded up."
-    },
-    "inodes": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total inodes."
-    },
-    "inodes_used": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Inodes in use."
-    },
-    "inodes_available": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Free inodes."
-    },
-    "inodes_use_percent": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "GNU's IUse%, rounded up."
+    {
+      "$ref": "#/$defs/error"
     }
-  },
-  "required": [
-    "filesystem"
   ],
-  "dependentRequired": {
-    "mount_bytes": [
-      "mount"
-    ],
-    "path_bytes": [
-      "path"
-    ]
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
   }
 }

@@ -8,7 +8,7 @@ milestone: "v0.3"
 depends_on:
 - 11
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
 priority: p1
 effort: l
 area: direction
@@ -62,6 +62,11 @@ One contract, implemented once in dogfish-core and used by every tool:
 ## Acceptance criteria
 
 - [ ] Every tool that produces records supports `-J` with NDJSON framing, and every file-changing tool reports its actions with `-J`.
-- [ ] Every `-J` producer has a published JSON Schema (version 1), and CI validates real output of every tool against it.
-- [ ] `dogfish query`, `head`, `tail`, `sort`, `uniq` and `cut` consume any producer's output.
-- [ ] `doc/ndjson.md` states the contract and compatibility policy, linked from the README.
+- [x] Every `-J` producer has a published JSON Schema (version 1), and CI validates real output of every tool against it.
+- [x] `dogfish query`, `head`, `tail`, `sort`, `uniq` and `cut` consume any producer's output.
+- [x] `doc/ndjson.md` states the contract and compatibility policy, linked from the README.
+
+## Notes
+
+- 2026-10-30: phase 2 (branch `ndjson-contract-2`). cp, mv, rm, mkdir, ln, chmod, chown and touch take `-J`: one action record per `-v` line, in `-v`'s order, instead of the text (`doc/ndjson.md`, "Action records"); with -J every diagnostic is also an error record on stdout, made once in `gnu_error!` (`ndjson::diagnostic`), stderr unchanged. Schemas for the eight tools and `error.v1.json`; every schema accepts the error record; tests/ndjson.rs validates real output of all of them and holds -J's records to -v's lines and -J's stderr to GNU's.
+- Criterion 1 is still open: tools that produce text GNU-style but no records yet (basename, dirname, mktemp, cat, tr, cut as a producer), and `mktemp`, `tee`, `dogfish undo` change files without action records.

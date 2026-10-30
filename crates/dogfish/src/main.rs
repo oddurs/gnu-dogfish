@@ -206,6 +206,7 @@ fn run(raw_args: Vec<OsString>) -> u8 {
                 // A failed write to standard output is reported as GNU's
                 // `close_stdout` does, once.
                 Some(io_err) if stdout::is_write_error(io_err) => {
+                    dogfish_core::ndjson::stop_capture();
                     stdout::mark_reported();
                     report_write_error(&tool_name, io_err);
                     exit_failure(&tool_name)
@@ -225,6 +226,10 @@ fn run(raw_args: Vec<OsString>) -> u8 {
             }
         }
     };
+    // The last -J records, and the error records queued behind them, go
+    // out before standard output is closed.
+    common::actions::finish();
+    dogfish_core::ndjson::stop_capture();
     finish(&tool_name, code)
 }
 

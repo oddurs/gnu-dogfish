@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/ln.v1.json",
+  "title": "ln -J record",
+  "description": "One link made by `ln -J`, where `ln -v` would print a line. Error records are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "link",
+          "description": "A hard link made. `source` is the existing file."
+        },
+        "source": {
+          "type": "string",
+          "description": "What the action read from or acted on, as named on the command line or below it."
+        },
+        "source_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `source`, base64, present only when they are not UTF-8 (`source` then holds the lossy form)."
+        },
+        "dest": {
+          "type": "string",
+          "description": "What the action created or replaced."
+        },
+        "dest_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `dest`, base64, present only when they are not UTF-8 (`dest` then holds the lossy form)."
+        },
+        "backup": {
+          "type": "string",
+          "description": "The --backup name the destination's earlier file was renamed to."
+        },
+        "backup_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `backup`, base64, present only when they are not UTF-8 (`backup` then holds the lossy form)."
+        },
+        "undo_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The `dogfish undo` id of the journal entry this action belongs to (`dogfish undo ID` reverses the whole operand)."
+        }
+      },
+      "required": [
+        "action",
+        "source",
+        "dest"
+      ],
+      "dependentRequired": {
+        "source_bytes": [
+          "source"
+        ],
+        "dest_bytes": [
+          "dest"
+        ],
+        "backup_bytes": [
+          "backup"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "symlink",
+          "description": "A symbolic link made. `source` is the target as stored in the link."
+        },
+        "source": {
+          "type": "string",
+          "description": "What the action read from or acted on, as named on the command line or below it."
+        },
+        "source_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `source`, base64, present only when they are not UTF-8 (`source` then holds the lossy form)."
+        },
+        "dest": {
+          "type": "string",
+          "description": "What the action created or replaced."
+        },
+        "dest_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `dest`, base64, present only when they are not UTF-8 (`dest` then holds the lossy form)."
+        },
+        "backup": {
+          "type": "string",
+          "description": "The --backup name the destination's earlier file was renamed to."
+        },
+        "backup_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `backup`, base64, present only when they are not UTF-8 (`backup` then holds the lossy form)."
+        },
+        "undo_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The `dogfish undo` id of the journal entry this action belongs to (`dogfish undo ID` reverses the whole operand)."
+        }
+      },
+      "required": [
+        "action",
+        "source",
+        "dest"
+      ],
+      "dependentRequired": {
+        "source_bytes": [
+          "source"
+        ],
+        "dest_bytes": [
+          "dest"
+        ],
+        "backup_bytes": [
+          "backup"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "backup",
+          "description": "The destination's earlier file renamed to its --backup name, just before the action that replaced it (the next record)."
+        },
+        "source": {
+          "type": "string",
+          "description": "The file backed up."
+        },
+        "source_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `source`, base64, present only when they are not UTF-8 (`source` then holds the lossy form)."
+        },
+        "dest": {
+          "type": "string",
+          "description": "Its backup name."
+        },
+        "dest_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `dest`, base64, present only when they are not UTF-8 (`dest` then holds the lossy form)."
+        }
+      },
+      "required": [
+        "action",
+        "source",
+        "dest"
+      ],
+      "dependentRequired": {
+        "source_bytes": [
+          "source"
+        ],
+        "dest_bytes": [
+          "dest"
+        ]
+      }
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

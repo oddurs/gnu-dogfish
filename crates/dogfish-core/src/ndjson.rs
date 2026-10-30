@@ -24,8 +24,17 @@
 //! intermediate `serde_json::Value`. A failure that the tool also reports on
 //! standard error goes in the stream too, as an error record
 //! ([`RecordWriter::error`]), so that a pipeline sees it in order.
+//!
+//! Most error records are not written by the tools themselves: once `-J` is
+//! given ([`capture_errors`]), every diagnostic printed through
+//! [`crate::gnu_error!`] (which `eprintln!` is in the tools) also becomes an
+//! error record ([`diagnostic`]), queued for the next record a
+//! [`RecordWriter::stdout`] writes, so that it lands in order.
 
+use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -88,13 +97,21 @@ pub struct RecordWriter<W: Write = Stdout> {
     buf: Vec<u8>,
     last_write: Instant,
     line_buffered: bool,
+    /// Takes the error records of diagnostics ([`diagnostic`]) into its
+    /// stream, as the writers to standard output do.
+    takes_errors: bool,
 }
 
 impl RecordWriter<Stdout> {
     /// Records to standard output, line-buffered when it is a terminal.
+    /// While it lives, the error record of each diagnostic goes into its
+    /// stream, before the next record written.
     pub fn stdout() -> Self {
         let tty = io::stdout().is_terminal();
-        Self::new(stdout()).line_buffered(tty)
+        WRITERS.fetch_add(1, Ordering::AcqRel);
+        let mut w = Self::new(stdout()).line_buffered(tty);
+        w.takes_errors = true;
+        w
     }
 }
 
@@ -105,6 +122,17 @@ impl<W: Write> RecordWriter<W> {
             buf: Vec::with_capacity(FLUSH_BYTES + 4096),
             last_write: Instant::now(),
             line_buffered: false,
+            takes_errors: false,
+        }
+    }
+
+    /// Moves the error records queued by diagnostics into the buffer, so
+    /// that they come before whatever is written next.
+    fn take_errors(&mut self) {
+        if self.takes_errors && HAVE_PENDING.load(Ordering::Acquire) {
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            self.buf.append(&mut pending);
+            HAVE_PENDING.store(false, Ordering::Release);
         }
     }
 
@@ -116,6 +144,7 @@ impl<W: Write> RecordWriter<W> {
 
     /// Writes one record, its fields filled in by `fill`.
     pub fn record(&mut self, fill: impl FnOnce(&mut Record<'_>)) -> io::Result<()> {
+        self.take_errors();
         self.buf.push(b'{');
         let mut rec = Record {
             buf: &mut self.buf,
@@ -128,6 +157,7 @@ impl<W: Write> RecordWriter<W> {
 
     /// Writes `value`, which must serialize as a JSON object, as one record.
     pub fn serialize<T: Serialize + ?Sized>(&mut self, value: &T) -> io::Result<()> {
+        self.take_errors();
         let start = self.buf.len();
         serde_json::to_writer(&mut self.buf, value).map_err(io::Error::other)?;
         if self.buf.get(start) != Some(&b'{') {
@@ -141,6 +171,7 @@ impl<W: Write> RecordWriter<W> {
     /// Writes a record that is already one compact JSON object (a line read
     /// from another producer), without its line terminator.
     pub fn line(&mut self, object: &[u8]) -> io::Result<()> {
+        self.take_errors();
         self.buf.extend_from_slice(object);
         self.buf.push(b'\n');
         self.written()
@@ -154,6 +185,7 @@ impl<W: Write> RecordWriter<W> {
 
     /// Writes out every buffered record.
     pub fn flush(&mut self) -> io::Result<()> {
+        self.take_errors();
         if !self.buf.is_empty() {
             let res = self.out.write_all(&self.buf);
             self.buf.clear();
@@ -185,7 +217,187 @@ impl<W: Write> Drop for RecordWriter<W> {
     /// reported at exit. Tools call [`RecordWriter::flush`] to see it sooner.
     fn drop(&mut self) {
         let _ = self.flush();
+        if self.takes_errors {
+            WRITERS.fetch_sub(1, Ordering::AcqRel);
+        }
     }
+}
+
+// ------------------------------------------------- diagnostics as records
+
+/// `-J` was given: diagnostics become error records too.
+static CAPTURE: AtomicBool = AtomicBool::new(false);
+/// The program name that starts each diagnostic (`rm: ...`).
+static TOOL: Mutex<String> = Mutex::new(String::new());
+/// Live [`RecordWriter::stdout`] writers; with none, an error record is
+/// written to standard output at once.
+static WRITERS: AtomicUsize = AtomicUsize::new(0);
+/// Error records waiting for the next record of a live writer.
+static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static HAVE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// How many names quoted since the last diagnostic are remembered.
+const QUOTED_KEPT: usize = 16;
+
+thread_local! {
+    /// Names quoted for messages since the last diagnostic: the bytes as
+    /// given, and as quoted ([`note_quoted`]).
+    static QUOTED: RefCell<Vec<(Vec<u8>, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// From now on, every diagnostic `tool` prints through
+/// [`crate::gnu_error!`] also writes an error record to standard output
+/// ([`diagnostic`]). Called when `-J` is given.
+pub fn capture_errors(tool: &str) {
+    let mut t = TOOL.lock().unwrap_or_else(|e| e.into_inner());
+    t.clear();
+    t.push_str(tool);
+    CAPTURE.store(true, Ordering::Release);
+}
+
+/// Diagnostics are no longer records: called at exit, before standard
+/// output is closed (a write error found there has no stream to go to).
+pub fn stop_capture() {
+    CAPTURE.store(false, Ordering::Release);
+}
+
+/// Whether diagnostics are turned into records.
+#[inline]
+pub fn capturing() -> bool {
+    CAPTURE.load(Ordering::Relaxed)
+}
+
+/// Remembers that `raw` (a file name as given) was quoted as `quoted` for
+/// a message, so that a diagnostic naming it can give its bytes as `path`.
+/// Does nothing unless [`capturing`].
+#[inline]
+pub fn note_quoted(raw: &[u8], quoted: &[u8]) {
+    if capturing() {
+        QUOTED.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.len() == QUOTED_KEPT {
+                q.remove(0);
+            }
+            q.push((raw.to_vec(), String::from_utf8_lossy(quoted).into_owned()));
+        });
+    }
+}
+
+/// Writes the error record of `msg`, a diagnostic just written to standard
+/// error (one line, without its newline), when [`capturing`]:
+///
+/// - `error` is the message without the `tool: ` prefix. A line that does
+///   not start with it (`Try 'rm --help' ...`) writes no record.
+/// - `path` is the file the message names first: of the names quoted since
+///   the last diagnostic ([`note_quoted`]), the one that appears earliest.
+/// - `errno` is the error number whose `strerror` text ends the message.
+///
+/// The record goes into the stream of a live [`RecordWriter::stdout`],
+/// before its next record, or else straight to standard output.
+pub fn diagnostic(msg: &str) {
+    let quoted = QUOTED.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    if !capturing() {
+        return;
+    }
+    let plain = strip_sgr(msg);
+    let rest = {
+        let tool = TOOL.lock().unwrap_or_else(|e| e.into_inner());
+        match plain
+            .strip_prefix(tool.as_str())
+            .and_then(|r| r.strip_prefix(": "))
+        {
+            Some(r) => r.to_owned(),
+            None => return,
+        }
+    };
+    let mut rec = ErrorRecord::new(&rest);
+    if let Some(p) = named_path(&rest, &quoted) {
+        rec = rec.path(p);
+    }
+    rec.errno = errno_of(&rest);
+    let mut bytes = vec![b'{'];
+    rec.fill(&mut Record {
+        buf: &mut bytes,
+        empty: true,
+    });
+    bytes.extend_from_slice(b"}\n");
+    if WRITERS.load(Ordering::Acquire) > 0 {
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(&bytes);
+        HAVE_PENDING.store(true, Ordering::Release);
+    } else {
+        let _ = stdout().write_all(&bytes);
+    }
+}
+
+/// `msg` without terminal colour sequences (a diagnostic's program name is
+/// bold on a terminal).
+fn strip_sgr(msg: &str) -> std::borrow::Cow<'_, str> {
+    if !msg.contains('\x1b') {
+        return msg.into();
+    }
+    let mut out = String::with_capacity(msg.len());
+    let mut chars = msg.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
+/// Of the names `quoted` for a message, the bytes of the one that appears
+/// first in `msg`. A name quoted only when it needs it (`quotef`) may stand
+/// bare, so a bare one must be a whole word: at the start or after a space,
+/// and before `:`, `,`, a space or the end.
+fn named_path<'q>(msg: &str, quoted: &'q [(Vec<u8>, String)]) -> Option<&'q [u8]> {
+    let mut best: Option<(usize, usize, &[u8])> = None;
+    for (raw, q) in quoted {
+        if q.is_empty() {
+            continue;
+        }
+        let delimited = q.starts_with(['\'', '"', '$']) || q.starts_with('\u{2018}');
+        let found = msg.match_indices(q.as_str()).map(|(i, _)| i).find(|&i| {
+            delimited || {
+                let before = msg[..i].chars().next_back();
+                let after = msg[i + q.len()..].chars().next();
+                before.is_none_or(|c| c == ' ')
+                    && after.is_none_or(|c| matches!(c, ':' | ',' | ' '))
+            }
+        });
+        if let Some(i) = found
+            && best.is_none_or(|(bi, blen, _)| i < bi || (i == bi && q.len() > blen))
+        {
+            best = Some((i, q.len(), raw));
+        }
+    }
+    best.map(|(_, _, raw)| raw)
+}
+
+/// The error number whose message ends `msg` (`...: Permission denied`).
+fn errno_of(msg: &str) -> Option<i32> {
+    static TABLE: std::sync::OnceLock<Vec<(i32, String)>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (1..256)
+            .map(|n| {
+                (
+                    n,
+                    crate::format::gnu_io_error(&io::Error::from_raw_os_error(n)),
+                )
+            })
+            .filter(|(_, t)| !t.starts_with("Unknown error"))
+            .collect()
+    });
+    let tail = msg.rsplit_once(": ").map_or(msg, |(_, t)| t);
+    table.iter().find(|(_, t)| t == tail).map(|(n, _)| *n)
 }
 
 /// An error record: `{"error":MESSAGE,"path":...,"errno":N}`. `message` is
@@ -349,7 +561,13 @@ impl Record<'_> {
     /// A file mode as `mode`, the permission bits in octal (`"0644"`), and
     /// `mode_symbolic`, as `ls -l` shows it (`"-rw-r--r--"`).
     pub fn mode(&mut self, mode: u32) -> &mut Self {
-        self.key("mode");
+        self.mode_as("mode", mode)
+    }
+
+    /// [`Record::mode`] under another name: `key` and `key_symbolic`
+    /// (`mode_before`, `mode_before_symbolic`).
+    pub fn mode_as(&mut self, key: &str, mode: u32) -> &mut Self {
+        self.key(key);
         let perm = mode & 0o7777;
         self.buf.extend_from_slice(&[
             b'"',
@@ -359,7 +577,7 @@ impl Record<'_> {
             b'0' + (perm & 7) as u8,
             b'"',
         ]);
-        self.key("mode_symbolic");
+        self.key_suffixed(key, "_symbolic");
         self.buf.push(b'"');
         self.buf.extend_from_slice(&mode_symbolic(mode));
         self.buf.push(b'"');
@@ -702,6 +920,70 @@ mod tests {
         })
         .unwrap();
         assert_eq!(w.get_mut().as_slice(), b"{\"n\":1}\n");
+    }
+
+    #[test]
+    fn diagnostics_name_their_file_and_error_number() {
+        let q = |raw: &[u8], quoted: &str| (raw.to_vec(), quoted.to_string());
+        let quoted = [
+            q(b"src", "'src'"),
+            q(b"a b", "'a b'"),
+            q(b"o", "o"),
+            q(b"x\xff", "'x'$'\\377'"),
+        ];
+        let msg = "cannot move 'a b' to 'src': Permission denied";
+        assert_eq!(named_path(msg, &quoted), Some(&b"a b"[..]));
+        // A bare (quotef) name is a whole word, not a part of one.
+        assert_eq!(named_path("cannot open: x", &quoted[2..3]), None);
+        assert_eq!(named_path("o: Is a directory", &quoted), Some(&b"o"[..]));
+        assert_eq!(
+            named_path("cannot stat 'x'$'\\377': No such file", &quoted),
+            Some(&b"x\xff"[..])
+        );
+        assert_eq!(named_path("missing operand", &quoted), None);
+        assert_eq!(errno_of(msg), Some(libc::EACCES));
+        assert_eq!(
+            errno_of("cannot remove 'd': Is a directory"),
+            Some(libc::EISDIR)
+        );
+        assert_eq!(errno_of("-r not specified; omitting directory 'd'"), None);
+        assert_eq!(strip_sgr("\x1b[1mrm\x1b[0m: x"), "rm: x");
+    }
+
+    #[test]
+    fn queued_error_records_come_before_the_next_record() {
+        let mut out = Vec::new();
+        {
+            let mut w = RecordWriter::new(&mut out);
+            w.takes_errors = true;
+            w.record(|r| {
+                r.u64("n", 1);
+            })
+            .unwrap();
+            PENDING
+                .lock()
+                .unwrap()
+                .extend_from_slice(b"{\"error\":\"e\"}\n");
+            HAVE_PENDING.store(true, Ordering::Release);
+            w.record(|r| {
+                r.u64("n", 2);
+            })
+            .unwrap();
+        }
+        assert_eq!(out, b"{\"n\":1}\n{\"error\":\"e\"}\n{\"n\":2}\n");
+        assert!(!HAVE_PENDING.load(Ordering::Acquire));
+        let mut b = Vec::new();
+        {
+            let mut w = RecordWriter::new(&mut b);
+            w.record(|r| {
+                r.mode_as("mode_before", FILE_TYPES[0].0 | 0o600);
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            b,
+            b"{\"mode_before\":\"0600\",\"mode_before_symbolic\":\"-rw-------\"}\n"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! `strftime` ([`strftime`]), `quotearg` file-name quoting and `fnmatch`
 //! patterns ([`fnmatch`]).
 
+pub(crate) mod actions;
 pub(crate) mod backup;
 pub(crate) mod canonicalize;
 pub(crate) mod copy;

@@ -2,43 +2,84 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/date.v1.json",
   "title": "date -J record",
-  "description": "One time printed by `date -J` (one per line of --file). One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
-  "type": "object",
-  "properties": {
-    "time": {
-      "type": "string",
-      "format": "date-time",
-      "description": "The time shown: RFC 3339, UTC, with nanoseconds."
+  "description": "One time printed by `date -J` (one per line of --file). Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The time shown: RFC 3339, UTC, with nanoseconds."
+        },
+        "time_ns": {
+          "type": "integer",
+          "description": "The time shown: nanoseconds since the epoch."
+        },
+        "utc_offset": {
+          "type": "integer",
+          "description": "The local time zone's offset from UTC at that time, in seconds east."
+        },
+        "zone": {
+          "type": "string",
+          "description": "The local time zone's abbreviation at that time (`%Z`)."
+        },
+        "zone_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `zone`, base64, present only when they are not UTF-8 (`zone` then holds the lossy form)."
+        },
+        "formatted": {
+          "type": "string",
+          "description": "The time as date would print it (FORMAT, or the default format)."
+        }
+      },
+      "required": [
+        "time",
+        "time_ns"
+      ],
+      "dependentRequired": {
+        "zone_bytes": [
+          "zone"
+        ]
+      }
     },
-    "time_ns": {
-      "type": "integer",
-      "description": "The time shown: nanoseconds since the epoch."
-    },
-    "utc_offset": {
-      "type": "integer",
-      "description": "The local time zone's offset from UTC at that time, in seconds east."
-    },
-    "zone": {
-      "type": "string",
-      "description": "The local time zone's abbreviation at that time (`%Z`)."
-    },
-    "zone_bytes": {
-      "type": "string",
-      "contentEncoding": "base64",
-      "description": "The bytes of `zone`, base64, present only when they are not UTF-8 (`zone` then holds the lossy form)."
-    },
-    "formatted": {
-      "type": "string",
-      "description": "The time as date would print it (FORMAT, or the default format)."
+    {
+      "$ref": "#/$defs/error"
     }
-  },
-  "required": [
-    "time",
-    "time_ns"
   ],
-  "dependentRequired": {
-    "zone_bytes": [
-      "zone"
-    ]
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
   }
 }
