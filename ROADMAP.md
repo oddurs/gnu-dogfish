@@ -41,7 +41,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 ## Deliberate extensions (not bugs)
 
 - Rich TTY output for `ls`, `df`, `du`, `stat`, `wc --table`, `env --table`; NDJSON input shown as a table by `head`, `tail`, `sort`, `uniq`, `shuf` and `cut -f NAME` on a terminal (or with `-J`) — piped output stays GNU's.
-- `-J/--json` NDJSON output and `dogfish query`.
+- `-J/--json[=VERSION]`: NDJSON records ([doc/ndjson.md](./doc/ndjson.md), one JSON Schema per tool in `doc/schema/`, printed by `dogfish schema TOOL`), and `dogfish query`. GNU has no `-J`; without it every tool's output is GNU's, byte for byte.
 - Compound durations such as `500ms` or `1m30s` for `sleep`, `timeout` and `watch` (GNU rejects them). Spelled-out units such as `1day` stay invalid, as in GNU.
 - `rm --safe`, `dogfish undo`, `dogfish history`, `--stats`. The switches `--stats`, `--no-color` and (for tools with rich terminal output that GNU gives no `--color`) `--color[=WHEN]` are accepted only when spelled in full, before `--` or a command, and never by `echo`, `printf`, `true`, `false` or `yes`, which keep GNU's behaviour; `DOGFISH_STATS=1` and `NO_COLOR` set them for every tool. Dogfish's own long options (`--json`, `ls --tree`, `rm --safe`, ...) are never abbreviated and never listed in GNU's ambiguity messages.
 - `ls -T` is GNU's tab size; the tree view is `ls --tree [-L DEPTH]`.
