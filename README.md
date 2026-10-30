@@ -43,28 +43,30 @@ GNU/Dogfish is Free Software (*"free" as in freedom, not merely "free beer"—th
 
 ## ⚡ Benchmarks vs. GNU Coreutils
 
-Every copy of `dogfish` ships with a head-to-head benchmark suite (`dogfish bench`) so you can check these claims on your own hardware:
+`util/bench.py` runs 47 head-to-head benchmarks: the same command line through GNU coreutils 9.4 and through Dogfish, alternating, 7 times each, with stdout to a regular file and `LC_ALL=C`. The figure is GNU's median time divided by Dogfish's, so above 1.0 means Dogfish is faster.
 
-```text
-$ dogfish bench -n 9 -s 32
- BENCHMARK            DOGFISH    SYSTEM        SPEEDUP  ENGINE STRATEGY
- ──────────────────────────────────────────────────────────────────────────────────
- wc -l (32 MiB)        5.90ms    7.92ms   1.34x faster  mmap + SIMD bytecount
- cp (32 MiB file)     18.26ms   26.47ms   1.45x faster  FICLONE / copy_file_range
- sort -r (32 MiB)     63.39ms   75.33ms   1.19x faster  rayon par_sort_by
- wc -lwc (32 MiB)     23.24ms  528.12ms  22.72x faster  mmap + single-pass scanner
- md5sum (32 MiB)      55.56ms   57.69ms   1.04x faster  mmap + ASM md-5
- sha256sum (32 MiB)   99.44ms   94.80ms          0.95x  mmap + ring SHA-256 (OpenSSL asm)
- seq 1 1,000,000       9.51ms    7.99ms          0.84x  itoa + 64KiB BufWriter
-```
+Measured on a quiet 4-core Intel Xeon @ 2.8 GHz VM (AVX-512, no SHA extensions), Ubuntu 24.04, portable release build (no `target-cpu=native`). Dogfish is at least as fast as GNU, in wall and CPU time, on 39 of the 47:
 
-**How this was measured:** best of 9 runs, warm page cache, GNU coreutils 9.4 on Ubuntu 24.04, a 4-core Intel Xeon @ 2.8 GHz VM (no SHA extensions), and the portable release build (no `target-cpu=native`). Each run includes process startup (~2 ms for both). What the numbers mean:
+| Benchmark | Wall | CPU | | Benchmark | Wall | CPU |
+|---|---:|---:|---|---|---:|---:|
+| `wc` 100 MB | 24.9× | 6.7× | | `ls -lR` 30k files | 1.25× | 1.30× |
+| `cut -c1-10` 100 MB | 2.56× | 2.83× | | `uniq -c` 1M lines | 1.29× | 1.30× |
+| `sort` 100 MB | 2.46× | 2.02× | | `shuf` 20 MB | 1.26× | 1.29× |
+| `base64 -d` 256 MB | 2.31× | 2.56× | | `tail -n 1M` | 1.21× | 1.37× |
+| `du -ah` 30k files | 1.97× | 1.14× | | `b2sum` 256 MB | 1.17× | 1.16× |
+| `tr a-z A-Z` 100 MB | 1.96× | 1.79× | | `wc -l` 100 MB | 1.13× | 1.11× |
+| `tac` 100 MB | 1.88× | 2.03× | | `rm -r` 30k files | 1.08× | 1.07× |
+| `nl` 100 MB | 1.78× | 1.85× | | `cp -r` 30k files | 1.06× | 1.06× |
+| `seq` 10M | 1.57× | 1.27× | | `sha256sum` 256 MB | 1.04× | 1.03× |
+| `head -n 1M` | 1.34× | 1.75× | | `md5sum` 256 MB | 1.02× | 1.04× |
 
-- **Where dogfish wins:** memory-mapped scanning, parallel sorting, and copying straight into a new file. The `wc -lwc` gap mostly reflects GNU 9.4's slow byte-at-a-time word counting; the outputs are identical.
-- **Where it doesn't:** SHA-256 runs on the same OpenSSL assembly GNU reaches through libcrypto, so it is a wash. `seq` is within startup noise.
-- **What `cp` costs when it overwrites:** dogfish keeps the old contents so `dogfish undo` can restore them, which makes overwriting slower than GNU. Set `DOGFISH_UNDO=off` to skip that.
+Where it is not (yet) faster:
 
-Results vary by OS, filesystem, CPU and file size. Run `dogfish bench` yourself before relying on any figure.
+- **Process startup:** 200 calls of `true`, `basename` or `cat` on a small file take 0.85-0.98× GNU's time. Dogfish makes the same system calls as GNU at startup; what is left is the dynamic loader binding about 135 more libc symbols and applying about 2,900 relocations in one multicall binary. Removing them would mean giving up PIE, full RELRO or dynamic NSS, which Dogfish keeps. The 2 ms `wc -c` and `wc -m` runs (0.95×) are this startup cost.
+- **Within a few percent:** `ls -1` over 300 directories (0.99× wall, 1.05× CPU) and `chmod -R` (0.98×), which make the same system calls as GNU and are bound by the kernel, and `du -s` (1.74× wall but 0.93× CPU, because it walks in parallel).
+- **What `cp` costs when it overwrites:** Dogfish keeps the old contents so `dogfish undo` can restore them. Set `DOGFISH_UNDO=off` to skip that.
+
+To reproduce: `util/bench.py` (add `-k sort` to run a subset, `REPEAT=N` to change the count, `--json FILE` to keep the results). `dogfish bench` is a smaller self-contained suite that ships in every binary. Results vary by OS, file system, CPU and file size, so measure on your own machine before relying on any figure.
 
 ---
 
