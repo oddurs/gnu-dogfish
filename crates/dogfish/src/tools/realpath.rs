@@ -6,9 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{
-    DogfishContext, emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, stdout,
-};
+use dogfish_core::{DogfishContext, emit_objects_or_table, gnu_io_error, stdout};
 
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
 use crate::common::getopt::{
@@ -196,7 +194,7 @@ pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             out.write_all(if zero { b"\0" } else { b"\n" })?;
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     drop(out);
     if json {
         emit_objects_or_table(&results, ctx, true, false)?;

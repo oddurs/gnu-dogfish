@@ -1282,6 +1282,9 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+    // GNU sort exits at its first failed write, leaving nothing for
+    // `close_stdout` to flush.
+    dogfish_core::stdout::gnu_flushes_early();
     Ok(match sort_main(parsed, ctx) {
         Ok(code) => code,
         Err(Die(code)) => code,
@@ -1394,6 +1397,14 @@ fn run(env: &mut Env, p: &SortArgs, ctx: &DogfishContext) -> Res<i32> {
     check_inputs(&p.files)?;
     if let Some(out) = &p.output {
         check_output(out)?;
+    } else if dogfish_core::stdout::was_closed()
+        && let Some(first) = p.files.iter().find(|f| *f != "-")
+    {
+        // GNU, run with standard output closed, opens the first named
+        // input on descriptor 1 and keeps it open.
+        use std::os::unix::fs::MetadataExt;
+        let blksize = std::fs::metadata(first).map_or(0, |m| m.blksize());
+        dogfish_core::stdout::gnu_input_on_fd1(blksize, true);
     }
 
     if p.merge {

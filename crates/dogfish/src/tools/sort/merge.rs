@@ -18,6 +18,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 
 use dogfish_core::gnu_io_error;
+use dogfish_core::stdout::StdioModel;
 
 use super::compare::Sorter;
 use super::debug::debug_line;
@@ -408,55 +409,33 @@ impl<'a> Env<'a> {
                         )));
                     }
                 }
-                Ok(LineWriter::new(
-                    Sink::Fd(fd1),
-                    name.clone(),
-                    false,
+                let blksize = fd1.metadata().map_or(0, |m| m.blksize());
+                let mut w =
+                    LineWriter::new(Sink::Fd(fd1), name.clone(), false, self.sorter, self.eol);
+                w.gnu = Some(StdioModel::for_blksize(blksize));
+                Ok(w)
+            }
+            None => {
+                let mut w = LineWriter::new(
+                    Sink::Stdout,
+                    STDOUT_NAME.into(),
+                    self.debug,
                     self.sorter,
                     self.eol,
-                ))
+                );
+                w.gnu = Some(StdioModel::new());
+                Ok(w)
             }
-            None => Ok(LineWriter::new(
-                Sink::Stdout,
-                STDOUT_NAME.into(),
-                self.debug,
-                self.sorter,
-                self.eol,
-            )),
         }
     }
 
     /// Finishes a writer (GNU `xfclose`).
-    pub(super) fn close_output(&self, w: LineWriter<'a>) -> Res<()> {
-        let stdout = matches!(w.out.get_ref(), Sink::Stdout | Sink::Fd(_));
-        let name = w.name.clone();
-        match w.out.into_inner() {
-            Ok(sink) => {
-                if let Sink::Fd(f) = &sink
-                    && let Err(e) = (&**f).flush()
-                {
-                    return Err(sort_die("fflush failed", &name, &e));
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let what = if stdout {
-                    "fflush failed"
-                } else {
-                    "close failed"
-                };
-                Err(output_error(what, &name, e.error(), stdout))
-            }
+    pub(super) fn close_output(&self, mut w: LineWriter<'a>) -> Res<()> {
+        match w.out.flush() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(w.failed("close failed", &e)),
         }
     }
-}
-
-/// A write error: for standard output, also recorded as reported.
-fn output_error(what: &str, name: &OsStr, e: &io::Error, stdout: bool) -> Die {
-    if stdout {
-        dogfish_core::stdout::mark_reported();
-    }
-    sort_die(what, name, e)
 }
 
 /// Whether a failed spawn failed to create the process (GNU's `fork`
@@ -700,6 +679,11 @@ pub(super) struct LineWriter<'a> {
     scratch: Vec<u8>,
     pub(super) lines: u64,
     pub(super) bytes: u64,
+    /// For the final output, glibc's buffer as GNU's `stdout` would fill it,
+    /// to word a write error as GNU does.
+    gnu: Option<StdioModel>,
+    /// GNU's `fwrite` would have called write(2) by now.
+    gnu_wrote: bool,
 }
 
 impl<'a> LineWriter<'a> {
@@ -713,7 +697,40 @@ impl<'a> LineWriter<'a> {
             scratch: Vec::new(),
             lines: 0,
             bytes: 0,
+            gnu: None,
+            gnu_wrote: false,
         }
+    }
+
+    /// Records GNU's `fwrite` of `n` bytes of output.
+    #[inline]
+    fn gnu_fwrite(&mut self, n: usize) {
+        if !self.gnu_wrote
+            && let Some(m) = &mut self.gnu
+        {
+            self.gnu_wrote = m.fwrite(n);
+        }
+    }
+
+    /// The diagnostic for a failed write. On the final output GNU dies in
+    /// the `fwrite` that had to write (`write failed`) or, with the output
+    /// still buffered, in the final `fflush` (`fflush failed`); its
+    /// `close_stdout` then adds `sort: write error` (Dogfish's exit does
+    /// that for standard output). On a temporary file, `what` happened.
+    fn failed(&self, what: &str, e: &io::Error) -> Die {
+        if self.gnu.is_none() {
+            return sort_die(what, &self.name, e);
+        }
+        let what = if self.gnu_wrote {
+            "write failed"
+        } else {
+            "fflush failed"
+        };
+        let die = sort_die(what, &self.name, e);
+        if matches!(self.out.get_ref(), Sink::Fd(_)) {
+            eprintln!("sort: write error");
+        }
+        die
     }
 
     pub(super) fn write_line(&mut self, line: &[u8]) -> Res<()> {
@@ -722,13 +739,15 @@ impl<'a> LineWriter<'a> {
         let res = if self.debug {
             self.scratch.clear();
             debug_line(self.sorter, &mut self.scratch, line);
+            self.gnu_fwrite(self.scratch.len());
             self.out.write_all(&self.scratch)
         } else {
+            self.gnu_fwrite(line.len() + 1);
             self.out
                 .write_all(line)
                 .and_then(|()| self.out.write_all(&[self.eol]))
         };
-        res.map_err(|e| self.write_failed(&e))
+        res.map_err(|e| self.failed("write failed", &e))
     }
 
     /// [`LineWriter::write_line`] for each of `lines`.
@@ -738,22 +757,18 @@ impl<'a> LineWriter<'a> {
         }
         let eol = [self.eol];
         for line in lines {
+            self.gnu_fwrite(line.len() + 1);
             if let Err(e) = self
                 .out
                 .write_all(line)
                 .and_then(|()| self.out.write_all(&eol))
             {
-                return Err(self.write_failed(&e));
+                return Err(self.failed("write failed", &e));
             }
             self.bytes += line.len() as u64 + 1;
         }
         self.lines += lines.len() as u64;
         Ok(())
-    }
-
-    fn write_failed(&self, e: &io::Error) -> Die {
-        let stdout = matches!(self.out.get_ref(), Sink::Stdout | Sink::Fd(_));
-        output_error("write failed", &self.name, e, stdout)
     }
 }
 

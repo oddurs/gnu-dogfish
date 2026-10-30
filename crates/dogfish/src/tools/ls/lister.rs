@@ -686,16 +686,22 @@ impl<W: Write> Lister<'_, W> {
         }
     }
 
-    /// GNU's final `restore_default_color`, skipped when it would be a no-op.
+    /// GNU's final `restore_default_color`, skipped when it would be a no-op,
+    /// and the unchecked `fflush` that follows it once colour was used.
     pub(crate) fn restore_default_color(&mut self) -> io::Result<()> {
         let Some(c) = &self.opts.colors else {
             return Ok(());
         };
-        if self.used_color.get() && !(c.seq(C_LEFT) == b"\x1b[" && c.seq(C_RIGHT) == b"m") {
+        if !self.used_color.get() {
+            return Ok(());
+        }
+        if !(c.seq(C_LEFT) == b"\x1b[" && c.seq(C_RIGHT) == b"m") {
             let mut buf = c.seq(C_LEFT).to_vec();
             buf.extend_from_slice(c.seq(C_RIGHT));
             self.out.write_all(&buf)?;
         }
+        let _ = self.out.flush();
+        dogfish_core::stdout::gnu_fflush();
         Ok(())
     }
 

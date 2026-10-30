@@ -1,4 +1,5 @@
-//! Signal names, as gnulib's sig2str/str2sig spell them (env, timeout).
+//! Signal names, as gnulib's sig2str/str2sig spell them (env, timeout), and
+//! the signal dispositions a child program inherits.
 
 #[cfg(target_os = "linux")]
 pub(crate) const SIGNAL_NAMES: &[(&str, libc::c_int)] = &[
@@ -174,4 +175,29 @@ pub(crate) fn sig_name_into(sig: libc::c_int, buf: &mut [u8; 16]) -> &[u8] {
     }
     let len = put_num(buf, 0, sig);
     &buf[..len]
+}
+
+/// Makes the program `cmd` runs inherit an ignored SIGPIPE, as one run by
+/// GNU's tools does: the standard library resets SIGPIPE to the default in
+/// the child, so `trap '' PIPE; timeout 5 yes | head -1` would kill `yes`
+/// instead of letting it see EPIPE.
+pub(crate) fn keep_ignored_sigpipe(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: sigaction(2) with a null new action only reads the current
+    // one into the zeroed local `old`.
+    let ignored = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    };
+    if ignored {
+        // SAFETY: the closure runs in the forked child and only calls
+        // signal(2), which is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+    }
 }

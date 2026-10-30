@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::Result;
 use dogfish_core::{
     ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
-    emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, sparkline_bar, stdout,
+    emit_objects_or_table, gnu_io_error, sparkline_bar, stdout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -619,6 +619,8 @@ enum Names {
 }
 
 pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+    // GNU line buffers standard output, before parsing options.
+    stdout::gnu_flushes_early();
     let parsed = match parse_wc_args(args) {
         Ok(p) => p,
         Err(code) => return Ok(code),
@@ -704,30 +706,32 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         Names::Files0(_, None) => 1,
     };
 
-    let mut out = io::BufWriter::new(stdout::stdout());
+    // GNU never checks its writes: every file is counted, and a write
+    // error is reported at exit. Line buffered, as in GNU.
+    let mut out = stdout::stdout();
     let mut ok = true;
     let mut totals = Totals::default();
     let mut read_stdin = false;
     let show_names = !parsed.files.is_empty() || parsed.files0_from.is_some();
-    let mut emit = |out: &mut io::BufWriter<stdout::Stdout>,
+    let mut emit = |out: &mut stdout::Stdout,
                     src: &InputSource,
                     res: io::Result<Counted>|
      -> io::Result<bool> {
         match res {
             Ok(c) => {
                 if let Some(e) = &c.error {
-                    out.flush()?;
+                    let _ = out.flush();
                     eprintln!("wc: {}: {}", qf(&c.rec.file), gnu_io_error(e));
                 }
                 if total_mode != TotalMode::Only {
                     let name = show_names.then_some(src.display_name());
-                    ignore_broken_pipe(write_counts(out, &opts, width, &c.rec, name))?;
+                    let _ = write_counts(out, &opts, width, &c.rec, name);
                 }
                 totals.add(&c.rec);
                 Ok(c.error.is_none())
             }
             Err(e) => {
-                out.flush()?;
+                let _ = out.flush();
                 eprintln!("wc: {}: {}", qf(src.display_name()), gnu_io_error(&e));
                 Ok(false)
             }
@@ -772,7 +776,7 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                         Ok(Some(n)) => n,
                         Ok(None) => break,
                         Err(e) => {
-                            out.flush()?;
+                            let _ = out.flush();
                             eprintln!("wc: {}: read error: {}", qf(&list.name), gnu_io_error(&e));
                             ok = false;
                             break;
@@ -781,7 +785,7 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                 };
                 index += 1;
                 if let Some(msg) = list.check_name(&name, index, true) {
-                    out.flush()?;
+                    let _ = out.flush();
                     eprintln!("wc: {msg}");
                     ok = false;
                     continue;
@@ -803,15 +807,15 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             "total bytes",
         ]) {
             if *overflowed {
-                out.flush()?;
+                let _ = out.flush();
                 eprintln!("wc: {what}: Value too large for defined data type");
                 ok = false;
             }
         }
         let name = (total_mode != TotalMode::Only).then_some("total");
-        ignore_broken_pipe(write_counts(&mut out, &opts, width, &totals.rec, name))?;
+        let _ = write_counts(&mut out, &opts, width, &totals.rec, name);
     }
-    ignore_broken_pipe(out.flush())?;
+    let _ = out.flush();
     if read_stdin && let Err(e) = close_stdin() {
         eprintln!("wc: -: {}", gnu_io_error(&e));
         return Ok(1);

@@ -486,6 +486,8 @@ shell_cases! {
     sort_general_long_double: ["sort"] "printf '1.189731495357231765e+4932\\n-3.3621031431120935063e-4932\\n0\\n3.3621031431120935063e-4932\\n2.2250738585072014e-308\\n1.0000000000000000001\\n1\\n-nan\\nnan\\nx\\n1e5000\\n' | sort -gs";
     sort_general_nan_merge: ["sort"] "echo nan > F; sort -g -m F F";
     sort_output_dash_is_a_file: ["sort"] "printf 'b\\na\\n' > f; sort -o - f; echo; cat ./-";
+    sort_output_file_full: ["sort"] "seq 3 > a; seq 30000 > b; for o in '' -m '-S 1k'; do sort $o -o /dev/full a; echo $?; sort $o -o /dev/full b b; echo $?; done";
+    sort_merge_spill_closed_stdout: ["sort"] "seq 3 > a; seq 30000 > b; sort -m a >&-; echo $?; sort -S 1k b >&-; echo $?";
     sort_stdin_closed: ["sort"] "sort - <&-; echo $?; sort -m - <&-; echo $?";
     // --debug: key underlining and warnings.
     sort_debug_keys: ["sort"] "printf '1\\n\\n44\\n33\\n2\\n' | sort -s -k2n --debug; printf ' 1.2ignore\\n 1.1e4ignore\\n' | sort -s -g --debug; printf 'A\\tchr10\\nB\\tchr1\\n' | sort -s -k2.4b,2.3n --debug";

@@ -14,7 +14,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use dogfish_core::{
     DogfishContext, emit_objects_or_table, format_mode_rwx, format_relative_time, format_size,
-    gnu_io_error, io::ignore_broken_pipe, outln, stdout,
+    gnu_io_error, outln, stdout,
 };
 use serde::Serialize;
 
@@ -175,7 +175,9 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     }
-    let mut out = io::BufWriter::new(stdout::stdout());
+    // GNU never checks its writes: every file is shown, and a write error
+    // is reported at exit.
+    let mut out = stdout::StdioBuf::new(stdout::stdout());
     let mut status = 0;
     for name in &operands {
         // `-` means standard input, as in GNU.
@@ -192,7 +194,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let mut buf = Vec::new();
         let expanded = if file_system {
             if name == "-" {
-                ignore_broken_pipe(out.flush())?; // GNU error() flushes stdout first.
+                let _ = out.flush(); // GNU error() flushes stdout first.
                 eprintln!(
                     "stat: using {} to denote standard input does not work in file system mode",
                     qa(name)
@@ -203,7 +205,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             let info = match FsStats::query(path) {
                 Ok(info) => info,
                 Err(e) => {
-                    ignore_broken_pipe(out.flush())?;
+                    let _ = out.flush();
                     eprintln!(
                         "stat: cannot read file system information for {}: {}",
                         qa(name),
@@ -230,7 +232,7 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             let meta = match meta {
                 Ok(m) => m,
                 Err(e) => {
-                    ignore_broken_pipe(out.flush())?;
+                    let _ = out.flush();
                     eprintln!("stat: cannot statx {}: {}", qa(name), gnu_io_error(&e));
                     status = 1;
                     continue;
@@ -254,17 +256,17 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         };
         if let Err(msg) = expanded {
             // GNU dies here, after writing what it expanded so far.
-            ignore_broken_pipe(out.write_all(&buf))?;
-            ignore_broken_pipe(out.flush())?;
+            let _ = out.write_all(&buf);
+            let _ = out.flush();
             eprintln!("stat: {msg}");
             return Ok(1);
         }
         if format.as_ref().is_some_and(|(_, printf)| !printf) {
             buf.push(b'\n');
         }
-        ignore_broken_pipe(out.write_all(&buf))?;
+        let _ = out.write_all(&buf);
     }
-    ignore_broken_pipe(out.flush())?;
+    let _ = out.flush();
     Ok(status)
 }
 

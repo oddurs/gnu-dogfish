@@ -246,6 +246,7 @@
   "tests/printf/printf-hex.sh",
   "tests/printf/printf-mb.sh",
   "tests/printf/printf-quote.sh",
+  "tests/printf/printf-surprise.sh",
   "tests/printf/printf.sh",
   "tests/rm/cycle.sh",
   "tests/rm/d-1.sh",

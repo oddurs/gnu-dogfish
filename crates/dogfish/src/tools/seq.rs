@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy, lossy_all, print_help, print_version,
@@ -354,10 +354,7 @@ fn seq_fast(mut cur: Vec<u8>, end: &[u8], inc: u32, sep: &[u8]) -> io::Result<u6
     let mut line = [0u8; FAST_LINE];
     macro_rules! flush {
         ($bytes:expr) => {
-            match out.write_all($bytes) {
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(count),
-                r => r?,
-            }
+            out.write_all($bytes)?
         };
     }
     while decimal_le(&cur, end) {
@@ -426,14 +423,6 @@ fn seq_fast(mut cur: Vec<u8>, end: &[u8], inc: u32, sep: &[u8]) -> io::Result<u6
     }
     flush!(&buf[..pos]);
     Ok(count)
-}
-
-fn write_or_pipe<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<bool> {
-    match out.write_all(bytes) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -546,7 +535,7 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
         serde_json::to_writer(&mut out, &vals)?;
         writeln!(out)?;
-        ignore_broken_pipe(out.flush())?;
+        out.flush()?;
         return Ok(0);
     }
 
@@ -593,16 +582,13 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let mut count = 0u64;
         let mut itoa_buf = itoa::Buffer::new();
         while (inc > 0 && cur <= end) || (inc < 0 && cur >= end) {
-            if count > 0 && !write_or_pipe(&mut out, sep)? {
-                return Ok(0);
+            if count > 0 {
+                out.write_all(sep)?;
             }
-            let written = if width > 0 {
-                write_or_pipe(&mut out, format!("{:0width$}", cur).as_bytes())?
+            if width > 0 {
+                out.write_all(format!("{:0width$}", cur).as_bytes())?;
             } else {
-                write_or_pipe(&mut out, itoa_buf.format(cur).as_bytes())?
-            };
-            if !written {
-                return Ok(0);
+                out.write_all(itoa_buf.format(cur).as_bytes())?;
             }
             count += 1;
             // Stop instead of wrapping around (which looped forever) near i64::MAX/MIN.
@@ -612,10 +598,10 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
         ctx.telemetry.add_items(count);
-        if count > 0 && !write_or_pipe(&mut out, b"\n")? {
-            return Ok(0);
+        if count > 0 {
+            out.write_all(b"\n")?;
         }
-        ignore_broken_pipe(out.flush())?;
+        out.flush()?;
         return Ok(0);
     }
 
@@ -627,9 +613,7 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut i = 1f64;
     let mut past_last = false;
     loop {
-        if !write_or_pipe(&mut out, &fmt.render(x))? {
-            return Ok(0);
-        }
+        out.write_all(&fmt.render(x))?;
         ctx.telemetry.add_items(1);
         if past_last {
             break;
@@ -650,14 +634,10 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 break;
             }
         }
-        if !write_or_pipe(&mut out, sep)? {
-            return Ok(0);
-        }
+        out.write_all(sep)?;
     }
-    if !write_or_pipe(&mut out, b"\n")? {
-        return Ok(0);
-    }
-    ignore_broken_pipe(out.flush())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(0)
 }
 

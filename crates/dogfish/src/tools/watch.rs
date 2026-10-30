@@ -14,6 +14,7 @@ use crate::common::getopt::{
     usage_error,
 };
 use crate::common::interval::{duration_from_secs, parse_interval};
+use crate::common::signals::keep_ignored_sigpipe;
 
 const WATCH_HELP: &str = "\
 Execute a program periodically, showing output fullscreen
@@ -92,6 +93,8 @@ fn parse_watch_args(args: Vec<OsString>) -> std::result::Result<WatchArgs, i32> 
 }
 
 pub fn run_watch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
+    // As procps' `close_stdout`: a broken pipe at exit is not reported.
+    stdout::ignore_epipe();
     let parsed = match parse_watch_args(args) {
         Ok(p) => p,
         Err(code) => return Ok(code),
@@ -106,7 +109,10 @@ pub fn run_watch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     loop {
         iter += 1;
         let start = std::time::Instant::now();
-        let output = Command::new("sh").arg("-c").arg(&cmd_str).output()?;
+        let mut sh = Command::new("sh");
+        sh.arg("-c").arg(&cmd_str);
+        keep_ignored_sigpipe(&mut sh);
+        let output = sh.output()?;
         let elapsed = start.elapsed();
 
         if ctx.stdout_is_tty() {

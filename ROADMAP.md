@@ -1,6 +1,6 @@
 # Roadmap & Known Gaps
 
-GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every option it implements when output is not a terminal. Everything below is a **known** difference: either not implemented yet, or a deliberate choice. GNU's own test suite measures how far that goes: 365 of the 375 GNU tests that exercise only Dogfish programs pass (see the README), and each failing test is a cairn item in [`cairn/items`](./cairn/items). The list below covers the differences known before that suite ran. If you hit one that isn't listed, please [open an issue](https://github.com/oddurs/gnu-dogfish/issues/new/choose) with the exact command line.
+GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every option it implements when output is not a terminal. Everything below is a **known** difference: either not implemented yet, or a deliberate choice. GNU's own test suite measures how far that goes: 366 of the 375 GNU tests that exercise only Dogfish programs pass (see the README), and each failing test is a cairn item in [`cairn/items`](./cairn/items). The list below covers the differences known before that suite ran. If you hit one that isn't listed, please [open an issue](https://github.com/oddurs/gnu-dogfish/issues/new/choose) with the exact command line.
 
 ## Cross-cutting
 
@@ -9,6 +9,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - **File names that are not UTF-8** work in `cp`, `mv`, `ln`, `mkdir`, `mktemp`, `rm`, `stat`, `df`, `realpath`, `basename`, `dirname`, `chmod`, `chown`, `touch`, `env`, `printenv`, `id`, `tail`, `ls`, `du`, `sort` (except names read with `--files0-from`) and the checksum tools (`md5sum`, `sha256sum`, `b2sum`, including `-c` lists). The other tools that read files (`cat`, `head`, `wc`, ...) still turn such a name into U+FFFD replacement characters, so they report it as missing.
 - **Extended floating point.** `seq` and `printf` use 64-bit doubles where GNU uses `long double`, so a few extreme values differ (e.g. `seq -f %g 1e20 1e20`). `%a` is not supported in `printf`. `sort -g` does convert to the x86-64 80-bit `long double` as GNU does there (on other architectures GNU's `long double` differs, Dogfish's does not).
 - **SELinux.** `-Z`/`--context` options are accepted and ignored.
+- **A closed standard output** (`>&-`) fails every write with `EBADF` and is diagnosed as GNU does, but Dogfish holds descriptor 1 open on `/dev/null` meanwhile, so no file a tool opens lands there. GNU's tools open their next file on it instead, which shows in a few corner cases: `/dev/stdout` names `/dev/null`, so `tee /dev/stdout >&-` and `sort -o /dev/stdout >&-` write there where GNU cannot open it, and `uniq IN OUT >&-` with an `OUT` that cannot be created reports why rather than GNU's `Bad file descriptor`.
 
 ## File & directory tools
 

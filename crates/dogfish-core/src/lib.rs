@@ -5,7 +5,7 @@
 //! - **Adaptive NDJSON / Table Output**: Emit structured JSON Lines when piped or `--json` is passed,
 //!   and automatically render aligned, colorized tables & sparklines on interactive TTYs.
 //! - **Zero-Copy & SIMD I/O**: `mmap`, 64 KiB aligned buffered writers, macOS `clonefile` / Linux CoW,
-//!   and graceful `SIGPIPE` / `EPIPE` handling.
+//!   and one standard output with GNU `close_stdout` write-error semantics.
 //! - **Undo Journal**: Transaction log and trash staging for reversible `rm`, `mv`, and `cp`.
 
 pub mod context;

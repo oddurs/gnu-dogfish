@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{
     ColumnAlign, DogfishContext, Style, Table, emit_objects_or_table, format_size, gnu_io_error,
-    io::ignore_broken_pipe, sparkline_bar, stdout,
+    sparkline_bar, stdout,
 };
 use serde::Serialize;
 
@@ -613,7 +613,7 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     } else {
         df_render_gnu(&rows, &cfg, &mut out)?;
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(status)
 }
 
@@ -1023,7 +1023,7 @@ fn df_render_gnu<W: Write>(rows: &[DfRow], cfg: &DfConfig, out: &mut W) -> io::R
             }
         }
         line.push(b'\n');
-        ignore_broken_pipe(out.write_all(&line))?;
+        out.write_all(&line)?;
     }
     Ok(())
 }
