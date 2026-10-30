@@ -1,0 +1,100 @@
+name: Benchmarks
+
+# Runs util/bench.py (Dogfish against GNU coreutils on the same inputs) on every
+# merge to main and keeps every run in history.ndjson on the bench-history
+# branch. The job fails when a benchmark's GNU/Dogfish ratio falls more than
+# 15% below its median over the last ten runs on the same CPU model; ratios
+# rather than times, so a slower runner does not read as a regression.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".cargo/config.toml"
+      - "util/bench.py"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# One run at a time, so two merges cannot both append to the history from the
+# same parent and have one push rejected.
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: Benchmarks against GNU
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push to the bench-history branch
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Self-test the regression check
+        run: python3 util/bench.py --self-test
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Fetch the history
+        run: |
+          if git fetch --depth=1 origin bench-history; then
+            git worktree add history FETCH_HEAD
+          else
+            git worktree add --orphan -b bench-history history
+          fi
+
+      - name: Run the benchmarks
+        env:
+          DOGFISH: target/release/dogfish
+          REPEAT: "5"
+        run: |
+          set -o pipefail
+          status=0
+          python3 util/bench.py --json run.json --history history/history.ndjson \
+            | tee bench.txt || status=$?
+          {
+            echo '## Benchmarks against GNU coreutils'
+            echo
+            echo 'Ratio GNU/Dogfish: above 1.0 Dogfish is faster.'
+            echo
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      # Kept even when the run regressed: the history is a record of what was
+      # measured, and the next run should compare against it.
+      - name: Save the history
+        if: always() && hashFiles('history/history.ndjson') != ''
+        run: |
+          cd history
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.ndjson
+          git commit -qm "bench: ${GITHUB_SHA::12}"
+          git push origin HEAD:refs/heads/bench-history
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: bench-${{ github.sha }}
+          path: |
+            run.json
+            bench.txt
+          if-no-files-found: ignore

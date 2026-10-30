@@ -4,7 +4,10 @@
   util/bench.py                      build Dogfish, run every benchmark, print a table
   util/bench.py -k sort -k wc        only benchmarks whose name contains a pattern
   util/bench.py --json out.json      also write the results
-  util/bench.py --baseline b.json    fail if a ratio is more than 20% worse than in b.json
+  util/bench.py --baseline b.json    fail if a ratio is more than 15% worse than in b.json
+  util/bench.py --history h.ndjson   compare against earlier runs on the same CPU, then
+                                     append this run (what CI does on every merge to main)
+  util/bench.py --self-test          check that the regression test catches a 20% slowdown
 
 Each benchmark runs the same command line with the GNU program (/usr/bin, or
 GNU= directory) and with Dogfish (through a symlink named like the tool, as
@@ -21,8 +24,10 @@ Environment: DOGFISH (binary; default: build target/release/dogfish), GNU
 """
 
 import argparse
+import datetime
 import json
 import os
+import platform
 import random
 import shutil
 import statistics
@@ -206,8 +211,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-k", action="append", default=[], help="only benchmarks whose name contains this")
     ap.add_argument("--json", help="write results to this file")
-    ap.add_argument("--baseline", help="compare against an earlier --json; exit 1 on a >20%% regression")
+    ap.add_argument("--baseline", help="compare against an earlier --json; exit 1 on a >15%% regression")
+    ap.add_argument("--history", help="NDJSON file of earlier runs: compare, exit 1 on a regression, append")
+    ap.add_argument("--self-test", action="store_true", help="test the regression check and exit")
     args = ap.parse_args()
+    if args.self_test:
+        return self_test()
 
     work = os.environ.get("WORK") or os.path.join(REPO, "target", "bench")
     repeat = int(os.environ.get("REPEAT", "7"))
@@ -226,10 +235,7 @@ def main():
     env = dict(os.environ, LC_ALL="C", DOGFISH_UNDO="off", DOGFISH_HOME=os.path.join(work, "home"))
     env.pop("LANG", None)
 
-    rows = []
-    for name, tool, argv, stdin, setup, inv in benchmarks(paths, scratch):
-        if args.k and not any(k in name for k in args.k):
-            continue
+    def measure(name, tool, argv, stdin, setup, inv, repeat):
         link = os.path.join(links, tool)
         if os.path.realpath(link) != dogfish:
             if os.path.lexists(link):
@@ -253,25 +259,138 @@ def main():
                "gnu_cpu": med["gnu"][1], "dogfish_cpu": med["dogfish"][1]}
         row["wall_ratio"] = row["gnu_wall"] / max(row["dogfish_wall"], 1e-9)
         row["cpu_ratio"] = row["gnu_cpu"] / max(row["dogfish_cpu"], 1e-9)
-        rows.append(row)
         flag = "" if row["wall_ratio"] >= 1 and row["cpu_ratio"] >= 1 else "  <-- slower"
         print(f"{name:28} wall {row['gnu_wall']*1000:9.1f} ms GNU {row['dogfish_wall']*1000:9.1f} ms Dogfish "
               f"x{row['wall_ratio']:5.2f} | cpu {row['gnu_cpu']*1000:9.1f} / {row['dogfish_cpu']*1000:9.1f} "
               f"x{row['cpu_ratio']:5.2f}{flag}", flush=True)
+        return row
+
+    chosen = [b for b in benchmarks(paths, scratch) if not args.k or any(k in b[0] for k in args.k)]
+    rows = [measure(*b, repeat) for b in chosen]
+
+    def confirm(bad):
+        """Measures each flagged benchmark again, twice as long; a regression
+        stands only if the second measurement shows it too."""
+        names = {b[0] for b in bad}
+        print(f"\nmeasuring again: {', '.join(sorted(names))}")
+        for b in chosen:
+            if b[0] in names:
+                row = measure(*b, 2 * repeat)
+                rows[:] = [row if r["name"] == b[0] else r for r in rows]
 
     slower = [r["name"] for r in rows if r["wall_ratio"] < 1 or r["cpu_ratio"] < 1]
     print(f"\n{len(rows) - len(slower)}/{len(rows)} benchmarks: Dogfish at least as fast as GNU "
           f"in wall and CPU time." + (f" Slower: {', '.join(slower)}" if slower else ""))
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump({"repeat": repeat, "results": rows}, f, indent=1)
+    run = {"repeat": repeat, "cpu": cpu_model(), "commit": os.environ.get("GITHUB_SHA", ""),
+           "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "results": rows}
+    status = 0
     if args.baseline:
-        base = {r["name"]: r for r in json.load(open(args.baseline))["results"]}
-        bad = [r["name"] for r in rows if r["name"] in base
-               and r["wall_ratio"] < 0.8 * base[r["name"]]["wall_ratio"]]
+        baseline = [json.load(open(args.baseline))]
+        bad = regressions(rows, baseline)
         if bad:
-            print("regressions (>20% worse than baseline): " + ", ".join(bad))
-            return 1
+            confirm(bad)
+            bad = regressions(rows, baseline)
+        if bad:
+            report(bad, "the baseline")
+            status = 1
+    if args.history:
+        history = load_history(args.history, run["cpu"])
+        bad = regressions(rows, history)
+        if bad:
+            confirm(bad)
+            bad = regressions(rows, history)
+        if bad:
+            report(bad, f"the median of the last {min(len(history), HISTORY)} runs on this CPU")
+            status = 1
+        elif history:
+            print(f"no regressions against the last {min(len(history), HISTORY)} runs on this CPU")
+        else:
+            print("no earlier runs on this CPU to compare with")
+        with open(args.history, "a") as f:
+            f.write(json.dumps(run, separators=(",", ":")) + "\n")
+    if args.json:  # after any measurement again
+        with open(args.json, "w") as f:
+            json.dump(run, f, indent=1)
+    return status
+
+
+# A benchmark regresses when its GNU/Dogfish ratio, wall or CPU, falls more than
+# THRESHOLD below the median of the last HISTORY comparable runs. Ratios rather
+# than times, because GNU runs on the same machine in the same minute: a slower
+# runner slows both sides, a slower Dogfish only one. 15% sits above the noise
+# of shared runners on ratios and still catches a 20% slowdown (1/1.2 = 0.83).
+THRESHOLD = 0.15
+HISTORY = 10
+
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine()
+
+
+def load_history(path, cpu):
+    """The runs in an NDJSON history file made on this CPU, oldest first."""
+    runs = []
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    run = json.loads(line)
+                    if run.get("cpu") == cpu:
+                        runs.append(run)
+    return runs
+
+
+def regressions(rows, history):
+    """(name, metric, ratio, reference) for each ratio more than THRESHOLD below
+    the median of the same benchmark's ratio over the last HISTORY runs."""
+    bad = []
+    recent = history[-HISTORY:]
+    for row in rows:
+        for metric in ("wall_ratio", "cpu_ratio"):
+            past = [r[metric] for run in recent for r in run["results"]
+                    if r["name"] == row["name"] and metric in r]
+            if not past:
+                continue
+            ref = statistics.median(past)
+            if row[metric] < (1 - THRESHOLD) * ref:
+                bad.append((row["name"], metric, row[metric], ref))
+    return bad
+
+
+def report(bad, against):
+    print(f"regressions (more than {THRESHOLD:.0%} worse than {against}):")
+    for name, metric, ratio, ref in bad:
+        print(f"  {name:28} {metric:10} x{ratio:5.2f}, was x{ref:5.2f}")
+
+
+def self_test():
+    """The regression test against synthetic runs: run-to-run noise of a few
+    percent passes, a Dogfish 20% slower on one benchmark is caught."""
+    rng = random.Random(7)
+
+    def run(slow=None, factor=1.0):
+        rows = []
+        for i, name in enumerate(("cat", "sort", "wc -l", "startup: true")):
+            g = 0.010 * (i + 1) * rng.uniform(0.97, 1.03)
+            d = 0.008 * (i + 1) * rng.uniform(0.97, 1.03) * (factor if name == slow else 1)
+            rows.append({"name": name, "wall_ratio": g / d, "cpu_ratio": g / d})
+        return rows
+
+    history = [{"results": run()} for _ in range(12)]
+    assert regressions(run(), history) == [], "noise flagged as a regression"
+    bad = regressions(run("sort", 1.2), history)
+    assert {b[0] for b in bad} == {"sort"}, f"20% slowdown not caught: {bad}"
+    assert regressions(run("sort", 1.2), []) == [], "flagged without history"
+    print("self-test passed: noise passes, a 20% slowdown is caught")
     return 0
 
 

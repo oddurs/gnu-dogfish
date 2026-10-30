@@ -3,10 +3,11 @@ id: 22
 uid: cf554b40-4407-429b-b5f7-1adb948ba0d1
 title: "Track performance against GNU in CI"
 type: chore
-status: backlog
+status: doing
+assignee: claude
 milestone: "v1.0"
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
 priority: p2
 effort: m
 area: performance
@@ -26,4 +27,8 @@ flags regressions beyond noise.
 ## Acceptance criteria
 
 - [ ] Benchmarks run on every merge to main with history kept.
-- [ ] A synthetic 20% slowdown is detected.
+- [x] A synthetic 20% slowdown is detected.
+
+## Notes
+
+- 2026-10-30: `.github/workflows/bench.yml` runs `util/bench.py --history` on each merge to main (REPEAT=5) and appends every run to `history.ndjson` on the `bench-history` branch. The check compares GNU/Dogfish ratios, not times, so a slower runner slows both sides. A ratio more than 15% below the median of the last ten runs on the same CPU model is measured again at twice the repeats, and fails the job only if it still regresses. `util/bench.py --self-test` runs in the job first: run-to-run noise passes, and a 20% slowdown in one benchmark is caught. A dedicated runner would allow a tighter threshold.
