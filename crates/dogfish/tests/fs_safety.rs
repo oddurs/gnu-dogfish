@@ -160,6 +160,22 @@ fn overwriting_mv_never_leaves_the_destination_missing() {
     panic!("mv a b never ran to completion");
 }
 
+/// `mv c c/c`, with `c` a symlink to a directory, moves the symlink into that
+/// directory: the rename takes away what `c/c` resolved through, so the move
+/// must be recorded by where it went, not by the path as given.
+#[test]
+fn undo_of_mv_through_the_moved_symlink() {
+    let sb = Sandbox::new();
+    sb.write("b/x", "x");
+    symlink("b", sb.path("c")).unwrap();
+    assert!(sb.run(&["mv", "c", "c/c"]).status.success());
+    assert!(!sb.exists("c") && sb.exists("b/c"));
+    let out = sb.run(&["undo"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_link(sb.path("c")).unwrap(), Path::new("b"));
+    assert!(!sb.exists("b/c"));
+}
+
 #[test]
 fn undo_refuses_to_clobber_new_files() {
     let sb = Sandbox::new();

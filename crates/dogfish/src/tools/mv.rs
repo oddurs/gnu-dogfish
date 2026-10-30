@@ -183,13 +183,15 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut renamed_entry = None;
     if target_dir.is_none() && !no_target_dir && operands.len() == 2 && !backup_no_clobber {
         let (src, dst) = (Path::new(&operands[0]), Path::new(&operands[1]));
+        // Resolved now: the rename can move what `dst`'s path goes through.
+        let stable_dst = stable_path(dst);
         // Write-ahead, as for every move (see `Copier::copy`).
         renamed_entry = journal.as_ref().and_then(|j| {
             j.begin(
                 "mv",
                 JournalAction::Move {
                     src: stable_path(src),
-                    dst: stable_path(dst),
+                    dst: stable_dst.clone(),
                     backup_path: None,
                     copied: false,
                     existed: fs::symlink_metadata(dst).is_ok(),
@@ -203,9 +205,9 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(()) => 0,
             Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
         });
-        if x.rename_errno != Some(0)
-            && let (Some(j), Some(mut e)) = (&journal, renamed_entry.take())
-        {
+        if x.rename_errno == Some(0) {
+            x.renamed_dst = Some(stable_dst);
+        } else if let (Some(j), Some(mut e)) = (&journal, renamed_entry.take()) {
             let _ = j.cancel(&mut e);
         }
     }
