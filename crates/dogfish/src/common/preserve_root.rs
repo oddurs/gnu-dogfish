@@ -27,7 +27,7 @@ pub(crate) fn refuse_root(tool: &str, operand: impl AsRef<OsStr>) {
 
 /// The device and inode numbers of `/`, as GNU's `get_root_dev_ino` records them
 /// for `chmod -R` and `chown -R` with `--preserve-root`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DevIno {
     pub dev: u64,
     pub ino: u64,
