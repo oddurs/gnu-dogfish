@@ -29,6 +29,7 @@ pub(crate) mod interval;
 pub(crate) mod json_opt;
 pub(crate) mod lines;
 pub(crate) mod locale;
+pub(crate) mod md5;
 pub(crate) mod mode;
 pub(crate) mod parse_datetime;
 pub(crate) mod path;

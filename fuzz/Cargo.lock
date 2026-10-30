@@ -230,6 +230,7 @@ dependencies = [
  "jwalk",
  "libc",
  "md-5",
+ "md5-asm",
  "memchr",
  "memmap2",
  "rayon",
@@ -456,6 +457,15 @@ checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
  "cfg-if",
  "digest",
+]
+
+[[package]]
+name = "md5-asm"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d19b8ee7fc7d812058d3b708c7f719efd0713d53854648e4223c6fcae709e2df"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

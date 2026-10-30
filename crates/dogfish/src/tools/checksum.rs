@@ -13,13 +13,13 @@ use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, RecordWriter, gnu_io_error,
     gnu_quote, stdout,
 };
-use md5::Md5;
 use rayon::prelude::*;
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version,
 };
 use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::md5::Md5;
 use crate::common::quote::qf;
 use crate::common::sha256::Sha256;
 
@@ -146,7 +146,7 @@ enum Hasher {
 impl Hasher {
     fn update(&mut self, data: &[u8]) {
         match self {
-            Self::Md5(h) => Digest::update(h, data),
+            Self::Md5(h) => h.update(data),
             Self::Sha256(h) => Digest::update(h, data),
             Self::Blake2b(h) => h.update(data),
         }
@@ -154,7 +154,7 @@ impl Hasher {
 
     fn finalize_hex(self) -> String {
         let bytes = match self {
-            Self::Md5(h) => h.finalize().to_vec(),
+            Self::Md5(h) => h.finish().to_vec(),
             Self::Sha256(h) => h.finalize().to_vec(),
             Self::Blake2b(h) => h.finalize(),
         };

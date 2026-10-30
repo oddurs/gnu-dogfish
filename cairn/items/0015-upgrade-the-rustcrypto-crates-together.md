@@ -63,10 +63,17 @@ md5sum regresses: `util/bench.py -k md5` (256 MB, GNU/Dogfish, alternating
 the old and new binaries, REPEAT=9) went from 1.01/1.03 wall (1.02/1.03 CPU)
 with md-5 0.10 + `asm` to 0.82/0.83 wall (0.84/0.82 CPU) with md-5 0.11,
 which has no x86-64 assembly backend (only `soft` and loongarch64). b2sum
-(1.15) and sha256sum (0.90, unchanged, a separate matter) did not move. The
-README's benchmark table now says so. Getting it back means calling an
-assembly MD5 compression function directly (e.g. the `md5-asm` crate's
-`compress`, which needs no digest traits) behind our own padding: a
-follow-up, not part of this item.
+(1.15) and sha256sum (0.90, unchanged, a separate matter) did not move.
+
+Fixed on the same branch: `crate::common::md5` calls
+`md5_asm::compress` directly on x86/x86-64 (md5-asm 0.5.2, MIT, a
+target-specific dependency, so the aarch64 macOS type-check never sees it)
+with its own RFC 1321 padding, and falls back to md-5 0.11 elsewhere; sort
+-R keeps md-5. Tested against md-5 0.11 for lengths 0..=200, the padding
+boundaries, 1 MiB and odd-sized streaming chunks. Bench, three rounds
+alternating the three binaries (REPEAT=9, wall/CPU): md-5 0.10 + asm
+1.02/1.01, 1.03/1.03, 1.03/1.02; md-5 0.11 0.80/0.82, 0.83/0.83, 0.83/0.82;
+md5-asm direct 1.00/1.01, 1.01/1.01, 1.00/1.02. Back at parity, so the
+README's table is restored.
 
 Criterion left unticked until the PR merges with the full suite green.
