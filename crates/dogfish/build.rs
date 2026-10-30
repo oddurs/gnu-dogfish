@@ -8,6 +8,11 @@
 //! an archive) here puts it on the link line ahead of `-lgcc_s`; the linker
 //! takes the functions from it, and `--as-needed` then drops `libgcc_s`.
 //! This is what Rust itself does for `+crt-static` builds.
+//!
+//! Cargo gives a build script's `rustc-link-lib` to the package's library
+//! target only, so `main.rs` names the (otherwise empty) library with
+//! `extern crate` for the instruction to reach the binary's link; a test
+//! in `tests/integration.rs` checks that `libgcc_s` stays out.
 
 use std::process::Command;
 

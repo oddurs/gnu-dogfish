@@ -13,6 +13,11 @@ macro_rules! eprintln {
     };
 }
 
+// Linked for its native libraries only: Cargo passes the build script's
+// `rustc-link-lib` (the static unwinder, see build.rs) to the library
+// target alone, and an unused library would not reach the binary's link.
+extern crate dogfish_internal;
+
 mod common;
 mod manual;
 mod schema;
