@@ -7,10 +7,13 @@
 //! `readdir`'s file type, so that an entry need not be `stat`ed just to tell
 //! a directory. [`WalkPath`] keeps the printable path alongside for
 //! messages. A walk keeps at most [`MAX_OPEN_DIRS`] directories open. Deeper
-//! down, rm and du let go of a directory while reading a subdirectory and get
-//! it back through `..` ([`DirFd::open_parent`]), so no depth needs a path
-//! the kernel would have to resolve in one piece (`PATH_MAX`); chmod still
-//! reaches such entries by full path ([`WalkPath::c_path`]).
+//! down, it lets go of a directory while reading a subdirectory and gets it
+//! back through `..` ([`Parent`], [`DirFd::open_parent`]), so no depth needs
+//! a path the kernel would have to resolve in one piece (`PATH_MAX`). A walk
+//! that follows every symlink cannot climb back that way, as a directory
+//! reached through a symlink is not a child of its `..`: `du -L` reaches
+//! entries that deep by full path ([`WalkPath::c_path`]), and `chown -RL`
+//! walks by full path throughout, as GNU's `FTS_LOGICAL` does.
 
 use std::ffi::{CStr, OsStr};
 use std::io;
@@ -91,6 +94,16 @@ impl<'a> At<'a> {
             .map(drop)
     }
 
+    /// `fchownat`; `follow` changes a final symlink's referent (`chown`
+    /// vs `lchown`). `None` leaves that id as it is.
+    pub(crate) fn chown(self, uid: Option<u32>, gid: Option<u32>, follow: bool) -> io::Result<()> {
+        let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        // `-1` (all ones) is "unchanged".
+        let (uid, gid) = (uid.unwrap_or(u32::MAX), gid.unwrap_or(u32::MAX));
+        // SAFETY: `name` is a NUL-terminated C string.
+        cvt(unsafe { libc::fchownat(self.dir, self.name.as_ptr(), uid, gid, flags) }).map(drop)
+    }
+
     /// `access (W_OK)` failing with `EACCES`.
     pub(crate) fn write_protected(self) -> bool {
         // SAFETY: `name` is a NUL-terminated C string.
@@ -144,6 +157,82 @@ impl DirFd {
         Ok(DirFd(OwnedFd::from(file)))
     }
 }
+
+/// The directory a walk acts on entries in: the working directory (operands
+/// are paths from it) or an open directory, which a deep walk lets go of
+/// while it works in a subdirectory, and gets back through that
+/// subdirectory's `..`.
+pub(crate) enum Parent {
+    Cwd,
+    Dir {
+        /// `None` while let go of.
+        fd: Option<DirFd>,
+        /// (device, inode), to check the directory got back through `..`;
+        /// known when a subdirectory may let go of it.
+        id: Option<(u64, u64)>,
+    },
+}
+
+impl Parent {
+    /// The open directory `dir`, `depth` levels below an operand, as the
+    /// directory of its entries. Its identity is taken when subdirectories one
+    /// level further down will let go of it ([`Parent::release_deep`]).
+    pub(crate) fn dir(dir: DirFd, depth: usize) -> io::Result<Self> {
+        let id = if depth + 1 >= MAX_OPEN_DIRS {
+            Some(dir.id()?)
+        } else {
+            None
+        };
+        Ok(Parent::Dir { fd: Some(dir), id })
+    }
+
+    /// The open directory, if it is one and is open.
+    pub(crate) fn open_dir(&self) -> Option<&DirFd> {
+        match self {
+            Parent::Dir { fd, .. } => fd.as_ref(),
+            Parent::Cwd => None,
+        }
+    }
+
+    /// Lets go of this directory while its subdirectory `depth` levels below
+    /// an operand is walked, if that is deep enough; true if it did, when the
+    /// directory must be got back with [`Parent::reacquire`].
+    pub(crate) fn release_deep(&mut self, depth: usize) -> bool {
+        depth >= MAX_OPEN_DIRS && self.release()
+    }
+
+    /// How to act on `name` in this directory.
+    pub(crate) fn at<'a>(&self, name: &'a CStr) -> At<'a> {
+        match self {
+            Parent::Cwd => At::cwd(name),
+            Parent::Dir { fd: Some(fd), .. } => At { dir: fd.fd(), name },
+            // Not reached: a directory is got back before it is used again.
+            // EBADF says so if it were.
+            Parent::Dir { fd: None, .. } => At { dir: -1, name },
+        }
+    }
+
+    /// Closes the directory for now; true if it was open.
+    pub(crate) fn release(&mut self) -> bool {
+        match self {
+            Parent::Dir { fd, id: Some(_) } => fd.take().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Opens the directory again, as the `..` of `child`.
+    pub(crate) fn reacquire(&mut self, child: &DirFd) -> io::Result<()> {
+        if let Parent::Dir { fd, id: Some(id) } = self {
+            *fd = Some(child.open_parent(*id)?);
+        }
+        Ok(())
+    }
+}
+
+/// A walk that had to give up altogether: a directory it let go of could not
+/// be got back (it was moved meanwhile). GNU's `fts_read` fails then, and the
+/// tool stops, leaving any further operands alone.
+pub(crate) struct Lost;
 
 /// How GNU's `fts_open` names a command-line operand: two or more trailing
 /// slashes become one (`a///` is `a/`, `///` is `/`).

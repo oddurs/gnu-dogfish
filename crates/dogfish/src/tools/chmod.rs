@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
-use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, WalkPath};
+use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath, fts_root_name};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
@@ -204,26 +204,37 @@ pub fn run_chmod(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 
     let mut ok = true;
     for f in &files {
-        let Ok(c_path) = CString::new(f.as_bytes()) else {
+        // Named as fts names it: `d//` is `d/`, in messages too.
+        let f = fts_root_name(f.as_bytes());
+        let Ok(c_path) = CString::new(f) else {
             continue;
         };
-        let mut path = WalkPath::new(f.as_bytes());
-        ok &= chmod_path(At::cwd(&c_path), &mut path, 0, &run, ctx);
+        let mut path = WalkPath::new(f);
+        match chmod_path(&mut Parent::Cwd, &c_path, &mut path, 0, &run, ctx) {
+            Ok(o) => ok &= o,
+            Err(Lost) => {
+                ok = false;
+                break;
+            }
+        }
     }
     Ok(if ok { 0 } else { 1 })
 }
 
-/// Changes the mode of `at` (printed as `path`), then with `-R` of everything
-/// below it, each entry relative to its open directory. `depth` 0 is an
-/// operand, whose symlinks are followed; below, symlinks are left alone.
+/// Changes the mode of `name` in `parent` (printed as `path`), then with `-R`
+/// of everything below it, each entry relative to its open directory. `depth`
+/// 0 is an operand, whose symlinks are followed; below, symlinks are left
+/// alone.
 fn chmod_path(
-    at: At<'_>,
+    parent: &mut Parent,
+    name: &CStr,
     path: &mut WalkPath,
     depth: usize,
     run: &ChmodRun,
     ctx: &DogfishContext,
-) -> bool {
+) -> Result<bool, Lost> {
     let top_level = depth == 0;
+    let at = parent.at(name);
     let lstat = match at.stat(false) {
         Ok(st) => st,
         Err(e) => {
@@ -237,7 +248,7 @@ fn chmod_path(
             if run.verbose {
                 outln!("{} could not be accessed", qa(path.as_path()));
             }
-            return false;
+            return Ok(false);
         }
     };
     let st = if EntryType::of(&lstat) == EntryType::Symlink {
@@ -249,7 +260,7 @@ fn chmod_path(
                     qa(path.as_path())
                 );
             }
-            return true;
+            return Ok(true);
         }
         match at.stat(true) {
             Ok(st) => st,
@@ -263,7 +274,7 @@ fn chmod_path(
                 if run.verbose {
                     outln!("{} could not be accessed", qa(path.as_path()));
                 }
-                return false;
+                return Ok(false);
             }
         }
     } else {
@@ -274,7 +285,7 @@ fn chmod_path(
     // too, and no directory below an operand can be `/` unnoticed.
     if is_root_dev_ino(run.root_dev_ino, DevIno::of_stat(&st)) {
         refuse_root("chmod", path.as_path());
-        return false;
+        return Ok(false);
     }
 
     #[allow(clippy::unnecessary_cast)] // `mode_t` is `u16` on macOS
@@ -331,41 +342,66 @@ fn chmod_path(
     }
 
     if run.recursive && is_dir {
-        let mut names = Names::default();
-        // An operand that is a symlink to a directory is followed.
-        let read = at
-            .open_dir(!top_level)
-            .and_then(|d| d.read_names(&mut names).map(|()| d));
-        match read {
-            Ok(dir) => {
-                // Deep down, entries are reached by full path, with no directory held open.
-                let dir = (depth < MAX_OPEN_DIRS).then_some(dir);
-                for i in 0..names.len() {
-                    let (name, _, _) = names.get(i);
-                    let mark = path.push(name.to_bytes());
-                    ok &= match &dir {
-                        Some(d) => chmod_path(At { dir: d.fd(), name }, path, depth + 1, run, ctx),
-                        None => match path.c_path().map(CStr::to_owned) {
-                            Some(full) => chmod_path(At::cwd(&full), path, depth + 1, run, ctx),
-                            None => false,
-                        },
-                    };
-                    path.truncate(mark);
-                }
+        ok &= chmod_dir(parent, name, path, depth, run, ctx)?;
+    }
+    Ok(ok)
+}
+
+/// With `-R`, changes the modes of the entries of directory `name` in
+/// `parent` (printed as `path`), `depth` levels below an operand. A
+/// directory deep enough lets go of `parent` meanwhile and gets it back
+/// through its own `..`, so every entry is reached by one name from its open
+/// directory, at any depth.
+fn chmod_dir(
+    parent: &mut Parent,
+    name: &CStr,
+    path: &mut WalkPath,
+    depth: usize,
+    run: &ChmodRun,
+    ctx: &DogfishContext,
+) -> Result<bool, Lost> {
+    let mut names = Names::default();
+    // An operand that is a symlink to a directory is followed.
+    let this = parent
+        .at(name)
+        .open_dir(depth > 0)
+        .and_then(|d| d.read_names(&mut names).map(|()| d))
+        .and_then(|d| Parent::dir(d, depth));
+    let mut this = match this {
+        Ok(this) => this,
+        Err(e) => {
+            if !run.quiet {
+                eprintln!(
+                    "chmod: cannot read directory {}: {}",
+                    qa(path.as_path()),
+                    gnu_io_error(&e)
+                );
             }
-            Err(e) => {
-                if !run.quiet {
-                    eprintln!(
-                        "chmod: cannot read directory {}: {}",
-                        qa(path.as_path()),
-                        gnu_io_error(&e)
-                    );
-                }
-                ok = false;
+            return Ok(false);
+        }
+    };
+    let released = parent.release_deep(depth);
+    let mut ok = true;
+    for i in 0..names.len() {
+        let (child, _, _) = names.get(i);
+        let mark = path.push(child.to_bytes());
+        let status = chmod_path(&mut this, child, path, depth + 1, run, ctx);
+        path.truncate(mark);
+        ok &= status?;
+    }
+    if released {
+        let got_back = match this.open_dir() {
+            Some(own) => parent.reacquire(own),
+            None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        };
+        if let Err(e) = got_back {
+            if !run.quiet {
+                eprintln!("chmod: fts_read failed: {}", gnu_io_error(&e));
             }
+            return Err(Lost);
         }
     }
-    ok
+    Ok(ok)
 }
 
 /// chmod's option table and help text, for its manual page and shell
@@ -397,7 +433,7 @@ mod tests {
         let c_path = CString::new(p.as_os_str().as_bytes()).unwrap();
         let mut path = WalkPath::new(p.as_os_str().as_bytes());
         let ctx = DogfishContext::new("chmod");
-        chmod_path(At::cwd(&c_path), &mut path, 0, &run, &ctx)
+        chmod_path(&mut Parent::Cwd, &c_path, &mut path, 0, &run, &ctx).unwrap_or(false)
     }
 
     #[test]
@@ -430,5 +466,42 @@ mod tests {
         // Without --preserve-root the same walk goes ahead.
         assert!(chmod_with_root(&link, None));
         assert_eq!((mode(&fake_root), mode(&inner)), (0o700, 0o700));
+    }
+
+    #[test]
+    fn a_directory_moved_while_let_go_of_stops_the_walk() {
+        use crate::common::dirfd::{At, MAX_OPEN_DIRS};
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), "x").unwrap();
+        let run = ChmodRun {
+            changes: None,
+            reference_mode: 0o700,
+            umask: 0o022,
+            recursive: true,
+            report_changes: false,
+            verbose: false,
+            quiet: true,
+            diagnose_surprises: false,
+            root_dev_ino: None,
+        };
+        let ctx = DogfishContext::new("chmod");
+        let top = CString::new(tmp.path().as_os_str().as_bytes()).unwrap();
+        let fd = At::cwd(&top).open_dir(false).unwrap();
+        // Deep enough to be let go of while `sub` is read; its `..` then
+        // turns out to be another directory than the one let go of, as if
+        // it had been moved meanwhile.
+        let meta = fs::metadata(tmp.path()).unwrap();
+        let mut parent = Parent::Dir {
+            fd: Some(fd),
+            id: Some((meta.dev(), meta.ino() + 1)),
+        };
+        let mut path = WalkPath::new(sub.as_os_str().as_bytes());
+        let walked = chmod_dir(&mut parent, c"sub", &mut path, MAX_OPEN_DIRS, &run, &ctx);
+        assert!(walked.is_err());
+        // What was reached before is changed; the directory is not got back.
+        assert_eq!(fs::metadata(sub.join("f")).unwrap().mode() & 0o7777, 0o700);
+        assert!(parent.open_dir().is_none());
     }
 }

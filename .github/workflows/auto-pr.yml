@@ -66,6 +66,12 @@ jobs:
               echo "A PR was opened for $BRANCH meanwhile"
               exit 0
             fi
+            # A repository setting, not a fault of the branch: say how to fix it
+            # without marking every new branch red.
+            if grep -q 'not permitted to create or approve pull requests' <<<"$out"; then
+              echo "::warning::Could not open a PR for $BRANCH: enable \"Allow GitHub Actions to create and approve pull requests\" in Settings > Actions > General, or set the AUTO_PR_TOKEN secret."
+              exit 0
+            fi
             echo "$out" >&2
             exit 1
           fi
