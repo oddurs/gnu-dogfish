@@ -66,7 +66,36 @@ fn fixture() -> &'static Path {
 
 /// The tools that change files: each of their runs gets a tree of its own
 /// ([`action_tree`]).
-const ACTION_TOOLS: &[&str] = &["cp", "mv", "rm", "mkdir", "ln", "chmod", "chown", "touch"];
+const ACTION_TOOLS: &[&str] = &[
+    "cp",
+    "mv",
+    "rm",
+    "mkdir",
+    "ln",
+    "chmod",
+    "chown",
+    "touch",
+    "mktemp",
+    "tee",
+    "undo",
+    "install-links",
+];
+
+/// What `tee` reads in the runs of [`producers`].
+const TEE_INPUT: &[u8] = b"to every file\n";
+
+/// Fills the journal of `dir` (an [`action_tree`]) with an entry of each
+/// kind, for `undo` to reverse: a copy over a file, a move, a trash.
+fn journal_some(dir: &Path) {
+    for args in [
+        &["cp", "a", "d/f"][..],
+        &["mv", "d/sub/g", "e/g"],
+        &["rm", "--safe", "d/l"],
+        &["cp", "-r", "d/sub", "copy"],
+    ] {
+        assert!(run_in(dir, args, b"").status.success(), "{args:?}");
+    }
+}
 
 /// A new directory for one run of a tool that changes files: `a` (a file),
 /// `d/` with `f`, `l` (a symlink to `f`), `sub/g` and, where the file system
@@ -94,7 +123,12 @@ fn action_tree() -> PathBuf {
 /// own if the tool changes files, else in the shared fixture.
 fn run_producer(tool: &str, args: &[&[u8]]) -> Output {
     if ACTION_TOOLS.contains(&tool) {
-        run_os(&action_tree(), &os_args(args), b"")
+        let dir = action_tree();
+        if tool == "undo" {
+            journal_some(&dir);
+        }
+        let input = if tool == "tee" { TEE_INPUT } else { b"" };
+        run_os(&dir, &os_args(args), input)
     } else {
         run_os(fixture(), &os_args(args), b"")
     }
@@ -191,6 +225,25 @@ fn producers() -> Vec<(&'static str, Vec<Vec<&'static [u8]>>)> {
         ),
         ("whoami", vec![c(&["whoami", "-J"])]),
         (
+            "hostname",
+            vec![c(&["hostname", "-J"]), c(&["hostname", "-sJ"])],
+        ),
+        (
+            "basename",
+            vec![
+                c(&["basename", "-J", "d/a.txt", ".txt"]),
+                c(&["basename", "-aJ", "d/a.txt", "/", "d/sub/"]),
+                c(&["basename", "-J"]),
+            ],
+        ),
+        (
+            "dirname",
+            vec![
+                c(&["dirname", "-J", "d/a.txt", "/", "x", "d/sub/"]),
+                c(&["dirname", "-zJ", "d/a.txt"]),
+            ],
+        ),
+        (
             "bench",
             vec![c(&["bench", "-J", "-n", "1", "--size-mb", "1"])],
         ),
@@ -246,6 +299,30 @@ fn producers() -> Vec<(&'static str, Vec<Vec<&'static [u8]>>)> {
         ),
         ("chown", vec![c(&["chown", "-RJ", "", "d", "missing"])]),
         ("touch", vec![c(&["touch", "-J", "a", "new", "missing/x"])]),
+        (
+            "mktemp",
+            vec![
+                c(&["mktemp", "-J", "-p", ".", "t.XXXXXX"]),
+                c(&["mktemp", "-dJ", "-p", "."]),
+                c(&["mktemp", "-uJ"]),
+                c(&["mktemp", "-J", "missing/XXXXXX"]),
+            ],
+        ),
+        (
+            "tee",
+            vec![
+                c(&["tee", "-J", "out", "d/f", "missing/x"]),
+                c(&["tee", "-aJ", "a"]),
+            ],
+        ),
+        ("undo", vec![c(&["undo", "-J", "-n", "9"])]),
+        (
+            "install-links",
+            vec![
+                c(&["install-links", "-J", "bin/x"]),
+                c(&["install-links", "-J", "a"]),
+            ],
+        ),
         // Only error records.
         (
             "error",
@@ -359,6 +436,8 @@ fn single_record_tools_write_one_line() {
         &["nproc", "-J"],
         &["whoami", "-J"],
         &["date", "-J"],
+        &["hostname", "-J"],
+        &["mktemp", "-uJ"],
     ] {
         let out = run_in(fixture(), args, b"");
         assert_eq!(
@@ -403,6 +482,29 @@ fn names_that_are_not_utf8_carry_their_bytes() {
     check(&[b"du", b"-aJ", b"d"], "path", path);
     check(&[b"realpath", b"-J", path], "path", path);
     check(&[b"md5sum", b"-J", path], "path", path);
+}
+
+#[test]
+fn operands_that_are_not_utf8_carry_their_bytes() {
+    // basename and dirname work on the operand alone, so this needs no file
+    // system that takes such names.
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let mut path = b"d\xfe/".to_vec();
+    path.extend_from_slice(BAD);
+    let args: Vec<&[u8]> = vec![b"basename", b"-J", &path];
+    let recs = records(&args, &run_os(fixture(), &os_args(&args), b""));
+    assert_eq!(recs[0]["path_bytes"], b64(&path));
+    assert_eq!(recs[0]["name_bytes"], b64(BAD));
+    assert_eq!(recs[0]["name"], String::from_utf8_lossy(BAD).as_ref());
+    let args: Vec<&[u8]> = vec![b"dirname", b"-J", &path];
+    let recs = records(&args, &run_os(fixture(), &os_args(&args), b""));
+    assert_eq!(recs[0]["dir_bytes"], b64(b"d\xfe"));
+    // A name that is UTF-8 has no twin.
+    let recs = records(
+        &[b"basename"],
+        &run_in(fixture(), &["basename", "-J", "d/a"], b""),
+    );
+    assert_eq!(recs, [serde_json::json!({"path": "d/a", "name": "a"})]);
 }
 
 #[test]
@@ -930,6 +1032,12 @@ fn json_keeps_gnu_stderr_and_writes_records_only() {
         &["wc", "missing", "a"],
         &["md5sum", "missing"],
         &["realpath", "missing/x"],
+        &["basename"],
+        &["basename", "a", "b", "c"],
+        &["dirname"],
+        &["mktemp", "missing/XXXXXX"],
+        &["mktemp", "XX"],
+        &["tee", "missing/x", "a"],
     ] {
         let plain = run_in(&action_tree(), args, b"");
         let json = run_in(&action_tree(), &with(args, "-J"), b"");
@@ -1006,4 +1114,113 @@ fn query_reads_action_and_error_records() {
     let changed = records(&[b"query"], &changed);
     assert!(!changed.is_empty());
     assert!(changed.iter().all(|r| r["status"] == "changed"));
+}
+
+#[test]
+fn records_of_mktemp_tee_undo_and_install_links() {
+    // mktemp: what it made, in place of its name.
+    let dir = action_tree();
+    let (recs, out) = act(&dir, &["mktemp", "-J", "-p", ".", "t.XXXX"]);
+    assert!(out.status.success());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["action"], "create");
+    let made = recs[0]["path"].as_str().unwrap();
+    assert!(
+        made.starts_with("./t.") && dir.join(made).is_file(),
+        "{made}"
+    );
+    let (recs, _) = act(&dir, &["mktemp", "-dJ", "-p", "."]);
+    assert_eq!(recs[0]["action"], "mkdir");
+    assert!(dir.join(recs[0]["path"].as_str().unwrap()).is_dir());
+    // -u makes nothing: no action.
+    let (recs, _) = act(&dir, &["mktemp", "-uJ", "-p", ".", "u.XXXX"]);
+    assert_eq!(recs[0]["dry_run"], true);
+    assert!(recs[0].get("action").is_none());
+    assert!(!dir.join(recs[0]["path"].as_str().unwrap()).exists());
+    let (recs, out) = act(&dir, &["mktemp", "-J", "nodir/XXXX"]);
+    assert_eq!(briefs(&recs), ["error nodir/XXXX"]);
+    assert_eq!(recs[0]["errno"], 2);
+    assert_eq!(out.status.code(), Some(1));
+
+    // tee: the data goes to the FILEs only; a record per FILE written.
+    let dir = action_tree();
+    let out = run_in(&dir, &["tee", "-J", "t1", "t2", "nodir/x"], b"data\n");
+    let recs = records(&[b"tee"], &out);
+    assert_eq!(briefs(&recs), ["error nodir/x", "write t1", "write t2"]);
+    assert_eq!(recs[1]["bytes"], 5);
+    assert_eq!(recs[1]["append"], false);
+    assert_eq!(fs::read(dir.join("t1")).unwrap(), b"data\n");
+    assert_eq!(fs::read(dir.join("t2")).unwrap(), b"data\n");
+    assert_eq!(out.stderr, b"tee: nodir/x: No such file or directory\n");
+    assert_eq!(out.status.code(), Some(1));
+    let out = run_in(&dir, &["tee", "-aJ", "t1"], b"more\n");
+    let recs = records(&[b"tee"], &out);
+    assert_eq!(recs[0]["append"], true);
+    assert_eq!(recs[0]["bytes"], 5);
+    assert_eq!(fs::read(dir.join("t1")).unwrap(), b"data\nmore\n");
+    // Without -J, standard output gets the data, as in GNU.
+    let out = run_in(&dir, &["tee", "t3"], b"x\n");
+    assert_eq!(out.stdout, b"x\n");
+
+    // undo: one record per entry, newest first, naming what it put back.
+    let dir = action_tree();
+    journal_some(&dir);
+    let hist = records(&[b"history"], &run_in(&dir, &["history", "-J"], b""));
+    let (recs, out) = act(&dir, &["undo", "-J", "-n", "9"]);
+    assert!(out.status.success());
+    assert_eq!(recs.len(), hist.len());
+    let ids: Vec<&Value> = recs.iter().map(|r| &r["undo_id"]).collect();
+    let want: Vec<&Value> = hist.iter().rev().map(|h| &h["id"]).collect();
+    assert_eq!(ids, want);
+    let at = |p: &str| dir.join(p).to_string_lossy().into_owned();
+    let undone: Vec<(&str, &str)> = recs
+        .iter()
+        .map(|r| (r["tool"].as_str().unwrap(), r["undone"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        undone,
+        [
+            ("cp", "copy"),
+            ("rm", "trash"),
+            ("mv", "move"),
+            ("cp", "copy")
+        ]
+    );
+    assert_eq!(recs[0]["removed"], serde_json::json!([at("copy")]));
+    assert_eq!(recs[0]["restored"], serde_json::json!([]));
+    assert_eq!(recs[1]["restored"], serde_json::json!([at("d/l")]));
+    assert_eq!(recs[2]["restored"], serde_json::json!([at("d/sub/g")]));
+    assert_eq!(recs[2]["removed"], serde_json::json!([at("e/g")]));
+    assert_eq!(recs[3]["restored"], serde_json::json!([at("d/f")]));
+    assert_eq!(
+        fs::read(dir.join("d/f")).unwrap(),
+        "x".repeat(3000).as_bytes()
+    );
+    assert!(dir.join("d/sub/g").exists() && !dir.join("e/g").exists());
+    // An empty journal: no records.
+    let (recs, out) = act(&dir, &["undo", "-J"]);
+    assert!(recs.is_empty() && out.status.success());
+    // A refusal is an error record naming the path.
+    let (_, _) = act(&dir, &["rm", "--safe", "a"]);
+    fs::write(dir.join("a"), "new\n").unwrap();
+    let (recs, out) = act(&dir, &["undo", "-J"]);
+    assert_eq!(briefs(&recs), [format!("error {}", at("a"))]);
+    assert_eq!(out.status.code(), Some(1));
+
+    // install-links: the directories it made, then each symlink.
+    let dir = action_tree();
+    let (recs, out) = act(&dir, &["install-links", "-J", "--prefix", "df-", "x/bin"]);
+    assert!(out.status.success());
+    assert_eq!(briefs(&recs[..2]), ["mkdir x", "mkdir x/bin"]);
+    let links: Vec<&Value> = recs[2..].iter().collect();
+    assert!(links.len() > 20);
+    for l in links {
+        assert_eq!(l["action"], "symlink");
+        let dest = l["dest"].as_str().unwrap();
+        assert!(dest.starts_with("x/bin/df-"), "{dest}");
+        assert_eq!(
+            fs::read_link(dir.join(dest)).unwrap().to_string_lossy(),
+            l["source"].as_str().unwrap()
+        );
+    }
 }

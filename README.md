@@ -107,7 +107,7 @@ cp: cannot stat 'missing': No such file or directory
 {"action":"copy","source":"src/main.rs","dest":"backup/main.rs","type":"file","bytes":14897,"undo_id":7}
 ```
 
-The tools that change files (`cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `touch`) write one record per action with `-J`, the structured form of `-v`, and with `-J` every diagnostic is also an `{"error":...,"path":...,"errno":...}` record, in order with the others; standard error stays GNU's.
+The tools that change files (`cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `touch`, `mktemp`, `tee`, `dogfish undo`, `dogfish install-links`) write one record per action with `-J`, the structured form of `-v`, and with `-J` every diagnostic is also an `{"error":...,"path":...,"errno":...}` record, in order with the others; standard error stays GNU's. Byte filters (`cat`, `tr`, `tac`, `nl`, `paste`, `base64`, ...) have no `-J`: their output is the data ([doc/ndjson.md](./doc/ndjson.md#tools-without-records)).
 
 ### 2. Global `--stats` Local Telemetry
 Append `--stats` to any Dogfish utility (or set `DOGFISH_STATS=1`; `echo`, `printf`, `true`, `false` and `yes` take their arguments as GNU does, so only the variable works there) to inspect wall-clock execution time, I/O throughput, item counts, and the active kernel/SIMD strategy:

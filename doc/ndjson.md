@@ -58,8 +58,9 @@ Field names are snake_case and mean the same in every tool:
 
 | Field | Meaning | Tools |
 |---|---|---|
-| `path` | the file's path: the operand as given, or a directory joined with an entry's name | ls, stat, du, wc, realpath, md5sum, sha256sum, b2sum, df, history; rm, mkdir, chmod, chown, touch, cp, mv; error records |
-| `name` | an entry's name in its directory; a variable's name | ls; env, printenv |
+| `path` | the file's path: the operand as given, or a directory joined with an entry's name | ls, stat, du, wc, realpath, md5sum, sha256sum, b2sum, df, history, basename, dirname; rm, mkdir, chmod, chown, touch, cp, mv, mktemp, tee, undo, install-links; error records |
+| `name` | an entry's name in its directory (what `basename` prints); a variable's name | ls, basename; env, printenv |
+| `dir` | the directory part of a name, as `dirname` prints it | dirname |
 | `type` | file type: `file`, `directory`, `symlink`, `fifo`, `socket`, `block_device`, `char_device`, `unknown` | ls, stat; cp, mv (of the source) |
 | `size` | bytes: a file's length (`st_size`); what du counts; a file system's size | ls, stat, du, df |
 | `blocks` | 512-byte blocks allocated (`st_blocks`) | ls, stat |
@@ -68,6 +69,7 @@ Field names are snake_case and mean the same in every tool:
 | `uid`, `gid` | user and group IDs | ls, stat, id, whoami, chown (after) |
 | `uid_before`, `gid_before` | the IDs before a change | chown |
 | `user`, `group` | their names, when they have one | ls, stat, id, whoami |
+| `hostname` | the host name `hostname` prints | hostname |
 | `nlink` | hard links | ls, stat |
 | `inode` | inode number | ls, stat |
 | `dev` | device number of the file system holding the file | ls, stat |
@@ -77,11 +79,16 @@ Field names are snake_case and mean the same in every tool:
 | `resolved` | a canonical name | realpath |
 | `value` | a variable's value; a number | env, printenv; seq |
 | `time` | the instant a record is about | date, history |
-| `bytes` | bytes read; bytes of data copied | wc, md5sum, sha256sum, b2sum; cp, mv |
+| `bytes` | bytes read; bytes of data copied or written | wc, md5sum, sha256sum, b2sum; cp, mv, tee |
 | `files` | entries counted below a directory | du |
-| `source`, `dest`, `backup` | the two ends of a copy, move or link, and the `--backup` name the destination's earlier file got | history; cp, mv, ln |
-| `action` | what an action record reports (see [Action records](#action-records)) | cp, mv, rm, mkdir, ln, chmod, chown, touch |
-| `undo_id` | the `dogfish undo` journal entry an action belongs to | cp, mv, rm --safe |
+| `source`, `dest`, `backup` | the two ends of a copy, move or link, and the `--backup` name the destination's earlier file got | history; cp, mv, ln, undo, install-links |
+| `action` | what an action record reports (see [Action records](#action-records)) | cp, mv, rm, mkdir, ln, chmod, chown, touch, mktemp, tee, undo, install-links |
+| `undo_id` | the `dogfish undo` journal entry an action belongs to, or that undo reversed | cp, mv, rm --safe; undo |
+| `tool`, `trash` | the tool that recorded a journal entry, and where the entry keeps a trashed file | history, undo |
+| `undone` | what the entry `undo` reversed had done: `trash`, `move` or `copy` (history's `action`) | undo |
+| `restored`, `removed` | arrays of paths: what undo gave back its earlier contents, and what it took away; a `_bytes` twin holds every element's bytes when one is not UTF-8 | undo |
+| `append` | tee added to the file (`-a`) rather than replacing it | tee |
+| `dry_run` | `mktemp -u`: a name was chosen, nothing made | mktemp |
 | `status`, `changed` | the outcome of a chmod or chown: `changed`, `retained`, `failed`, `inaccessible`, `skipped`; and whether the file changed. Of a `--check` line: `ok`, `failed`, `unreadable` | chmod, chown; md5sum, sha256sum, b2sum |
 | `created` | the file did not exist before | touch |
 | `error`, `errno` | a diagnostic without the `tool: ` prefix, and the system error number | error records |
@@ -102,7 +109,8 @@ Each tool's schema lists all of its fields with a description of each.
 | `realpath -J` | operand | [realpath](./schema/realpath.v1.json) |
 | `env -J`, `printenv -J` | variable | [env](./schema/env.v1.json), [printenv](./schema/printenv.v1.json) |
 | `id -J` | user | [id](./schema/id.v1.json) |
-| `uname -J`, `nproc -J`, `whoami -J` | run (one record) | [uname](./schema/uname.v1.json), [nproc](./schema/nproc.v1.json), [whoami](./schema/whoami.v1.json) |
+| `uname -J`, `nproc -J`, `whoami -J`, `hostname -J` | run (one record) | [uname](./schema/uname.v1.json), [nproc](./schema/nproc.v1.json), [whoami](./schema/whoami.v1.json), [hostname](./schema/hostname.v1.json) |
+| `basename -J`, `dirname -J` | NAME operand: `{"path":...,"name":...}`, `{"path":...,"dir":...}` (`-z` changes only the text) | [basename](./schema/basename.v1.json), [dirname](./schema/dirname.v1.json) |
 | `date -J` | time shown (one per line of `--file`) | [date](./schema/date.v1.json) |
 | `seq -J` | number: `{"value":N}` | [seq](./schema/seq.v1.json) |
 | `dogfish history -J` | journal entry | [history](./schema/history.v1.json) |
@@ -110,6 +118,10 @@ Each tool's schema lists all of its fields with a description of each.
 | `cp -J`, `mv -J`, `rm -J`, `mkdir -J`, `ln -J` | action, where `-v` prints a line ([Action records](#action-records)) | [cp](./schema/cp.v1.json), [mv](./schema/mv.v1.json), [rm](./schema/rm.v1.json), [mkdir](./schema/mkdir.v1.json), [ln](./schema/ln.v1.json) |
 | `chmod -J`, `chown -J` | file processed, where `-v` (or with `-c` alone, `-c`) prints a line | [chmod](./schema/chmod.v1.json), [chown](./schema/chown.v1.json) |
 | `touch -J` | file whose times were set | [touch](./schema/touch.v1.json) |
+| `mktemp -J` | run: what it created, in place of the name it prints | [mktemp](./schema/mktemp.v1.json) |
+| `tee -J` | FILE written, once its input ends | [tee](./schema/tee.v1.json) |
+| `dogfish undo -J` | journal entry undone | [undo](./schema/undo.v1.json) |
+| `dogfish install-links -J` | directory and symlink made | [install-links](./schema/install-links.v1.json) |
 | any of them | diagnostic ([Errors](#errors)) | [error](./schema/error.v1.json) |
 
 Example:
@@ -125,28 +137,50 @@ The tools that change files report what they did with `-J`: one record per
 action, written as it completes, the structured form of `-v`. A tool given
 `-J` decides what to report exactly as `-v` does (`chmod` and `chown` as
 `-v`, or with `-c` alone as `-c`), so the records are the `-v` lines, in
-the same order, and the `-v` text is not written. `touch` has no `-v`: it
-writes one record per file whose times it set.
+the same order, and the `-v` text is not written. `touch`, `mktemp`,
+`tee`, `dogfish undo` and `dogfish install-links` have no `-v`: they write
+a record for each thing they did, in place of their usual output, as the
+table says.
 
 | `action` | Written when | Fields | `-v` says |
 |---|---|---|---|
 | `copy` | cp (and mv across file systems) has made a copy: a regular file once its data is written, a directory when it is created (before its contents) | `source`, `dest`, `type` (of the source), `bytes` (regular files), `backup`, `undo_id` | `'a' -> 'b'`, `copied 'a' -> 'b'` |
 | `move` | mv renamed a file | `source`, `dest`, `type`, `backup`, `undo_id` | `renamed 'a' -> 'b'` |
-| `link`, `symlink` | ln, `cp -l`/`-s` (and `cp -a` for a file hard-linked to one already copied) made a link | `source` (the file linked to; for a symlink, its target as stored), `dest` (the link), `backup`, `undo_id` | `'b' => 'a'`, `'b' -> 'a'`, `'a' -> 'b'` |
+| `link`, `symlink` | ln, `cp -l`/`-s` (and `cp -a` for a file hard-linked to one already copied) made a link; `dogfish install-links` made a symlink to the dogfish binary | `source` (the file linked to; for a symlink, its target as stored), `dest` (the link), `backup`, `undo_id` | `'b' => 'a'`, `'b' -> 'a'`, `'a' -> 'b'` |
 | `backup` | `--backup` renamed the destination's file, just before the action that replaces it (the next record, whose `backup` names it) | `source` (the file), `dest` (its backup name) | `(backup: 'b~')`, `'b~' ~ ...` |
 | `unbackup` | a backup was renamed back after the action that was to replace its file failed | `source` (the backup), `dest` | `... (unbackup)` |
 | `remove`, `rmdir` | rm removed a file or a directory; cp removed a destination to replace it; mv removed a source after copying it across file systems | `path`, `undo_id` | `removed 'f'`, `removed directory 'd'` |
 | `trash` | `rm --safe` moved an operand to the trash | `path`, `undo_id` | `trashed 'f' (undo id #N ...)` |
-| `mkdir` | mkdir (each parent with `-p`), `cp --parents` or mv across file systems created a directory | `path` (and `source` for cp, `undo_id` for mv) | `mkdir: created directory 'd'`, `created directory 'd'` |
+| `mkdir` | mkdir (each parent with `-p`), `cp --parents`, mv across file systems, `mktemp -d` or `dogfish install-links` (for TARGET_DIR, outermost first) created a directory | `path` (and `source` for cp, `undo_id` for mv) | `mkdir: created directory 'd'`, `created directory 'd'` |
 | `chmod` | chmod processed a file | `path`, `status`, `changed`, `mode_before`(`_symbolic`), `mode`(`_symbolic`) | `mode of 'f' changed from ... to ...`, `... retained as ...`, `failed to change mode ...`, `... could not be accessed`, `neither symbolic link ... nor referent has been changed` |
 | `chown` | chown processed a file | `path`, `status`, `changed`, `uid_before`, `gid_before`, `uid`, `gid` | `changed ownership of ...`, `ownership of ... retained`, `failed to change ...` |
 | `touch` | touch set a file's times | `path`, `created` | (touch has no `-v`) |
+| `create` | mktemp created a file (`mkdir` for `mktemp -d`; with `-u`, which creates nothing, the record has no `action` but `"dry_run":true`) | `path` | (the name mktemp prints) |
+| `write` | tee wrote to a FILE: one record per FILE, once the input has ended (or, with `--output-error=exit`, once tee stops). With `-J` the data goes to the FILEs only: standard output holds the records. A FILE that could not be opened or written has an error record instead | `path`, `bytes`, `append` | (tee has no `-v`) |
+| `undo` | `dogfish undo` reversed a journal entry (one record per entry, newest first; an empty journal writes none) | `undo_id`, `tool`, `undone`, the entry's `path`/`trash` or `source`/`dest`/`backup` as `history -J` gives them, `restored`, `removed` | `✔ Undone: [id #N, tool: T] ...` |
 
 `status` is `changed`, `retained` or `failed` (the change was refused; the
 modes and ids then say what was asked for), `inaccessible` (the file could
 not be reached) or, for `chmod -R`, `skipped` (a symbolic link, which
 neither it nor its referent changes); `changed` is true exactly when the
 status is `changed`.
+
+Why tee reports at the end rather than per write: a write record per
+`read(2)` of input would say nothing a reader can use, and the end is when
+a FILE's contents are known. Records of what tee did not finish (a FILE
+that failed) are error records, as everywhere.
+
+`undo`'s `restored` lists the paths given back what they held before the
+operation (the trashed file, the moved file at its source, a destination's
+earlier contents), and `removed` the paths the operation had made that
+undo took away (a copy, a move's destination); both are empty when there
+was nothing left to undo (an interrupted operation that never got that
+far). The journal holds absolute paths, so these are absolute.
+
+```console
+$ dogfish undo -J
+{"action":"undo","undo_id":7,"tool":"mv","undone":"move","source":"/home/ada/a","dest":"/home/ada/b","restored":["/home/ada/a"],"removed":["/home/ada/b"]}
+```
 
 `undo_id` is the id of the `dogfish undo` journal entry the action is part
 of (one per command-line operand: every record of `cp -r d e` has the
@@ -166,6 +200,27 @@ $ dogfish cp -rJ src dst
 $ dogfish cp -rJ src missing dst | dogfish query -w 'action == copy' -f dest,bytes
 $ dogfish chmod -RJ go-w . | dogfish query -w changed=true
 ```
+
+## Tools without records
+
+A tool gets `-J` when its output is a value, or a set of values, about the
+system, about files or about its operands, or when it changes files. Some
+tools are neither, and take no `-J`, by design:
+
+- **Byte filters: their output is the data.** `cat`, `tac`, `tr`, `nl`,
+  `paste`, `base64` and `basenc` (and `head`, `tail`, `cut`, `sort`,
+  `uniq` and `shuf` on text) pass bytes through, transformed. Wrapping
+  each line in a record would add nothing a reader could not do with the
+  text, and would turn data that need not be text, or UTF-8, into
+  strings. When they read records, the record readers among them pass the
+  records on ([Reading records](#reading-records-query-head-tail-sort-uniq-cut-shuf)).
+- **Tools that print what they are given**: `echo`, `printf`, `yes`.
+- **Tools that run something else or only wait**: `timeout`, `watch`,
+  `sleep`, `true`, `false`; and `dogfish init`, whose output is shell code.
+
+`dogfish schema TOOL` says so for each of them. `sort -o` and `shuf -o`
+write their output to a file instead of standard output; it is still the
+data, and they have no action record for it.
 
 ## Reading records: `query`, `head`, `tail`, `sort`, `uniq`, `cut`, `shuf`
 

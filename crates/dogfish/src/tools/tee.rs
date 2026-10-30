@@ -6,11 +6,14 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, gnu_quote_file, stdout};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_io_error, stdout};
 
+use crate::common::actions;
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy_all, print_help, print_version,
+    Getopt, HasArg, OptSpec, argmatch, getopt_error, print_help, print_version,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::quote::qf;
 
 const TEE_HELP: &str = "\
 Copy standard input to each FILE, and also to standard output
@@ -26,6 +29,8 @@ Options:
   -p                           Operate in a more appropriate MODE with pipes (same as
                                --output-error=warn-nopipe)
       --output-error[=<MODE>]  Set behavior on write error: warn, warn-nopipe, exit, exit-nopipe
+  -J, --json[=VERSION]         Copy to the FILEs only, and write one NDJSON record per
+                               FILE written instead (Dogfish)
       --help                   Display this help and exit
 ";
 
@@ -35,11 +40,12 @@ enum TeeOpt {
     IgnoreInterrupts,
     NoPipe,
     OutputError,
+    Json,
     Help,
     Version,
 }
 
-/// GNU's `long_options` and `"aip"`.
+/// GNU's `long_options` and `"aip"`, plus the Dogfish `-J, --json`.
 const SPECS: &[OptSpec<TeeOpt>] = &[
     OptSpec::both(b'a', "append", HasArg::No, TeeOpt::Append),
     OptSpec::both(
@@ -52,13 +58,17 @@ const SPECS: &[OptSpec<TeeOpt>] = &[
     OptSpec::long("help", HasArg::No, TeeOpt::Help),
     OptSpec::long("version", HasArg::No, TeeOpt::Version),
     OptSpec::short(b'p', HasArg::No, TeeOpt::NoPipe),
+    json_short(TeeOpt::Json),
+    json_long(TeeOpt::Json),
 ];
 
 struct TeeArgs {
     append: bool,
     ignore_interrupts: bool,
     mode: OutputError,
-    files: Vec<String>,
+    /// `-J`: standard output holds a record per FILE, not the data.
+    json: bool,
+    files: Vec<OsString>,
 }
 
 /// Parses the command line; `Err` is the exit status after `--help`,
@@ -69,6 +79,7 @@ fn parse_tee_args(args: Vec<OsString>) -> std::result::Result<TeeArgs, i32> {
         append: false,
         ignore_interrupts: false,
         mode: OutputError::Sigpipe,
+        json: false,
         files: Vec::new(),
     };
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
@@ -94,11 +105,15 @@ fn parse_tee_args(args: Vec<OsString>) -> std::result::Result<TeeArgs, i32> {
                     )?,
                 };
             }
+            TeeOpt::Json => {
+                check_json_version("tee", v.as_deref())?;
+                p.json = true;
+            }
             TeeOpt::Help => return Err(print_help(TEE_HELP)),
             TeeOpt::Version => return Err(print_version("tee")),
         }
     }
-    p.files = lossy_all(opts.operands());
+    p.files = opts.operands();
     Ok(p)
 }
 
@@ -116,8 +131,10 @@ enum OutputError {
 /// One destination of `tee`; `fd` is `None` once it has failed and been
 /// dropped. `_file` keeps a named output open.
 struct TeeOutput {
-    name: String,
+    name: OsString,
     fd: Option<RawFd>,
+    /// Bytes written to it.
+    written: u64,
     /// Whether to watch this output for a broken pipe while input is idle.
     pollable: bool,
     _file: Option<File>,
@@ -240,18 +257,26 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let pipe_check = nopipe && input_may_block(libc::STDIN_FILENO);
 
     let mut status = 0;
-    let mut outputs = vec![TeeOutput {
-        name: "standard output".to_string(),
-        // A closed standard output (held by /dev/null) fails every write
-        // with EBADF, as in GNU: descriptor -1 does just that.
-        fd: Some(if stdout::was_closed() {
-            -1
-        } else {
-            libc::STDOUT_FILENO
-        }),
-        pollable: pipe_check && is_pipe(libc::STDOUT_FILENO),
-        _file: None,
-    }];
+    // With -J, standard output holds the records, so the data goes to the
+    // FILEs alone.
+    let mut outputs = Vec::with_capacity(parsed.files.len() + 1);
+    if parsed.json {
+        actions::start();
+    } else {
+        outputs.push(TeeOutput {
+            name: "standard output".into(),
+            // A closed standard output (held by /dev/null) fails every write
+            // with EBADF, as in GNU: descriptor -1 does just that.
+            fd: Some(if stdout::was_closed() {
+                -1
+            } else {
+                libc::STDOUT_FILENO
+            }),
+            written: 0,
+            pollable: pipe_check && is_pipe(libc::STDOUT_FILENO),
+            _file: None,
+        });
+    }
     for path in &parsed.files {
         let opened = OpenOptions::new()
             .create(true)
@@ -263,12 +288,14 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(f) => outputs.push(TeeOutput {
                 name: path.clone(),
                 fd: Some(f.as_raw_fd()),
+                written: 0,
                 pollable: pipe_check && is_pipe(f.as_raw_fd()),
                 _file: Some(f),
             }),
             Err(e) => {
-                eprintln!("tee: {}: {}", gnu_quote_file(path), gnu_io_error(&e));
+                eprintln!("tee: {}: {}", qf(path), gnu_io_error(&e));
                 if exits {
+                    report_writes(&outputs, parsed.append);
                     return Ok(1);
                 }
                 status = 1;
@@ -283,13 +310,15 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         if !warns_epipe && e.raw_os_error() == Some(libc::EPIPE) {
             return false;
         }
-        eprintln!("tee: {}: {}", gnu_quote_file(&out.name), gnu_io_error(e));
+        eprintln!("tee: {}: {}", qf(&out.name), gnu_io_error(e));
         *status = 1;
         exits
     };
 
     let mut stdin = io::stdin().lock();
     let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
+    // An output failed in a mode that exits at once.
+    let mut exiting = false;
     while let Some(first) = outputs.iter().position(|o| o.fd.is_some()) {
         if let (true, Some(fd)) = (outputs[first].pollable, outputs[first].fd) {
             match iopoll(libc::STDIN_FILENO, fd) {
@@ -297,6 +326,7 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 Ok(PollEvent::BrokenOutput) => {
                     let e = io::Error::from_raw_os_error(libc::EPIPE);
                     if fail_output(&mut outputs[first], &e, &mut status) {
+                        report_writes(&outputs, parsed.append);
                         return Ok(1);
                     }
                     continue;
@@ -327,16 +357,40 @@ pub fn run_tee(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             };
             // Unbuffered like GNU: every chunk reaches every output at once.
             match write_wait(fd, chunk) {
-                Ok(()) => ctx.telemetry.add_written(chunk.len() as u64),
+                Ok(()) => {
+                    out.written += chunk.len() as u64;
+                    ctx.telemetry.add_written(chunk.len() as u64);
+                }
                 Err(e) => {
                     if fail_output(out, &e, &mut status) {
-                        return Ok(1);
+                        exiting = true;
+                        break;
                     }
                 }
             }
         }
+        if exiting {
+            break;
+        }
     }
-    Ok(status)
+    report_writes(&outputs, parsed.append);
+    Ok(if exiting { 1 } else { status })
+}
+
+/// With `-J`, the record of each FILE tee wrote to: `{"action":"write",
+/// "path":...,"bytes":N,"append":BOOL}`, once its input is done. A FILE that
+/// could not be opened, or failed, has an error record instead.
+fn report_writes(outputs: &[TeeOutput], append: bool) {
+    if !actions::on() {
+        return;
+    }
+    for out in outputs.iter().filter(|o| o.fd.is_some()) {
+        actions::record("write", |r| {
+            r.os_str("path", &out.name)
+                .u64("bytes", out.written)
+                .bool("append", append);
+        });
+    }
 }
 
 /// tee's option table and help text, for its manual page and shell
