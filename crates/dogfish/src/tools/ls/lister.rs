@@ -390,11 +390,15 @@ impl<W: Write> Lister<'_, W> {
     fn inspect_link(&self, f: &mut LsFile) {
         let o = self.opts;
         let is_link = f.meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
-        // GNU also checks link targets for --group-directories-first and colours.
-        let check_target = o.indicator >= Indicator::FileType || o.check_symlink_mode;
-        if !is_link
-            || !(o.format == LsFormat::Long || check_target || o.json || self.rich.is_some())
-        {
+        // As GNU's gobble_file: the link is read for -l, and for
+        // --group-directories-first and colours that depend on the target
+        // (`check_symlink_mode`); its target is then stat'ed for those or an
+        // indicator. A plain -F prints `@` without either. The NDJSON and
+        // terminal outputs always show the target.
+        let gnu_reads = o.format == LsFormat::Long || o.check_symlink_mode;
+        let reads = gnu_reads || o.json || self.rich.is_some();
+        let check_target = reads && (o.indicator >= Indicator::FileType || o.check_symlink_mode);
+        if !is_link || !reads {
             return;
         }
         if let Ok(target) = fs::read_link(&f.path) {
@@ -424,7 +428,13 @@ impl<W: Write> Lister<'_, W> {
         command_line: bool,
     ) -> io::Result<()> {
         let o = self.opts;
-        let id = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        // Only -R can come back to a directory, so only -R needs its identity
+        // (one stat fewer for each listing otherwise).
+        let id = if o.recursive {
+            fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        } else {
+            None
+        };
         let shown = bytes_path(name);
         if let Some(id) = id
             && self.active.contains(&id)

@@ -3,7 +3,8 @@
 Dogfish is safe Rust except where it has to talk to the operating system
 through `libc`: system calls and C library functions that the standard library
 does not wrap (`statfs`, `getpwnam`, `utimensat`, `copy_file_range`, signal
-handling, ...), and one memory map. This file lists every `unsafe` in the
+handling, ...), one memory map, and the SHA-256 loop in assembly
+(`common/sha256.rs`). This file lists every `unsafe` in the
 workspace, what it does and why it is sound.
 
 ## Rules
@@ -242,8 +243,9 @@ with `read(2)` instead.
 
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
-| `blocks` | call of the `#[target_feature(enable = "avx2,bmi1,bmi2")]` `compress` | An `Avx2Sha256` is only made after `is_fastest` detected AVX2, BMI1 and BMI2. |
-| `store` | `_mm256_storeu_si256` | The destination is a 32-byte (8 × `u32`) subslice; the store is unaligned. |
+| `blocks` | call of the assembly `compress_avx2` or `compress_avx512vl` | An `Avx2Sha256` is only made after `is_fastest` detected AVX2, BMI1 and BMI2, the instructions `compress_avx2` uses; `vl` is only set after `has_avx512vl` detected AVX-512F and VL, which `compress_avx512vl` uses as well. The call passes at least one whole 64-byte block (`data` and `n` come from a non-empty `&[[u8; 64]]`), which the code only reads, and `&mut` to the 8-word state, which it updates. |
+| `attribute` | `#[unsafe(naked)]` on `compress_avx2` and `compress_avx512vl` (one macro) | The body is the whole function in assembly, with the `sysv64` ABI declared: it saves and restores the callee-saved registers it uses (rbx, rbp, r12-r15) and rsp, keeps its frame below the caller's rsp (aligned down to 64 bytes, 576 bytes), reads only the `n` blocks at `data`, `CONSTS` and its frame, writes only the state and its frame, ends with `vzeroupper` and returns. The `avx2_paths_match_ring` test runs both on lengths 0-320 and random lengths and splits. |
+| `extern` | `unsafe extern "sysv64" fn` of the same | The contract above: callers check the CPU features and pass valid pointers. |
 
 ### `crates/dogfish/src/common/signals.rs`
 

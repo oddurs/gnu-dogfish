@@ -17,7 +17,8 @@ name = "dogfish"
 path = "src/main.rs"
 
 # Empty unless the `fuzzing` feature is on: then it exposes the parsers to
-# the fuzz targets in `fuzz/` (see src/lib.rs). The binary does not use it.
+# the fuzz targets in `fuzz/` (see src/lib.rs). The binary links it only to
+# get build.rs's static unwinder, which Cargo hands to this target alone.
 [lib]
 name = "dogfish_internal"
 path = "src/lib.rs"

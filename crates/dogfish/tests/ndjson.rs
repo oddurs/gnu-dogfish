@@ -798,9 +798,22 @@ fn action_records_are_the_lines_of_v_in_order() {
                 .into_iter()
                 .filter(|n| !n.contains('\u{fffd}'))
                 .collect();
+            // A name quoted whole first: `d/sub` is also a substring of the
+            // line for `d/sub/g`, and taking that line for the directory's
+            // record (as inode order may have it come first) leaves none
+            // for the file's.
             let hit = unmatched
                 .iter()
-                .position(|line| wanted.iter().all(|n| line.contains(n.as_str())));
+                .position(|line| {
+                    wanted
+                        .iter()
+                        .all(|n| line.contains(format!("'{n}'").as_str()))
+                })
+                .or_else(|| {
+                    unmatched
+                        .iter()
+                        .position(|line| wanted.iter().all(|n| line.contains(n.as_str())))
+                });
             let Some(i) = hit else {
                 panic!("{args:?}: no line for {r} in {unmatched:#?}");
             };

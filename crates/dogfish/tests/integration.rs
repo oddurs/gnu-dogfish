@@ -40,6 +40,27 @@ fn test_true_and_false_exit_codes() {
     assert_eq!(run(&["false"]).status.code(), Some(1));
 }
 
+/// build.rs links GCC's unwinder statically on GNU/Linux, so the dynamic
+/// loader has one shared library fewer to load at every start (when the
+/// link line stopped carrying it, startup got 8% slower unnoticed).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn test_binary_does_not_need_libgcc_s() {
+    let have_libgcc_eh = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .arg("-print-file-name=libgcc_eh.a")
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains('/'));
+    if !have_libgcc_eh {
+        return;
+    }
+    let image = fs::read(bin()).unwrap();
+    let needle = b"libgcc_s.so";
+    assert!(
+        !image.windows(needle.len()).any(|w| w == needle),
+        "the binary names libgcc_s.so: the static unwinder did not reach the link"
+    );
+}
+
 #[test]
 fn test_echo_flags_and_escapes() {
     let out = run(&["echo", "hello", "dogfish"]);
