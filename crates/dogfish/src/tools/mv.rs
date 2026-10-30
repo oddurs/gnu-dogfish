@@ -234,6 +234,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     match targets {
         Targets::Into(dir, sources) => {
             copier.x.rename_errno = None;
+            copier.set_target_dir(Path::new(&dir));
             if sources.len() >= 2 {
                 copier.track_destinations();
             }

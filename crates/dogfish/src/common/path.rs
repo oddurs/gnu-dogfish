@@ -135,8 +135,11 @@ pub(crate) fn dir_name(p: &Path) -> PathBuf {
 }
 
 /// gnulib `same_name`: true when `a` and `b` name the same directory entry —
-/// equal last components (ignoring trailing slashes) in the same directory,
-/// compared without following a symlink in the last place.
+/// equal last components (ignoring trailing slashes) in the same directory.
+/// The last components are compared as names, never followed; the
+/// directories are stat'ed through symlinks, as `same_nameat` does
+/// (`fstatat` without `AT_SYMLINK_NOFOLLOW`): with `l` a symlink to `.`,
+/// `l/f` and `f` are one entry.
 pub(crate) fn same_name(a: &Path, b: &Path) -> bool {
     let base = |p: &Path| {
         let last = last_component(p.as_os_str().as_bytes());
@@ -145,10 +148,7 @@ pub(crate) fn same_name(a: &Path, b: &Path) -> bool {
     if base(a) != base(b) {
         return false;
     }
-    match (
-        fs::symlink_metadata(dir_name(a)),
-        fs::symlink_metadata(dir_name(b)),
-    ) {
+    match (fs::metadata(dir_name(a)), fs::metadata(dir_name(b))) {
         (Ok(x), Ok(y)) => same_inode(&x, &y),
         _ => false,
     }

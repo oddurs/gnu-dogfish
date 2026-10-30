@@ -688,6 +688,60 @@ fn failed_cp_link_with_backup_puts_the_backup_back_and_records_nothing() {
     remove_other_fs_trash(&sb);
 }
 
+/// `a/` holding `c` and `a/a`, a symlink to `../a` (so `a/a/a` is `a/a`).
+fn dir_with_symlink_to_itself(sb: &Sandbox) {
+    sb.write("a/c", "");
+    symlink("../a", sb.path("a/a")).unwrap();
+}
+
+#[test]
+fn cp_backup_onto_itself_through_a_directory_symlink_changes_nothing() {
+    // `a/a/a` is the entry `a/a`. The same-file check compared the parent
+    // directories without following `a/a`, so cp renamed `a/a` to `a/a~`
+    // and then failed, leaving it renamed.
+    let sb = Sandbox::new();
+    dir_with_symlink_to_itself(&sb);
+    let out = sb.run(&["cp", "--backup=simple", "-r", "a/a", "a/a"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), "cp: 'a/a' and 'a/a/a' are the same file\n");
+    assert_eq!(fs::read_link(sb.path("a/a")).unwrap(), Path::new("../a"));
+    assert!(!sb.exists("a/a~"));
+    assert!(sb.history().is_empty(), "{:?}", sb.history());
+}
+
+#[test]
+fn undo_puts_back_a_backup_made_through_a_symlink_it_renamed() {
+    // The backup renames the symlink the destination's path goes through;
+    // the journal recorded the path as spelled (`a/a/a`), which then named
+    // nothing, so undo left the symlink renamed.
+    let sb = Sandbox::new();
+    dir_with_symlink_to_itself(&sb);
+    let out = sb.run(&["mv", "--backup=numbered", "a", "a/a"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "mv: cannot move 'a' to a subdirectory of itself, 'a/a/a'\n"
+    );
+    assert!(sb.exists("a/a.~1~"));
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(fs::read_link(sb.path("a/a")).unwrap(), Path::new("../a"));
+    assert!(!sb.exists("a/a.~1~"));
+
+    // As GNU, cp can't put the backup back by the path as spelled; undo can.
+    symlink(".", sb.path("l")).unwrap();
+    let out = sb.run(&["cp", "-Pb", "-T", "a/a", "l/l"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("cannot un-backup 'l/l'"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(fs::read_link(sb.path("l")).unwrap(), Path::new("."));
+    assert!(!sb.exists("l~"));
+    assert!(sb.history().is_empty(), "{:?}", sb.history());
+}
+
 #[test]
 fn undo_of_mv_across_file_systems_keeps_hard_links() {
     // The move copies `a` and unlinks it; its inode lives on as `b`. Undo
