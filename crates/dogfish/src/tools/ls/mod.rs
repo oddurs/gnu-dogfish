@@ -14,7 +14,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{ColorMode, DogfishContext, RecordWriter, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, stdout};
 
 use crate::common::uname_info::get_uname_info;
 use crate::tools::ls::colors::{C_EXEC, C_MISSING, C_ORPHAN, LsColors};
@@ -23,18 +23,12 @@ use crate::tools::ls::options::{LsFormat, LsIgnore, parse_ls_args};
 use crate::tools::ls::rich::render_tree;
 
 pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
-    let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty()) {
+    // `--color=WHEN` and the Dogfish `--no-color` each set both the GNU and
+    // the rich output's colours; the later of the two wins.
+    let (mut opts, operands) = match parse_ls_args(&args[1..], ctx.stdout_is_tty(), &ctx.switches) {
         Ok(v) => v,
         Err(status) => return Ok(status),
     };
-    // `--color=WHEN` also sets the rich output's colours; the Dogfish
-    // `--no-color` turns both off.
-    if let Some(mode) = opts.color_mode {
-        ctx.switches.set_color(mode);
-    }
-    if ctx.color_mode() == ColorMode::Never {
-        opts.color = false;
-    }
     let targets: Vec<Vec<u8>> = if operands.is_empty() {
         vec![b".".to_vec()]
     } else {

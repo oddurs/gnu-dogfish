@@ -934,6 +934,63 @@ fn test_error_handling_and_exit_codes() {
     assert!(!run(&["definitely_not_a_utility"]).status.success());
 }
 
+/// `ls`'s GNU `--color[=WHEN]` and the Dogfish `--no-color`: whichever comes
+/// last wins, on a pipe (GNU's colours) and on a terminal (the rich output).
+#[test]
+fn test_ls_color_and_no_color_last_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let dir = dir.to_str().unwrap();
+    let colored = |out: &Output| out.stdout.contains(&0x1b);
+    let ls = |args: &[&str]| {
+        Command::new(bin())
+            .arg("ls")
+            .args(args)
+            .arg(dir)
+            .env_remove("LS_COLORS")
+            .output()
+            .expect("failed to execute dogfish")
+    };
+    for (args, want) in [
+        (&["--color=always", "--no-color"][..], false),
+        (&["--no-color", "--color=always"], true),
+        (&["--color", "--no-color"], false),
+        (&["--no-color", "--color"], true),
+        (&["--no-color", "--color=never"], false),
+        (&["--color=always", "--no-color", "--color=yes"], true),
+    ] {
+        let out = ls(args);
+        assert!(out.status.success(), "{args:?}");
+        assert_eq!(colored(&out), want, "ls {args:?}: {:?}", stdout_str(&out));
+    }
+
+    // The rich terminal output, on a pty from util-linux `script`.
+    let have_script = Command::new("script")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !have_script {
+        return;
+    }
+    for (args, want) in [
+        ("--color=always --no-color", false),
+        ("--no-color --color=always", true),
+        ("--color --no-color", false),
+        ("--no-color --color", true),
+    ] {
+        let out = Command::new("script")
+            .args(["-qec", &format!("{} ls {args} {dir}", bin()), "/dev/null"])
+            .env_remove("LS_COLORS")
+            .env("TERM", "xterm")
+            .env_remove("NO_COLOR")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(colored(&out), want, "pty ls {args}: {:?}", stdout_str(&out));
+    }
+}
+
 #[test]
 fn test_global_stats_and_color_flags_on_every_category() {
     // `--stats` should emit `[⚡ gnu/dogfish ...]` on stderr without polluting stdout
