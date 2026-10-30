@@ -956,6 +956,34 @@ fn undo_restores_known_counterexamples() {
             ));
         }
     }
+    // cairn 0065: `rm --safe a/b` leaves `a/c` with a link in the trash, so
+    // `cp -a` replaces `a/c` with a new inode rather than write through it.
+    // Undoing the copy restored its contents but not its inode, and the `b`
+    // the trash gave back was no longer linked to it.
+    cases.push((
+        vec![
+            (2, file(b"")),
+            (
+                0,
+                dir(vec![(1, file(b"")), (2, Node::HardLink(1)), (0, file(b""))]),
+            ),
+            (1, dir(vec![(0, file(b""))])),
+            (3, dir(vec![(1, file(b"")), (3, file(b"")), (2, file(b""))])),
+        ],
+        vec![],
+        vec![
+            fixed_op(Tool::Cp, &["-T", "-r"], vec![at(3, false), at(1, false)]),
+            fixed_op(
+                Tool::Rm,
+                &[],
+                vec![P {
+                    second: Some(1),
+                    ..at(0, false)
+                }],
+            ),
+            fixed_op(Tool::Cp, &["-a", "-T"], vec![at(3, false), at(0, false)]),
+        ],
+    ));
     for (work, other, ops) in &cases {
         if let Err(e) = check_sequence(work, other, ops) {
             panic!("{ops:?}: {e}");

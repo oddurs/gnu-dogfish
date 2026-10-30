@@ -223,6 +223,7 @@ fn asan(root: &Path) -> Step {
         .arg(format!("+{ASAN_TOOLCHAIN}"))
         .args(["test", "-Zbuild-std", "--target", &target])
         .args(["--workspace", "--locked", "--lib", "--bins", "--tests"])
+        .arg("--no-fail-fast")
         .arg("--target-dir")
         .arg(root.join("target/asan"))
         .env("RUSTFLAGS", "-Zsanitizer=address")
@@ -230,6 +231,10 @@ fn asan(root: &Path) -> Step {
         // Dogfish catches SIGBUS itself, to report a mapped input truncated
         // under it; ASan's own handler would take the signal first.
         .env("ASAN_OPTIONS", asan_options())
+        .env(
+            "LSAN_OPTIONS",
+            format!("suppressions={}", root.join("util/lsan.supp").display()),
+        )
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .current_dir(root))
     .map_err(|e| {

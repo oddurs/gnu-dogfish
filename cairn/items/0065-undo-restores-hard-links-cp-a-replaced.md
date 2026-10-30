@@ -25,3 +25,8 @@ Undoing an in-place copy restores the link structure the backup records. Files t
 
 - [x] `restore_in_place` relinks files the backup links and separates files it does not, with unit tests for both directions.
 - [x] The macOS seed is kept in `undo_model.proptest-regressions`.
+- [x] An original inode that `cp -a` replaced comes back on undo, so links elsewhere (the trash of an `rm --safe`) find it again; the shrunk sequence is a known counterexample in `undo_model.rs`.
+
+## 2026-10-30
+
+CI then shrank the macOS failure to `cp -T -r d b; rm --safe a/b; cp -a -T d a`, which also fails on Linux. After `rm --safe a/b`, `a/c` still has a link in the trash, so `cp -a` replaces it with a new inode. A content-only backup cannot bring that inode back. A `Take::Copy` backup now also hard-links each multiply-linked file into `<slot>.inodes`, and restore puts that original inode back in place of a replacement. The sweep counts `.inodes` as referenced while its slot is, and the backup limit removes the two together. One visible effect: while an entry lives, those files show one more link, as with the other trash links (see ROADMAP.md).

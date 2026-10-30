@@ -457,6 +457,98 @@ fn link_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
     copy_into_slot(src, slot)
 }
 
+/// Where [`copy_keeping_inodes`] keeps the original inodes of a slot's files.
+fn inodes_path(slot: &Path) -> PathBuf {
+    let mut p = slot.as_os_str().to_os_string();
+    p.push(".inodes");
+    PathBuf::from(p)
+}
+
+/// As [`copy_into_slot`], for a backup restored in place: each file of `src`
+/// with more than one link is also hard-linked into `<slot>.inodes`, named
+/// by its path under `src` (hex-encoded, `-` for `src` itself). A `cp -a` may
+/// replace such a file rather than write through it (GNU does, to keep its
+/// other links unchanged); undo then puts the original inode back, so the
+/// links that went elsewhere (the trash of an `rm --safe`, another
+/// directory) find it again.
+fn copy_keeping_inodes(src: &Path, slot: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> io::Result<()> {
+        let m = fs::symlink_metadata(dir)?;
+        if m.is_dir() {
+            for e in fs::read_dir(dir)? {
+                let name = e?.file_name();
+                walk(&dir.join(&name), &rel.join(&name), out)?;
+            }
+        } else if m.nlink() > 1 {
+            out.push((dir.to_path_buf(), rel.to_path_buf()));
+        }
+        Ok(())
+    }
+    let mut linked = Vec::new();
+    walk(src, Path::new(""), &mut linked)?;
+    if !linked.is_empty() {
+        let dir = inodes_path(slot);
+        fs::create_dir_all(&dir)?;
+        for (path, rel) in linked {
+            let name: String = if rel.as_os_str().is_empty() {
+                "-".to_string()
+            } else {
+                rel.as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            };
+            crash_point();
+            match fs::hard_link(&path, dir.join(name)) {
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+                    let _ = remove_any(&dir);
+                    return Err(e);
+                }
+                _ => {}
+            }
+        }
+    }
+    copy_into_slot(src, slot)
+}
+
+/// The original inodes [`copy_keeping_inodes`] kept for `slot`, by the path
+/// under `target` they were at.
+fn kept_inodes(slot: &Path, target: &Path) -> std::collections::HashMap<PathBuf, PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut kept = std::collections::HashMap::new();
+    let Ok(rd) = fs::read_dir(inodes_path(slot)) else {
+        return kept;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let rel = if name == "-" {
+            Some(Vec::new())
+        } else {
+            (0..name.len())
+                .step_by(2)
+                .map(|i| {
+                    name.get(i..i + 2)
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                })
+                .collect::<Option<Vec<u8>>>()
+        };
+        if let Some(rel) = rel {
+            let rel = PathBuf::from(std::ffi::OsString::from_vec(rel));
+            let t = if rel.as_os_str().is_empty() {
+                target.to_path_buf()
+            } else {
+                target.join(rel)
+            };
+            kept.insert(t, e.path());
+        }
+    }
+    kept
+}
+
 /// Copies `src` into the new trash slot `slot`, which appears only once complete.
 fn copy_into_slot(src: &Path, slot: &Path) -> io::Result<()> {
     let mut part = slot.as_os_str().to_os_string();
@@ -872,6 +964,7 @@ impl UndoJournal {
             if let Some(p) = e.action.drop_backup() {
                 crash_point();
                 remove_any(&p)?;
+                remove_any(&inodes_path(&p))?;
                 total -= e.backup_bytes;
                 e.backup_purged = true;
                 changed = true;
@@ -894,6 +987,7 @@ impl UndoJournal {
         let referenced: HashSet<PathBuf> = entries
             .iter()
             .flat_map(|e| e.action.payload_paths().map(Path::to_path_buf))
+            .flat_map(|p| [inodes_path(&p), p])
             .collect();
         for (i, dir) in self.trash_dirs().iter().enumerate() {
             let items = match fs::read_dir(dir) {
@@ -934,7 +1028,7 @@ impl UndoJournal {
         self.update(entry)?;
         let res = match how {
             Take::Move => move_path(target, &slot),
-            Take::Copy => copy_into_slot(target, &slot),
+            Take::Copy => copy_keeping_inodes(target, &slot),
             Take::Link => link_into_slot(target, &slot),
         };
         match res {
@@ -1252,9 +1346,14 @@ impl UndoJournal {
         match backup {
             Some(b) if exists_no_follow(b) => {
                 if exists && in_place {
-                    self.restore_in_place(b, created, &mut Relinks::default())?;
+                    let mut re = Relinks {
+                        kept: kept_inodes(b, created),
+                        ..Relinks::default()
+                    };
+                    self.restore_in_place(b, created, &mut re)?;
                     crash_point();
                     remove_any(b)?;
+                    remove_any(&inodes_path(b))?;
                 } else {
                     // Into the trash rather than deleted, in case it was edited since the
                     // copy; unreferenced, it is swept after ORPHAN_TTL_SECS.
@@ -1298,6 +1397,23 @@ impl UndoJournal {
         let (mb, mt) = (fs::symlink_metadata(backup)?, fs::symlink_metadata(target)?);
         if mb.is_file() && mt.is_file() {
             let (kb, kt) = ((mb.dev(), mb.ino()), (mt.dev(), mt.ino()));
+            if let Some(orig) = re.kept.get(target).cloned()
+                && let Ok(mo) = fs::symlink_metadata(&orig)
+                && (mo.dev(), mo.ino()) != kt
+                && !re.copies.contains_key(&kb)
+            {
+                // Replaced by a new inode: the original, with the backup's
+                // contents, goes back in its place.
+                self.restore_in_place(backup, &orig, &mut Relinks::default())?;
+                self.set_aside(target)?;
+                crash_point();
+                fs::hard_link(&orig, target)?;
+                if mb.nlink() > 1 {
+                    re.copies.insert(kb, target.to_path_buf());
+                }
+                re.restored.insert((mo.dev(), mo.ino()), kb);
+                return Ok(());
+            }
             let first = re.copies.get(&kb).cloned();
             let shared = re.restored.get(&kt).is_some_and(|k| *k != kb);
             if let Some(first) = first {
@@ -1371,6 +1487,8 @@ struct Relinks {
     copies: std::collections::HashMap<(u64, u64), PathBuf>,
     /// (device, inode) of a target restored in place → the backup file's.
     restored: std::collections::HashMap<(u64, u64), (u64, u64)>,
+    /// Target path → the original inode kept for it (see [`kept_inodes`]).
+    kept: std::collections::HashMap<PathBuf, PathBuf>,
 }
 
 #[cfg(test)]
