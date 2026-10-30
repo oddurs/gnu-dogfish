@@ -57,6 +57,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo xtask unsafe-audit
 
+      - name: JSON Schemas of the -J records (doc/schema)
+        if: runner.os == 'Linux'
+        run: cargo xtask schemas
+
       - name: Docs
         if: runner.os == 'Linux'
         run: cargo xtask doc

@@ -75,24 +75,32 @@ Pipe structured objects between standard Unix commands in `bash`, `zsh`, or `fis
 
 ```bash
 # Single-stage SQL-like query on `ls -J` output:
-dogfish ls -J crates/dogfish/src \
-  | dogfish query --where "size>10K" --sort size --desc --select name,size,kind,modified_relative
+dogfish ls -J crates/dogfish/src/tools \
+  | dogfish query --where "size>10K" --where type=file --sort size --desc --select name,size,mtime
 
 # Or compose standard Unix tools with NDJSON flags:
-dogfish ls -J crates/dogfish/src \
+dogfish ls -J crates/dogfish/src/tools \
   | dogfish sort --where "size>1K" --by size --desc \
-  | dogfish cut -f name,size,kind,modified_relative \
-  | dogfish head -n 5
+  | dogfish cut -f name,size,mtime \
+  | dogfish head -n 3 -J
 ```
-Output:
+Output (the records; on a terminal without `-J`, the same as a table):
 ```text
- name       size  kind  modified_relative
- ────────────────────────────────────────
- fs_ops.rs  31.2 KiB  file  4m ago           
- text.rs    28.7 KiB  file  2m ago           
- sys.rs     19.4 KiB  file  8m ago           
- meta.rs    12.1 KiB  file  1m ago           
- hash.rs    11.0 KiB  file  7m ago           
+{"name":"sort.rs","size":92311,"mtime":"2026-10-29T18:03:19.123456789Z"}
+{"name":"cp.rs","size":81734,"mtime":"2026-10-29T17:58:02.004718233Z"}
+{"name":"du.rs","size":49528,"mtime":"2026-10-29T18:01:44.981027611Z"}
+```
+
+Every `-J` record follows one contract, described in **[doc/ndjson.md](./doc/ndjson.md)**: one compact JSON object per line, streamed as produced; sizes and counts as integers; times as RFC 3339 UTC strings with nanoseconds plus an integer `*_ns` twin; modes in octal and symbolic form; names as received, with a base64 `*_bytes` twin when they are not UTF-8; the same field names in every tool. Each tool's records have a versioned JSON Schema in [`doc/schema/`](./doc/schema/) (`dogfish schema ls` prints one), and the compatibility policy is that fields may be added, while removing, renaming or retyping one needs a new version (`--json=2`).
+
+```console
+$ dogfish seq -J 2
+{"value":1}
+{"value":2}
+$ dogfish id -J
+{"uid":1000,"user":"ada","gid":1000,"group":"ada","euid":1000,"egid":1000,"groups":[{"gid":1000,"name":"ada"}]}
+$ dogfish du -a -J src | dogfish query -w "size>8K" -s size -d -n 1
+{"path":"src","size":1265664,"files":143}
 ```
 
 ### 2. Global `--stats` Local Telemetry
@@ -150,7 +158,7 @@ Like BusyBox, `dogfish` compiles into a single stripped, LTO-optimized binary th
 
 ### GNU compatibility
 
-When output goes to a pipe or a file, Dogfish behaves like GNU coreutils 9.4 byte for byte for the options it implements: the same output, error messages and exit codes. When output goes to a terminal, the visual tools (`ls`, `df`, `du`, `stat`, `wc --table`, ...) switch to their rich tables and sparklines. `-J/--json` always emits NDJSON for `dogfish query` pipelines.
+When output goes to a pipe or a file, Dogfish behaves like GNU coreutils 9.4 byte for byte for the options it implements: the same output, error messages and exit codes. When output goes to a terminal, the visual tools (`ls`, `df`, `du`, `stat`, `wc --table`, ...) switch to their rich tables and sparklines. `-J/--json` always emits NDJSON records ([doc/ndjson.md](./doc/ndjson.md)) for `dogfish query` pipelines; without it, output is GNU's.
 
 This is checked on every Linux CI run by a differential suite of more than 1,800 cases, which runs each command through both Dogfish and GNU in identical fixture trees and compares the results (`crates/dogfish/tests/gnu_compat*.rs`).
 

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/history.v1.json",
+  "title": "history -J record",
+  "description": "One entry of the undo journal, from `history -J`. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The journal entry's number."
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the operation was recorded (whole seconds): RFC 3339, UTC, with nanoseconds."
+    },
+    "time_ns": {
+      "type": "integer",
+      "description": "When the operation was recorded (whole seconds): nanoseconds since the epoch."
+    },
+    "tool": {
+      "type": "string",
+      "description": "The tool that recorded it."
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "trash",
+        "move",
+        "copy"
+      ],
+      "description": "What was done: `rm` moved a file to the trash, or a file was moved or copied."
+    },
+    "path": {
+      "type": "string",
+      "description": "Of trash: the original path."
+    },
+    "path_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+    },
+    "trash": {
+      "type": "string",
+      "description": "Of trash: where the file is kept."
+    },
+    "trash_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `trash`, base64, present only when they are not UTF-8 (`trash` then holds the lossy form)."
+    },
+    "source": {
+      "type": "string",
+      "description": "Of move and copy: the source."
+    },
+    "source_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `source`, base64, present only when they are not UTF-8 (`source` then holds the lossy form)."
+    },
+    "dest": {
+      "type": "string",
+      "description": "Of move and copy: the destination."
+    },
+    "dest_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `dest`, base64, present only when they are not UTF-8 (`dest` then holds the lossy form)."
+    },
+    "backup": {
+      "type": "string",
+      "description": "What the destination held before, kept for undo."
+    },
+    "backup_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `backup`, base64, present only when they are not UTF-8 (`backup` then holds the lossy form)."
+    },
+    "backup_size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bytes held in the backup."
+    },
+    "backup_purged": {
+      "type": "boolean",
+      "description": "Present (true) when the backup was discarded to stay under the limit."
+    },
+    "pending": {
+      "type": "boolean",
+      "description": "Present (true) while the operation is running or was interrupted."
+    },
+    "cancelled": {
+      "type": "boolean",
+      "description": "Present (true) when the operation recorded nothing to undo."
+    }
+  },
+  "required": [
+    "id",
+    "time",
+    "time_ns",
+    "tool",
+    "action"
+  ],
+  "dependentRequired": {
+    "path_bytes": [
+      "path"
+    ],
+    "trash_bytes": [
+      "trash"
+    ],
+    "source_bytes": [
+      "source"
+    ],
+    "dest_bytes": [
+      "dest"
+    ],
+    "backup_bytes": [
+      "backup"
+    ]
+  }
+}

@@ -1,11 +1,12 @@
 //! uname — With `--json` and visual card mode
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, outln};
+use dogfish_core::{DogfishContext, RecordWriter, outln};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 use crate::common::uname_info::{UNKNOWN, get_uname_info};
 
@@ -25,7 +26,7 @@ Options:
   -p, --processor          Print the processor type (non-portable)
   -i, --hardware-platform  Print the hardware platform (non-portable)
   -o, --operating-system   Print the operating system
-  -J, --json               Emit structured JSON
+  -J, --json[=VERSION]     Print every field above as one NDJSON record
       --help               Display this help and exit
 ";
 
@@ -81,7 +82,8 @@ const SPECS: &[OptSpec<UnameArgsOpt>] = &[
         UnameArgsOpt::Platform,
     ),
     OptSpec::both(b'o', "operating-system", HasArg::No, UnameArgsOpt::Os),
-    OptSpec::both(b'J', "json", HasArg::No, UnameArgsOpt::Json),
+    json_short(UnameArgsOpt::Json),
+    json_long(UnameArgsOpt::Json),
     OptSpec::long("help", HasArg::No, UnameArgsOpt::Help),
     OptSpec::long("version", HasArg::No, UnameArgsOpt::Version),
 ];
@@ -92,7 +94,7 @@ fn parse_uname_args(args: Vec<std::ffi::OsString>) -> std::result::Result<UnameA
     let mut parsed = UnameArgs::default();
     let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
     while let Some(opt) = opts.next() {
-        let (o, _) = opt.map_err(|e| getopt_error("uname", &e))?;
+        let (o, v) = opt.map_err(|e| getopt_error("uname", &e))?;
         match o {
             UnameArgsOpt::All => parsed.all = true,
             UnameArgsOpt::Sysname => parsed.sysname = true,
@@ -103,7 +105,10 @@ fn parse_uname_args(args: Vec<std::ffi::OsString>) -> std::result::Result<UnameA
             UnameArgsOpt::Processor => parsed.processor = true,
             UnameArgsOpt::Platform => parsed.platform = true,
             UnameArgsOpt::Os => parsed.os = true,
-            UnameArgsOpt::Json => parsed.json = true,
+            UnameArgsOpt::Json => {
+                check_json_version("uname", v.as_deref())?;
+                parsed.json = true;
+            }
             UnameArgsOpt::Help => return Err(print_help(UNAME_HELP)),
             UnameArgsOpt::Version => return Err(print_version("uname")),
         }
@@ -126,7 +131,9 @@ pub fn run_uname(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result
     let info = get_uname_info()?;
 
     if parsed.json {
-        outln!("{}", serde_json::to_string_pretty(&info)?);
+        let mut w = RecordWriter::stdout();
+        w.serialize(&info)?;
+        w.flush()?;
         return Ok(0);
     }
 

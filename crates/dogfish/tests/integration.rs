@@ -80,8 +80,10 @@ fn test_seq_integer_float_padded_and_json() {
     assert_eq!(stdout_str(&out_desc), "5\n3\n1\n");
 
     let out_json = run(&["seq", "-J", "1", "3"]);
-    let arr: Vec<i64> = serde_json::from_slice(&out_json.stdout).unwrap();
-    assert_eq!(arr, vec![1, 2, 3]);
+    assert_eq!(
+        stdout_str(&out_json),
+        "{\"value\":1}\n{\"value\":2}\n{\"value\":3}\n"
+    );
 }
 
 #[test]
@@ -117,7 +119,7 @@ fn test_whoami_id_uname_hostname_nproc() {
 
     let np = run(&["nproc", "-J"]);
     let np_v: serde_json::Value = serde_json::from_slice(&np.stdout).unwrap();
-    assert!(np_v["available_cpus"].as_u64().unwrap() >= 1);
+    assert!(np_v["processors"].as_u64().unwrap() >= 1);
 }
 
 #[test]
@@ -141,7 +143,8 @@ fn test_date_epoch_iso_and_json() {
 
     let out_j = run(&["date", "-d", "@1700000000", "-J"]);
     let v: serde_json::Value = serde_json::from_slice(&out_j.stdout).unwrap();
-    assert_eq!(v["unix"].as_i64(), Some(1700000000));
+    assert_eq!(v["time_ns"].as_i64(), Some(1_700_000_000_000_000_000));
+    assert_eq!(v["time"], "2023-11-14T22:13:20.000000000Z");
 }
 
 #[test]
@@ -382,7 +385,7 @@ fn test_ndjson_pipeline_and_query_engine() {
             "-w",
             "size>1K",
             "-w",
-            "kind=file",
+            "type=file",
             "-s",
             "size",
             "-d",
@@ -530,7 +533,10 @@ fn test_cp_cow_mv_rm_safe_and_multi_step_undo() {
         .args(["history", "-J"])
         .output()
         .unwrap();
-    let entries: Vec<serde_json::Value> = serde_json::from_slice(&hist.stdout).unwrap();
+    let entries: Vec<serde_json::Value> = stdout_str(&hist)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     assert_eq!(entries.len(), 3);
 
     // Undo #3 (`rm --safe`) -> `moved.txt` is back!

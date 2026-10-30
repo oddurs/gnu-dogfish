@@ -9,16 +9,16 @@ use anyhow::Result;
 use blake2::Blake2bVar;
 use digest::{Digest, Update, VariableOutput};
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table, gnu_io_error,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, RecordWriter, gnu_io_error,
     gnu_quote, stdout,
 };
 use md5::Md5;
 use rayon::prelude::*;
-use serde::Serialize;
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::qf;
 use crate::common::sha256::Sha256;
 
@@ -152,7 +152,7 @@ Options:
       --status...       Don't output anything, status code shows success (with --check)
       --strict          Exit non-zero for improperly formatted checksum lines (with --check)
   -w, --warn...         Warn about improperly formatted checksum lines (with --check)
-  -J, --json            Emit structured JSON / NDJSON
+  -J, --json[=VERSION]  One NDJSON record per file (with --check: per line)
       --help            Display this help and exit
 ";
 
@@ -175,7 +175,7 @@ Options:
       --status...       Don't output anything, status code shows success (with --check)
       --strict          Exit non-zero for improperly formatted checksum lines (with --check)
   -w, --warn...         Warn about improperly formatted checksum lines (with --check)
-  -J, --json            Emit structured JSON / NDJSON
+  -J, --json[=VERSION]  One NDJSON record per file (with --check: per line)
       --help            Display this help and exit
 ";
 
@@ -198,7 +198,7 @@ Options:
       --status...       Don't output anything, status code shows success (with --check)
       --strict          Exit non-zero for improperly formatted checksum lines (with --check)
   -w, --warn...         Warn about improperly formatted checksum lines (with --check)
-  -J, --json            Emit structured JSON / NDJSON
+  -J, --json[=VERSION]  One NDJSON record per file (with --check: per line)
       --help            Display this help and exit
 ";
 
@@ -236,7 +236,8 @@ const B2SUM_SPECS: &[OptSpec<SumOpt>] = &[
     OptSpec::both(b't', "text", HasArg::No, SumOpt::Text),
     OptSpec::long("help", HasArg::No, SumOpt::Help),
     OptSpec::long("version", HasArg::No, SumOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, SumOpt::Json).exact(),
+    json_short(SumOpt::Json),
+    json_long(SumOpt::Json),
 ];
 
 /// `tool`'s table: b2sum's, or the others' without `--length`.
@@ -302,7 +303,10 @@ impl HashMode {
                 SumOpt::Zero => m.zero = true,
                 SumOpt::Binary => m.binary = Some(true),
                 SumOpt::Text => m.binary = Some(false),
-                SumOpt::Json => m.json = true,
+                SumOpt::Json => {
+                    check_json_version(tool, v.as_deref())?;
+                    m.json = true;
+                }
                 SumOpt::Help => return Err(print_help(help)),
                 SumOpt::Version => return Err(print_version(tool)),
             }
@@ -351,12 +355,10 @@ impl HashMode {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Clone)]
 struct HashRecord {
     algorithm: String,
-    file: String,
     /// The file name as given (raw bytes), for the GNU output lines.
-    #[serde(skip)]
     name: Vec<u8>,
     digest: String,
     bytes: u64,
@@ -479,26 +481,34 @@ fn run_sum(algo: Algo, mode: HashMode, ctx: &DogfishContext) -> Result<i32> {
     };
 
     let mut exit_code = 0;
-    let mut records = Vec::with_capacity(results.len());
     // Line buffered, and never checked: as in GNU, every file is done and a
     // write error is reported at exit.
     let mut out = stdout::stdout();
+    let mut records = mode.json.then(RecordWriter::stdout);
     for (src, res) in sources.iter().zip(results) {
         match res {
-            Ok(rec) => {
-                if !mode.json {
+            Ok(rec) => match &mut records {
+                Some(w) => w.record(|r| {
+                    r.bytes("path", &rec.name)
+                        .str("algorithm", &rec.algorithm)
+                        .str("digest", &rec.digest)
+                        .u64("bytes", rec.bytes);
+                })?,
+                None => {
                     let _ = write_digest_line(&mut out, algo, &rec, &mode);
                 }
-                records.push(rec);
-            }
+            },
             Err(e) => {
+                if let Some(w) = &mut records {
+                    w.flush()?;
+                }
                 eprintln!("{tool}: {}: {}", qf(src.name()), gnu_io_error(&e));
                 exit_code = 1;
             }
         }
     }
-    if mode.json {
-        emit_objects_or_table(&records, ctx, true, false)?;
+    if let Some(w) = &mut records {
+        w.flush()?;
     }
     Ok(exit_code)
 }
@@ -591,7 +601,6 @@ fn compute_source_hash(algo: Algo, src: &Source, ctx: &DogfishContext) -> io::Re
     ctx.telemetry.add_items(1);
     Ok(HashRecord {
         algorithm: algo.tag(),
-        file: src.name().to_string_lossy().into_owned(),
         name: src.name().as_bytes().to_vec(),
         digest: hasher.finalize_hex(),
         bytes: bytes_len,
@@ -773,7 +782,11 @@ fn verify_checksums(
     // Unchecked, as in GNU: every line is verified, and a write error is
     // reported at exit.
     let mut out = stdout::StdioBuf::new(stdout::stdout());
-    let mut json_results = Vec::new();
+    // -J: one record per checked line, each written at once (diagnostics
+    // about the same file follow it in order).
+    let mut records = mode
+        .json
+        .then(|| RecordWriter::stdout().line_buffered(true));
     let mut all_ok = true;
     let mut style = LineStyle::Unknown;
 
@@ -827,7 +840,7 @@ fn verify_checksums(
             };
             tally.properly_formatted = true;
             let mut shown = shown_name(&entry.file);
-            let file = String::from_utf8_lossy(&entry.file).into_owned();
+            let file = entry.file.clone();
             let target = if entry.file == b"-" {
                 Source::Stdin
             } else {
@@ -843,12 +856,12 @@ fn verify_checksums(
                     tally.unreadable += 1;
                     let _ = out.flush();
                     eprintln!("{tool}: {}: {}", qf(target.name()), gnu_io_error(&e));
-                    if mode.json {
-                        json_results.push(serde_json::json!({
-                            "file": file,
-                            "status": "FAILED open or read",
-                            "expected": entry.digest,
-                        }));
+                    if let Some(w) = &mut records {
+                        w.record(|r| {
+                            r.bytes("path", &file)
+                                .str("status", "unreadable")
+                                .str("expected", &entry.digest);
+                        })?;
                     } else if !mode.status_only {
                         shown.extend_from_slice(b": FAILED open or read\n");
                         let _ = out.write_all(&shown);
@@ -861,13 +874,13 @@ fn verify_checksums(
                         tally.mismatched += 1;
                     }
                     let verdict = if ok { "OK" } else { "FAILED" };
-                    if mode.json {
-                        json_results.push(serde_json::json!({
-                            "file": file,
-                            "status": verdict,
-                            "expected": entry.digest,
-                            "actual": actual.digest,
-                        }));
+                    if let Some(w) = &mut records {
+                        w.record(|r| {
+                            r.bytes("path", &file)
+                                .str("status", if ok { "ok" } else { "failed" })
+                                .str("expected", &entry.digest)
+                                .str("actual", &actual.digest);
+                        })?;
                     } else if !mode.status_only && (!ok || !mode.quiet) {
                         shown.extend_from_slice(format!(": {verdict}\n").as_bytes());
                         let _ = out.write_all(&shown);
@@ -889,9 +902,6 @@ fn verify_checksums(
             && !(mode.strict && tally.misformatted > 0);
     }
 
-    if mode.json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&json_results)?)?;
-    }
     let _ = out.flush();
     Ok(if all_ok { 0 } else { 1 })
 }

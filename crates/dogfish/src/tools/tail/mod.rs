@@ -16,9 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use anyhow::Result;
-use dogfish_core::{
-    DogfishContext, emit_objects_or_table, gnu_io_error, read_ndjson_stdin, stdout,
-};
+use dogfish_core::{DogfishContext, emit_records, gnu_io_error, parse_ndjson, stdout};
 use memchr::{memchr_iter, memrchr};
 
 use crate::common::getopt::{
@@ -26,7 +24,8 @@ use crate::common::getopt::{
 };
 use crate::common::head_tail::{last_lines_start, parse_count, to_usize};
 use crate::common::input::{RawStdout, close_stdin, safe_read, stdin_file, stdin_is_closed};
-use crate::common::lines::{line_end, looks_like_json, lossy_lines};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::{line_end, looks_like_json};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, qf, quote_locale};
 use crate::common::strtod::strtod_prefix;
@@ -62,7 +61,7 @@ Options:
                         every N seconds
   -v, --verbose         Always output headers giving file names
   -z, --zero-terminated Line delimiter is NUL, not newline
-  -J, --json
+  -J, --json[=VERSION]  Pass NDJSON records on as NDJSON, even on a terminal
       --help            Print help
 ";
 
@@ -120,7 +119,8 @@ const SPECS: &[OptSpec<TailOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, TailOpt::ZeroTerminated),
     OptSpec::long("help", HasArg::No, TailOpt::Help),
     OptSpec::long("version", HasArg::No, TailOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, TailOpt::Json).exact(),
+    json_short(TailOpt::Json),
+    json_long(TailOpt::Json),
     OptSpec::short(b'f', HasArg::No, TailOpt::Follow),
     OptSpec::short(b'F', HasArg::No, TailOpt::FollowName),
     digit(b'0'),
@@ -278,7 +278,10 @@ fn parse_tail_args(args: Vec<OsString>) -> std::result::Result<TailArgs, i32> {
             },
             TailOpt::Verbose => a.header_mode = HeaderMode::Always,
             TailOpt::ZeroTerminated => a.line_end = line_end(true),
-            TailOpt::Json => a.json = true,
+            TailOpt::Json => {
+                check_json_version("tail", v.as_deref())?;
+                a.json = true;
+            }
             TailOpt::Digit(c) => {
                 eprintln!("tail: option used in invalid context -- {}", char::from(c));
                 return Err(1);
@@ -1091,14 +1094,14 @@ fn tail_ndjson(a: &TailArgs, ctx: &DogfishContext) -> Result<i32> {
     io::stdin().lock().read_to_end(&mut all)?;
     let count = a.n_units;
     if looks_like_json(&all)
-        && let Some(objs) = read_ndjson_stdin(&lossy_lines(&all))
+        && let Some(records) = parse_ndjson(&all)
     {
         ctx.telemetry
             .set_strategy("NDJSON object stream + auto-table");
-        let start = objs.len().saturating_sub(to_usize(count));
-        let slice = &objs[start..];
+        let start = records.len().saturating_sub(to_usize(count));
+        let slice = &records[start..];
         ctx.telemetry.add_items(slice.len() as u64);
-        emit_objects_or_table(slice, ctx, a.json, !a.json)?;
+        emit_records(slice, ctx, a.json)?;
         return Ok(0);
     }
     let start = last_lines_start(&all, count, a.line_end);

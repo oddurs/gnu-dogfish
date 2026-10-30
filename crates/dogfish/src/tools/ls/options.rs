@@ -11,6 +11,7 @@ use crate::common::getopt::{
 use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, parse_block_size,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{Quoting, quote_bytes};
 use crate::common::strftime::Timespec;
 use crate::tools::ls::colors::LsColors;
@@ -79,7 +80,8 @@ const LS_OPTIONS: &[OptSpec<&str>] = &[
     // Dogfish extensions.
     OptSpec::long("tree", HasArg::No, "tree").exact(),
     OptSpec::long("level", HasArg::Required, "level").exact(),
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
     // Short-only options.
     OptSpec::short(b'c', HasArg::No, "ctime"),
     OptSpec::short(b'C', HasArg::No, "vertical"),
@@ -193,7 +195,7 @@ Sort entries alphabetically if none of -cftuvSUX nor --sort is specified.
   -1                         list one file per line
       --tree                 Dogfish: render the hierarchy as a tree (-L depth)
       --level=N              Dogfish: maximum --tree depth (default 3)
-  -J, --json                 Dogfish: emit NDJSON records
+  -J, --json[=VERSION]       Dogfish: one NDJSON record per file (version 1)
       --help                 display this help and exit
       --version              output version information and exit
 
@@ -694,7 +696,10 @@ pub(crate) fn parse_ls_args(
                     2
                 })?
             }
-            "json" => o.json = true,
+            "json" => {
+                check_json_version("ls", raw.as_deref())?;
+                o.json = true;
+            }
             "help" => return Err(print_help(LS_HELP)),
             "version" => return Err(print_version("ls")),
             _ => unreachable!("unhandled ls option"),

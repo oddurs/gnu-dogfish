@@ -15,6 +15,7 @@ macro_rules! eprintln {
 
 mod common;
 mod manual;
+mod schema;
 mod tool_list;
 mod tools;
 
@@ -171,6 +172,11 @@ fn run(raw_args: Vec<OsString>) -> u8 {
             // option tables (`cargo xtask docs-gen` writes them all).
             Some("--generate") => {
                 let code = manual::generate(&raw_args[2..]);
+                return finish("dogfish", code);
+            }
+            // The JSON Schema of a tool's -J records (doc/ndjson.md).
+            Some("schema") => {
+                let code = schema::run(&raw_args[2..]);
                 return finish("dogfish", code);
             }
             Some(sub) => {

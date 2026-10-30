@@ -56,14 +56,15 @@ impl Sandbox {
         fs::read_dir(self.path(".dogfish/trash")).unwrap().count()
     }
 
+    /// The journal, one `history --json` record per entry.
     fn history(&self) -> Vec<serde_json::Value> {
         let out = self.run(&["history", "--json"]);
         assert!(out.status.success(), "{}", stderr(&out));
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .clone()
+        out.stdout
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect()
     }
 }
 
@@ -446,9 +447,7 @@ fn concurrent_journal_writers_do_not_lose_entries() {
     for mut c in children {
         assert!(c.wait().unwrap().success());
     }
-    let out = sb.run(&["history", "--json"]);
-    let entries: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(entries.as_array().unwrap().len(), 16);
+    assert_eq!(sb.history().len(), 16);
 }
 
 #[test]

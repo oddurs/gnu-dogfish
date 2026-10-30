@@ -7,7 +7,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use dogfish_core::{ColumnAlign, Style, Table, format_mode_rwx, format_size, gnu_io_error};
+use dogfish_core::{
+    ColumnAlign, RecordWriter, Style, Table, format_mode_rwx, format_size, gnu_io_error,
+};
 
 use crate::common::canonicalize::{CanMode, canonicalize_mode};
 use crate::common::file_info::{
@@ -17,6 +19,7 @@ use crate::common::file_info::{
 use crate::common::fnmatch::fnmatch;
 use crate::common::human::{HUMAN_AUTOSCALE, human_readable};
 use crate::common::quote::{Quoting, char_at, display_width, qa, qf, quote_bytes_raw};
+use crate::common::records::{Owners, file_fields};
 use crate::common::strftime::{Timespec, format_local_time};
 use crate::tools::ls::colors::{
     C_BLK, C_CAP, C_CHR, C_CLR_TO_EOL, C_DIR, C_END, C_EXEC, C_FIFO, C_FILE, C_LEFT, C_LINK,
@@ -24,7 +27,7 @@ use crate::tools::ls::colors::{
     C_SETUID, C_SOCK, C_STICKY, C_STICKY_OTHER_WRITABLE, LsColors, colorize_mode, style_entry_name,
 };
 use crate::tools::ls::options::{Indicator, LsDeref, LsFormat, LsIgnore, LsOpts, LsSort, LsTime};
-use crate::tools::ls::rich::{LsEntry, ls_json_entry};
+use crate::tools::ls::rich::{LsEntry, rich_entry};
 use crate::tools::ls::version_sort::filevercmp;
 
 /// One listed file.
@@ -182,7 +185,8 @@ pub(crate) struct Lister<'a, W: Write> {
     pub(crate) first_header: bool,
     /// Dogfish styling on a terminal.
     pub(crate) rich: Option<Style>,
-    pub(crate) json: Vec<LsEntry>,
+    /// With `-J`: where the records go (nothing else is printed then).
+    pub(crate) json: Option<(RecordWriter, Owners)>,
     /// Directories being listed (for `-R` loop detection).
     pub(crate) active: Vec<(u64, u64)>,
     /// GNU `used_color`: whether a colour sequence has been written yet.
@@ -209,7 +213,7 @@ impl<W: Write> Lister<'_, W> {
             o.recursive || !(plain.is_empty() && targets.len() <= 1 && dirs.len() == 1);
         if !plain.is_empty() {
             self.print_files(&plain, &sorted, false)?;
-            if !dirs.is_empty() {
+            if !dirs.is_empty() && !o.json {
                 self.out.write_all(&[o.eol])?;
             }
         }
@@ -224,6 +228,9 @@ impl<W: Write> Lister<'_, W> {
         // the two streams interleave as GNU's do. A failed flush shows up
         // again on the next write.
         let _ = self.out.flush();
+        if let Some((w, _)) = &mut self.json {
+            let _ = w.flush();
+        }
         eprintln!("ls: {msg}");
         self.status = self.status.max(if serious { 2 } else { 1 });
     }
@@ -385,7 +392,9 @@ impl<W: Write> Lister<'_, W> {
         let is_link = f.meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
         // GNU also checks link targets for --group-directories-first and colours.
         let check_target = o.indicator >= Indicator::FileType || o.check_symlink_mode;
-        if !is_link || !(o.format == LsFormat::Long || check_target || self.rich.is_some()) {
+        if !is_link
+            || !(o.format == LsFormat::Long || check_target || o.json || self.rich.is_some())
+        {
             return;
         }
         if let Ok(target) = fs::read_link(&f.path) {
@@ -436,7 +445,7 @@ impl<W: Write> Lister<'_, W> {
                 return Ok(());
             }
         };
-        if print_name {
+        if print_name && !o.json {
             if !self.first_header {
                 self.out.write_all(&[o.eol])?;
             }
@@ -974,8 +983,18 @@ impl<W: Write> Lister<'_, W> {
         total: bool,
     ) -> io::Result<()> {
         let o = self.opts;
-        if o.json {
-            self.json.extend(files.iter().map(|f| ls_json_entry(f)));
+        if let Some((w, owners)) = &mut self.json {
+            for f in files {
+                w.record(|r| {
+                    r.bytes("path", path_bytes(&f.path)).bytes("name", &f.name);
+                    if let Some(m) = &f.meta {
+                        file_fields(r, m, owners);
+                    }
+                    if let Some(t) = &f.link_target {
+                        r.bytes("target", t);
+                    }
+                })?;
+            }
             return Ok(());
         }
         if let Some(st) = self.rich {
@@ -1388,7 +1407,7 @@ impl<W: Write> Lister<'_, W> {
     /// The Dogfish table / grid used on a terminal.
     fn print_rich(&mut self, files: &[&LsFile], st: Style) -> io::Result<()> {
         let o = self.opts;
-        let entries: Vec<LsEntry> = files.iter().map(|f| ls_json_entry(f)).collect();
+        let entries: Vec<LsEntry> = files.iter().map(|f| rich_entry(f)).collect();
         let classify = o.indicator != Indicator::None;
         if o.format == LsFormat::Long {
             let mut tbl = Table::new(vec![
@@ -1406,7 +1425,7 @@ impl<W: Write> Lister<'_, W> {
                 } else {
                     st.green(&format_size(e.size, true))
                 };
-                let mut name = style_entry_name(&e.name, &e.kind, &e.mode, classify, st);
+                let mut name = style_entry_name(&e.name, e.kind, &e.mode, classify, st);
                 if let Some(target) = &f.link_target {
                     name = format!("{name} -> {}", st.magenta(&String::from_utf8_lossy(target)));
                 }
@@ -1423,7 +1442,7 @@ impl<W: Write> Lister<'_, W> {
         let styled: Vec<(String, usize)> = entries
             .iter()
             .map(|e| {
-                let s = style_entry_name(&e.name, &e.kind, &e.mode, classify, st);
+                let s = style_entry_name(&e.name, e.kind, &e.mode, classify, st);
                 let w = dogfish_core::table::visible_width(&s);
                 (s, w)
             })

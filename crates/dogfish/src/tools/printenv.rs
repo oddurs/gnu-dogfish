@@ -5,11 +5,12 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy_all, print_help, print_version, try_help,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 
 const PRINTENV_HELP: &str = "\
 Print the values of the specified environment VARIABLE(s). If no VARIABLE is specified, print name
@@ -22,7 +23,8 @@ Arguments:
 
 Options:
   -0, --null  End each output line with NUL, not newline
-  -J, --json  
+  -J, --json[=VERSION]
+              One NDJSON record per variable: name and value
       --help  Display this help and exit
 ";
 
@@ -42,7 +44,8 @@ const SPECS: &[OptSpec<PrintenvOpt>] = &[
     OptSpec::both(b'0', "null", HasArg::No, PrintenvOpt::Null),
     OptSpec::long("help", HasArg::No, PrintenvOpt::Help),
     OptSpec::long("version", HasArg::No, PrintenvOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, PrintenvOpt::Json).exact(),
+    json_short(PrintenvOpt::Json),
+    json_long(PrintenvOpt::Json),
     OptSpec::short(b'i', HasArg::No, PrintenvOpt::EnvOnly),
     OptSpec::short(b'u', HasArg::Required, PrintenvOpt::EnvOnly),
 ];
@@ -67,9 +70,13 @@ fn parse_printenv_args(args: Vec<OsString>) -> std::result::Result<PrintenvArgs,
         Order::StopAtOperand,
     );
     while let Some(opt) = opts.next() {
-        match opt.map_err(|e| getopt_error("printenv", &e))?.0 {
+        let (key, value) = opt.map_err(|e| getopt_error("printenv", &e))?;
+        match key {
             PrintenvOpt::Null => p.null = true,
-            PrintenvOpt::Json => p.json = true,
+            PrintenvOpt::Json => {
+                check_json_version("printenv", value.as_deref())?;
+                p.json = true;
+            }
             PrintenvOpt::EnvOnly => return Err(try_help("printenv")),
             PrintenvOpt::Help => return Err(print_help(PRINTENV_HELP)),
             PrintenvOpt::Version => return Err(print_version("printenv")),
@@ -85,20 +92,13 @@ pub fn run_printenv(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         Err(code) => return Ok(code),
     };
     let term: &[u8] = if parsed.null { b"\0" } else { b"\n" };
+    if parsed.json {
+        return printenv_json(&parsed.vars);
+    }
     let mut out = io::BufWriter::new(stdout::stdout());
 
     if parsed.vars.is_empty() {
-        if parsed.json {
-            let map: std::collections::BTreeMap<String, String> = std::env::vars_os()
-                .map(|(k, v)| {
-                    (
-                        k.to_string_lossy().into_owned(),
-                        v.to_string_lossy().into_owned(),
-                    )
-                })
-                .collect();
-            writeln!(out, "{}", serde_json::to_string_pretty(&map)?)?;
-        } else {
+        {
             // Environment order, like GNU (which walks `environ`).
             for (k, v) in std::env::vars_os() {
                 out.write_all(k.as_bytes())?;
@@ -125,6 +125,34 @@ pub fn run_printenv(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         }
     }
     out.flush()?;
+    Ok(exit_code)
+}
+
+/// `-J`: one `{"name","value"}` record per variable, in environment order
+/// or the order asked for; a variable that is not set has none (and makes
+/// the exit status 1, as without `-J`).
+fn printenv_json(vars: &[String]) -> Result<i32> {
+    let mut w = RecordWriter::stdout();
+    let mut exit_code = 0;
+    if vars.is_empty() {
+        for (k, v) in std::env::vars_os() {
+            w.record(|r| {
+                r.os_str("name", &k).os_str("value", &v);
+            })?;
+        }
+    }
+    for name in vars {
+        match (!name.contains('='))
+            .then(|| std::env::var_os(name))
+            .flatten()
+        {
+            Some(v) => w.record(|r| {
+                r.str("name", name).os_str("value", &v);
+            })?,
+            None => exit_code = 1,
+        }
+    }
+    w.flush()?;
     Ok(exit_code)
 }
 

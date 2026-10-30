@@ -9,15 +9,14 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, emit_objects_or_table, gnu_io_error, read_ndjson_stdin,
-};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, emit_records, gnu_io_error, parse_ndjson};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, try_help,
 };
 use crate::common::input::{RawStdout, stdin_file};
-use crate::common::lines::{lossy_lines, split_records};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::split_records;
 use crate::common::quote::{qf, quote_locale};
 use crate::common::xstrtol::{StrtolError, xstrtoumax};
 
@@ -37,7 +36,7 @@ Mandatory arguments to long options are mandatory for short options too.
       --random-source=FILE  get random bytes from FILE
   -r, --repeat              output lines can be repeated
   -z, --zero-terminated     line delimiter is NUL, not newline
-  -J, --json                print NDJSON objects as JSON
+  -J, --json[=VERSION]      write NDJSON records, even on a terminal
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -67,7 +66,8 @@ const SPECS: &[OptSpec<ShufOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, ShufOpt::ZeroTerminated),
     OptSpec::long("help", HasArg::No, ShufOpt::Help),
     OptSpec::long("version", HasArg::No, ShufOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, ShufOpt::Json).exact(),
+    json_short(ShufOpt::Json),
+    json_long(ShufOpt::Json),
 ];
 
 /// What shuf was asked to do.
@@ -144,8 +144,8 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<ShufConfig, i32> {
     };
     let mut g = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     while let Some(next) = g.next() {
-        let (key, value) = next.map_err(|e| getopt_error("shuf", &e))?;
-        let value = value.as_deref().map(lossy).unwrap_or_default();
+        let (key, raw) = next.map_err(|e| getopt_error("shuf", &e))?;
+        let value = raw.as_deref().map(lossy).unwrap_or_default();
         match key {
             ShufOpt::Echo => cfg.echo = true,
             ShufOpt::InputRange => {
@@ -175,7 +175,10 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<ShufConfig, i32> {
             }
             ShufOpt::Repeat => cfg.repeat = true,
             ShufOpt::ZeroTerminated => cfg.eol = 0,
-            ShufOpt::Json => cfg.json = true,
+            ShufOpt::Json => {
+                check_json_version("shuf", raw.as_deref())?;
+                cfg.json = true;
+            }
             ShufOpt::Help => return Err(print_help(SHUF_HELP)),
             ShufOpt::Version => return Err(print_version("shuf")),
         }
@@ -353,7 +356,7 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         && !cfg.repeat
         && cfg.eol == b'\n'
         && cfg.outfile.is_none()
-        && let Some(mut objs) = read_ndjson_stdin(&lossy_lines(&data))
+        && let Some(mut objs) = parse_ndjson(&data)
     {
         let mut rng = match Rng::new(cfg.random_source.as_deref()) {
             Ok(r) => r,
@@ -370,7 +373,7 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             .map(|i| std::mem::take(&mut objs[i as usize]))
             .collect();
         ctx.telemetry.add_items(picked.len() as u64);
-        emit_objects_or_table(&picked, ctx, cfg.json, !cfg.json)?;
+        emit_records(&picked, ctx, cfg.json)?;
         return Ok(0);
     }
 

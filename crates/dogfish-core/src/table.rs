@@ -1,7 +1,6 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 
-use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::context::DogfishContext;
@@ -113,93 +112,153 @@ pub fn pad_visible(s: &str, width: usize, align: ColumnAlign) -> String {
     }
 }
 
-/// Attempts to read stdin lines and detect if they are NDJSON (or a JSON array) emitted by
-/// an upstream Dogfish utility. Returns `Some(objects)` if structured JSON is detected, or
-/// `None` if plain text.
-pub fn read_ndjson_stdin(lines: &[String]) -> Option<Vec<Value>> {
-    let non_empty: Vec<&str> = lines
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+/// One record read from an upstream producer: the parsed object, and the
+/// compact line it came as, so a consumer that passes it on writes it back
+/// unchanged (field order and all).
+#[derive(Debug, Clone, Default)]
+pub struct InputRecord {
+    pub value: Value,
+    pub line: String,
+}
+
+impl InputRecord {
+    fn new(value: Value, line: String) -> Self {
+        Self { value, line }
+    }
+
+    /// The record with only `fields`, in that order. A selected field keeps
+    /// its `<field>_bytes` twin (the raw bytes of a name that is not UTF-8).
+    pub fn project(&self, fields: &[&str]) -> Self {
+        let mut map = Map::new();
+        let mut line = String::from("{");
+        let Some(orig) = self.value.as_object() else {
+            return Self::new(Value::Object(map), "{}".into());
+        };
+        let mut put = |k: &str, v: &Value, map: &mut Map<String, Value>| {
+            if map.contains_key(k) {
+                return;
+            }
+            if line.len() > 1 {
+                line.push(',');
+            }
+            let mut key = Vec::new();
+            crate::ndjson::push_json_str(&mut key, k);
+            line.push_str(&String::from_utf8_lossy(&key));
+            line.push(':');
+            line.push_str(&v.to_string());
+            map.insert(k.to_string(), v.clone());
+        };
+        for &k in fields {
+            if let Some(v) = orig.get(k) {
+                put(k, v, &mut map);
+                let twin = format!("{k}_bytes");
+                if let Some(b) = orig.get(&twin) {
+                    put(&twin, b, &mut map);
+                }
+            }
+        }
+        line.push('}');
+        Self::new(Value::Object(map), line)
+    }
+
+    /// The record with `key` set to `value` (appended, or replaced).
+    pub fn with_field(mut self, key: &str, value: Value) -> Self {
+        let Some(map) = self.value.as_object_mut() else {
+            return self;
+        };
+        let replaced = map.insert(key.to_string(), value.clone()).is_some();
+        if replaced {
+            self.line = self.value.to_string();
+        } else if let Some(body) = self.line.trim_end().strip_suffix('}') {
+            let mut line = body.to_string();
+            if map.len() > 1 {
+                line.push(',');
+            }
+            let mut k = Vec::new();
+            crate::ndjson::push_json_str(&mut k, key);
+            line.push_str(&String::from_utf8_lossy(&k));
+            line.push(':');
+            line.push_str(&value.to_string());
+            line.push('}');
+            self.line = line;
+        } else {
+            self.line = self.value.to_string();
+        }
+        self
+    }
+}
+
+/// Parses `input` as a stream of records from an upstream Dogfish producer
+/// (or anything else that writes NDJSON): every non-blank line one JSON
+/// object. A single JSON array of objects is taken too, for input from
+/// other programs. `None` if the input is anything else; blank input is no
+/// records.
+pub fn parse_ndjson(input: &[u8]) -> Option<Vec<InputRecord>> {
+    let text = String::from_utf8_lossy(input);
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
         .collect();
-    if non_empty.is_empty() {
-        return None;
+    let Some(first) = lines.first() else {
+        return Some(Vec::new());
+    };
+    if first.starts_with('[') {
+        let joined = lines.join("\n");
+        return match serde_json::from_str::<Value>(&joined) {
+            Ok(Value::Array(arr)) if arr.iter().all(Value::is_object) => Some(
+                arr.into_iter()
+                    .map(|v| {
+                        let line = v.to_string();
+                        InputRecord::new(v, line)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
     }
-
-    // Check if the entire input is a single JSON array
-    let joined = non_empty.join("\n");
-    if joined.starts_with('[')
-        && let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&joined)
-        && arr.iter().all(|v| v.is_object())
-    {
-        return Some(arr);
-    }
-
-    // Otherwise check if every line is a JSON object (NDJSON)
-    if !non_empty[0].starts_with('{') {
-        return None;
-    }
-
-    let mut objs = Vec::with_capacity(non_empty.len());
-    for line in non_empty {
+    let mut records = Vec::with_capacity(lines.len());
+    for line in lines {
+        if !line.starts_with('{') {
+            return None;
+        }
         match serde_json::from_str::<Value>(line) {
-            Ok(val @ Value::Object(_)) => objs.push(val),
+            Ok(val @ Value::Object(_)) => records.push(InputRecord::new(val, line.to_string())),
             _ => return None,
         }
     }
-    Some(objs)
+    Some(records)
 }
 
-/// Emits a slice of JSON objects as:
-/// - **NDJSON** when piped (`!ctx.stdout_is_tty()`) or when `force_json` is false in a pipeline
-/// - **Pretty JSON Array** if `--json` was explicitly passed on a TTY (`force_json && ctx.stdout_is_tty()`)
-/// - **Auto-formatted Terminal Table** if rendering an NDJSON stream to an interactive TTY!
-pub fn emit_objects_or_table<T: Serialize>(
-    items: &[T],
-    ctx: &DogfishContext,
-    explicit_json: bool,
-    render_tty_table: bool,
-) -> io::Result<()> {
-    let mut out = io::BufWriter::new(crate::stdout::stdout());
-
-    let values: Vec<Value> = items
-        .iter()
-        .filter_map(|item| serde_json::to_value(item).ok())
-        .collect();
-
-    if explicit_json && !ctx.stdout_is_tty() {
-        // Emit NDJSON into the pipe so downstream Dogfish utilities can stream-parse it!
-        for val in &values {
-            serde_json::to_writer(&mut out, val)?;
-            writeln!(out)?;
-        }
-        return out.flush();
+/// The field to sort or group records by when none is named: `name` if the
+/// records have one, else `path`.
+pub fn default_key(records: &[InputRecord]) -> &'static str {
+    match records.first().and_then(|r| r.value.as_object()) {
+        Some(o) if !o.contains_key("name") && o.contains_key("path") => "path",
+        _ => "name",
     }
+}
 
-    if explicit_json && ctx.stdout_is_tty() && !render_tty_table {
-        // Emit pretty JSON on terminal when explicitly asked via `-J`
-        serde_json::to_writer_pretty(&mut out, &values)?;
-        writeln!(out)?;
-        return out.flush();
-    }
-
-    if ctx.stdout_is_tty() {
+/// Writes records on to the next tool: NDJSON, each record as it came, or a
+/// table on a terminal unless `json` (`-J`) asks for the records there too.
+pub fn emit_records(records: &[InputRecord], ctx: &DogfishContext, json: bool) -> io::Result<()> {
+    if !json && ctx.stdout_is_tty() {
+        let values: Vec<&Value> = records.iter().map(|r| &r.value).collect();
+        let mut out = io::BufWriter::new(crate::stdout::stdout());
         render_json_objects_as_table(&values, &mut out, ctx.style())?;
         return out.flush();
     }
-
-    // Default piped NDJSON
-    for val in &values {
-        serde_json::to_writer(&mut out, val)?;
-        writeln!(out)?;
+    let mut w = crate::ndjson::RecordWriter::stdout();
+    for r in records {
+        w.line(r.line.as_bytes())?;
     }
-    out.flush()
+    w.flush()
 }
 
-/// Renders an arbitrary slice of JSON objects into a clean, aligned terminal table,
-/// automatically formatting byte sizes and numeric columns!
+/// Renders JSON objects as an aligned terminal table, sizes made readable.
+/// The machine-only twins of a field (`path_bytes`, `mtime_ns`) are left out.
 pub fn render_json_objects_as_table<W: Write>(
-    objects: &[Value],
+    objects: &[&Value],
     out: &mut W,
     style: Style,
 ) -> io::Result<()> {
@@ -209,7 +268,13 @@ pub fn render_json_objects_as_table<W: Write>(
     let Some(first_obj) = objects[0].as_object() else {
         return Ok(());
     };
-    let keys: Vec<String> = first_obj.keys().cloned().collect();
+    let twin = |k: &str| {
+        ["_bytes", "_ns"].iter().any(|suffix| {
+            k.strip_suffix(suffix)
+                .is_some_and(|stem| first_obj.contains_key(stem))
+        })
+    };
+    let keys: Vec<String> = first_obj.keys().filter(|k| !twin(k)).cloned().collect();
     if keys.is_empty() {
         return Ok(());
     }
@@ -275,6 +340,17 @@ pub fn compare_json_field(a: &Value, b: &Value, field: &str) -> std::cmp::Orderi
     let va = a.get(field);
     let vb = b.get(field);
     match (va, vb) {
+        // Integers exactly: nanosecond times do not fit an f64.
+        (Some(Value::Number(na)), Some(Value::Number(nb)))
+            if na.as_i64().is_some() && nb.as_i64().is_some() =>
+        {
+            na.as_i64().cmp(&nb.as_i64())
+        }
+        (Some(Value::Number(na)), Some(Value::Number(nb)))
+            if na.as_u64().is_some() && nb.as_u64().is_some() =>
+        {
+            na.as_u64().cmp(&nb.as_u64())
+        }
         (Some(Value::Number(na)), Some(Value::Number(nb))) => {
             let fa = na.as_f64().unwrap_or(0.0);
             let fb = nb.as_f64().unwrap_or(0.0);
@@ -349,10 +425,11 @@ pub fn eval_json_where(obj: &Value, expr: &str) -> bool {
     true
 }
 
-pub fn read_all_stdin_lines() -> io::Result<Vec<String>> {
-    let stdin = io::stdin();
-    let reader = io::BufReader::new(stdin.lock());
-    reader.lines().collect()
+/// All of standard input.
+pub fn read_all_stdin() -> io::Result<Vec<u8>> {
+    let mut all = Vec::new();
+    io::stdin().lock().read_to_end(&mut all)?;
+    Ok(all)
 }
 
 #[cfg(test)]
@@ -369,25 +446,56 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ndjson_stdin_objects_and_arrays() {
-        let lines = vec![
-            r#"{"name":"a.rs","size":120}"#.to_string(),
-            r#"{"name":"b.rs","size":450}"#.to_string(),
-        ];
-        let parsed = read_ndjson_stdin(&lines).unwrap();
+    fn test_parse_ndjson_objects_and_arrays() {
+        let input = b"{\"name\":\"a.rs\",\"size\":120}\n\n{\"size\":450,\"name\":\"b.rs\"}\r\n";
+        let parsed = parse_ndjson(input).unwrap();
         assert_eq!(parsed.len(), 2);
+        // Lines are kept as they came, field order included.
+        assert_eq!(parsed[1].line, r#"{"size":450,"name":"b.rs"}"#);
+        assert_eq!(parsed[1].value["size"], 450);
 
-        let arr_lines = vec![
-            "[".to_string(),
-            r#"  {"name":"x","size":10},"#.to_string(),
-            r#"  {"name":"y","size":20}"#.to_string(),
-            "]".to_string(),
-        ];
-        let parsed_arr = read_ndjson_stdin(&arr_lines).unwrap();
+        let arr = b"[\n  {\"name\":\"x\",\"size\":10},\n  {\"name\":\"y\",\"size\":20}\n]\n";
+        let parsed_arr = parse_ndjson(arr).unwrap();
         assert_eq!(parsed_arr.len(), 2);
+        assert_eq!(parsed_arr[0].line, r#"{"name":"x","size":10}"#);
 
-        let plain_lines = vec!["hello world".to_string(), "not json".to_string()];
-        assert!(read_ndjson_stdin(&plain_lines).is_none());
+        assert!(parse_ndjson(b"hello world\nnot json\n").is_none());
+        assert!(parse_ndjson(b"{\"a\":1}\n[1]\n").is_none());
+        assert!(parse_ndjson(b"[1, 2]").is_none());
+        assert_eq!(parse_ndjson(b"\n \n").map(|r| r.len()), Some(0));
+    }
+
+    #[test]
+    fn records_project_and_gain_fields_in_place() {
+        let input = r#"{"path":"a�","path_bytes":"Yf8=","size":3,"type":"file"}"#;
+        let r = &parse_ndjson(input.as_bytes()).unwrap()[0];
+        let p = r.project(&["size", "path", "nope"]);
+        assert_eq!(p.line, r#"{"size":3,"path":"a�","path_bytes":"Yf8="}"#);
+        assert_eq!(p.value["path_bytes"], "Yf8=");
+        let c = r.clone().with_field("count", json!(2));
+        assert_eq!(
+            c.line,
+            r#"{"path":"a�","path_bytes":"Yf8=","size":3,"type":"file","count":2}"#
+        );
+        assert_eq!(c.value["count"], 2);
+        let again = c.with_field("count", json!(5));
+        assert_eq!(again.value["count"], 5);
+        assert_eq!(
+            serde_json::from_str::<Value>(&again.line).unwrap()["count"],
+            5
+        );
+        let empty = parse_ndjson(b"{}").unwrap()[0]
+            .clone()
+            .with_field("count", json!(1));
+        assert_eq!(empty.line, r#"{"count":1}"#);
+        assert_eq!(
+            default_key(&parse_ndjson(br#"{"path":"x"}"#).unwrap()),
+            "path"
+        );
+        assert_eq!(
+            default_key(&parse_ndjson(br#"{"name":"x","path":"y"}"#).unwrap()),
+            "name"
+        );
     }
 
     #[test]
@@ -414,5 +522,12 @@ mod tests {
         let b = json!({"name": "beta", "size": 200});
         assert_eq!(compare_json_field(&a, &b, "size"), std::cmp::Ordering::Less);
         assert_eq!(compare_json_field(&a, &b, "name"), std::cmp::Ordering::Less);
+        // Nanosecond times differ in digits an f64 drops.
+        let a = json!({"mtime_ns": 1_793_210_599_123_456_789_i64});
+        let b = json!({"mtime_ns": 1_793_210_599_123_456_790_i64});
+        assert_eq!(
+            compare_json_field(&a, &b, "mtime_ns"),
+            std::cmp::Ordering::Less
+        );
     }
 }
