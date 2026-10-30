@@ -6,11 +6,10 @@ use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, Table,
-    emit_objects_or_table, gnu_io_error, sparkline_bar, stdout,
+    ColumnAlign, DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, RecordWriter, Table,
+    gnu_io_error, sparkline_bar, stdout,
 };
 use rayon::prelude::*;
-use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 
 use crate::common::files0::{Files0From, extra_operand_error};
@@ -19,6 +18,7 @@ use crate::common::getopt::{
     print_version, unsupported,
 };
 use crate::common::input::{close_stdin, safe_read, stdin_file, stdin_is_closed};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::locale::utf8_locale;
 use crate::common::quote::{qa, qf};
 
@@ -41,7 +41,7 @@ Options:
                          standard input
       --total=WHEN       When to print a line with total counts;
                          WHEN can be: auto, always, only, never
-  -J, --json             Emit structured JSON / NDJSON
+  -J, --json[=VERSION]   One NDJSON record of counts per file
   -t, --table            Render a rich visual breakdown table with sparklines
       --help             Print help
 ";
@@ -93,7 +93,8 @@ const SPECS: &[OptSpec<WcArgsOpt>] = &[
         WcArgsOpt::MaxLineLength,
     ),
     OptSpec::long("total", HasArg::Required, WcArgsOpt::Total),
-    OptSpec::both(b'J', "json", HasArg::No, WcArgsOpt::Json),
+    json_short(WcArgsOpt::Json),
+    json_long(WcArgsOpt::Json),
     OptSpec::both(b't', "table", HasArg::No, WcArgsOpt::Table),
     OptSpec::long("help", HasArg::No, WcArgsOpt::Help),
     OptSpec::long("version", HasArg::No, WcArgsOpt::Version),
@@ -112,7 +113,10 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
             WcArgsOpt::Lines => parsed.lines = true,
             WcArgsOpt::Words => parsed.words = true,
             WcArgsOpt::MaxLineLength => parsed.max_line_length = true,
-            WcArgsOpt::Json => parsed.json = true,
+            WcArgsOpt::Json => {
+                check_json_version("wc", v.as_deref())?;
+                parsed.json = true;
+            }
             WcArgsOpt::Table => parsed.table = true,
             WcArgsOpt::Files0From => parsed.files0_from = v.as_deref().map(lossy),
             WcArgsOpt::Total => {
@@ -137,7 +141,7 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
     Ok(parsed)
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Clone, Default)]
 struct WcRecord {
     file: String,
     lines: u64,
@@ -823,7 +827,8 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     Ok(i32::from(!ok))
 }
 
-/// `--json` / `--table`: records for every input, then NDJSON or a table.
+/// `--json` / `--table`: every count of every input, as one NDJSON record
+/// per input (written as it is counted) or a table.
 fn wc_rich(
     sources: &[InputSource],
     opts: &WcOpts,
@@ -832,25 +837,42 @@ fn wc_rich(
 ) -> Result<i32> {
     let mut exit_code = 0;
     let mut records = Vec::with_capacity(sources.len());
+    let mut w = json.then(RecordWriter::stdout);
     for src in sources {
         match count_source(src, opts, ctx) {
             Ok(c) => {
                 if let Some(e) = &c.error {
+                    if let Some(w) = &mut w {
+                        w.flush()?;
+                    }
                     eprintln!("wc: {}: {}", qf(&c.rec.file), gnu_io_error(e));
                     exit_code = 1;
                 }
                 let mut rec = c.rec;
                 rec.file = src.display_name().to_string();
-                records.push(rec);
+                match &mut w {
+                    Some(w) => w.record(|r| {
+                        r.str("path", &rec.file)
+                            .u64("lines", rec.lines)
+                            .u64("words", rec.words)
+                            .u64("chars", rec.chars)
+                            .u64("bytes", rec.bytes)
+                            .u64("max_line_length", rec.max_line_length);
+                    })?,
+                    None => records.push(rec),
+                }
             }
             Err(e) => {
+                if let Some(w) = &mut w {
+                    w.flush()?;
+                }
                 eprintln!("wc: {}: {}", qf(src.display_name()), gnu_io_error(&e));
                 exit_code = 1;
             }
         }
     }
-    if json {
-        emit_objects_or_table(&records, ctx, true, false)?;
+    if let Some(mut w) = w {
+        w.flush()?;
         return Ok(exit_code);
     }
     let max_bytes = records.iter().map(|r| r.bytes).max().unwrap_or(1).max(1);

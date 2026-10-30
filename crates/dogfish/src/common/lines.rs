@@ -9,13 +9,9 @@ pub(crate) fn line_end(zero_terminated: bool) -> u8 {
     if zero_terminated { 0 } else { b'\n' }
 }
 
-/// Splits a buffer into lines (without their `\n`); a final unterminated line
-/// is yielded as well, but a trailing `\n` does not produce an empty line.
-pub(crate) fn split_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
-    split_records(buf, b'\n')
-}
-
-/// [`split_lines`] for records ending in `eol`.
+/// Splits a buffer into records ending in `eol` (without it); a final
+/// unterminated record is yielded as well, but a trailing `eol` does not
+/// produce an empty one.
 pub(crate) fn split_records(buf: &[u8], eol: u8) -> impl Iterator<Item = &[u8]> {
     let body = buf.strip_suffix(&[eol]).unwrap_or(buf);
     let empty = buf.is_empty();
@@ -29,14 +25,4 @@ pub(crate) fn is_blank(b: u8) -> bool {
 /// Returns true if the (trimmed) input looks like the start of an NDJSON / JSON stream.
 pub(crate) fn looks_like_json(bytes: &[u8]) -> bool {
     matches!(bytes.trim_ascii_start().first(), Some(b'{') | Some(b'['))
-}
-
-pub(crate) fn lossy_lines(bytes: &[u8]) -> Vec<String> {
-    split_lines(bytes)
-        .map(|l| String::from_utf8_lossy(chomp_cr(l)).into_owned())
-        .collect()
-}
-
-fn chomp_cr(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
 }

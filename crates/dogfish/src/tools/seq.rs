@@ -5,12 +5,13 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, gnu_quote, stdout};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, RecordWriter, gnu_quote, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy, lossy_all, print_help, print_version,
     usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
 use crate::common::strtod::strtod_prefix;
 
@@ -28,7 +29,7 @@ Print numbers from FIRST to LAST, in steps of INCREMENT.
   -f, --format=FORMAT      use printf style floating-point FORMAT
   -s, --separator=STRING   use STRING to separate numbers (default: \\n)
   -w, --equal-width        equalize width by padding with leading zeroes
-  -J, --json               print the numbers as a JSON array
+  -J, --json[=VERSION]     print each number as an NDJSON record: value
       --help        display this help and exit
       --version     output version information and exit
 
@@ -52,7 +53,8 @@ const SEQ_OPTS: &[OptSpec<&str>] = &[
     OptSpec::both(b's', "separator", HasArg::Required, "separator"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
 ];
 
 /// A scanned `seq` operand: its value and the output width and precision
@@ -453,7 +455,13 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             "format" => format = v,
             "separator" => separator = v.unwrap_or_default(),
             "equal-width" => equal_width = true,
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("seq", v.as_deref().map(std::ffi::OsStr::new))
+                {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "help" => return Ok(print_help(SEQ_HELP)),
             "version" => return Ok(print_version("seq")),
             _ => unreachable!("every seq option is handled"),
@@ -520,21 +528,33 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let ints = (first.int, step.int, last.int);
 
     if json {
-        let all_int = matches!(ints, (Some(_), Some(_), Some(_)));
-        let mut vals = Vec::new();
-        let mut x = first.value;
-        let mut i = 0f64;
-        while !out_of_range(x) {
-            vals.push(if all_int {
-                serde_json::json!(x as i64)
-            } else {
-                serde_json::json!(x)
-            });
-            i += 1.0;
-            x = first.value + i * step.value;
+        // One record per number, streamed (`seq -J inf` runs as long as
+        // `seq inf`): integers exactly when all three operands are, else
+        // floating point, which ends at the first value that is not finite.
+        let mut w = RecordWriter::new(&mut out);
+        if let (Some(mut cur), Some(inc), Some(end)) = ints {
+            while (inc > 0 && cur <= end) || (inc < 0 && cur >= end) {
+                w.record(|r| {
+                    r.i64("value", cur);
+                })?;
+                match cur.checked_add(inc) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+        } else {
+            let mut x = first.value;
+            let mut i = 0f64;
+            while x.is_finite() && !out_of_range(x) {
+                w.record(|r| {
+                    r.f64("value", x);
+                })?;
+                i += 1.0;
+                x = first.value + i * step.value;
+            }
         }
-        serde_json::to_writer(&mut out, &vals)?;
-        writeln!(out)?;
+        w.flush()?;
+        drop(w);
         out.flush()?;
         return Ok(0);
     }

@@ -246,6 +246,7 @@ dependencies = [
  "base64",
  "bytecount",
  "chrono",
+ "itoa",
  "libc",
  "memchr",
  "memmap2",

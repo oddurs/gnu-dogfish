@@ -1,11 +1,12 @@
 //! nproc — Print number of available processing units
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_quote, outln};
+use dogfish_core::{DogfishContext, RecordWriter, gnu_quote, outln};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 
 const NPROC_HELP: &str = "\
@@ -17,7 +18,9 @@ Usage: nproc [OPTIONS]
 Options:
       --all         Print the number of installed processors
       --ignore <N>  If possible, exclude N processing units
-  -J, --json        
+  -J, --json[=VERSION]
+                    Print one NDJSON record: processors (what nproc
+                    prints) and installed
       --help        Display this help and exit
 ";
 
@@ -40,7 +43,8 @@ enum NprocArgsOpt {
 const SPECS: &[OptSpec<NprocArgsOpt>] = &[
     OptSpec::long("all", HasArg::No, NprocArgsOpt::All),
     OptSpec::long("ignore", HasArg::Required, NprocArgsOpt::Ignore),
-    OptSpec::both(b'J', "json", HasArg::No, NprocArgsOpt::Json),
+    json_short(NprocArgsOpt::Json),
+    json_long(NprocArgsOpt::Json),
     OptSpec::long("help", HasArg::No, NprocArgsOpt::Help),
     OptSpec::long("version", HasArg::No, NprocArgsOpt::Version),
 ];
@@ -55,7 +59,10 @@ fn parse_nproc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<NprocA
         match o {
             NprocArgsOpt::All => parsed.all = true,
             NprocArgsOpt::Ignore => parsed.ignore = v.as_deref().map(lossy),
-            NprocArgsOpt::Json => parsed.json = true,
+            NprocArgsOpt::Json => {
+                check_json_version("nproc", v.as_deref())?;
+                parsed.json = true;
+            }
             NprocArgsOpt::Help => return Err(print_help(NPROC_HELP)),
             NprocArgsOpt::Version => return Err(print_version("nproc")),
         }
@@ -153,10 +160,12 @@ pub fn run_nproc(args: Vec<std::ffi::OsString>, _ctx: &DogfishContext) -> Result
         1
     };
     if parsed.json {
-        outln!(
-            "{}",
-            serde_json::json!({ "available_cpus": count, "total_cpus": online_processors(true) })
-        );
+        let mut w = RecordWriter::stdout();
+        w.record(|r| {
+            r.u64("processors", count)
+                .u64("installed", online_processors(true));
+        })?;
+        w.flush()?;
     } else {
         outln!("{}", count);
     }

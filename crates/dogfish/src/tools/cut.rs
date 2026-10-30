@@ -7,17 +7,17 @@ use std::os::unix::ffi::OsStringExt;
 
 use anyhow::Result;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, emit_objects_or_table,
-    eval_json_where, gnu_io_error, read_ndjson_stdin, stdout,
+    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputRecord, InputSource, emit_records,
+    eval_json_where, gnu_io_error, parse_ndjson, stdout,
 };
 use memchr::memchr2;
-use serde_json::{Map, Value};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, usage_error,
 };
 use crate::common::input::RawStdout;
-use crate::common::lines::{line_end, looks_like_json, lossy_lines, split_records};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::{line_end, looks_like_json, split_records};
 use crate::common::quote::{qf, quote_locale};
 
 const CUT_HELP: &str = "\
@@ -50,7 +50,8 @@ Options:
           Output delimiter (defaults to input delimiter)
   -w, --where <WHERE_EXPR>
           Filter NDJSON objects before projecting (e.g., `--where \"size>1K\"`)
-  -J, --json
+  -J, --json[=VERSION]
+          Write NDJSON records, even on a terminal
           
       --help
           Print help
@@ -108,7 +109,8 @@ const SPECS: &[OptSpec<CutOpt>] = &[
     OptSpec::long("version", HasArg::No, CutOpt::Version),
     OptSpec::long("field", HasArg::Required, CutOpt::Fields).exact(),
     OptSpec::both(b'w', "where", HasArg::Required, CutOpt::Where).exact(),
-    OptSpec::both(b'J', "json", HasArg::No, CutOpt::Json).exact(),
+    json_short(CutOpt::Json),
+    json_long(CutOpt::Json),
     OptSpec::short(b'n', HasArg::No, CutOpt::NoSplit),
 ];
 
@@ -119,6 +121,9 @@ fn parse_cut_args(args: Vec<OsString>) -> std::result::Result<CutArgs, i32> {
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     while let Some(opt) = opts.next() {
         let (o, v) = opt.map_err(|e| getopt_error("cut", &e))?;
+        if matches!(o, CutOpt::Json) {
+            check_json_version("cut", v.as_deref())?;
+        }
         let raw = v.map(OsString::into_vec).unwrap_or_default();
         let text = String::from_utf8_lossy(&raw).into_owned();
         match o {
@@ -567,7 +572,7 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let mut all = Vec::new();
         io::stdin().lock().read_to_end(&mut all)?;
         if looks_like_json(&all)
-            && let Some(objs) = read_ndjson_stdin(&lossy_lines(&all))
+            && let Some(objs) = parse_ndjson(&all)
         {
             return cut_objects(objs, &parsed, ctx);
         }
@@ -608,29 +613,16 @@ pub fn run_cut(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 /// `-f name,size` / `--where` over NDJSON objects.
-fn cut_objects(mut objs: Vec<Value>, parsed: &CutArgs, ctx: &DogfishContext) -> Result<i32> {
+fn cut_objects(mut objs: Vec<InputRecord>, parsed: &CutArgs, ctx: &DogfishContext) -> Result<i32> {
     if let Some(ref expr) = parsed.where_expr {
-        objs.retain(|o| eval_json_where(o, expr));
+        objs.retain(|o| eval_json_where(&o.value, expr));
     }
     if let Some(ref f_spec) = parsed.fields {
         ctx.telemetry.set_strategy("NDJSON field projection");
         let requested: Vec<&str> = f_spec.split(',').map(|s| s.trim()).collect();
-        objs = objs
-            .into_iter()
-            .map(|obj| {
-                let mut m = Map::new();
-                if let Some(orig) = obj.as_object() {
-                    for &k in &requested {
-                        if let Some(v) = orig.get(k) {
-                            m.insert(k.to_string(), v.clone());
-                        }
-                    }
-                }
-                Value::Object(m)
-            })
-            .collect();
+        objs = objs.iter().map(|r| r.project(&requested)).collect();
     }
-    emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json)?;
+    emit_records(&objs, ctx, parsed.json)?;
     Ok(0)
 }
 

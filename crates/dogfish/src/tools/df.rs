@@ -11,10 +11,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use dogfish_core::{
-    ColumnAlign, DogfishContext, Style, Table, emit_objects_or_table, format_size, gnu_io_error,
+    ColumnAlign, DogfishContext, Record, RecordWriter, Style, Table, format_size, gnu_io_error,
     sparkline_bar, stdout,
 };
-use serde::Serialize;
 
 use crate::common::file_info::find_mount_point;
 use crate::common::getopt::{
@@ -24,6 +23,7 @@ use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_B, HUMAN_BASE_1024, HUMAN_SI, HUMAN_SUPPRESS_POINT_ZERO, env_block_size,
     human_readable, parse_block_size,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{Quoting, locale_is_utf8, qf, quote_bytes, quote_f};
 
 const DF_OPTIONS: &[OptSpec<&str>] = &[
@@ -44,7 +44,8 @@ const DF_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
     // Short-only options.
     OptSpec::short(b'k', HasArg::No, "kilobytes"),
     OptSpec::short(b'm', HasArg::No, "megabytes"),
@@ -72,7 +73,7 @@ or all file systems by default.
   -t, --type=TYPE       limit listing to file systems of type TYPE
   -T, --print-type      print file system type
   -x, --exclude-type=TYPE   limit listing to file systems not of type TYPE
-  -J, --json            emit NDJSON records (Dogfish extension)
+  -J, --json[=VERSION]  one NDJSON record per file system (Dogfish extension)
       --help            display this help and exit
       --version         output version information and exit
 
@@ -81,17 +82,6 @@ field names are: 'source', 'fstype', 'itotal', 'iused', 'iavail', 'ipcent',
 'size', 'used', 'avail', 'pcent', 'file' and 'target'.
 On a terminal Dogfish draws usage bars unless -P, -i or --output is given.
 ";
-
-#[derive(Serialize)]
-struct DfRecord {
-    filesystem: String,
-    fs_type: String,
-    total_bytes: u64,
-    used_bytes: u64,
-    available_bytes: u64,
-    use_percent: f64,
-    mount_point: String,
-}
 
 /// The columns `df` can print, in `--output` order.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -524,7 +514,12 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             "total" => total = true,
             "type" => cfg.select_types.push(opt.value.unwrap_or_default()),
             "exclude-type" => cfg.exclude_types.push(opt.value.unwrap_or_default()),
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("df", opt.value.as_deref().map(OsStr::new)) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "sync" | "no-sync" | "ignored" => {}
             "help" => return Ok(print_help(DF_HELP)),
             "version" => return Ok(print_version("df")),
@@ -603,8 +598,11 @@ pub fn run_df(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     }
 
     if json {
-        let records: Vec<DfRecord> = rows.iter().map(df_record).collect();
-        emit_objects_or_table(&records, ctx, true, false)?;
+        let mut w = RecordWriter::stdout();
+        for row in &rows {
+            w.record(|r| df_record(r, row, &cfg))?;
+        }
+        w.flush()?;
         return Ok(status);
     }
     let mut out = io::BufWriter::new(stdout::stdout());
@@ -1028,26 +1026,43 @@ fn df_render_gnu<W: Write>(rows: &[DfRow], cfg: &DfConfig, out: &mut W) -> io::R
     Ok(())
 }
 
-fn df_record(row: &DfRow) -> DfRecord {
-    let u = &row.usage;
-    let total = u.blocks.saturating_mul(u.block_size);
-    let free = u.free.saturating_mul(u.block_size);
-    let available = u.available.saturating_mul(u.block_size);
-    let used = total.saturating_sub(free);
-    let denom = used + available;
-    let pct = if denom > 0 {
-        used as f64 / denom as f64 * 100.0
+/// One `-J` record: the file system, its mount point and the operand that
+/// named it, sizes in bytes and inode counts, with GNU's rounded-up use
+/// percentages. A row GNU shows as `-` has no numbers; the `--total` row is
+/// marked `total`.
+fn df_record(r: &mut Record<'_>, row: &DfRow, cfg: &DfConfig) {
+    let is_total = row.source == "total" && row.file == "-" && row.fs_type == "-";
+    r.str("filesystem", &row.source);
+    if is_total {
+        r.bool("total", true);
     } else {
-        0.0
-    };
-    DfRecord {
-        filesystem: row.source.clone(),
-        fs_type: row.fs_type.clone(),
-        total_bytes: total,
-        used_bytes: used,
-        available_bytes: available,
-        use_percent: (pct * 10.0).round() / 10.0,
-        mount_point: row.target.to_string_lossy().into_owned(),
+        r.str("fs_type", &row.fs_type).os_str("mount", &row.target);
+        if row.file != "-" {
+            r.os_str("path", &row.file);
+        }
+    }
+    if row.unknown {
+        return;
+    }
+    let u = &row.usage;
+    let blocks = df_figures(row, cfg, false);
+    let used = i128::from(blocks.used) * if blocks.used_negative { -1 } else { 1 };
+    let bytes = |n: u64| n.saturating_mul(u.block_size);
+    r.u64("size", bytes(blocks.total))
+        .i64(
+            "used",
+            i64::try_from(used * i128::from(u.block_size)).unwrap_or(i64::MAX),
+        )
+        .u64("available", bytes(blocks.available));
+    if let Some(p) = df_percent(&blocks) {
+        r.u64("use_percent", p);
+    }
+    let inodes = df_figures(row, cfg, true);
+    r.u64("inodes", inodes.total)
+        .u64("inodes_used", inodes.used)
+        .u64("inodes_available", inodes.available);
+    if let Some(p) = df_percent(&inodes) {
+        r.u64("inodes_use_percent", p);
     }
 }
 
@@ -1075,17 +1090,28 @@ fn df_render_rich<W: Write>(
         ("USAGE", ColumnAlign::Left),
         ("MOUNTED ON", ColumnAlign::Left),
     ]);
-    for m in rows.iter().map(df_record) {
-        let ratio = (m.use_percent / 100.0).clamp(0.0, 1.0);
-        let usage_col = format!("{} {:>5.1}%", sparkline_bar(ratio, 10, st), m.use_percent);
+    for row in rows {
+        let u = &row.usage;
+        let total = u.blocks.saturating_mul(u.block_size);
+        let free = u.free.saturating_mul(u.block_size);
+        let available = u.available.saturating_mul(u.block_size);
+        let used = total.saturating_sub(free);
+        let denom = used + available;
+        let pct = if denom > 0 {
+            used as f64 / denom as f64 * 100.0
+        } else {
+            0.0
+        };
+        let ratio = (pct / 100.0).clamp(0.0, 1.0);
+        let usage_col = format!("{} {:>5.1}%", sparkline_bar(ratio, 10, st), pct);
         table.add_row(vec![
-            st.bold(&m.filesystem),
-            st.dim(&m.fs_type),
-            size(m.total_bytes),
-            st.yellow(&size(m.used_bytes)),
-            st.green(&size(m.available_bytes)),
+            st.bold(&row.source),
+            st.dim(&row.fs_type),
+            size(total),
+            st.yellow(&size(used)),
+            st.green(&size(available)),
             usage_col,
-            st.bold_cyan(&m.mount_point),
+            st.bold_cyan(&row.target.to_string_lossy()),
         ]);
     }
     table.render(out, st)

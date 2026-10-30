@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use std::ffi::OsString;
 
 use anyhow::Result;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, outln, sparkline_bar, stdout};
-use serde::Serialize;
+use dogfish_core::{
+    ColumnAlign, DogfishContext, RecordWriter, Table, outln, sparkline_bar, stdout,
+};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, count_arg, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 
 const BENCH_HELP: &str = "\
@@ -25,7 +27,7 @@ Usage: bench [OPTIONS]
 Options:
   -n, --iterations <ITERATIONS>  Number of iterations per benchmark [default: 7]
   -s, --size-mb <SIZE_MB>        Size of generated benchmark payload in MiB [default: 32]
-  -J, --json                     Emit JSON benchmark results
+  -J, --json[=VERSION]           One NDJSON record per benchmark
   -h, --help                     Print help
 ";
 
@@ -47,7 +49,8 @@ enum BenchOpt {
 const SPECS: &[OptSpec<BenchOpt>] = &[
     OptSpec::both(b'n', "iterations", HasArg::Required, BenchOpt::Iterations),
     OptSpec::both(b's', "size-mb", HasArg::Required, BenchOpt::SizeMb),
-    OptSpec::both(b'J', "json", HasArg::No, BenchOpt::Json),
+    json_short(BenchOpt::Json),
+    json_long(BenchOpt::Json),
     OptSpec::both(b'h', "help", HasArg::No, BenchOpt::Help),
     OptSpec::long("version", HasArg::No, BenchOpt::Version),
 ];
@@ -62,12 +65,15 @@ fn parse_bench_args(args: Vec<OsString>) -> std::result::Result<BenchArgs, i32> 
     };
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     while let Some(opt) = opts.next() {
-        let (o, v) = opt.map_err(|e| getopt_error("bench", &e))?;
-        let v = v.as_deref().map(lossy).unwrap_or_default();
+        let (o, raw) = opt.map_err(|e| getopt_error("bench", &e))?;
+        let v = raw.as_deref().map(lossy).unwrap_or_default();
         match o {
             BenchOpt::Iterations => p.iterations = count_arg("bench", "--iterations", &v)?,
             BenchOpt::SizeMb => p.size_mb = count_arg("bench", "--size-mb", &v)?,
-            BenchOpt::Json => p.json = true,
+            BenchOpt::Json => {
+                check_json_version("bench", raw.as_deref())?;
+                p.json = true;
+            }
             BenchOpt::Help => return Err(print_help(BENCH_HELP)),
             BenchOpt::Version => return Err(print_version("bench")),
         }
@@ -81,9 +87,10 @@ fn parse_bench_args(args: Vec<OsString>) -> std::result::Result<BenchArgs, i32> 
     Ok(p)
 }
 
-#[derive(Serialize)]
 struct BenchRow {
     benchmark: String,
+    dogfish: Duration,
+    system: Duration,
     dogfish_ms: f64,
     system_ms: f64,
     speedup: f64,
@@ -266,7 +273,19 @@ pub fn run_bench(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     if parsed.json {
-        outln!("{}", serde_json::to_string_pretty(&results)?);
+        // The best wall time of the runs on each side, in nanoseconds.
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let mut w = RecordWriter::stdout();
+        for row in &results {
+            w.record(|r| {
+                r.str("benchmark", &row.benchmark)
+                    .u64("dogfish_duration_ns", ns(row.dogfish))
+                    .u64("system_duration_ns", ns(row.system))
+                    .f64("speedup", row.speedup)
+                    .str("strategy", &row.strategy);
+            })?;
+        }
+        w.flush()?;
         return Ok(0);
     }
 
@@ -329,6 +348,8 @@ fn make_bench_row(name: &str, df: Duration, sys: Duration, strategy: &str) -> Be
     let speedup = if df_ms > 0.0 { sys_ms / df_ms } else { 1.0 };
     BenchRow {
         benchmark: name.to_string(),
+        dogfish: df,
+        system: sys,
         dogfish_ms: (df_ms * 100.0).round() / 100.0,
         system_ms: (sys_ms * 100.0).round() / 100.0,
         speedup: (speedup * 100.0).round() / 100.0,
