@@ -45,7 +45,7 @@ GNU/Dogfish is Free Software (*"free" as in freedom, not merely "free beer"—th
 
 `util/bench.py` runs 47 head-to-head benchmarks: the same command line through GNU coreutils 9.4 and through Dogfish, alternating, 7 times each, with stdout to a regular file and `LC_ALL=C`. The figure is GNU's median time divided by Dogfish's, so above 1.0 means Dogfish is faster.
 
-Measured on a quiet 4-core Intel Xeon @ 2.8 GHz VM (AVX-512, no SHA extensions), Ubuntu 24.04, portable release build (no `target-cpu=native`). Dogfish is at least as fast as GNU, in wall and CPU time, on 39 of the 47:
+Measured on a quiet 4-core Intel Xeon @ 2.8 GHz VM (AVX-512, no SHA extensions), Ubuntu 24.04, portable release build (no `target-cpu=native`). Dogfish is at least as fast as GNU, in wall and CPU time, on 39 of the 47 (38 since the md-5 0.11 upgrade; see `md5sum` below):
 
 | Benchmark | Wall | CPU | | Benchmark | Wall | CPU |
 |---|---:|---:|---|---|---:|---:|
@@ -58,12 +58,13 @@ Measured on a quiet 4-core Intel Xeon @ 2.8 GHz VM (AVX-512, no SHA extensions),
 | `tac` 100 MB | 1.88× | 2.03× | | `rm -r` 30k files | 1.08× | 1.07× |
 | `nl` 100 MB | 1.78× | 1.85× | | `cp -r` 30k files | 1.06× | 1.06× |
 | `seq` 10M | 1.57× | 1.27× | | `sha256sum` 256 MB | 1.04× | 1.03× |
-| `head -n 1M` | 1.34× | 1.75× | | `md5sum` 256 MB | 1.02× | 1.04× |
+| `head -n 1M` | 1.34× | 1.75× | | | | |
 
 Where it is not (yet) faster:
 
 - **Process startup:** 200 calls of `true`, `basename` or `cat` on a small file take 0.85-0.98× GNU's time. Dogfish makes the same system calls as GNU at startup; what is left is the dynamic loader binding about 135 more libc symbols and applying about 2,900 relocations in one multicall binary. Removing them would mean giving up PIE, full RELRO or dynamic NSS, which Dogfish keeps. The 2 ms `wc -c` and `wc -m` runs (0.95×) are this startup cost.
 - **Within a few percent:** `ls -1` over 300 directories (0.99× wall, 1.05× CPU) and `chmod -R` (0.98×), which make the same system calls as GNU and are bound by the kernel, and `du -s` (1.74× wall but 0.93× CPU, because it walks in parallel).
+- **`md5sum`:** 0.84× (was 1.02×). md-5 0.11 dropped the `asm` feature, so MD5 runs its portable Rust compression function instead of the `md5-asm` assembly it used before.
 - **What `cp` costs when it overwrites:** Dogfish keeps the old contents so `dogfish undo` can restore them. Set `DOGFISH_UNDO=off` to skip that.
 
 To reproduce: `util/bench.py` (add `-k sort` to run a subset, `REPEAT=N` to change the count, `--json FILE` to keep the results). `dogfish bench` is a smaller self-contained suite that ships in every binary. Results vary by OS, file system, CPU and file size, so measure on your own machine before relying on any figure.

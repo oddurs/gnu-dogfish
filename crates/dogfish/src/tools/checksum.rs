@@ -6,8 +6,9 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-use blake2::Blake2bVar;
-use digest::{Digest, Update, VariableOutput};
+use blake2::Blake2bVarCore;
+use digest::Digest;
+use digest::block_api::{Buffer, UpdateCore, VariableOutputCore};
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, RecordWriter, gnu_io_error,
     gnu_quote, stdout,
@@ -56,6 +57,43 @@ impl digest::FixedOutput for RingSha256 {
     }
 }
 
+/// BLAKE2b with its digest length chosen at run time (`b2sum -l N`).
+///
+/// blake2 0.11 dropped the runtime-length `Blake2bVar` and digest 0.11 its
+/// `VariableOutput` wrapper; only the compile-time `Blake2b<U..>` types remain.
+/// This is that wrapper's job done by hand: the block-level core (which takes
+/// the length at run time and folds it into the parameter block, as BLAKE2
+/// requires) behind the lazy block buffer BLAKE2 needs, so the final block is
+/// compressed with the finalization flag. The core's output is truncated on
+/// the left (`TruncSide::Left`).
+struct Blake2bRt {
+    core: Blake2bVarCore,
+    buffer: Buffer<Blake2bVarCore>,
+    len: usize,
+}
+
+impl Blake2bRt {
+    /// `len` is in bytes, 1 to 64.
+    fn new(len: usize) -> Self {
+        Self {
+            core: VariableOutputCore::new(len).expect("valid BLAKE2b length"),
+            buffer: Buffer::<Blake2bVarCore>::default(),
+            len,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let Self { core, buffer, .. } = self;
+        buffer.digest_blocks(data, |blocks| core.update_blocks(blocks));
+    }
+
+    fn finalize(mut self) -> Vec<u8> {
+        let mut out = digest::Output::<Blake2bVarCore>::default();
+        self.core.finalize_variable_core(&mut self.buffer, &mut out);
+        out[..self.len].to_vec()
+    }
+}
+
 /// The digest a `*sum` tool computes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Algo {
@@ -94,9 +132,7 @@ impl Algo {
         match self {
             Self::Md5 => Hasher::Md5(Md5::new()),
             Self::Sha256 => Hasher::Sha256(RingSha256::default()),
-            Self::Blake2b(bits) => {
-                Hasher::Blake2b(Blake2bVar::new(bits / 8).expect("valid BLAKE2b length"))
-            }
+            Self::Blake2b(bits) => Hasher::Blake2b(Blake2bRt::new(bits / 8)),
         }
     }
 }
@@ -104,7 +140,7 @@ impl Algo {
 enum Hasher {
     Md5(Md5),
     Sha256(RingSha256),
-    Blake2b(Blake2bVar),
+    Blake2b(Blake2bRt),
 }
 
 impl Hasher {
@@ -112,7 +148,7 @@ impl Hasher {
         match self {
             Self::Md5(h) => Digest::update(h, data),
             Self::Sha256(h) => Digest::update(h, data),
-            Self::Blake2b(h) => Update::update(h, data),
+            Self::Blake2b(h) => h.update(data),
         }
     }
 
@@ -120,12 +156,7 @@ impl Hasher {
         let bytes = match self {
             Self::Md5(h) => h.finalize().to_vec(),
             Self::Sha256(h) => h.finalize().to_vec(),
-            Self::Blake2b(h) => {
-                let mut out = vec![0u8; h.output_size()];
-                h.finalize_variable(&mut out)
-                    .expect("buffer matches the output size");
-                out
-            }
+            Self::Blake2b(h) => h.finalize(),
         };
         data_encoding::HEXLOWER.encode(&bytes)
     }
@@ -940,4 +971,44 @@ pub(crate) fn manual(tool: &'static str) -> crate::manual::Manual {
         _ => MD5SUM_HELP,
     };
     crate::manual::Manual::new(tool, help, specs_for(tool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime-length wrapper agrees with blake2's compile-time types
+    /// around the 128-byte block boundary (BLAKE2 must not compress the last
+    /// full block until it knows it is the last), however the input is split.
+    #[test]
+    fn blake2b_rt_matches_fixed_output_types() {
+        let data: Vec<u8> = (0..=600u32).map(|i| (i * 7 + 3) as u8).collect();
+        for n in [0, 1, 127, 128, 129, 255, 256, 257, 600] {
+            let input = &data[..n];
+            for split in [0, 1, 64, 128, n] {
+                let split = split.min(n);
+                let rt = |len| {
+                    let mut h = Blake2bRt::new(len);
+                    h.update(&input[..split]);
+                    h.update(&input[split..]);
+                    h.finalize()
+                };
+                assert_eq!(rt(64), blake2::Blake2b512::digest(input).to_vec());
+                assert_eq!(rt(32), blake2::Blake2b256::digest(input).to_vec());
+                assert_eq!(rt(16), blake2::Blake2b128::digest(input).to_vec());
+            }
+        }
+    }
+
+    /// RFC 7693 appendix A: BLAKE2b-512 of "abc".
+    #[test]
+    fn blake2b_rt_abc() {
+        let mut h = Blake2bRt::new(64);
+        h.update(b"abc");
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&h.finalize()),
+            "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1\
+             7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+        );
+    }
 }

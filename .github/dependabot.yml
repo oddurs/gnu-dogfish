@@ -8,24 +8,13 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     groups:
-      # Crates that must move together: digest's traits are implemented by md-5,
-      # blake2 and the ring adapter in hash.rs, so a lone bump never compiles.
+      # Crates that must move together: md-5 and blake2 implement digest's
+      # traits, as does the ring SHA-256 adapter in
+      # crates/dogfish/src/tools/checksum.rs, so a lone bump never compiles.
       rustcrypto:
         patterns: ["digest", "md-5", "blake2", "sha2"]
       cargo-minor:
         update-types: [minor, patch]
-    ignore:
-      # digest 0.11 / blake2 0.11 / md-5 0.11 need a hand-written port (no
-      # Blake2bVar, no md-5 asm feature, new digest traits for the ring
-      # adapter): cairn item 0015. Remove this when it lands.
-      - dependency-name: "digest"
-        versions: [">=0.11"]
-      - dependency-name: "blake2"
-        versions: [">=0.11"]
-      - dependency-name: "md-5"
-        versions: [">=0.11"]
-      - dependency-name: "sha2"
-        versions: [">=0.11"]
 
   - package-ecosystem: github-actions
     directory: /
