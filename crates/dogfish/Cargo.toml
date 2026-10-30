@@ -53,6 +53,10 @@ tempfile.workspace = true
 itoa.workspace = true
 ring.workspace = true
 
+# md5sum's compression function (crate::common::md5); x86 only.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
+md5-asm.workspace = true
+
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 
