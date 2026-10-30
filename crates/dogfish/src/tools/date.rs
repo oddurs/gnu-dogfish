@@ -84,7 +84,7 @@ const RFC_3339_FORMATS: [(&str, &str); 3] = [
 /// Formats one time with `fmt`, or reports it as out of range.
 fn render_date(stamp: Stamp, fmt: &[u8]) -> Option<Vec<u8>> {
     let lt = local_time(stamp.sec)?;
-    let mut line = format_time(fmt, &lt, stamp.ns, stamp.sec, false);
+    let mut line = format_time(fmt, &lt, stamp.ns, false);
     line.push(b'\n');
     Some(line)
 }
