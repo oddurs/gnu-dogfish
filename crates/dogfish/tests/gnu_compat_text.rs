@@ -452,6 +452,11 @@ shell_cases! {
     // ---------------------------------------------------------------- tac
     tac_closed_stdin: ["tac"] "tac - - <&-; echo $?";
     tac_pipe_twice: ["tac"] "printf 'x\\ny\\n' | tac - -";
+    // A directory fails where tac_seekable reads (EINVAL or EISDIR, as the
+    // file system has it), and the diagnostic comes before the output still
+    // in tac's 8 KiB buffer, after what stdio already had.
+    tac_directory: ["tac"] "mkdir d; tac d; echo $?";
+    tac_directory_order: ["tac"] "mkdir d; printf 'a\\nb\\n' > f; seq 1500 > m; seq 3000 > b; tac f d f 2>&1 | cat; tac m d m 2>&1 | md5sum; tac b d f 2>&1 | md5sum; tac f nonexist f 2>&1 | cat; tac - d < f 2>&1 | cat";
 
     // ---------------------------------------------- echo / mktemp, POSIX
     echo_posixly_correct: ["echo"] "export POSIXLY_CORRECT=1; env echo -n -E 'foo\\n'; env echo -nE foo; env echo -E -n foo; env echo --version";
