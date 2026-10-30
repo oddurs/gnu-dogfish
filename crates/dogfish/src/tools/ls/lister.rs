@@ -428,7 +428,13 @@ impl<W: Write> Lister<'_, W> {
         command_line: bool,
     ) -> io::Result<()> {
         let o = self.opts;
-        let id = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        // Only -R can come back to a directory, so only -R needs its identity
+        // (one stat fewer for each listing otherwise).
+        let id = if o.recursive {
+            fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        } else {
+            None
+        };
         let shown = bytes_path(name);
         if let Some(id) = id
             && self.active.contains(&id)
