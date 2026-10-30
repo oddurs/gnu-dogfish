@@ -11,6 +11,8 @@
 
 mod common;
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -44,6 +46,26 @@ fn fixtures() -> &'static Path {
             ),
         ];
         common::write_files(&dir, files);
+        // Names that are not UTF-8 (`@xff@` in a case's arguments). Some
+        // file systems (APFS) refuse them with EILSEQ; the cases then
+        // compare the diagnostics of a missing file instead.
+        let odd: &[(&[u8], &[u8])] = &[
+            (b"odd\xffname.txt", b"b\na\na\nc:d\n"),
+            (b"one\xff.txt", b"only\n"),
+            (b"nl\n\xff", b"x\n"),
+            (b"dates\xff.txt", b"@1\nbogus\n"),
+        ];
+        for (name, data) in odd {
+            match std::fs::write(dir.join(OsStr::from_bytes(name)), data) {
+                Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {}
+                res => res.unwrap(),
+            }
+        }
+        std::fs::write(
+            dir.join("names0-odd.txt"),
+            b"odd\xffname.txt\0lines.txt\0nope\xff\0",
+        )
+        .unwrap();
         dir
     })
 }
@@ -347,6 +369,50 @@ gnu_cases! {
     json_lines_uniq: "uniq" [] stdin b"{\"a\":  1}\n{\"a\":  1}\n";
     json_lines_cut: "cut" ["-c1-5"] stdin b"{\"a\":  1}\n";
     json_lines_cut_fields: "cut" ["-f1"] stdin b"{\"a\":  1}\n";
+
+    // ------------------------------- file names that are not UTF-8
+    // `@xff@` is the byte 0xff: the file is opened by its exact bytes, named
+    // unquoted in output (headers, counts) and shell-escaped in messages.
+    cat_non_utf8: "cat" ["odd@xff@name.txt", "nope@xff@", "one@xff@.txt"];
+    cat_number_non_utf8: "cat" ["-n", "odd@xff@name.txt", "nope@xff@"];
+    head_non_utf8: "head" ["-n", "1", "odd@xff@name.txt", "lines.txt", "nope@xff@"];
+    head_non_utf8_elide_bytes: "head" ["-v", "-c", "-2", "odd@xff@name.txt"];
+    tail_non_utf8: "tail" ["-n", "1", "odd@xff@name.txt", "lines.txt", "nope@xff@"];
+    wc_non_utf8: "wc" ["odd@xff@name.txt", "nope@xff@", "one@xff@.txt"];
+    wc_non_utf8_newline: "wc" ["-l", "nl\n@xff@", "one@xff@.txt"];
+    wc_files0_from_non_utf8_names: "wc" ["--files0-from=names0-odd.txt"];
+    wc_files0_from_non_utf8_stdin: "wc" ["-c", "--files0-from=-"] stdin b"odd\xffname.txt\0one\xff.txt";
+    wc_files0_from_non_utf8_list: "wc" ["--files0-from=nope@xff@"];
+    wc_files0_from_non_utf8_extra: "wc" ["--files0-from=-", "x@xff@"];
+    sort_non_utf8: "sort" ["odd@xff@name.txt", "one@xff@.txt"];
+    sort_non_utf8_missing: "sort" ["odd@xff@name.txt", "nope@xff@"];
+    sort_files0_from_non_utf8_names:"sort" ["--files0-from=names0-odd.txt"];
+    sort_files0_from_non_utf8_stdin: "sort" ["--files0-from=-"] stdin b"odd\xffname.txt\0one\xff.txt";
+    sort_files0_from_non_utf8_list: "sort" ["--files0-from=nope@xff@"];
+    sort_files0_from_non_utf8_extra: "sort" ["--files0-from=-", "x@xff@"];
+    uniq_non_utf8: "uniq" ["-c", "odd@xff@name.txt"];
+    uniq_non_utf8_missing: "uniq" ["nope@xff@"];
+    uniq_non_utf8_output_unwritable: "uniq" ["odd@xff@name.txt", "nodir@xff@/out"];
+    uniq_non_utf8_extra_operand: "uniq" ["a", "b", "c@xff@"];
+    cut_non_utf8: "cut" ["-d:", "-f1", "odd@xff@name.txt", "nope@xff@"];
+    tac_non_utf8: "tac" ["odd@xff@name.txt", "nope@xff@", "one@xff@.txt"];
+    paste_non_utf8: "paste" ["odd@xff@name.txt", "one@xff@.txt"];
+    paste_non_utf8_missing: "paste" ["-s", "one@xff@.txt", "nope@xff@"];
+    nl_non_utf8: "nl" ["odd@xff@name.txt", "nope@xff@", "one@xff@.txt"];
+    shuf_non_utf8: "shuf" ["one@xff@.txt"];
+    shuf_non_utf8_missing: "shuf" ["nope@xff@"];
+    shuf_non_utf8_output_unwritable: "shuf" ["-o", "nodir@xff@/out", "one@xff@.txt"];
+    shuf_non_utf8_random_source: "shuf" ["--random-source=nope@xff@", "lines.txt"];
+    shuf_non_utf8_extra_operand: "shuf" ["a", "b@xff@"];
+    shuf_directory: "shuf" ["."];
+    base64_non_utf8: "base64" ["one@xff@.txt"];
+    base64_non_utf8_missing: "base64" ["nope@xff@"];
+    base64_non_utf8_extra_operand: "base64" ["a", "b@xff@"];
+    basenc_non_utf8: "basenc" ["--base32", "one@xff@.txt"];
+    date_file_non_utf8: "date" ["-f", "dates@xff@.txt", "+%s"] env [("TZ", "UTC0")];
+    date_file_non_utf8_missing: "date" ["-f", "nope@xff@"];
+    date_reference_non_utf8: "date" ["-r", "one@xff@.txt", "+%Y"] env [("TZ", "UTC0")];
+    date_reference_non_utf8_missing: "date" ["-r", "nope@xff@"];
 }
 
 // ------------------------------------------------------- shell pipelines

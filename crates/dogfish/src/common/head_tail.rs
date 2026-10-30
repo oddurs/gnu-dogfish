@@ -1,16 +1,18 @@
 //! Helpers shared by head and tail: `==> NAME <==` headers, GNU counts and
 //! the last-N-lines scan.
 
+use std::ffi::OsStr;
+
 use dogfish_core::InputSource;
 use memchr::memrchr_iter;
 
 use crate::common::xstrtol::xdectoumax;
 
 /// Name GNU uses for an input in `==> NAME <==` headers and messages.
-pub(crate) fn header_name(src: &InputSource) -> &str {
+pub(crate) fn header_name(src: &InputSource) -> &OsStr {
     match src {
-        InputSource::Stdin => "standard input",
-        InputSource::File(p) => p.as_str(),
+        InputSource::Stdin => OsStr::new("standard input"),
+        InputSource::File(p) => p,
     }
 }
 

@@ -2,16 +2,14 @@
 //! streaming: output is written as input is read, so `paste /dev/zero`
 //! stops at the first write error)
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
 use std::os::unix::ffi::OsStringExt;
 
 use anyhow::Result;
 use dogfish_core::{DogfishContext, FastReader, InputSource, gnu_io_error, stdout};
 
-use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version,
-};
+use crate::common::getopt::{Getopt, HasArg, OptSpec, getopt_error, print_help, print_version};
 use crate::common::quote::{Quoting, qf, quote_bytes};
 
 const PASTE_HELP: &str = "\
@@ -86,13 +84,8 @@ impl Delims<'_> {
     }
 }
 
-fn open(name: &str) -> io::Result<Box<dyn BufRead>> {
-    let src = if name == "-" {
-        InputSource::Stdin
-    } else {
-        InputSource::File(name.to_string())
-    };
-    Ok(FastReader::open(&src)?.into_bufread())
+fn open(name: &OsStr) -> io::Result<Box<dyn BufRead>> {
+    Ok(FastReader::open(&InputSource::from_arg(name))?.into_bufread())
 }
 
 /// Copies the rest of the current line of `r` to `out`, without its
@@ -124,7 +117,7 @@ fn copy_line<W: Write>(r: &mut dyn BufRead, eol: u8, out: &mut W) -> io::Result<
 /// GNU `paste_parallel`; false when an input failed. `Err` is a write
 /// error. As in GNU, a file that cannot be opened ends the run.
 fn paste_parallel<W: Write>(
-    files: &[String],
+    files: &[OsString],
     delims: &[Option<u8>],
     eol: u8,
     out: &mut W,
@@ -228,7 +221,7 @@ fn paste_parallel<W: Write>(
 
 /// GNU `paste_serial`; false when an input failed. `Err` is a write error.
 fn paste_serial<W: Write>(
-    files: &[String],
+    files: &[OsString],
     delims: &[Option<u8>],
     eol: u8,
     out: &mut W,
@@ -315,9 +308,9 @@ pub fn run_paste(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             PasteOpt::Version => return Ok(print_version("paste")),
         }
     }
-    let mut files = lossy_all(opts.operands());
+    let mut files = opts.operands();
     if files.is_empty() {
-        files.push("-".to_string());
+        files.push(OsString::from("-"));
     }
     let Ok(delims) = collapse_escapes(&delim_arg) else {
         eprintln!(
