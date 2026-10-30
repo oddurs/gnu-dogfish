@@ -1,6 +1,6 @@
 # Roadmap & Known Gaps
 
-GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every option it implements when output is not a terminal. Everything below is a **known** difference: either not implemented yet, or a deliberate choice. GNU's own test suite measures how far that goes: 366 of the 375 GNU tests that exercise only Dogfish programs pass (see the README), and each failing test is a cairn item in [`cairn/items`](./cairn/items). The list below covers the differences known before that suite ran. If you hit one that isn't listed, please [open an issue](https://github.com/oddurs/gnu-dogfish/issues/new/choose) with the exact command line.
+GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every option it implements when output is not a terminal. Everything below is a **known** difference: either not implemented yet, or a deliberate choice. GNU's own test suite measures how far that goes: all 378 GNU tests that exercise only Dogfish programs and run in CI pass (39 more skip) (see the README). The list below covers the differences known before that suite ran. If you hit one that isn't listed, please [open an issue](https://github.com/oddurs/gnu-dogfish/issues/new/choose) with the exact command line.
 
 ## Cross-cutting
 
