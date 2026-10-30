@@ -56,9 +56,11 @@ Measured on a quiet 4-core Intel Xeon @ 2.8 GHz VM (AVX-512, no SHA extensions),
 | `du -ah` 30k files | 1.97× | 1.14× | | `b2sum` 256 MB | 1.17× | 1.16× |
 | `tr a-z A-Z` 100 MB | 1.96× | 1.79× | | `wc -l` 100 MB | 1.13× | 1.11× |
 | `tac` 100 MB | 1.88× | 2.03× | | `rm -r` 30k files | 1.08× | 1.07× |
-| `nl` 100 MB | 1.78× | 1.85× | | `cp -r` 30k files | 1.06× | 1.06× |
+| `nl` 100 MB | 1.78× | 1.85× | | `cp -r` 30k files | 2.37×¹ | 1.15×¹ |
 | `seq` 10M | 1.57× | 1.27× | | `sha256sum` 256 MB | 1.04× | 1.03× |
 | `head -n 1M` | 1.34× | 1.75× | | `md5sum` 256 MB | 1.02× | 1.04× |
+
+¹ Measured again (REPEAT=9) once `cp -r` began copying files on two worker threads, one directory each; its output, messages and exit status stay GNU's.
 
 Where it is not (yet) faster:
 
@@ -178,7 +180,7 @@ GNU's own test suite is the harder bar. `util/gnu-tests.sh` runs coreutils 9.4's
 
 | Category | Utilities | Highlights |
 | :--- | :--- | :--- |
-| **File & Directory** (16) | `ls`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `stat`, `touch`, `df`, `du`, `realpath`, `basename`, `dirname`, `mktemp` | APFS `clonefile` CoW in `cp`; parallel `jwalk` in `du`; `--tree` & `-J` in `ls`; sparkline bars in `df`/`du`; visual card in `stat`; `--safe` trash in `rm`. |
+| **File & Directory** (16) | `ls`, `cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `stat`, `touch`, `df`, `du`, `realpath`, `basename`, `dirname`, `mktemp` | APFS `clonefile` CoW in `cp`; parallel `jwalk` in `du`; parallel file copying in `cp -r`; `--tree` & `-J` in `ls`; sparkline bars in `df`/`du`; visual card in `stat`; `--safe` trash in `rm`. |
 | **Text & Streaming** (13) | `cat`, `tac`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `tr`, `paste`, `nl`, `shuf`, `query` | SIMD `bytecount`/`memchr`; SQL-like NDJSON `query` (`-w`, `-s`, `-f`, `-n`); `--where` & `--by <field>` in `sort`; reverse SIMD `tac`; Fisher-Yates `shuf`. |
 | **Hashing & Encoding** (5) | `b2sum`, `sha256sum`, `md5sum`, `base64`, `basenc` | Multi-threaded `rayon` file hashing; `-c` (`--check`) verifier; `base64url`, `base32`, `base16`/`hex`, `base2`/`bin` in `basenc`. |
 | **Shell & System** (18) | `echo`, `printf`, `env`, `printenv`, `id`, `uname`, `hostname`, `nproc`, `whoami`, `yes`, `true`, `false`, `sleep`, `timeout`, `watch`, `seq`, `date`, `tee` | 64 KiB page-aligned vector output in `yes`; human durations (`500ms`, `1m30s`) in `sleep`, `timeout`, and `watch`; `--table` and `-J` in `env`. |

@@ -7,6 +7,7 @@
 //! there when it is replaced, copied there when it is written into), and the
 //! operation is recorded once it is done, so `dogfish undo` can reverse it.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -15,6 +16,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 use dogfish_core::ndjson::file_type_name;
 use dogfish_core::{
@@ -85,6 +88,7 @@ pub(crate) enum Reflink {
 }
 
 /// GNU's `struct cp_options`, as far as Dogfish supports it.
+#[derive(Clone)]
 pub(crate) struct CopyOptions {
     pub(crate) backup: BackupMode,
     pub(crate) suffix: String,
@@ -316,6 +320,14 @@ pub(crate) struct Copier<'a> {
     method: CopyMethod,
     /// The same, as `--debug` reports it.
     debug: CopyDebug,
+    /// Workers copying regular files, once there is something for them.
+    par: RefCell<Option<Parallel>>,
+    /// This operand's regular files may be copied by workers
+    /// ([`Self::parallel_ok`]).
+    par_on: bool,
+    /// On a worker: what would go to standard error, kept for the walk to
+    /// write in order.
+    capture: Option<RefCell<Vec<String>>>,
 }
 
 /// Arguments of one `copy_internal` level that change while recursing.
@@ -324,6 +336,221 @@ struct Level<'p> {
     dereference: Deref,
     command_line_arg: bool,
     parent: Option<&'p fs::Metadata>,
+}
+
+/// A regular file whose `copy_reg` runs on a worker thread.
+struct Job {
+    /// Its place in the serial order of the walk.
+    seq: u64,
+    src: PathBuf,
+    dst: PathBuf,
+    dst_mode: u32,
+    omitted: u32,
+    src_sb: fs::Metadata,
+    dereference: Deref,
+}
+
+/// What a [`Job`] did: whether it succeeded, and what it would have written
+/// to standard error.
+struct Done {
+    seq: u64,
+    ok: bool,
+    /// Diagnostics, one a line, without the newline.
+    stderr: Vec<String>,
+}
+
+/// Most worker threads copying files (besides the walk's). Creating files is
+/// what costs, and the kernel spends more CPU on it the more run at once: on
+/// 4 cores, 2 workers copied 30,000 files 2.3x faster than GNU in wall time
+/// and 1.1x in CPU time, 3 workers 2.9x in wall but 0.9-1.1x in CPU, 4 workers
+/// 2.9x in wall but 0.75x in CPU.
+const MAX_WORKERS: usize = 2;
+/// Most files in one batch, and most batches waiting.
+const MAX_BATCH: usize = 1024;
+const MAX_IN_FLIGHT: usize = 64;
+
+/// How many workers [`Parallel`] may start.
+fn workers() -> usize {
+    thread::available_parallelism().map_or(1, |n| n.get().min(MAX_WORKERS))
+}
+
+/// Regular files copied into directories this run created, on worker threads.
+///
+/// Creating a file costs the kernel most of a recursive copy's time, and
+/// creates in different directories run in parallel (in one directory they
+/// contend for its lock), so each directory's files go to a worker as one
+/// batch. The walk itself stays on the calling thread, in GNU's order, and
+/// so does everything it decides and reports. Nothing a worker does is
+/// observable before the walk next waits for the workers ([`Copier::drain`]):
+/// before it reports anything itself, before it changes the permissions of a
+/// directory files may still be created in, and at the end of each operand.
+/// Then the workers' messages are written in the order the serial copy would
+/// have written them.
+struct Parallel {
+    /// To the workers; dropped to stop them.
+    jobs: Option<mpsc::Sender<Vec<Job>>>,
+    queue: Arc<Mutex<mpsc::Receiver<Vec<Job>>>>,
+    done_tx: mpsc::Sender<Vec<Done>>,
+    done: mpsc::Receiver<Vec<Done>>,
+    workers: Vec<thread::JoinHandle<()>>,
+    max_workers: usize,
+    /// Files of the directory being walked, not yet handed over.
+    batch: Vec<Job>,
+    /// Batches handed over and not yet back.
+    in_flight: usize,
+    /// Results back from the workers, not yet reported.
+    finished: Vec<Done>,
+    seq: u64,
+    /// A file copied by a worker failed since the operand began.
+    failed: bool,
+    tool: &'static str,
+    x: CopyOptions,
+    umask: u32,
+    ctx: DogfishContext,
+}
+
+impl Parallel {
+    fn new(tool: &'static str, x: CopyOptions, umask: u32, ctx: DogfishContext, n: usize) -> Self {
+        let (jobs, queue) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        Parallel {
+            jobs: Some(jobs),
+            queue: Arc::new(Mutex::new(queue)),
+            done_tx,
+            done,
+            workers: Vec::new(),
+            max_workers: n,
+            batch: Vec::new(),
+            in_flight: 0,
+            finished: Vec::new(),
+            seq: 0,
+            failed: false,
+            tool,
+            x,
+            umask,
+            ctx,
+        }
+    }
+
+    /// One more worker, while there are fewer than `max_workers`.
+    fn spawn_worker(&mut self) {
+        if self.workers.len() >= self.max_workers {
+            return;
+        }
+        let queue = Arc::clone(&self.queue);
+        let done = self.done_tx.clone();
+        let (tool, x, umask, ctx) = (self.tool, self.x.clone(), self.umask, self.ctx.clone());
+        let spawned = thread::Builder::new().spawn(move || {
+            let mut c = Copier::new(tool, x, None, umask, &ctx);
+            c.capture = Some(RefCell::new(Vec::new()));
+            loop {
+                // The lock is held only while waiting for the next batch.
+                let batch = match queue.lock() {
+                    Ok(q) => q.recv(),
+                    Err(_) => break,
+                };
+                let Ok(batch) = batch else { break };
+                let results = batch
+                    .into_iter()
+                    .map(|j| {
+                        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut new_dst = true;
+                            c.copy_reg(
+                                &j.src,
+                                &j.dst,
+                                j.dst_mode,
+                                j.omitted,
+                                &mut new_dst,
+                                &j.src_sb,
+                                j.dereference,
+                                false,
+                            )
+                        }))
+                        .unwrap_or(false);
+                        let stderr = c
+                            .capture
+                            .as_ref()
+                            .map(|s| std::mem::take(&mut *s.borrow_mut()))
+                            .unwrap_or_default();
+                        Done {
+                            seq: j.seq,
+                            ok,
+                            stderr,
+                        }
+                    })
+                    .collect();
+                if done.send(results).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Ok(h) = spawned {
+            self.workers.push(h);
+        }
+    }
+
+    /// Hands the current batch to the workers; gives it back when no worker
+    /// could be started (then nothing is in flight, and the caller copies it).
+    fn flush(&mut self) -> Option<Vec<Job>> {
+        if self.batch.is_empty() {
+            return None;
+        }
+        let batch = std::mem::take(&mut self.batch);
+        if self.workers.len() <= self.in_flight {
+            self.spawn_worker();
+        }
+        let tx = self.jobs.as_ref().filter(|_| !self.workers.is_empty())?;
+        if let Err(mpsc::SendError(batch)) = tx.send(batch) {
+            return Some(batch);
+        }
+        self.in_flight += 1;
+        // Keep what is queued bounded: wait for a batch to come back.
+        while self.in_flight >= MAX_IN_FLIGHT {
+            self.receive_one();
+        }
+        None
+    }
+
+    fn receive_one(&mut self) {
+        match self.done.recv() {
+            Ok(v) => {
+                self.in_flight -= 1;
+                self.finished.extend(v);
+            }
+            Err(_) => {
+                // Cannot happen: `done_tx` is still here.
+                self.in_flight = 0;
+                self.failed = true;
+            }
+        }
+    }
+
+    /// Waits for every batch handed over, then reports their files in walk
+    /// order. The current batch must have been flushed.
+    fn drain(&mut self) {
+        while self.in_flight > 0 {
+            self.receive_one();
+        }
+        if self.finished.is_empty() {
+            return;
+        }
+        self.finished.sort_unstable_by_key(|d| d.seq);
+        for d in self.finished.drain(..) {
+            self.failed |= !d.ok;
+            for line in d.stderr {
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
+impl Drop for Parallel {
+    fn drop(&mut self) {
+        self.jobs = None;
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 fn errno(e: &io::Error) -> i32 {
@@ -767,6 +994,9 @@ impl<'a> Copier<'a> {
                 reflink: DebugVal::Unknown,
                 sparse_detection: DebugVal::Unknown,
             },
+            par: RefCell::new(None),
+            par_on: false,
+            capture: None,
         }
     }
 
@@ -800,11 +1030,143 @@ impl<'a> Copier<'a> {
     }
 
     fn diag(&self, msg: &str) {
-        eprintln!("{}: {msg}", self.tool);
+        self.say(format!("{}: {msg}", self.tool));
     }
 
     fn diag_err(&self, msg: &str, e: &io::Error) {
-        eprintln!("{}: {msg}: {}", self.tool, gnu_io_error(e));
+        self.say(format!("{}: {msg}: {}", self.tool, gnu_io_error(e)));
+    }
+
+    /// Writes a diagnostic: after what the workers have to report, which
+    /// comes first in GNU's order; on a worker, into [`Self::capture`].
+    fn say(&self, line: String) {
+        match &self.capture {
+            Some(c) => c.borrow_mut().push(line),
+            None => {
+                self.drain();
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    // ------------------------------------------------------ parallel copy
+
+    /// Whether this operand's regular files may be copied by workers: only
+    /// when nothing about them is observable but the files themselves and
+    /// their error messages (which [`Parallel`] keeps in order). Not with
+    /// -v, -J, --debug or prompts (output per file); not with what GNU
+    /// decides from files already copied (hard links, --backup, -u), or
+    /// attributes set on a directory after its files (-p, -a); not when
+    /// following symlinks (-L), where a source may be a file being copied;
+    /// not when moving; and not under crash injection, which counts steps.
+    fn parallel_ok(&self) -> bool {
+        let x = &self.x;
+        x.recursive
+            && !x.move_mode
+            && !x.verbose
+            && !x.debug
+            && !actions::on()
+            && matches!(
+                x.interactive,
+                Interactive::Unspecified | Interactive::AlwaysYes
+            )
+            && x.backup == BackupMode::None
+            && !x.update
+            && !x.hard_link
+            && !x.symbolic_link
+            && !x.preserve_links
+            && !x.preserve_ownership
+            && !x.preserve_timestamps
+            && !x.preserve_mode
+            && !x.require_preserve
+            && x.data_copy_required
+            && x.dereference != Deref::Always
+            && self.capture.is_none()
+            && std::env::var_os("DOGFISH_CRASH_AT").is_none()
+            && workers() > 1
+    }
+
+    /// Copies the regular file `src` to the new `dst` on a worker, as
+    /// [`Self::copy_reg`] would here.
+    fn defer_reg(
+        &mut self,
+        src: &Path,
+        dst: &Path,
+        dst_mode: u32,
+        omitted: u32,
+        src_sb: &fs::Metadata,
+        dereference: Deref,
+    ) {
+        let par = self.par.get_mut().get_or_insert_with(|| {
+            Parallel::new(
+                self.tool,
+                self.x.clone(),
+                self.umask,
+                self.ctx.clone(),
+                workers(),
+            )
+        });
+        par.seq += 1;
+        par.batch.push(Job {
+            seq: par.seq,
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            dst_mode,
+            omitted,
+            src_sb: src_sb.clone(),
+            dereference,
+        });
+        if par.batch.len() >= MAX_BATCH {
+            self.flush_batch();
+        }
+    }
+
+    /// Hands the current directory's files to the workers.
+    fn flush_batch(&mut self) {
+        let pending = self.par.get_mut().as_mut().and_then(Parallel::flush);
+        self.copy_here(pending);
+    }
+
+    /// Waits for the workers to finish every file handed over, and writes
+    /// their messages.
+    fn drain(&self) {
+        let mut pending = None;
+        if let Some(p) = self.par.borrow_mut().as_mut() {
+            pending = p.flush();
+            p.drain();
+        }
+        self.copy_here(pending);
+    }
+
+    /// No worker could be started: copies a batch on this thread.
+    fn copy_here(&self, batch: Option<Vec<Job>>) {
+        let Some(batch) = batch else { return };
+        let mut c = Copier::new(self.tool, self.x.clone(), None, self.umask, self.ctx);
+        let mut failed = false;
+        for j in batch {
+            let mut new_dst = true;
+            failed |= !c.copy_reg(
+                &j.src,
+                &j.dst,
+                j.dst_mode,
+                j.omitted,
+                &mut new_dst,
+                &j.src_sb,
+                j.dereference,
+                false,
+            );
+        }
+        if let Some(p) = self.par.borrow_mut().as_mut() {
+            p.failed |= failed;
+        }
+    }
+
+    /// Whether a worker's file failed since the operand began (and forget it).
+    fn take_par_failed(&mut self) -> bool {
+        self.par
+            .get_mut()
+            .as_mut()
+            .is_some_and(|p| std::mem::take(&mut p.failed))
     }
 
     fn chown_failure_ok(&self, e: &io::Error) -> bool {
@@ -1132,6 +1494,7 @@ impl<'a> Copier<'a> {
             plan.entry = j.begin(self.tool, self.plan_action(&plan)).ok();
         }
         self.plan = Some(plan);
+        self.par_on = self.parallel_ok();
         let mut first_dir_created = false;
         let mut out = Outcome::default();
         let level = Level {
@@ -1149,6 +1512,10 @@ impl<'a> Copier<'a> {
             &mut out.copy_into_self,
             &mut out.rename_succeeded,
         );
+        // Every file is copied, and reported, before the operand is done.
+        self.drain();
+        out.ok &= !self.take_par_failed();
+        self.par_on = false;
         out.renamed = std::mem::take(&mut self.renamed);
         out
     }
@@ -2117,6 +2484,18 @@ impl<'a> Copier<'a> {
             || (self.x.copy_as_regular && !is_type(src_mode, S_IFLNK))
         {
             copied_as_regular = true;
+            // Into a directory this run made: a worker may copy it.
+            if self.par_on && new_dst && !top && !verbose_pending && is_type(src_mode, S_IFREG) {
+                self.defer_reg(
+                    src,
+                    dst,
+                    dst_mode_bits & S_IRWXUGO,
+                    omitted,
+                    &ssb,
+                    deref_level,
+                );
+                return delayed_ok;
+            }
             let ok = self.copy_reg(
                 src,
                 dst,
@@ -2240,6 +2619,15 @@ impl<'a> Copier<'a> {
         }
         if copied_as_regular {
             return delayed_ok;
+        }
+
+        // A directory's permissions may be about to change (withdrawing the
+        // write permission files are created with): finish its files first.
+        if src_is_dir
+            && self.par_on
+            && (restore_dst_mode || self.x.explicit_no_preserve_mode || omitted & !self.umask != 0)
+        {
+            self.drain();
         }
 
         if self.x.preserve_timestamps
@@ -2409,6 +2797,8 @@ impl<'a> Copier<'a> {
         };
         let mut ok = true;
         let mut new_first = false;
+        // A batch holds the files of one directory.
+        self.flush_batch();
         for name in names {
             let s = join(src, &name);
             let d = join(dst, &name);
@@ -2432,6 +2822,7 @@ impl<'a> Copier<'a> {
             }
             new_first |= first;
         }
+        self.flush_batch();
         *first_dir_created = new_first;
         ok
     }
