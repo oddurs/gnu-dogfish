@@ -3,6 +3,8 @@ name: Fuzz
 # Runs every fuzz target in fuzz/ (`cargo xtask fuzz TARGET SECONDS`) for a
 # few minutes, weekly and on demand. Each target's corpus is cached between
 # runs, so coverage accumulates; a crash fails the job and uploads its input.
+# A second job runs util/date-fuzz.py, which compares Dogfish's date strings
+# with GNU's for the same time; a divergence fails it and uploads the cases.
 
 on:
   schedule:
@@ -84,4 +86,40 @@ jobs:
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  # Differential: Dogfish `date -d`/`-f` and `touch -d` against the runner's
+  # GNU coreutils 9.4 (ubuntu-24.04), with the clock pinned by libfaketime.
+  date-differential:
+    name: Differential date strings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Install libfaketime
+        run: sudo apt-get update && sudo apt-get install -y faketime
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Fuzz
+        env:
+          SECONDS_TOTAL: ${{ inputs.seconds || '300' }}
+        run: python3 util/date-fuzz.py --seconds "$SECONDS_TOTAL" --out date-divergences.jsonl
+
+      - name: Upload the divergences
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: date-divergences
+          path: date-divergences.jsonl
           if-no-files-found: ignore

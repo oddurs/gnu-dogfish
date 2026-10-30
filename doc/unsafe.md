@@ -170,6 +170,7 @@ with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `local_time` | `localtime_r` and `tm_zone` | Out-pointer; a non-null `tm_zone` points at libc's zone-name storage and is copied before any other time call. |
+| `format_time` | `mktime` for `%s` | In/out pointer to a local, initialized `struct tm` copy. |
 
 ### `crates/dogfish/src/common/dirfd.rs`
 

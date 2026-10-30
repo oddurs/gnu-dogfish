@@ -98,14 +98,9 @@ fn iso_week_days(yday: i64, wday: i64) -> i64 {
 
 /// Renders `fmt` like GNU `date`'s strftime: the C-locale conversions plus
 /// GNU's `%N`, `%q`, `%P`, `%s`, `%:z`.., and the `_ - 0 + ^ #` flags, field
-/// widths and the `E`/`O` modifiers.
-pub(crate) fn format_time(
-    fmt: &[u8],
-    lt: &LocalTime,
-    ns: u32,
-    epoch: i64,
-    upcase: bool,
-) -> Vec<u8> {
+/// widths and the `E`/`O` modifiers. `lt` is in the current `TZ`, which `%s`
+/// converts it back from.
+pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> Vec<u8> {
     let tm = &lt.tm;
     let year = i64::from(tm.tm_year) + 1900;
     let mut out = Vec::new();
@@ -187,16 +182,21 @@ pub(crate) fn format_time(
             let pad = if space_pad && pad == 0 { b'_' } else { pad };
             push_number(out, digits, value, pad, width, false, 0);
         };
-        let year_sign = |out: &mut Vec<u8>, digits: i64, value: i64| {
+        // nstrftime's DO_YEARISH: a magnitude and a sign, so that the
+        // century of years -99..-1 can be "-0".
+        let year_signed = |out: &mut Vec<u8>, digits: i64, magnitude: u64, negative: bool| {
             let limit = if digits == 2 { 99 } else { 9999 };
-            let sign = pad == b'+' && (value > limit || digits < width);
-            push_number(out, digits, value, pad, width, sign, 0);
+            let sign = pad == b'+' && (magnitude > limit || digits < width);
+            push_signed(out, digits, magnitude, negative, pad, width, sign, 0);
+        };
+        let year_sign = |out: &mut Vec<u8>, digits: i64, value: i64| {
+            year_signed(out, digits, value.unsigned_abs(), value < 0);
         };
         let text = |out: &mut Vec<u8>, s: &[u8], upper: bool, lower: bool| {
             push_padded(out, s, width, pad, upper, lower);
         };
         let sub = |out: &mut Vec<u8>, subfmt: &str, upper: bool| {
-            let rendered = format_time(subfmt.as_bytes(), lt, ns, epoch, upper);
+            let rendered = format_time(subfmt.as_bytes(), lt, ns, upper);
             push_padded(out, &rendered, width, pad, false, false);
         };
         match conv {
@@ -217,13 +217,31 @@ pub(crate) fn format_time(
                 let name = if conv == b'B' { name } else { &name[..3] };
                 text(&mut out, name.as_bytes(), to_upper || change_case, false);
             }
-            b'c' => sub(&mut out, "%a %b %e %H:%M:%S %Y", to_upper),
+            // nstrftime leaves %c and %x to glibc's own strftime, whose %Y
+            // is the plain int tm_year + 1900 (no padding, and wrapping past
+            // INT_MAX) and whose %y is (tm_year % 100 + 100) % 100.
+            b'c' => {
+                let mut s = format_time(b"%a %b %e %H:%M:%S ", lt, ns, to_upper);
+                s.extend_from_slice(tm.tm_year.wrapping_add(1900).to_string().as_bytes());
+                push_padded(&mut out, &s, width, pad, false, false);
+            }
+            b'x' => {
+                let mut s = format_time(b"%m/%d/", lt, ns, to_upper);
+                let yy = (tm.tm_year % 100 + 100) % 100;
+                s.extend_from_slice(format!("{yy:02}").as_bytes());
+                push_padded(&mut out, &s, width, pad, false, false);
+            }
             b'C' => {
-                let century = year.div_euclid(100);
-                year_sign(&mut out, 2, century);
+                // nstrftime truncates toward zero, so the century of a
+                // negative year has the year's sign: -382247 is -3822.
+                let tm_year = i64::from(tm.tm_year);
+                let negative = tm_year < -1900;
+                let zero_thru_1899 = i64::from(!negative && tm_year < 0);
+                let century = (tm_year - 99 * zero_thru_1899) / 100 + 19;
+                year_signed(&mut out, 2, century.unsigned_abs(), negative);
             }
             b'd' => num(&mut out, 2, tm.tm_mday.into(), false),
-            b'D' | b'x' => sub(&mut out, "%m/%d/%y", to_upper),
+            b'D' => sub(&mut out, "%m/%d/%y", to_upper),
             b'e' => num(&mut out, 2, tm.tm_mday.into(), true),
             b'F' => {
                 let (year_pad, year_width) = if pad == 0 && width < 0 {
@@ -232,7 +250,7 @@ pub(crate) fn format_time(
                     (if pad == 0 { '0' } else { pad as char }, (width - 6).max(0))
                 };
                 let subfmt = format!("%{year_pad}{year_width}Y-%m-%d");
-                let rendered = format_time(subfmt.as_bytes(), lt, ns, epoch, to_upper);
+                let rendered = format_time(subfmt.as_bytes(), lt, ns, to_upper);
                 out.extend_from_slice(&rendered);
             }
             b'g' | b'G' | b'V' => {
@@ -251,7 +269,19 @@ pub(crate) fn format_time(
                     }
                 }
                 match conv {
-                    b'g' => year_sign(&mut out, 2, (year + adjust).rem_euclid(100)),
+                    b'g' => {
+                        // Two digits of the magnitude for negative years.
+                        let tm_year = i64::from(tm.tm_year);
+                        let yy = (tm_year % 100 + adjust) % 100;
+                        let yy = if yy >= 0 {
+                            yy
+                        } else if tm_year < -1900 - adjust {
+                            -yy
+                        } else {
+                            yy + 100
+                        };
+                        year_sign(&mut out, 2, yy);
+                    }
                     b'G' => year_sign(&mut out, 4, year + adjust),
                     _ => num(&mut out, 2, days / 7 + 1, false),
                 }
@@ -288,7 +318,22 @@ pub(crate) fn format_time(
             b'q' => num(&mut out, 1, i64::from(tm.tm_mon) / 3 + 1, false),
             b'r' => sub(&mut out, "%I:%M:%S %p", to_upper),
             b'R' => sub(&mut out, "%H:%M", to_upper),
-            b's' => push_number(&mut out, 1, epoch, pad, width, false, 0),
+            b's' => {
+                // nstrftime's %s is mktime of the broken-down time, not the
+                // instant it came from: in a repeated hour whose two offsets
+                // share tm_isdst (Moscow, 2014-10-26 01:00) it can name the
+                // other one. The call also moves the C library's mktime
+                // guess, which later mktime calls of `date -f` start from.
+                let mut ltm = *tm;
+                ltm.tm_yday = -1;
+                // SAFETY: `ltm` is a valid, initialized struct tm.
+                let t = unsafe { libc::mktime(&mut ltm) };
+                if ltm.tm_yday < 0 {
+                    // EOVERFLOW: GNU's strftime gives up here.
+                    return out;
+                }
+                push_number(&mut out, 1, t as i64, pad, width, false, 0);
+            }
             b'S' => num(&mut out, 2, tm.tm_sec.into(), false),
             b'T' | b'X' => sub(&mut out, "%H:%M:%S", to_upper),
             b'u' => num(&mut out, 1, i64::from((tm.tm_wday + 6) % 7 + 1), false),
@@ -305,7 +350,15 @@ pub(crate) fn format_time(
                 i64::from((tm.tm_yday - (tm.tm_wday + 6) % 7 + 7) / 7),
                 false,
             ),
-            b'y' => num(&mut out, 2, year.rem_euclid(100), false),
+            b'y' => {
+                let tm_year = i64::from(tm.tm_year);
+                let yy = match tm_year % 100 {
+                    yy if yy >= 0 => yy,
+                    yy if tm_year < -1900 => -yy,
+                    yy => yy + 100,
+                };
+                year_sign(&mut out, 2, yy);
+            }
             b'Y' => year_sign(&mut out, 4, year),
             // Without a known DST state there is no known offset.
             b'z' if tm.tm_isdst < 0 => {}

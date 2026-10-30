@@ -654,7 +654,7 @@ impl Control {
             zone: Vec::new(),
         };
         let mut s =
-            String::from_utf8_lossy(&format_time(b"(Y-M-D) %Y-%m-%d %H:%M:%S", &lt, 0, 0, false))
+            String::from_utf8_lossy(&format_time(b"(Y-M-D) %Y-%m-%d %H:%M:%S", &lt, 0, false))
                 .into_owned();
         if with_zone && self.zones_seen > 0 {
             let mut tz = i64::from(self.time_zone);
@@ -1659,30 +1659,34 @@ pub(crate) fn parse_datetime2(
     let mut pc = parser.pc;
 
     if debug {
-        let mut m = String::from("input timezone: ");
+        // Bytes: the zone name is echoed as given, UTF-8 or not.
+        let mut m = b"input timezone: ".to_vec();
         if pc.timespec_seen {
-            m.push_str("'@timespec' - always UTC");
+            m.extend_from_slice(b"'@timespec' - always UTC");
         } else if pc.zones_seen > 0 {
-            m.push_str("parsed date/time string");
+            m.extend_from_slice(b"parsed date/time string");
         } else if let Some(name) = &tzstring {
-            let name = String::from_utf8_lossy(name);
             if tz_from_string {
-                m.push_str(&format!("TZ=\"{name}\" in date string"));
-            } else if name == "UTC0" {
-                m.push_str("TZ=\"UTC0\" environment value or -u");
+                m.extend_from_slice(b"TZ=\"");
+                m.extend_from_slice(name);
+                m.extend_from_slice(b"\" in date string");
+            } else if name == b"UTC0" {
+                m.extend_from_slice(b"TZ=\"UTC0\" environment value or -u");
             } else {
-                m.push_str(&format!("TZ=\"{name}\" environment value"));
+                m.extend_from_slice(b"TZ=\"");
+                m.extend_from_slice(name);
+                m.extend_from_slice(b"\" environment value");
             }
         } else {
-            m.push_str("system default");
+            m.extend_from_slice(b"system default");
         }
         if pc.local_zones_seen > 0 && pc.zones_seen == 0 && 0 < pc.local_isdst {
-            m.push_str(", dst");
+            m.extend_from_slice(b", dst");
         }
         if pc.zones_seen > 0 {
-            m.push_str(&format!(" ({})", time_zone_str(pc.time_zone.into())));
+            m.extend_from_slice(format!(" ({})", time_zone_str(pc.time_zone.into())).as_bytes());
         }
-        m.push('\n');
+        m.push(b'\n');
         dbg(m);
     }
 

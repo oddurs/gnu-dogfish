@@ -181,7 +181,7 @@ pub fn strftime(data: &[u8]) {
     let (sel, fmt) = split_first(data);
     let sec = i64::from(sel) * 86_400 * 365 - 30 * 86_400 * 365;
     if let Some(lt) = common::date_format::local_time(sec) {
-        let _ = common::date_format::format_time(fmt, &lt, 999_999_999, sec, sel & 1 == 1);
+        let _ = common::date_format::format_time(fmt, &lt, 999_999_999, sel & 1 == 1);
     }
     let _ = common::strftime::format_local_time(
         &text(fmt),
