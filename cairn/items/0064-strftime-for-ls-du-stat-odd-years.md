@@ -3,10 +3,11 @@ id: 64
 uid: 8905dfbc-f171-4f2a-b8df-7ce794668114
 title: "common/strftime: GNU's results for negative and huge years (ls, du, stat)"
 type: bug
-status: planned
+status: done
 milestone: "v0.3"
 created: 2026-10-30
 updated: 2026-10-30
+closed_at: 2026-10-30
 priority: p3
 effort: s
 area: compat
@@ -26,4 +27,9 @@ Both formatters agree with GNU for every year; ideally they are one formatter.
 
 ## Acceptance criteria
 
-- [ ] Differential cases for ls, du and stat with negative and very large years match GNU.
+- [x] Differential cases for ls, du and stat with negative and very large years match GNU.
+
+## Notes
+
+- 2026-10-30: common/strftime.rs now renders through common/date_format.rs, so date, ls, du and stat share one nstrftime. Beyond %C/%y/%g and %c/%x, the old copy did not pad %Y/%G/%F to four digits (`ls -l` showed year 1 as "1" where GNU shows "0001") and did not know the + flag. Differential runs of the shared formatter against GNU date also fixed E/O modifiers (gnulib hands `%O` numbers and `%EC`/`%Ey`/`%EY` to glibc's strftime; Dogfish now calls it the same way), the padding of unknown conversions, "%5%d", colons before something other than z, and flags on %F and %D. The cases (`odd_years::*` and `date_modifiers_*` in gnu_compat_dates.rs) put the files on /dev/shm when the target file system clamps times to 1901..2446 (ext4 with 128-byte inodes).
+- Left: GNU date widens `%-N` to the clock resolution (`%9N`); Dogfish does not (ROADMAP.md).
