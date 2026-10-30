@@ -1,5 +1,7 @@
 //! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
@@ -10,10 +12,12 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath, fts_root_name};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
@@ -38,6 +42,8 @@ With --reference, change the owner and group of each FILE to those of RFILE.
       --reference=RFILE  use RFILE's owner and group rather than specifying
                          OWNER:GROUP values
   -R, --recursive        operate on files and directories recursively
+  -J, --json[=VERSION]   Dogfish: one NDJSON record per file processed (what -v,
+                           or with -c what -c, reports), instead of the text
 
 The following options modify how a hierarchy is traversed when the -R
 option is also specified.  If more than one is specified, only the final
@@ -68,6 +74,7 @@ enum ChownOpt {
     TraverseCmdline,
     TraverseAll,
     TraverseNone,
+    Json,
     Help,
     Version,
 }
@@ -90,6 +97,8 @@ const SPECS: &[OptSpec<ChownOpt>] = &[
     OptSpec::short(b'H', HasArg::No, ChownOpt::TraverseCmdline),
     OptSpec::short(b'L', HasArg::No, ChownOpt::TraverseAll),
     OptSpec::short(b'P', HasArg::No, ChownOpt::TraverseNone),
+    json_short(ChownOpt::Json),
+    json_long(ChownOpt::Json),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +129,10 @@ struct ChownRun {
     quiet: bool,
     /// `/`'s identity under `-R --preserve-root` (GNU `chopt.root_dev_ino`).
     root_dev_ino: Option<DevIno>,
+    /// Under `-L`, the directories being walked (entered, not yet left), as
+    /// fts keeps them in logical mode (`enter_dir`/`leave_dir` in gnulib's
+    /// `fts-cycle.c`) to find a directory that is its own ancestor.
+    active_dirs: RefCell<HashSet<DevIno>>,
 }
 
 pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -136,8 +149,10 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         verbose: false,
         quiet: false,
         root_dev_ino: None,
+        active_dirs: RefCell::default(),
     };
     let (mut deref, mut preserve_root, mut reference) = (None, false, None);
+    let mut json = false;
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -169,7 +184,18 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             TraverseCmdline => run.traverse = Traverse::CommandLine,
             TraverseAll => run.traverse = Traverse::All,
             TraverseNone => run.traverse = Traverse::None,
+            Json => {
+                if let Err(code) = check_json_version("chown", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
         }
+    }
+    if json {
+        // A record wherever -v (or, with -c alone, -c) would print a line.
+        run.verbose |= !run.report_changes;
+        actions::start();
     }
     if run.recursive && run.traverse == Traverse::None {
         if deref == Some(true) {
@@ -358,9 +384,29 @@ fn user_group_str(user: Option<&str>, group: Option<&str>) -> Option<String> {
     }
 }
 
+/// The `uid` and `gid` fields of a `-J` record (`uid_before`, ... with a
+/// suffix), those that are known.
+fn ids(r: &mut dogfish_core::Record<'_>, suffix: &str, uid: Option<u32>, gid: Option<u32>) {
+    if let Some(u) = uid {
+        r.u64(&format!("uid{suffix}"), u64::from(u));
+    }
+    if let Some(g) = gid {
+        r.u64(&format!("gid{suffix}"), u64::from(g));
+    }
+}
+
 /// With `-v`, what GNU reports for a file it could not even stat.
 fn describe_failure_without_old(path: &Path, new_spec: Option<&str>, run: &ChownRun) {
-    if run.verbose {
+    if actions::on() {
+        if run.verbose {
+            actions::record("chown", |r| {
+                r.os_str("path", path)
+                    .str("status", "inaccessible")
+                    .bool("changed", false);
+                ids(r, "", run.spec.uid, run.spec.gid);
+            });
+        }
+    } else if run.verbose {
         let what = if run.spec.user.is_some() {
             "ownership"
         } else {
@@ -415,10 +461,21 @@ fn chown_path(
         }
     };
     let walked_type = EntryType::of(&walked);
-    let traverse_dir = run.recursive && walked_type == EntryType::Dir;
+    let mut traverse_dir = run.recursive && walked_type == EntryType::Dir;
+    // fts `enter_dir` in logical mode: a directory already being walked is
+    // `FTS_DC`. chown changes it like a file and does not enter it again;
+    // GNU's `cycle_warning_required` is false under `FTS_LOGICAL`, so there
+    // is no warning and the exit status is unaffected.
+    let dir_id = DevIno::of_stat(&walked);
+    if traverse_dir && run.traverse == Traverse::All && !run.active_dirs.borrow_mut().insert(dir_id)
+    {
+        traverse_dir = false;
+    }
+    let entered = traverse_dir && run.traverse == Traverse::All;
     // GNU `change_file_owner`, FTS_D: every directory the walk would enter is
     // checked, the command-line operands and those reached through `-L` alike.
-    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of_stat(&walked)) {
+    if traverse_dir && is_root_dev_ino(run.root_dev_ino, dir_id) {
+        leave_dir(run, entered, dir_id);
         refuse_root("chown", path.as_path());
         return Ok(false);
     }
@@ -445,7 +502,9 @@ fn chown_path(
     let mut ok = true;
     // Like GNU (fts post-order), a directory's contents are changed before it.
     if traverse_dir {
-        ok &= chown_dir(parent, name, path, depth, walk_follows, run, ctx)?;
+        let status = chown_dir(parent, name, path, depth, walk_follows, run, ctx);
+        leave_dir(run, entered, dir_id);
+        ok &= status?;
     }
 
     let (old_uid, old_gid) = (st.st_uid, st.st_gid);
@@ -486,7 +545,37 @@ fn chown_path(
             }
         }
     }
-    if run.verbose || (run.report_changes && status_changed) {
+    if actions::on() {
+        if run.verbose || (run.report_changes && status_changed) {
+            let status = if failed {
+                "failed"
+            } else if status_changed {
+                "changed"
+            } else {
+                "retained"
+            };
+            actions::record("chown", |r| {
+                r.os_str("path", path.as_path())
+                    .str("status", status)
+                    .bool("changed", status_changed);
+                ids(r, "_before", Some(old_uid), Some(old_gid));
+                // What the file has now, or was to have.
+                let done = |want: Option<u32>, old: u32| {
+                    if failed || status_changed {
+                        want.unwrap_or(old)
+                    } else {
+                        old
+                    }
+                };
+                ids(
+                    r,
+                    "",
+                    Some(done(spec.uid, old_uid)),
+                    Some(done(spec.gid, old_gid)),
+                );
+            });
+        }
+    } else if run.verbose || (run.report_changes && status_changed) {
         let what = if spec.user.is_some() {
             "ownership"
         } else if spec.group.is_some() {
@@ -513,6 +602,13 @@ fn chown_path(
     Ok(ok)
 }
 
+/// fts `leave_dir`: `dir`, which the walk `entered`, is no longer being walked.
+fn leave_dir(run: &ChownRun, entered: bool, dir: DevIno) {
+    if entered {
+        run.active_dirs.borrow_mut().remove(&dir);
+    }
+}
+
 /// With `-R`, changes the owners of the entries of directory `name` in
 /// `parent` (printed as `path`), `depth` levels below an operand; `follow`:
 /// the walk followed `name` if it is a symlink. A directory deep enough lets
@@ -522,7 +618,8 @@ fn chown_path(
 /// `-L` is GNU's `FTS_LOGICAL`, which walks by full path (`FTS_NOCHDIR`): a
 /// directory may be reached through a symlink, whose `..` is not where the
 /// walk came from. So does this, failing where GNU's does (`PATH_MAX`, a
-/// symlink loop).
+/// symlink chain too long to resolve); a directory that is its own
+/// ancestor is found by `chown_path` before it gets here.
 fn chown_dir(
     parent: &mut Parent,
     name: &CStr,
@@ -625,6 +722,7 @@ mod tests {
             verbose: false,
             quiet: true,
             root_dev_ino: root,
+            active_dirs: RefCell::default(),
         }
     }
 

@@ -1222,7 +1222,8 @@ fn du_and_df_json_stay_ndjson_when_piped() {
 
     let out = dogfish(&["df", "-J", "a.txt"]);
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(record["total_bytes"].as_u64().unwrap() > 0);
+    assert!(record["size"].as_u64().unwrap() > 0);
+    assert_eq!(record["path"], "a.txt");
 }
 
 #[test]

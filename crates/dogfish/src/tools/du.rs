@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use dogfish_core::{
-    DogfishContext, emit_objects_or_table, format_size, gnu_io_error, sparkline_bar, stdout,
+    DogfishContext, RecordWriter, format_size, gnu_io_error, sparkline_bar, stdout,
 };
-use serde::Serialize;
 
 use crate::common::dirfd::{At, DirFd, EntryType, MAX_OPEN_DIRS, Names, fts_root_name};
 use crate::common::files0::{Files0From, extra_operand_error};
@@ -22,6 +21,7 @@ use crate::common::human::{
     HUMAN_AUTOSCALE, HUMAN_BASE_1024, HUMAN_SI, env_block_size, human_readable, parse_block_size,
     parse_size_suffixed,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{Quoting, qa, qf, quote_bytes, quote_locale};
 use crate::common::strftime::{Timespec, format_local_time};
 
@@ -52,7 +52,8 @@ const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
     // Short-only options.
     OptSpec::short(b'H', HasArg::No, "dereference-args"),
     OptSpec::short(b'k', HasArg::No, "kilobytes"),
@@ -99,7 +100,8 @@ Summarize device usage of the set of FILEs, recursively for directories.
   -X, --exclude-from=FILE  exclude files that match any pattern in FILE
       --exclude=PATTERN    exclude files that match PATTERN
   -x, --one-file-system    skip directories on different file systems
-  -J, --json            emit NDJSON records (Dogfish extension)
+  -J, --json[=VERSION]  one NDJSON record per line du would print (Dogfish
+                          extension)
       --help            display this help and exit
       --version         output version information and exit
 
@@ -107,14 +109,6 @@ Directory trees are read in parallel; output order matches GNU du. On a
 terminal (without -a/-d/-s/-S) Dogfish shows the top level sorted by size
 with usage bars.
 ";
-
-#[derive(Serialize, Clone)]
-struct DuRecord {
-    path: String,
-    size: u64,
-    size_human: String,
-    files: u64,
-}
 
 /// Which timestamp `--time` shows.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1038,7 +1032,12 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             }
             "time-style" => time_style = raw.clone(),
             "one-file-system" => cfg.one_file_system = true,
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("du", raw.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "help" => return Ok(print_help(DU_HELP)),
             "version" => return Ok(print_version("du")),
             _ => unreachable!("unhandled du option"),
@@ -1132,6 +1131,32 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         out.write_all(&line.path)?;
         out.write_all(&[eol])
     };
+    // -J: one record per line GNU would print, as it would print it.
+    let mut records = json.then(RecordWriter::stdout);
+    let time_key = match cfg.time {
+        Some(DuTime::Mtime) => Some("mtime"),
+        Some(DuTime::Atime) => Some("atime"),
+        Some(DuTime::Ctime) => Some("ctime"),
+        None => None,
+    };
+    let count_key = if cfg.inodes { "inodes" } else { "size" };
+    let mut write_record = |line: Option<&DuLine>| -> io::Result<()> {
+        let Some(w) = records.as_mut() else {
+            return Ok(());
+        };
+        let Some(line) = line else {
+            return w.flush();
+        };
+        w.record(|r| {
+            r.bytes("path", &line.path)
+                .u64(count_key, line.size)
+                .u64("files", line.files);
+            if let Some(key) = time_key {
+                let nsec = u32::try_from(line.time.nsec).unwrap_or(0);
+                r.time(key, line.time.sec, nsec);
+            }
+        })
+    };
     let streaming = !rich && !json;
     // GNU flushes standard output after every line.
     stdout::gnu_flushes_early();
@@ -1144,6 +1169,8 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         lines: Vec::new(),
         sink: if streaming {
             Some(&mut write_line)
+        } else if json {
+            Some(&mut write_record)
         } else {
             None
         },
@@ -1189,16 +1216,7 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
     ctx.telemetry.add_items(grand.files);
 
     if json {
-        let records: Vec<DuRecord> = lines
-            .iter()
-            .map(|l| DuRecord {
-                path: String::from_utf8_lossy(&l.path).into_owned(),
-                size: l.size,
-                size_human: format_size(l.size, true),
-                files: l.files,
-            })
-            .collect();
-        emit_objects_or_table(&records, ctx, true, false)?;
+        write_record(None)?;
         return Ok(status);
     }
     if rich {

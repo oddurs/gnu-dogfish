@@ -10,8 +10,7 @@ use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, InputSource, emit_objects_or_table, gnu_io_error,
-    read_ndjson_stdin, stdout,
+    DEFAULT_BUF_SIZE, DogfishContext, InputSource, emit_records, gnu_io_error, parse_ndjson, stdout,
 };
 use memchr::{memchr_iter, memrchr};
 
@@ -20,7 +19,8 @@ use crate::common::getopt::{
 };
 use crate::common::head_tail::{header_name, parse_count, to_usize};
 use crate::common::input::{RawStdout, close_stdin, full_read, safe_read, stdin_file};
-use crate::common::lines::{line_end, looks_like_json, lossy_lines};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::{line_end, looks_like_json};
 use crate::common::quote::{qa, qf, quote_locale};
 
 const HEAD_HELP: &str = "\
@@ -38,7 +38,7 @@ Options:
   -q, --quiet           Never print headers giving file names [alias: --silent]
   -v, --verbose         Always print headers giving file names
   -z, --zero-terminated Line delimiter is NUL, not newline
-  -J, --json            Force JSON output when processing NDJSON
+  -J, --json[=VERSION]  Pass NDJSON records on as NDJSON, even on a terminal
       --help            Print help
 ";
 
@@ -73,7 +73,8 @@ const SPECS: &[OptSpec<HeadOpt>] = &[
     OptSpec::both(b'z', "zero-terminated", HasArg::No, HeadOpt::ZeroTerminated),
     OptSpec::long("help", HasArg::No, HeadOpt::Help),
     OptSpec::long("version", HasArg::No, HeadOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, HeadOpt::Json).exact(),
+    json_short(HeadOpt::Json),
+    json_long(HeadOpt::Json),
     digit(b'0'),
     digit(b'1'),
     digit(b'2'),
@@ -135,7 +136,10 @@ fn parse_head_args(args: Vec<OsString>) -> std::result::Result<HeadArgs, i32> {
             HeadOpt::Quiet => (a.quiet, a.verbose) = (true, false),
             HeadOpt::Verbose => (a.quiet, a.verbose) = (false, true),
             HeadOpt::ZeroTerminated => a.zero_terminated = true,
-            HeadOpt::Json => a.json = true,
+            HeadOpt::Json => {
+                check_json_version("head", v.as_deref())?;
+                a.json = true;
+            }
             HeadOpt::Digit(c) => {
                 eprintln!("head: invalid trailing option -- {}", char::from(c));
                 return Err(try_help("head"));
@@ -681,8 +685,7 @@ impl<W: Write> Head<'_, W> {
 fn head_stdin_adaptive(count: u64, json: bool, ctx: &DogfishContext) -> Result<i32> {
     let stdin = io::stdin();
     let mut reader = io::BufReader::with_capacity(DEFAULT_BUF_SIZE, stdin.lock());
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let mut out = io::BufWriter::new(stdout::stdout());
 
     // Peek the first line to see if it starts with '{' or '[' before reading all of stdin!
     let mut first_line = Vec::new();
@@ -692,13 +695,13 @@ fn head_stdin_adaptive(count: u64, json: bool, ctx: &DogfishContext) -> Result<i
     if looks_like_json(&first_line) {
         let mut all = first_line;
         reader.read_to_end(&mut all)?;
-        if let Some(objs) = read_ndjson_stdin(&lossy_lines(&all)) {
+        if let Some(records) = parse_ndjson(&all) {
             ctx.telemetry
                 .set_strategy("NDJSON object stream + auto-table");
-            let slice = &objs[..objs.len().min(to_usize(count))];
+            let slice = &records[..records.len().min(to_usize(count))];
             ctx.telemetry.add_items(slice.len() as u64);
             drop(out);
-            emit_objects_or_table(slice, ctx, json, !json)?;
+            emit_records(slice, ctx, json)?;
             return Ok(0);
         }
         copy_first_lines(&mut &all[..], count, &mut out).map(|_| ())?;

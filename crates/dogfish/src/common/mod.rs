@@ -8,6 +8,7 @@
 //! `strftime` ([`strftime`]), `quotearg` file-name quoting and `fnmatch`
 //! patterns ([`fnmatch`]).
 
+pub(crate) mod actions;
 pub(crate) mod backup;
 pub(crate) mod canonicalize;
 pub(crate) mod copy;
@@ -25,6 +26,7 @@ pub(crate) mod head_tail;
 pub(crate) mod human;
 pub(crate) mod input;
 pub(crate) mod interval;
+pub(crate) mod json_opt;
 pub(crate) mod lines;
 pub(crate) mod locale;
 pub(crate) mod mode;
@@ -35,6 +37,7 @@ pub(crate) mod preserve_root;
 pub(crate) mod printf_format;
 pub(crate) mod prompt;
 pub(crate) mod quote;
+pub(crate) mod records;
 pub(crate) mod sha256;
 pub(crate) mod signals;
 pub(crate) mod strftime;

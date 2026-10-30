@@ -11,10 +11,12 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error};
 
+use crate::common::actions;
 use crate::common::date_format::{Stamp, local_time};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::parse_datetime::{TimeZone, parse_datetime, zero_tm};
 use crate::common::path::c_path;
 use crate::common::quote::{qa, quote_locale};
@@ -38,6 +40,7 @@ is supplied.
       --time=WORD        change the specified time:
                            WORD is access, atime, or use: equivalent to -a
                            WORD is modify or mtime: equivalent to -m
+  -J, --json[=VERSION]   Dogfish: write one NDJSON record per file touched
       --help             display this help and exit
       --version          output version information and exit
 
@@ -57,6 +60,7 @@ enum TouchOpt {
     Reference,
     StampArg,
     Time,
+    Json,
     Help,
     Version,
 }
@@ -74,6 +78,8 @@ const SPECS: &[OptSpec<TouchOpt>] = &[
     OptSpec::short(b'f', HasArg::No, TouchOpt::Ignored),
     OptSpec::short(b'm', HasArg::No, TouchOpt::Modify),
     OptSpec::short(b't', HasArg::Required, TouchOpt::StampArg),
+    json_short(TouchOpt::Json),
+    json_long(TouchOpt::Json),
 ];
 
 /// Which times to change (`-a`, `-m`, `--time`).
@@ -96,6 +102,12 @@ pub fn run_touch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         match o {
             Help => return Ok(print_help(TOUCH_HELP)),
             Version => return Ok(print_version("touch")),
+            Json => {
+                if let Err(code) = check_json_version("touch", v.as_deref()) {
+                    return Ok(code);
+                }
+                actions::start();
+            }
             Access => change_times |= CH_ATIME,
             Modify => change_times |= CH_MTIME,
             NoCreate => no_create = true,
@@ -287,6 +299,9 @@ fn touch_one(
 ) -> bool {
     let mut opened = None;
     let mut open_err = None;
+    let may_create = file.as_bytes() != b"-" && !(no_create || no_deref);
+    // With -J, whether the file is created (one more lstat, only then).
+    let created = actions::on() && may_create && fs::symlink_metadata(file).is_err();
     let fd: Option<RawFd> = if file.as_bytes() == b"-" {
         Some(libc::STDOUT_FILENO)
     } else if !(no_create || no_deref) {
@@ -343,6 +358,9 @@ fn touch_one(
     };
     drop(opened);
     let Err(utime_err) = result else {
+        actions::record("touch", |r| {
+            r.os_str("path", file).bool("created", created);
+        });
         return true;
     };
     // Do not diagnose "touch -c - >&-".

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/bench.v1.json",
+  "title": "bench -J record",
+  "description": "One benchmark of `dogfish bench -J`. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "benchmark": {
+          "type": "string",
+          "description": "What was run."
+        },
+        "dogfish_duration_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Dogfish's best wall time, in nanoseconds."
+        },
+        "system_duration_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The system tool's best wall time, in nanoseconds."
+        },
+        "speedup": {
+          "type": "number",
+          "description": "system / Dogfish, rounded to two decimals."
+        },
+        "strategy": {
+          "type": "string",
+          "description": "How Dogfish does it."
+        }
+      },
+      "required": [
+        "benchmark",
+        "dogfish_duration_ns",
+        "system_duration_ns",
+        "speedup",
+        "strategy"
+      ]
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

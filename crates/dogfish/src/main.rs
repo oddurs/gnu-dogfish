@@ -15,6 +15,7 @@ macro_rules! eprintln {
 
 mod common;
 mod manual;
+mod schema;
 mod tool_list;
 mod tools;
 
@@ -173,6 +174,11 @@ fn run(raw_args: Vec<OsString>) -> u8 {
                 let code = manual::generate(&raw_args[2..]);
                 return finish("dogfish", code);
             }
+            // The JSON Schema of a tool's -J records (doc/ndjson.md).
+            Some("schema") => {
+                let code = schema::run(&raw_args[2..]);
+                return finish("dogfish", code);
+            }
             Some(sub) => {
                 let sub_clean = sub.strip_prefix("df-").unwrap_or(sub).to_string();
                 let mut a = Vec::with_capacity(raw_args.len() - 1);
@@ -200,6 +206,7 @@ fn run(raw_args: Vec<OsString>) -> u8 {
                 // A failed write to standard output is reported as GNU's
                 // `close_stdout` does, once.
                 Some(io_err) if stdout::is_write_error(io_err) => {
+                    dogfish_core::ndjson::stop_capture();
                     stdout::mark_reported();
                     report_write_error(&tool_name, io_err);
                     exit_failure(&tool_name)
@@ -219,6 +226,10 @@ fn run(raw_args: Vec<OsString>) -> u8 {
             }
         }
     };
+    // The last -J records, and the error records queued behind them, go
+    // out before standard output is closed.
+    common::actions::finish();
+    dogfish_core::ndjson::stop_capture();
     finish(&tool_name, code)
 }
 

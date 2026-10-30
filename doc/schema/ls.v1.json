@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/ls.v1.json",
+  "title": "ls -J record",
+  "description": "One file listed by `ls -J`: what stat(2) says about it (lstat, unless -L or a command-line dereference applies). Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The file's path: the operand, or the directory listed joined with the entry's name."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name as listed: the operand, or the entry's name in its directory."
+        },
+        "name_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `name`, base64, present only when they are not UTF-8 (`name` then holds the lossy form)."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "file",
+            "directory",
+            "symlink",
+            "fifo",
+            "socket",
+            "block_device",
+            "char_device",
+            "unknown"
+          ],
+          "description": "The file type."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "st_size: the length in bytes (of a symlink: of its target name)."
+        },
+        "blocks": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "st_blocks: 512-byte blocks allocated."
+        },
+        "mode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 4,
+          "description": "The permission bits (including set-user-ID, set-group-ID and sticky) in octal, as `0644`."
+        },
+        "mode_symbolic": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "description": "The mode as `ls -l` shows it, as `-rw-r--r--`."
+        },
+        "nlink": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The number of hard links."
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The owner's user ID."
+        },
+        "user": {
+          "type": "string",
+          "description": "The owner's user name; absent when the ID has none."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The group ID."
+        },
+        "group": {
+          "type": "string",
+          "description": "The group name; absent when the ID has none."
+        },
+        "inode": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The inode number."
+        },
+        "dev": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The device number of the file system holding the file."
+        },
+        "rdev_major": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Of a device file: its major device number."
+        },
+        "rdev_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Of a device file: its minor device number."
+        },
+        "mtime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last modification: RFC 3339, UTC, with nanoseconds."
+        },
+        "mtime_ns": {
+          "type": "integer",
+          "description": "Last modification: nanoseconds since the epoch."
+        },
+        "atime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last access: RFC 3339, UTC, with nanoseconds."
+        },
+        "atime_ns": {
+          "type": "integer",
+          "description": "Last access: nanoseconds since the epoch."
+        },
+        "ctime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last status change: RFC 3339, UTC, with nanoseconds."
+        },
+        "ctime_ns": {
+          "type": "integer",
+          "description": "Last status change: nanoseconds since the epoch."
+        },
+        "btime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Birth (creation), where the file system records it: RFC 3339, UTC, with nanoseconds."
+        },
+        "btime_ns": {
+          "type": "integer",
+          "description": "Birth (creation), where the file system records it: nanoseconds since the epoch."
+        },
+        "target": {
+          "type": "string",
+          "description": "Of a symlink: what it points to, as stored."
+        },
+        "target_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `target`, base64, present only when they are not UTF-8 (`target` then holds the lossy form)."
+        }
+      },
+      "required": [
+        "path",
+        "name"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ],
+        "name_bytes": [
+          "name"
+        ],
+        "target_bytes": [
+          "target"
+        ]
+      }
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

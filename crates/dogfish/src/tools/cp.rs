@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error};
 
+use crate::common::actions;
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions, Interactive, Reflink, Sparse};
 use crate::common::file_times::{Stamp, set_file_times};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, process_umask};
 use crate::common::path::{
     Deref, base_len, file_name_concat, last_component, strip_trailing_slashes,
@@ -69,6 +71,8 @@ are recorded so that `dogfish undo` can reverse them.
   -u                           equivalent to --update[=older]
   -v, --verbose                explain what is being done
   -x, --one-file-system        stay on this file system
+  -J, --json[=VERSION]         Dogfish: one NDJSON record per action (what -v
+                                 reports), instead of -v's text
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -107,6 +111,7 @@ enum CpOpt {
     Verbose,
     OneFileSystem,
     Context,
+    Json,
     Help,
     Version,
 }
@@ -151,6 +156,8 @@ const SPECS: &[OptSpec<CpOpt>] = &[
     OptSpec::short(b'r', HasArg::No, CpOpt::Recursive),
     OptSpec::short(b'u', HasArg::No, CpOpt::UpdateOlder),
     OptSpec::short(b'Z', HasArg::No, CpOpt::Context),
+    json_short(CpOpt::Json),
+    json_long(CpOpt::Json),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -263,6 +270,7 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(o) => o,
             Err(e) => return Ok(getopt_error("cp", &e)),
         };
+        let json_arg = v.clone();
         let raw = v.clone().unwrap_or_default();
         let v = v.as_deref().map(lossy).unwrap_or_default();
         match opt {
@@ -390,6 +398,14 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 }
             }
             Verbose => o.verbose = true,
+            Json => {
+                if let Err(code) = check_json_version("cp", json_arg.as_deref()) {
+                    return Ok(code);
+                }
+                // A record wherever -v would print a line.
+                o.verbose = true;
+                actions::start();
+            }
             OneFileSystem => o.one_file_system = true,
         }
     }
@@ -687,7 +703,11 @@ fn make_dir_parents(
                     );
                     return false;
                 }
-                if x.verbose {
+                if actions::on() {
+                    actions::record("mkdir", |r| {
+                        r.os_str("path", &dir).os_str("source", src);
+                    });
+                } else if x.verbose {
                     // GNU prints both names as they are, unquoted.
                     let mut line = src.as_os_str().as_bytes().to_vec();
                     line.extend_from_slice(b" -> ");

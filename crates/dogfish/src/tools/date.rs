@@ -5,22 +5,16 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote_file, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, gnu_io_error, gnu_quote_file, stdout};
 
-use crate::common::date_format::{LocalTime, Stamp, format_time, local_time};
+use crate::common::date_format::{Stamp, format_time, local_time};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
     unsupported, usage_error,
 };
-use crate::common::parse_datetime::{TimeZone, gmtime, parse_datetime2, tzset};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::parse_datetime::{TimeZone, parse_datetime2, tzset};
 use crate::common::quote::quote_locale;
-
-fn utc_time(t: i64) -> Option<LocalTime> {
-    Some(LocalTime {
-        tm: gmtime(t)?,
-        zone: b"UTC".to_vec(),
-    })
-}
 
 const DATE_HELP: &str = "\
 Usage: date [OPTION]... [+FORMAT]
@@ -37,7 +31,8 @@ Display date and time in the given FORMAT.
                                FMT='date', 'seconds', or 'ns'
   -r, --reference=FILE       display the last modification time of FILE
   -u, --utc, --universal     print Coordinated Universal Time (UTC)
-  -J, --json                 print the time as a JSON object
+  -J, --json[=VERSION]       print each time as an NDJSON record: time (UTC),
+                               time_ns, utc_offset, zone and formatted
       --help        display this help and exit
       --version     output version information and exit
 
@@ -66,7 +61,8 @@ const DATE_OPTS: &[OptSpec<&str>] = &[
     OptSpec::long("universal", HasArg::No, "utc"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
     OptSpec::short(b'I', HasArg::Optional, "iso-8601"),
     OptSpec::short(b'R', HasArg::No, "rfc-email"),
 ];
@@ -129,7 +125,12 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
                 set_str = value;
             }
             "utc" => utc = true,
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("date", raw.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "debug" => debug = true,
             "rfc-email" => formats.push(b"%a, %d %b %Y %H:%M:%S %z".to_vec()),
             "iso-8601" => {
@@ -217,22 +218,20 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
             );
         }
         if json {
-            let iso = |s: Stamp| {
-                render_date(s, b"%Y-%m-%dT%H:%M:%S%:z")
-                    .map(|v| String::from_utf8_lossy(v.trim_ascii_end()).into_owned())
-            };
-            let obj = serde_json::json!({
-                "unix": stamp.sec,
-                "unix_ms": stamp.sec.saturating_mul(1000) + i64::from(stamp.ns / 1_000_000),
-                "utc": utc_time(stamp.sec).map(|lt| {
-                    let s = format_time(b"%Y-%m-%dT%H:%M:%S%:z", &lt, stamp.ns, false);
-                    String::from_utf8_lossy(&s).into_owned()
-                }),
-                "local": iso(stamp),
-                "format": render_date(stamp, &fmt)
-                    .map(|v| String::from_utf8_lossy(v.trim_ascii_end()).into_owned()),
-            });
-            writeln!(out, "{}", serde_json::to_string_pretty(&obj)?)?;
+            // The instant in UTC, the local zone's offset and name, and the
+            // time as FORMAT (or the default format) shows it.
+            let local = local_time(stamp.sec);
+            let mut w = RecordWriter::new(&mut *out);
+            w.record(|r| {
+                r.time("time", stamp.sec, stamp.ns);
+                if let Some(lt) = &local {
+                    r.i64("utc_offset", lt.tm.tm_gmtoff).bytes("zone", &lt.zone);
+                }
+                if let Some(text) = render_date(stamp, &fmt) {
+                    r.bytes("formatted", text.trim_ascii_end());
+                }
+            })?;
+            w.flush()?;
             return Ok(true);
         }
         match render_date(stamp, &fmt) {

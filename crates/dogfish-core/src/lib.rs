@@ -2,8 +2,8 @@
 //!
 //! Features:
 //! - **Global `--stats` telemetry**: Microsecond timing, throughput, and kernel strategy tracking.
-//! - **Adaptive NDJSON / Table Output**: Emit structured JSON Lines when piped or `--json` is passed,
-//!   and automatically render aligned, colorized tables & sparklines on interactive TTYs.
+//! - **Structured output**: the `-J/--json` record contract ([`ndjson`]: NDJSON,
+//!   versioned, one schema per tool), and aligned, colorized tables on interactive TTYs.
 //! - **Zero-Copy & SIMD I/O**: `mmap`, 64 KiB aligned buffered writers, macOS `clonefile` / Linux CoW,
 //!   and one standard output with GNU `close_stdout` write-error semantics.
 //! - **Undo Journal**: Transaction log and trash staging for reversible `rm`, `mv`, and `cp`.
@@ -13,6 +13,7 @@ pub mod crash;
 pub mod format;
 pub mod io;
 pub mod journal;
+pub mod ndjson;
 pub mod stdout;
 pub mod table;
 
@@ -28,4 +29,7 @@ pub use io::{
     same_file,
 };
 pub use journal::{JournalAction, JournalEntry, Take, UndoJournal};
-pub use table::{ColumnAlign, Table, emit_objects_or_table, eval_json_where, read_ndjson_stdin};
+pub use ndjson::{ErrorRecord, Record, RecordWriter};
+pub use table::{
+    ColumnAlign, InputRecord, Table, default_key, emit_records, eval_json_where, parse_ndjson,
+};

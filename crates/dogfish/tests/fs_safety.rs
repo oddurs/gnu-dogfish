@@ -56,14 +56,15 @@ impl Sandbox {
         fs::read_dir(self.path(".dogfish/trash")).unwrap().count()
     }
 
+    /// The journal, one `history --json` record per entry.
     fn history(&self) -> Vec<serde_json::Value> {
         let out = self.run(&["history", "--json"]);
         assert!(out.status.success(), "{}", stderr(&out));
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .clone()
+        out.stdout
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect()
     }
 }
 
@@ -157,6 +158,22 @@ fn overwriting_mv_never_leaves_the_destination_missing() {
         }
     }
     panic!("mv a b never ran to completion");
+}
+
+/// `mv c c/c`, with `c` a symlink to a directory, moves the symlink into that
+/// directory: the rename takes away what `c/c` resolved through, so the move
+/// must be recorded by where it went, not by the path as given.
+#[test]
+fn undo_of_mv_through_the_moved_symlink() {
+    let sb = Sandbox::new();
+    sb.write("b/x", "x");
+    symlink("b", sb.path("c")).unwrap();
+    assert!(sb.run(&["mv", "c", "c/c"]).status.success());
+    assert!(!sb.exists("c") && sb.exists("b/c"));
+    let out = sb.run(&["undo"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_link(sb.path("c")).unwrap(), Path::new("b"));
+    assert!(!sb.exists("b/c"));
 }
 
 #[test]
@@ -446,9 +463,7 @@ fn concurrent_journal_writers_do_not_lose_entries() {
     for mut c in children {
         assert!(c.wait().unwrap().success());
     }
-    let out = sb.run(&["history", "--json"]);
-    let entries: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(entries.as_array().unwrap().len(), 16);
+    assert_eq!(sb.history().len(), 16);
 }
 
 #[test]

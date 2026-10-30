@@ -6,12 +6,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, emit_objects_or_table, gnu_io_error, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, gnu_io_error, stdout};
 
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::qf;
 
 const REALPATH_HELP: &str = "\
@@ -28,7 +29,8 @@ all but the last component must exist
       --relative-base=DIR      print absolute paths unless paths below DIR
   -s, --strip, --no-symlinks   don't expand symlinks
   -z, --zero                   end each output line with NUL, not newline
-  -J, --json                   emit {input, realpath} objects (Dogfish)
+  -J, --json[=VERSION]         one NDJSON record per name: path and resolved
+                                 (Dogfish)
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -78,7 +80,8 @@ const SPECS: &[OptSpec<RealpathOpt>] = &[
     OptSpec::both(b'P', "physical", HasArg::No, RealpathOpt::Physical),
     OptSpec::long("help", HasArg::No, RealpathOpt::Help),
     OptSpec::long("version", HasArg::No, RealpathOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, RealpathOpt::Json).exact(),
+    json_short(RealpathOpt::Json),
+    json_long(RealpathOpt::Json),
 ];
 
 pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -113,7 +116,12 @@ pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             RelativeTo => relative_to = v,
             RelativeBase => relative_base = v,
             Zero => zero = true,
-            Json => json = true,
+            Json => {
+                if let Err(code) = check_json_version("realpath", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
         }
     }
     let operands = opts.operands();
@@ -164,14 +172,17 @@ pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     };
 
     let mut out = io::BufWriter::new(stdout::stdout());
+    let mut records = json.then(RecordWriter::stdout);
     let mut exit_code = 0;
-    let mut results = Vec::new();
     for arg in &operands {
         let resolved = match canon(Path::new(arg)) {
             Ok(p) => p,
             Err(e) => {
                 if !quiet {
                     out.flush()?;
+                    if let Some(w) = &mut records {
+                        w.flush()?;
+                    }
                     eprintln!("realpath: {}: {}", qf(arg), gnu_io_error(&e));
                 }
                 exit_code = 1;
@@ -185,19 +196,18 @@ pub fn run_realpath(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             _ => resolved,
         };
         ctx.telemetry.add_items(1);
-        if json {
-            results.push(
-                serde_json::json!({ "input": arg.to_string_lossy(), "realpath": shown.to_string_lossy() }),
-            );
+        if let Some(w) = &mut records {
+            w.record(|r| {
+                r.os_str("path", arg).os_str("resolved", &shown);
+            })?;
         } else {
             out.write_all(shown.as_os_str().as_bytes())?;
             out.write_all(if zero { b"\0" } else { b"\n" })?;
         }
     }
     out.flush()?;
-    drop(out);
-    if json {
-        emit_objects_or_table(&results, ctx, true, false)?;
+    if let Some(w) = &mut records {
+        w.flush()?;
     }
     Ok(exit_code)
 }

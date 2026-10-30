@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::backup::{BackupMode, backup_mode, backup_name, backup_suffix};
 use crate::common::canonicalize::{CanMode, canonicalize_mode, relpath};
 use crate::common::copy::{force_linkat, force_symlinkat};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::path::{
     base_len, c_path, dir_name, file_name_concat, last_component, same_inode, same_name,
 };
@@ -46,6 +48,8 @@ Create links to each TARGET; hard links by default, symbolic links with -s.
                                 the links
   -T, --no-target-directory   treat LINK_NAME as a normal file always
   -v, --verbose               print name of each linked file
+  -J, --json[=VERSION]        Dogfish: one NDJSON record per link made (what -v
+                                reports), instead of -v's text
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -66,6 +70,7 @@ enum LnOpt {
     TargetDir,
     NoTargetDir,
     Verbose,
+    Json,
     Help,
     Version,
 }
@@ -89,6 +94,8 @@ const SPECS: &[OptSpec<LnOpt>] = &[
     OptSpec::long("version", HasArg::No, LnOpt::Version),
     OptSpec::short(b'b', HasArg::No, LnOpt::Backup),
     OptSpec::short(b'd', HasArg::No, LnOpt::Directory),
+    json_short(LnOpt::Json),
+    json_long(LnOpt::Json),
 ];
 
 struct LnOpts {
@@ -185,6 +192,13 @@ pub fn run_ln(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
             NoTargetDir => no_target_dir = true,
             Verbose => o.verbose = true,
+            Json => {
+                if let Err(code) = check_json_version("ln", raw.as_deref()) {
+                    return Ok(code);
+                }
+                o.verbose = true;
+                actions::start();
+            }
         }
     }
     let mut files = opts.operands();
@@ -504,7 +518,19 @@ impl Linker<'_> {
                     self.record(dest, &s);
                 }
                 self.ctx.telemetry.add_items(1);
-                if self.o.verbose {
+                if actions::on() {
+                    if let Some(b) = &backup {
+                        actions::record("backup", |r| {
+                            r.os_str("source", dest).os_str("dest", b);
+                        });
+                    }
+                    actions::record(if symbolic { "symlink" } else { "link" }, |r| {
+                        r.os_str("source", &source).os_str("dest", dest);
+                        if let Some(b) = &backup {
+                            r.os_str("backup", b);
+                        }
+                    });
+                } else if self.o.verbose {
                     let arrow = if symbolic { "->" } else { "=>" };
                     match &backup {
                         Some(b) => outln!("{} ~ {} {arrow} {}", qa(b), qa(dest), qa(&source)),

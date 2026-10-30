@@ -574,9 +574,14 @@ impl Sandbox {
             "history failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| TestCaseError::fail(format!("history --json: {e}")))?;
-        Ok(v.as_array().map_or(0, Vec::len))
+        // One NDJSON record per journal entry.
+        let mut n = 0;
+        for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            serde_json::from_slice::<serde_json::Value>(line)
+                .map_err(|e| TestCaseError::fail(format!("history --json: {e}")))?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// The home trash and the trash directories on other file systems.

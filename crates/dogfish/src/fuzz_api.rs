@@ -507,20 +507,28 @@ pub fn ls_colors(data: &[u8]) {
 // ---------------------------------------------------------------- tables
 
 /// The NDJSON reader and the `--where` filter: `field!=v` is always the
-/// negation of `field=v`.
+/// negation of `field=v`; a record's line parses back to its value, and so
+/// does a projection's.
 pub fn table(data: &[u8]) {
     init();
-    let s = text(data);
-    let mut lines: Vec<String> = s.lines().map(str::to_string).collect();
-    let expr = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.remove(0)
+    let (first, rest) = match data.iter().position(|&b| b == b'\n') {
+        Some(i) => (&data[..i], &data[i + 1..]),
+        None => (data, &data[..0]),
     };
-    let Some(objs) = dogfish_core::read_ndjson_stdin(&lines) else {
+    let expr = text(first);
+    let Some(records) = dogfish_core::parse_ndjson(rest) else {
         return;
     };
-    for o in &objs {
+    let objs: Vec<&serde_json::Value> = records.iter().map(|r| &r.value).collect();
+    for r in &records {
+        let back: serde_json::Value = serde_json::from_str(&r.line).expect("a record's line");
+        assert_eq!(back, r.value);
+        let fields: Vec<&str> = expr.split(',').collect();
+        let p = r.project(&fields);
+        let back: serde_json::Value = serde_json::from_str(&p.line).expect("a projection's line");
+        assert_eq!(back, p.value);
+    }
+    for o in objs.iter().copied() {
         assert!(o.is_object());
         let _ = dogfish_core::eval_json_where(o, &expr);
         if let Some(map) = o.as_object()
@@ -534,6 +542,6 @@ pub fn table(data: &[u8]) {
                 assert_ne!(eq, ne, "{field}={rhs} on {value}");
             }
         }
-        let _ = dogfish_core::table::compare_json_field(o, &objs[0], &expr);
+        let _ = dogfish_core::table::compare_json_field(o, objs[0], &expr);
     }
 }

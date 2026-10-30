@@ -617,12 +617,22 @@ macro_rules! out {
 /// standard output is flushed first ([`gnu_fflush`]), for the tools whose
 /// stdio calls are modelled. A failure to write the diagnostic is ignored,
 /// as in GNU (`eprintln!` would panic).
+///
+/// With `-J` ([`crate::ndjson::capture_errors`]), the diagnostic also
+/// becomes an error record on standard output ([`crate::ndjson::diagnostic`]);
+/// standard error gets the same bytes either way.
 #[macro_export]
 macro_rules! gnu_error {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
         $crate::stdout::gnu_fflush();
-        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        if $crate::ndjson::capturing() {
+            let msg = ::std::format!($($arg)*);
+            let _ = ::std::writeln!(::std::io::stderr(), "{msg}");
+            $crate::ndjson::diagnostic(&msg);
+        } else {
+            let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        }
     }};
 }
 

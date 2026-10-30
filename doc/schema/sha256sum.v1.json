@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/sha256sum.v1.json",
+  "title": "sha256sum -J record",
+  "description": "One file hashed by `sha256sum -J`, or with --check one checked line. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The input, `-` for standard input."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "algorithm": {
+          "type": "string",
+          "const": "SHA256",
+          "description": "The algorithm, as GNU's --tag names it."
+        },
+        "digest": {
+          "type": "string",
+          "description": "The checksum, lower-case hexadecimal."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes read."
+        }
+      },
+      "required": [
+        "path",
+        "algorithm",
+        "digest",
+        "bytes"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The file named by the checksum line."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "failed",
+            "unreadable"
+          ],
+          "description": "The verdict: the checksum matched, did not, or the file could not be read."
+        },
+        "expected": {
+          "type": "string",
+          "description": "The checksum from the list."
+        },
+        "actual": {
+          "type": "string",
+          "description": "The checksum computed (absent when unreadable)."
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "expected"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

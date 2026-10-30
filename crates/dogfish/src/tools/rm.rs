@@ -10,11 +10,13 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, UndoJournal, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::dirfd::{At, EntryType, MAX_OPEN_DIRS, Names, Parent, WalkPath, fts_root_name};
 use crate::common::file_info::{describe_mode, file_type_description};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, print_help, print_version, try_help, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::path::last_component;
 use crate::common::preserve_root::{is_root_dir, refuse_root};
 use crate::common::prompt::{Interactive, ask};
@@ -42,6 +44,8 @@ Remove (unlink) the FILE(s).
   -v, --verbose         explain what is being done
       --safe, --trash   move files to Dogfish's trash instead (undo with
                           `dogfish undo`)
+  -J, --json[=VERSION]  write one NDJSON record per file removed, as -v
+                          reports it, instead of -v's text
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -60,6 +64,7 @@ enum RmOpt {
     Recursive,
     Verbose,
     Safe,
+    Json,
     Help,
     Version,
 }
@@ -84,6 +89,8 @@ const SPECS: &[OptSpec<RmOpt>] = &[
     OptSpec::short(b'i', HasArg::No, RmOpt::EveryFile),
     OptSpec::short(b'I', HasArg::No, RmOpt::Once),
     OptSpec::short(b'R', HasArg::No, RmOpt::Recursive),
+    json_short(RmOpt::Json),
+    json_long(RmOpt::Json),
 ];
 
 struct RmRun {
@@ -175,6 +182,7 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     };
     let (mut prompt_once, mut preserve_root, mut preserve_all, mut safe) =
         (false, true, false, false);
+    let mut json = false;
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -266,11 +274,22 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Recursive => run.recursive = true,
             Verbose => run.verbose = true,
             Safe => safe = true,
+            Json => {
+                if let Err(code) = check_json_version("rm", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             Help => return Ok(print_help(RM_HELP)),
             Version => return Ok(print_version("rm")),
         }
     }
     let files = opts.operands();
+    if json {
+        // A record wherever -v would print a line.
+        run.verbose = true;
+        actions::start();
+    }
     if files.is_empty() {
         return Ok(if run.force {
             0
@@ -370,7 +389,11 @@ pub fn run_rm(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             match j.stage_to_trash(p) {
                 Ok(entry) => {
                     ctx.telemetry.add_items(1);
-                    if run.verbose {
+                    if actions::on() {
+                        actions::record("trash", |r| {
+                            r.os_str("path", f).u64("undo_id", entry.id);
+                        });
+                    } else if run.verbose {
                         let st = ctx.style();
                         outln!(
                             "{} {} (undo id #{}: run `{}` to restore)",
@@ -507,7 +530,13 @@ fn rm_file(
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                outln!("removed {}", qa(p));
+                if actions::on() {
+                    actions::record("remove", |r| {
+                        r.os_str("path", p);
+                    });
+                } else {
+                    outln!("removed {}", qa(p));
+                }
             }
             RmStatus::Removed
         }
@@ -557,7 +586,13 @@ fn rm_empty_dir(
         Ok(()) => {
             ctx.telemetry.add_items(1);
             if run.verbose {
-                outln!("removed directory {}", qa(p));
+                if actions::on() {
+                    actions::record("rmdir", |r| {
+                        r.os_str("path", p);
+                    });
+                } else {
+                    outln!("removed directory {}", qa(p));
+                }
             }
             RmStatus::Removed
         }

@@ -1155,6 +1155,15 @@ tree_cases! {
         setup("mkdir s && : > s/c && ln -s ../s s/s");
     mv_simple_backup_through_dir_symlink: "mv" ["-bv", "s", "s/s"]
         setup("mkdir s && : > s/c && ln -s ../s s/s");
+    // -L through symlinks to an ancestor: copy.c's own "cyclic" message. (cp
+    // reads a directory sorted by inode number, which differs between the two
+    // trees: one loop per directory keeps the messages in a fixed order.)
+    cp_dereference_directory_cycle: "cp" ["-RL", "c/d", "o"] setup(CYCLE_TREE);
+    cp_dereference_longer_directory_cycle: "cp" ["-RL", "l", "o"]
+        setup("mkdir -p l/a/b && : > l/a/f && ln -s ../.. l/a/b/loop");
+    cp_dereference_directory_cycle_operand: "cp" ["-RL", "c/d/e/up", "o"] setup(CYCLE_TREE);
+    // chmod has no -L (it never follows symlinks met in the walk).
+    chmod_recursive_dereference_is_no_option: "chmod" ["-RL", "u+w", "c"] setup(CYCLE_TREE);
     cp_backup_through_dot_symlink_cannot_unbackup: "cp" ["-Pbv", "-T", "la", "l/l"]
         setup("ln -s . l");
 
@@ -1491,6 +1500,64 @@ fn cp_backup_and_no_clobber_upstream() {
           Try 'cp --help' for more information.\n"
     );
     assert_eq!(fs::read(dir.join("b")).unwrap(), b"B\n");
+}
+
+/// Directories that are their own ancestors through symlinks: `c/d/e/up -> ..`
+/// and the longer loop `c/a/b/loop -> ../..`, besides a symlink to a sibling.
+const CYCLE_TREE: &str = "mkdir -p c/d/e c/a/b && : > c/d/e/f && ln -s .. c/d/e/up \
+                          && ln -s ../.. c/a/b/loop && ln -s ../d c/a/side";
+
+/// `chown -RL` (to the current user and group, so it runs unprivileged) on
+/// trees with directory cycles: like GNU's fts in logical mode, the walk
+/// changes a directory it is already inside but does not enter it again, and
+/// says nothing (`cycle_warning_required` is false for `FTS_LOGICAL`).
+#[test]
+fn chown_dereference_directory_cycles() {
+    let me = fs::metadata(scratch_root()).unwrap();
+    let (user, group) = (me.uid().to_string(), me.gid().to_string());
+    let both = format!("{user}:{group}");
+    let colon_group = format!(":{group}");
+    let cases: &[(&str, &[&str])] = &[
+        ("chown_dereference_cycle_verbose", &["-RLv", &user, "c"]),
+        (
+            "chown_dereference_cycle_changes",
+            &["-RLc", &both, "c", "c/d"],
+        ),
+        (
+            "chown_dereference_cycle_operand",
+            &["-RLv", &colon_group, "c/d/e/up", "c/a/b/loop"],
+        ),
+        (
+            "chown_dereference_cycle_no_dereference",
+            &["-RLhv", &user, "c"],
+        ),
+        (
+            "chown_dereference_cycle_preserve_root",
+            &["-RLv", "--preserve-root", &user, "c"],
+        ),
+        (
+            "chown_dereference_cycle_from",
+            &["-RLv", "--from=0", &user, "c"],
+        ),
+        (
+            "chown_cmdline_link_into_cycle",
+            &["-RHv", &user, "c/d/e/up"],
+        ),
+        ("chown_physical_cycle_links", &["-RPv", &user, "c"]),
+    ];
+    for (name, args) in cases {
+        TreeCase {
+            name,
+            tool: "chown",
+            args,
+            stdin: None,
+            setup: Some(CYCLE_TREE),
+            tz: "UTC0",
+            posix2_version: None,
+            cmp: Compare::default(),
+        }
+        .run();
+    }
 }
 
 /// `chmod -R` and `chown -R` (to the current user and group) on a tree deeper

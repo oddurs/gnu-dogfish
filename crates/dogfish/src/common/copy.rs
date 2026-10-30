@@ -16,12 +16,13 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 
-use dogfish_core::outln;
+use dogfish_core::ndjson::file_type_name;
 use dogfish_core::{
-    CopyMethod, DogfishContext, JournalAction, JournalEntry, Take, UndoJournal, crash_point,
-    gnu_io_error, move_path,
+    CopyMethod, DogfishContext, JournalAction, JournalEntry, Record, Take, UndoJournal,
+    crash_point, gnu_io_error, move_path, outln,
 };
 
+use crate::common::actions;
 use crate::common::backup::{Backup, BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
@@ -121,6 +122,9 @@ pub(crate) struct CopyOptions {
     /// mv: `Some(0)` when the source was already renamed, `Some(errno)` when
     /// that failed, `None` when no rename was tried.
     pub(crate) rename_errno: Option<i32>,
+    /// mv: with `rename_errno == Some(0)`, where the destination was before the
+    /// rename resolved it away (`mv c c/c`, `c` a symlink to a directory).
+    pub(crate) renamed_dst: Option<PathBuf>,
 }
 
 impl CopyOptions {
@@ -157,6 +161,7 @@ impl CopyOptions {
             keep_directory_symlink: false,
             last_file: false,
             rename_errno: None,
+            renamed_dst: None,
         }
     }
 
@@ -806,6 +811,55 @@ impl<'a> Copier<'a> {
         matches!(errno(e), libc::EPERM | libc::EINVAL) && !self.privileged
     }
 
+    /// The undo id of the operand being copied, once the journal has it.
+    pub(crate) fn undo_id(&self) -> Option<u64> {
+        self.plan.as_ref()?.entry.as_ref().map(|e| e.id)
+    }
+
+    /// With `-J`, the record of an action from `src` to `dst` (what `-v`
+    /// shows as `src -> dst`), after the record of the `--backup` that
+    /// made way for it.
+    fn emit_action(
+        &self,
+        action: &str,
+        src: &Path,
+        dst: &Path,
+        backup: Option<&Path>,
+        extra: impl FnOnce(&mut Record<'_>),
+    ) {
+        if let Some(b) = backup {
+            actions::record("backup", |r| {
+                r.os_str("source", dst).os_str("dest", b);
+            });
+        }
+        let id = self.undo_id();
+        actions::record(action, |r| {
+            r.os_str("source", src).os_str("dest", dst);
+            extra(r);
+            if let Some(b) = backup {
+                r.os_str("backup", b);
+            }
+            if let Some(id) = id {
+                r.u64("undo_id", id);
+            }
+        });
+    }
+
+    /// `-v`'s `removed 'DST'`, or its record with `-J`.
+    fn report_removed(&self, p: &Path) {
+        if actions::on() {
+            let id = self.undo_id();
+            actions::record("remove", |r| {
+                r.os_str("path", p);
+                if let Some(id) = id {
+                    r.u64("undo_id", id);
+                }
+            });
+        } else {
+            outln!("removed {}", qa(p));
+        }
+    }
+
     fn emit_verbose(&self, prefix: &str, src: &Path, dst: &Path, backup: Option<&Path>) {
         match backup {
             Some(b) => outln!("{prefix}{} -> {} (backup: {})", qa(src), qa(dst), qa(b)),
@@ -1065,8 +1119,11 @@ impl<'a> Copier<'a> {
         };
         if let Some(e) = self.adopted.take() {
             // Begun by the caller before it renamed `src` to `dst`.
-            if let JournalAction::Move { src_inode, .. } = &e.action {
+            // Its `dst` was resolved before the rename, which can move what the
+            // path went through (`mv c c/c`, `c` a symlink to a directory).
+            if let JournalAction::Move { src_inode, dst, .. } = &e.action {
                 plan.src_inode = *src_inode;
+                plan.created = dst.clone();
             }
             plan.existed = false;
             plan.entry = Some(e);
@@ -1132,7 +1189,7 @@ impl<'a> Copier<'a> {
         match force_linkat(src, dst, dereference, replace, None) {
             Ok(linked) => {
                 if (linked == Linked::Replaced || saved) && verbose {
-                    outln!("removed {}", qa(dst));
+                    self.report_removed(dst);
                 }
                 true
             }
@@ -1359,7 +1416,11 @@ impl<'a> Copier<'a> {
         // Where `dst` is once renamed: GNU reaches it through the target
         // directory's descriptor, which still works when the rename moved what
         // the path went through (`mv b a b`, with `b` a symlink to a directory).
-        let mut renamed_dst = dst.to_path_buf();
+        let mut renamed_dst = self
+            .x
+            .renamed_dst
+            .take()
+            .unwrap_or_else(|| dst.to_path_buf());
         if x_move {
             if rename_errno < 0 {
                 renamed_dst = stable_path(dst);
@@ -1533,7 +1594,7 @@ impl<'a> Copier<'a> {
                 if skipped {
                     if self.x.interactive == Interactive::AlwaysNo {
                         self.diag(&format!("not replacing {}", qa(dst)));
-                    } else if self.x.debug {
+                    } else if self.x.debug && !actions::on() {
                         dogfish_core::outln!("skipped {}", qa(dst));
                     }
                     return_now = true;
@@ -1641,7 +1702,7 @@ impl<'a> Copier<'a> {
                         }
                         new_dst = true;
                         if self.x.verbose {
-                            outln!("removed {}", qa(dst));
+                            self.report_removed(dst);
                         }
                     }
                 }
@@ -1680,8 +1741,12 @@ impl<'a> Copier<'a> {
             && (is_type(src_mode, S_IFREG)
                 || (self.x.copy_as_regular && !is_type(src_mode, S_IFLNK)));
         let mut verbose_pending = false;
+        // With -J, the record is written once the file is made.
+        let mut json_pending = false;
         if self.x.verbose && !x_move && !src_is_dir {
-            if rich_verbose {
+            if actions::on() {
+                json_pending = true;
+            } else if rich_verbose {
                 verbose_pending = true;
             } else {
                 self.emit_verbose("", src, dst, dst_backup.as_deref());
@@ -1763,6 +1828,9 @@ impl<'a> Copier<'a> {
                         src_sb.as_ref(),
                     );
                 }
+                if json_pending {
+                    self.emit_action("link", &earlier, dst, dst_backup.as_deref(), |_| {});
+                }
                 return true;
             }
         }
@@ -1821,7 +1889,17 @@ impl<'a> Copier<'a> {
             }
 
             if rename_errno == 0 {
-                if self.x.verbose {
+                if actions::on() {
+                    // What was renamed is at `dst` now.
+                    let kind = fs::symlink_metadata(dst)
+                        .ok()
+                        .map(|m| file_type_name(m.mode()));
+                    self.emit_action("move", src, dst, dst_backup.as_deref(), |r| {
+                        if let Some(k) = kind {
+                            r.str("type", k);
+                        }
+                    });
+                } else if self.x.verbose {
                     self.emit_verbose("renamed ", src, dst, dst_backup.as_deref());
                 }
                 *rename_succeeded = true;
@@ -1883,7 +1961,11 @@ impl<'a> Copier<'a> {
                 return false;
             }
             if self.x.verbose && !src_is_dir {
-                self.emit_verbose("copied ", src, dst, dst_backup.as_deref());
+                if actions::on() {
+                    json_pending = true;
+                } else {
+                    self.emit_verbose("copied ", src, dst, dst_backup.as_deref());
+                }
             }
             new_dst = true;
         }
@@ -1953,7 +2035,21 @@ impl<'a> Copier<'a> {
                         dst_sb = Some(m);
                     }
                 }
-                if self.x.verbose {
+                if actions::on() {
+                    if x_move {
+                        let id = self.undo_id();
+                        actions::record("mkdir", |r| {
+                            r.os_str("path", dst);
+                            if let Some(id) = id {
+                                r.u64("undo_id", id);
+                            }
+                        });
+                    } else {
+                        self.emit_action("copy", src, dst, None, |r| {
+                            r.str("type", "directory");
+                        });
+                    }
+                } else if self.x.verbose {
                     if x_move {
                         outln!("created directory {}", qa(dst));
                     } else {
@@ -2114,6 +2210,25 @@ impl<'a> Copier<'a> {
             return self.un_backup(dst_backup.as_deref(), &earlier_file, dst, Some(&ssb));
         }
 
+        if json_pending {
+            let action = if self.x.symbolic_link {
+                "symlink"
+            } else if self.x.hard_link {
+                "link"
+            } else {
+                "copy"
+            };
+            let bytes = copied_as_regular.then_some(ssb.len());
+            self.emit_action(action, src, dst, dst_backup.as_deref(), |r| {
+                if action == "copy" {
+                    r.str("type", file_type_name(src_mode));
+                }
+                if let Some(b) = bytes {
+                    r.u64("bytes", b);
+                }
+            });
+        }
+
         if command_line_arg
             && let Ok(m) = fs::symlink_metadata(dst)
             && let Some(d) = &mut self.dest_info
@@ -2248,7 +2363,11 @@ impl<'a> Copier<'a> {
             match fs::rename(from, to) {
                 Err(e) => self.diag_err(&format!("cannot un-backup {}", qa(dst)), &e),
                 Ok(()) => {
-                    if self.x.verbose {
+                    if actions::on() {
+                        actions::record("unbackup", |r| {
+                            r.os_str("source", b).os_str("dest", dst);
+                        });
+                    } else if self.x.verbose {
                         outln!("{} -> {} (unbackup)", qa(b), qa(dst));
                     }
                     self.forget_backup(b, dst);
@@ -2354,6 +2473,7 @@ impl<'a> Copier<'a> {
         );
         // GNU `emit_debug`, once the source was opened.
         if self.x.debug
+            && !actions::on()
             && source_opened
             && !self.x.hard_link
             && !self.x.symbolic_link
@@ -2453,7 +2573,7 @@ impl<'a> Copier<'a> {
                 match self.remove_dst(dst, false, top) {
                     Ok(()) => {
                         if self.x.verbose {
-                            outln!("removed {}", qa(dst));
+                            self.report_removed(dst);
                         }
                     }
                     Err(e) if errno(&e) == libc::ENOENT => {}

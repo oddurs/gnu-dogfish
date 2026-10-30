@@ -8,17 +8,17 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 
 use anyhow::Result;
 use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, emit_objects_or_table, gnu_io_error, read_ndjson_stdin,
-    table::compare_json_field,
+    DEFAULT_BUF_SIZE, DogfishContext, InputRecord, default_key, emit_records, gnu_io_error,
+    parse_ndjson, table::compare_json_field,
 };
-use serde_json::Value;
 
 use crate::common::getopt::{
     Arg, Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
     try_help,
 };
 use crate::common::input::RawStdout;
-use crate::common::lines::{is_blank, looks_like_json, lossy_lines};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::{is_blank, looks_like_json};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, qf, quote_locale};
 use crate::common::xstrtol::{StrtolError, xstrtoumax};
@@ -46,7 +46,7 @@ Mandatory arguments to long options are mandatory for short options too.
   -z, --zero-terminated     line delimiter is NUL, not newline
   -w, --check-chars=N   compare no more than N characters in lines
       --by=FIELD        deduplicate NDJSON objects by FIELD (default: name)
-  -J, --json            print NDJSON objects as JSON
+  -J, --json[=VERSION]  write NDJSON records, even on a terminal
       --help        display this help and exit
       --version     output version information and exit
 
@@ -97,7 +97,8 @@ const SPECS: &[OptSpec<UniqOpt>] = &[
     OptSpec::long("help", HasArg::No, UniqOpt::Help),
     OptSpec::long("version", HasArg::No, UniqOpt::Version),
     OptSpec::long("by", HasArg::Required, UniqOpt::By).exact(),
-    OptSpec::both(b'J', "json", HasArg::No, UniqOpt::Json).exact(),
+    json_short(UniqOpt::Json),
+    json_long(UniqOpt::Json),
     digit(b'0'),
     digit(b'1'),
     digit(b'2'),
@@ -290,7 +291,10 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
             }
             UniqOpt::ZeroTerminated => cfg.delimiter = 0,
             UniqOpt::By => cfg.by_field = Some(value_or_empty()),
-            UniqOpt::Json => cfg.json = true,
+            UniqOpt::Json => {
+                check_json_version("uniq", value.as_deref().map(std::ffi::OsStr::new))?;
+                cfg.json = true;
+            }
             UniqOpt::Help => return Err(print_help(UNIQ_HELP)),
             UniqOpt::Version => return Err(print_version("uniq")),
         }
@@ -510,7 +514,7 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         if looks_like_json(peek) {
             let mut all = Vec::new();
             input.read_to_end(&mut all)?;
-            if let Some(objs) = read_ndjson_stdin(&lossy_lines(&all)) {
+            if let Some(objs) = parse_ndjson(&all) {
                 return uniq_objects(objs, &cfg, ctx);
             }
             input = BufReader::with_capacity(DEFAULT_BUF_SIZE, Box::new(io::Cursor::new(all)));
@@ -549,20 +553,20 @@ pub fn run_uniq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 }
 
 /// `--by FIELD`: groups adjacent NDJSON objects with equal FIELD.
-fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Result<i32> {
+fn uniq_objects(objs: Vec<InputRecord>, cfg: &UniqConfig, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry.set_strategy("NDJSON object deduplication");
-    let field = cfg.by_field.as_deref().unwrap_or("name");
-    let mut groups: Vec<(Value, usize)> = Vec::new();
+    let field = cfg.by_field.as_deref().unwrap_or(default_key(&objs));
+    let mut groups: Vec<(InputRecord, usize)> = Vec::new();
     for obj in objs {
         if let Some((last, cnt)) = groups.last_mut()
-            && compare_json_field(last, &obj, field) == Ordering::Equal
+            && compare_json_field(&last.value, &obj.value, field) == Ordering::Equal
         {
             *cnt += 1;
             continue;
         }
         groups.push((obj, 1));
     }
-    let filtered: Vec<Value> = groups
+    let filtered: Vec<InputRecord> = groups
         .into_iter()
         .filter(|(_, c)| {
             if !cfg.output_unique {
@@ -573,16 +577,15 @@ fn uniq_objects(objs: Vec<Value>, cfg: &UniqConfig, ctx: &DogfishContext) -> Res
                 true
             }
         })
-        .map(|(mut val, c)| {
-            if cfg.count
-                && let Some(map) = val.as_object_mut()
-            {
-                map.insert("count".to_string(), serde_json::json!(c));
+        .map(|(rec, c)| {
+            if cfg.count {
+                rec.with_field("count", serde_json::json!(c))
+            } else {
+                rec
             }
-            val
         })
         .collect();
-    emit_objects_or_table(&filtered, ctx, cfg.json, !cfg.json)?;
+    emit_records(&filtered, ctx, cfg.json)?;
     Ok(0)
 }
 

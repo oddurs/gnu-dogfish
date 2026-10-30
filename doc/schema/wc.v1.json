@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/wc.v1.json",
+  "title": "wc -J record",
+  "description": "The counts of one input of `wc -J`; every count is given, whatever options select. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The input, `-` for standard input."
+        },
+        "lines": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Newlines."
+        },
+        "words": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Words."
+        },
+        "chars": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Characters (bytes in a non-UTF-8 locale)."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes."
+        },
+        "max_line_length": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The widest line's display width."
+        }
+      },
+      "required": [
+        "path",
+        "lines",
+        "words",
+        "chars",
+        "bytes",
+        "max_line_length"
+      ]
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

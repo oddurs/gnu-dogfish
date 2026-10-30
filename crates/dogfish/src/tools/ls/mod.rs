@@ -14,7 +14,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use anyhow::Result;
-use dogfish_core::{ColorMode, DogfishContext, emit_objects_or_table, stdout};
+use dogfish_core::{ColorMode, DogfishContext, RecordWriter, stdout};
 
 use crate::common::uname_info::get_uname_info;
 use crate::tools::ls::colors::{C_EXEC, C_MISSING, C_ORPHAN, LsColors};
@@ -41,6 +41,11 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         operands.into_iter().map(OsString::into_vec).collect()
     };
     let st = ctx.style();
+    // -J lists files as records, and nothing else: no tree, no --dired offsets.
+    if opts.json {
+        opts.tree = false;
+        opts.dired = false;
+    }
 
     if opts.tree {
         ctx.telemetry.set_strategy("recursive visual tree renderer");
@@ -95,7 +100,9 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         status: 0,
         first_header: true,
         rich: rich.then_some(st),
-        json: Vec::new(),
+        json: opts
+            .json
+            .then(|| (RecordWriter::stdout(), Default::default())),
         active: Vec::new(),
         used_color: std::cell::Cell::new(false),
         time_cache: std::cell::RefCell::new(None),
@@ -104,16 +111,14 @@ pub fn run_ls(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         .run(&targets)
         .and_then(|()| lister.restore_default_color())
         .and_then(|()| lister.dump_dired());
+    let res = res.and_then(|()| match &mut lister.json {
+        Some((w, _)) => {
+            ctx.telemetry.set_strategy("NDJSON records");
+            w.flush()
+        }
+        None => Ok(()),
+    });
     res?;
-    ctx.telemetry.add_items(lister.json.len() as u64);
-    if opts.json {
-        ctx.telemetry
-            .set_strategy("NDJSON structured object stream");
-        let records = std::mem::take(&mut lister.json);
-        drop(lister);
-        emit_objects_or_table(&records, ctx, true, false)?;
-        return Ok(0);
-    }
     let status = lister.status;
     lister.out.flush()?;
     Ok(status)

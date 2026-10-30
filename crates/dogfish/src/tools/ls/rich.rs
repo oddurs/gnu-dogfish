@@ -1,4 +1,4 @@
-//! Terminal-only output: `--json` entries and `--tree`.
+//! Terminal-only output: the rich listing's entries and `--tree`.
 
 use std::fs;
 use std::io::{self, Write};
@@ -7,39 +7,29 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use dogfish_core::{DogfishContext, Style, format_mode_rwx, format_relative_time};
-use serde::Serialize;
 
-use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
+use crate::common::users::get_username_by_uid;
 use crate::tools::ls::lister::LsFile;
 
-#[derive(Serialize, Clone)]
-pub struct LsEntry {
-    pub name: String,
-    pub path: String,
-    pub kind: String,
-    pub size: u64,
-    pub mode: String,
-    pub mode_octal: String,
-    pub user: String,
-    pub group: String,
-    pub modified_unix: i64,
-    pub modified_relative: String,
+/// What the terminal view shows of one file.
+pub(crate) struct LsEntry {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) size: u64,
+    pub(crate) mode: String,
+    pub(crate) user: String,
+    pub(crate) modified_relative: String,
 }
 
-pub(crate) fn ls_json_entry(f: &LsFile) -> LsEntry {
+pub(crate) fn rich_entry(f: &LsFile) -> LsEntry {
     let name = String::from_utf8_lossy(&f.name).into_owned();
-    let path = f.path.to_string_lossy().into_owned();
     let Some(meta) = &f.meta else {
         return LsEntry {
             name,
-            path,
-            kind: "unknown".into(),
+            kind: "unknown",
             size: 0,
             mode: "?????????".into(),
-            mode_octal: "?".into(),
             user: "?".into(),
-            group: "?".into(),
-            modified_unix: 0,
             modified_relative: "?".into(),
         };
     };
@@ -54,17 +44,13 @@ pub(crate) fn ls_json_entry(f: &LsFile) -> LsEntry {
         "file"
     };
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let (uid, gid) = (meta.uid(), meta.gid());
+    let uid = meta.uid();
     LsEntry {
         name,
-        path,
-        kind: kind.to_string(),
+        kind,
         size: meta.len(),
         mode: format_mode_rwx(mode),
-        mode_octal: format!("{:04o}", mode & 0o7777),
         user: get_username_by_uid(uid).unwrap_or_else(|| uid.to_string()),
-        group: get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string()),
-        modified_unix: meta.mtime(),
         modified_relative: format_relative_time(mtime),
     }
 }

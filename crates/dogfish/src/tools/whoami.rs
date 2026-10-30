@@ -3,11 +3,12 @@
 use std::ffi::OsString;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, outln};
+use dogfish_core::{DogfishContext, RecordWriter, outln};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 use crate::common::users::get_username_by_uid;
 
@@ -18,7 +19,8 @@ Usage: whoami [OPTIONS]
 
 Options:
       --help  Display this help and exit
-  -J, --json
+  -J, --json[=VERSION]
+              Print one NDJSON record: uid and user
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,7 +34,8 @@ enum WhoamiOpt {
 const SPECS: &[OptSpec<WhoamiOpt>] = &[
     OptSpec::long("help", HasArg::No, WhoamiOpt::Help),
     OptSpec::long("version", HasArg::No, WhoamiOpt::Version),
-    OptSpec::both(b'J', "json", HasArg::No, WhoamiOpt::Json).exact(),
+    json_short(WhoamiOpt::Json),
+    json_long(WhoamiOpt::Json),
 ];
 
 pub fn run_whoami(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
@@ -40,7 +43,12 @@ pub fn run_whoami(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     while let Some(opt) = opts.next() {
         match opt {
-            Ok((WhoamiOpt::Json, _)) => json = true,
+            Ok((WhoamiOpt::Json, v)) => {
+                if let Err(code) = check_json_version("whoami", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             Ok((WhoamiOpt::Help, _)) => return Ok(print_help(WHOAMI_HELP)),
             Ok((WhoamiOpt::Version, _)) => return Ok(print_version("whoami")),
             Err(e) => return Ok(getopt_error("whoami", &e)),
@@ -59,10 +67,11 @@ pub fn run_whoami(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         return Ok(1);
     };
     if json {
-        outln!(
-            "{}",
-            serde_json::json!({ "uid": uid, "username": username })
-        );
+        let mut w = RecordWriter::stdout();
+        w.record(|r| {
+            r.u64("uid", u64::from(uid)).str("user", &username);
+        })?;
+        w.flush()?;
     } else {
         outln!("{}", username);
     }

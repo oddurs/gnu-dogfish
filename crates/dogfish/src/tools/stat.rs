@@ -13,10 +13,9 @@ use std::time::SystemTime;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use dogfish_core::{
-    DogfishContext, emit_objects_or_table, format_mode_rwx, format_relative_time, format_size,
-    gnu_io_error, outln, stdout,
+    DogfishContext, RecordWriter, format_mode_rwx, format_relative_time, format_size, gnu_io_error,
+    outln, stdout,
 };
-use serde::Serialize;
 
 use crate::common::file_info::{
     dev_major, dev_minor, file_type_description, find_mount_point, group_name, meta_atime,
@@ -25,7 +24,9 @@ use crate::common::file_info::{
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{Quoting, qa, quote_bytes, quote_bytes_raw};
+use crate::common::records::{Owners, file_fields};
 use crate::common::strftime::{Timespec, format_local_time};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
@@ -39,7 +40,8 @@ const STAT_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
     // Dogfish extensions.
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
 ];
 
 const STAT_HELP: &str = "\
@@ -54,7 +56,7 @@ Display file or file system status.
       --printf=FORMAT   like --format, but interpret backslash escapes,
                           and do not output a mandatory trailing newline
   -t, --terse           print the information in terse form
-  -J, --json            emit NDJSON records (Dogfish extension)
+  -J, --json[=VERSION]  one NDJSON record per FILE (Dogfish extension)
       --help            display this help and exit
       --version         output version information and exit
 
@@ -90,15 +92,13 @@ Blocks: Total: %-10b Free: %-10f Available: %a\n\
 Inodes: Total: %-10c Free: %d\n";
 const STAT_FS_TERSE_FORMAT: &str = "%n %i %l %t %s %S %b %f %a %c %d\n";
 
-#[derive(Serialize)]
+/// What the terminal card shows of one file.
 struct StatRecord {
     name: String,
     file_type: String,
     size: u64,
     size_human: String,
     blocks: u64,
-    io_block: u64,
-    device: u64,
     inode: u64,
     links: u64,
     mode_octal: String,
@@ -131,7 +131,13 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             "dereference" => dereference = true,
             "file-system" => file_system = true,
             "terse" => terse = true,
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("stat", opt.value.as_deref().map(OsStr::new))
+                {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "format" => format = Some((opt.value.unwrap_or_default(), false)),
             "printf" => format = Some((opt.value.unwrap_or_default(), true)),
             "cached" => {
@@ -155,8 +161,11 @@ pub fn run_stat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     if operands.is_empty() {
         return Ok(usage_error("stat", "missing operand"));
     }
-    if json || (ctx.stdout_is_tty() && format.is_none() && !terse && !file_system) {
-        return stat_card(&operands, dereference, json, ctx);
+    if json {
+        return stat_json(&operands, dereference, ctx);
+    }
+    if ctx.stdout_is_tty() && format.is_none() && !terse && !file_system {
+        return stat_card(&operands, dereference, ctx);
     }
 
     let selinux = selinux_enabled();
@@ -887,13 +896,47 @@ fn linux_fs_type_name(magic: u64) -> String {
     name.to_string()
 }
 
-/// The Dogfish visual card (TTY) and `--json` records.
-fn stat_card(
-    files: &[OsString],
-    dereference: bool,
-    json: bool,
-    ctx: &DogfishContext,
-) -> Result<i32> {
+/// `-J`: one record per file, `path` as given and what `stat(2)` says.
+fn stat_json(files: &[OsString], dereference: bool, ctx: &DogfishContext) -> Result<i32> {
+    let mut w = RecordWriter::stdout();
+    let mut owners = Owners::default();
+    let mut exit_code = 0;
+    for f in files {
+        let p = Path::new(f);
+        let meta = match if dereference {
+            fs::metadata(p)
+        } else {
+            fs::symlink_metadata(p)
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                w.flush()?;
+                eprintln!("stat: cannot statx {}: {}", qa(f), gnu_io_error(&e));
+                exit_code = 1;
+                continue;
+            }
+        };
+        let target = if meta.file_type().is_symlink() {
+            fs::read_link(p).ok()
+        } else {
+            None
+        };
+        w.record(|r| {
+            r.os_str("path", f);
+            file_fields(r, &meta, &mut owners);
+            r.u64("io_block", meta.blksize());
+            if let Some(t) = &target {
+                r.os_str("target", t);
+            }
+        })?;
+        ctx.telemetry.add_items(1);
+    }
+    w.flush()?;
+    Ok(exit_code)
+}
+
+/// The Dogfish visual card shown on a terminal.
+fn stat_card(files: &[OsString], dereference: bool, ctx: &DogfishContext) -> Result<i32> {
     let mut records = Vec::with_capacity(files.len());
     let mut exit_code = 0;
 
@@ -951,8 +994,6 @@ fn stat_card(
             size: meta.len(),
             size_human: format_size(meta.len(), true),
             blocks: meta.blocks(),
-            io_block: meta.blksize(),
-            device: meta.dev(),
             inode: meta.ino(),
             links: meta.nlink(),
             mode_octal: format!("{:04o}", mode & 0o7777),
@@ -969,11 +1010,6 @@ fn stat_card(
         };
         records.push(rec);
         ctx.telemetry.add_items(1);
-    }
-
-    if json {
-        emit_objects_or_table(&records, ctx, true, false)?;
-        return Ok(exit_code);
     }
 
     let st = ctx.style();

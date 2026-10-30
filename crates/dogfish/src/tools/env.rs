@@ -5,14 +5,16 @@ use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-use dogfish_core::{ColumnAlign, DogfishContext, Table, gnu_io_error, gnu_quote, stdout};
-use serde::Serialize;
+use dogfish_core::{
+    ColumnAlign, DogfishContext, RecordWriter, Table, gnu_io_error, gnu_quote, stdout,
+};
 
 use crate::common::exit_status::{EXIT_CANCELED, EXIT_CANNOT_INVOKE, EXIT_ENOENT};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, error_bytes, getopt_error, lossy, print_help, print_version,
     try_help, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::signals::{parse_signal, rt_signal_range, sig_name_into};
 
@@ -46,7 +48,7 @@ Set each NAME to VALUE in the environment and run COMMAND.
       --ignore-signal[=SIG]   set handling of SIG signal(s) to do nothing
       --list-signal-handling  list non default signal handling to stderr
   -v, --debug          print verbose information for each processing step
-  -J, --json           print the environment as JSON objects
+  -J, --json[=VERSION] print the environment as NDJSON records: name, value
   -t, --table          print the environment as a table
       --help        display this help and exit
       --version     output version information and exit
@@ -85,7 +87,8 @@ const ENV_OPTS: &[OptSpec<&str>] = &[
     OptSpec::both(b'S', "split-string", HasArg::Required, "split-string"),
     OptSpec::long("help", HasArg::No, "help"),
     OptSpec::long("version", HasArg::No, "version"),
-    OptSpec::both(b'J', "json", HasArg::No, "json").exact(),
+    json_short("json"),
+    json_long("json"),
     OptSpec::both(b't', "table", HasArg::No, "table").exact(),
     shebang_space(b' '),
     shebang_space(b'\t'),
@@ -376,7 +379,7 @@ fn exec_with_env(argv: &[OsString], env: &EnvList) -> io::Error {
     }
 }
 
-#[derive(Serialize)]
+/// One row of `env --table`.
 struct EnvRecord {
     key: String,
     value: String,
@@ -430,7 +433,12 @@ pub fn run_env(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             "unset" => unset.push(raw.unwrap_or_default()),
             "chdir" => chdir = raw,
             "debug" => debug = true,
-            "json" => json = true,
+            "json" => {
+                if let Err(code) = check_json_version("env", raw.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             "table" => table = true,
             "list-signal-handling" => list_signals = true,
             "shebang-space" => {
@@ -576,7 +584,19 @@ fn print_env(
     table: bool,
     ctx: &DogfishContext,
 ) -> Result<i32> {
-    if json || table {
+    if json {
+        let mut w = RecordWriter::stdout();
+        for e in &env.0 {
+            let name = EnvList::name_of(e);
+            w.record(|r| {
+                r.bytes("name", name)
+                    .bytes("value", e.get(name.len() + 1..).unwrap_or_default());
+            })?;
+        }
+        w.flush()?;
+        return Ok(0);
+    }
+    if table {
         let records: Vec<EnvRecord> = env
             .0
             .iter()
@@ -589,9 +609,7 @@ fn print_env(
                 }
             })
             .collect();
-        if json {
-            dogfish_core::emit_objects_or_table(&records, ctx, true, false)?;
-        } else {
+        {
             let mut tbl = Table::new(vec![
                 ("VARIABLE", ColumnAlign::Left),
                 ("VALUE", ColumnAlign::Left),

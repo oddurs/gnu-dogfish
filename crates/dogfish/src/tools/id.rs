@@ -4,12 +4,13 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, stdout};
 use serde::Serialize;
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
 
@@ -31,7 +32,8 @@ Options:
   -r, --real     Print the real ID instead of the effective ID, with -u, -g, -G
   -u, --user     Print only the effective user ID
   -z, --zero     Delimit entries with NUL characters, not whitespace
-  -J, --json     Emit structured JSON
+  -J, --json[=VERSION]
+                 One NDJSON record per user: ids, names and groups
       --help     Display this help and exit
 ";
 
@@ -72,7 +74,8 @@ const SPECS: &[OptSpec<IdArgsOpt>] = &[
     OptSpec::both(b'r', "real", HasArg::No, IdArgsOpt::Real),
     OptSpec::both(b'u', "user", HasArg::No, IdArgsOpt::User),
     OptSpec::both(b'z', "zero", HasArg::No, IdArgsOpt::Zero),
-    OptSpec::both(b'J', "json", HasArg::No, IdArgsOpt::Json),
+    json_short(IdArgsOpt::Json),
+    json_long(IdArgsOpt::Json),
     OptSpec::long("help", HasArg::No, IdArgsOpt::Help),
     OptSpec::long("version", HasArg::No, IdArgsOpt::Version),
     OptSpec::short(b'a', HasArg::No, IdArgsOpt::Ignored),
@@ -84,7 +87,7 @@ fn parse_id_args(args: Vec<std::ffi::OsString>) -> std::result::Result<IdArgs, i
     let mut parsed = IdArgs::default();
     let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
     while let Some(opt) = opts.next() {
-        let (o, _) = opt.map_err(|e| getopt_error("id", &e))?;
+        let (o, v) = opt.map_err(|e| getopt_error("id", &e))?;
         match o {
             IdArgsOpt::Context => parsed.context = true,
             IdArgsOpt::Group => parsed.group = true,
@@ -93,7 +96,10 @@ fn parse_id_args(args: Vec<std::ffi::OsString>) -> std::result::Result<IdArgs, i
             IdArgsOpt::Real => parsed.real = true,
             IdArgsOpt::User => parsed.user = true,
             IdArgsOpt::Zero => parsed.zero = true,
-            IdArgsOpt::Json => parsed.json = true,
+            IdArgsOpt::Json => {
+                check_json_version("id", v.as_deref())?;
+                parsed.json = true;
+            }
             IdArgsOpt::Ignored => parsed.ignored = true,
             IdArgsOpt::Help => return Err(print_help(ID_HELP)),
             IdArgsOpt::Version => return Err(print_version("id")),
@@ -103,13 +109,12 @@ fn parse_id_args(args: Vec<std::ffi::OsString>) -> std::result::Result<IdArgs, i
     Ok(parsed)
 }
 
+/// One entry of a `-J` record's `groups`.
 #[derive(Serialize)]
-struct IdRecord {
-    uid: u32,
-    user: String,
+struct GroupEntry {
     gid: u32,
-    group: String,
-    groups: Vec<(u32, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// Looks `spec` up as a user name, falling back to a numeric user ID.
@@ -332,16 +337,31 @@ pub fn run_id(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
             }
         };
         if parsed.json {
-            let group_entry =
-                |g: u32| (g, get_groupname_by_gid(g).unwrap_or_else(|| g.to_string()));
-            let rec = IdRecord {
-                uid: who.euid,
-                user: get_username_by_uid(who.euid).unwrap_or_else(|| who.euid.to_string()),
-                gid: who.egid,
-                group: group_entry(who.egid).1,
-                groups: who.groups().into_iter().map(group_entry).collect(),
-            };
-            writeln!(out, "{}", serde_json::to_string_pretty(&rec)?)?;
+            // One record per user: real and effective ids, names where the
+            // ids have them, and every group.
+            let groups: Vec<GroupEntry> = who
+                .groups()
+                .into_iter()
+                .map(|gid| GroupEntry {
+                    gid,
+                    name: get_groupname_by_gid(gid),
+                })
+                .collect();
+            let mut w = RecordWriter::new(stdout::stdout());
+            w.record(|r| {
+                r.u64("uid", u64::from(who.ruid));
+                if let Some(n) = get_username_by_uid(who.ruid) {
+                    r.str("user", &n);
+                }
+                r.u64("gid", u64::from(who.rgid));
+                if let Some(n) = get_groupname_by_gid(who.rgid) {
+                    r.str("group", &n);
+                }
+                r.u64("euid", u64::from(who.euid))
+                    .u64("egid", u64::from(who.egid))
+                    .value("groups", &groups);
+            })?;
+            w.flush()?;
             continue;
         }
         let mut line = Vec::new();

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/du.v1.json",
+  "title": "du -J record",
+  "description": "One line `du` would print, in the same order. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "The file or directory, as du would print it (`total` for the -c row)."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes counted for it and everything below it: disk usage, or the apparent size with --apparent-size / -b. Absent with --inodes."
+        },
+        "inodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "With --inodes: the number of inodes counted, instead of size."
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The number of entries counted."
+        },
+        "mtime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "With --time: the latest mtime in the subtree: RFC 3339, UTC, with nanoseconds."
+        },
+        "mtime_ns": {
+          "type": "integer",
+          "description": "With --time: the latest mtime in the subtree: nanoseconds since the epoch."
+        },
+        "atime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "With --time=atime: the latest atime in the subtree: RFC 3339, UTC, with nanoseconds."
+        },
+        "atime_ns": {
+          "type": "integer",
+          "description": "With --time=atime: the latest atime in the subtree: nanoseconds since the epoch."
+        },
+        "ctime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "With --time=ctime: the latest ctime in the subtree: RFC 3339, UTC, with nanoseconds."
+        },
+        "ctime_ns": {
+          "type": "integer",
+          "description": "With --time=ctime: the latest ctime in the subtree: nanoseconds since the epoch."
+        }
+      },
+      "required": [
+        "path",
+        "files"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      },
+      "anyOf": [
+        {
+          "required": [
+            "size"
+          ]
+        },
+        {
+          "required": [
+            "inodes"
+          ]
+        }
+      ]
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

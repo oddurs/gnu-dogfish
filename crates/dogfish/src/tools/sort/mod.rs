@@ -18,8 +18,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use anyhow::Result;
 use digest::Digest;
 use dogfish_core::{
-    DogfishContext, FastReader, emit_objects_or_table, eval_json_where, gnu_io_error,
-    read_ndjson_stdin, table::compare_json_field,
+    DogfishContext, FastReader, default_key, emit_records, eval_json_where, gnu_io_error,
+    parse_ndjson, table::compare_json_field,
 };
 use md5::Md5;
 use rayon::prelude::*;
@@ -29,7 +29,8 @@ use crate::common::getopt::{
     Arg, Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, print_help, print_version,
 };
 use crate::common::input::{close_stdin, stdin_file, stdin_is_closed};
-use crate::common::lines::{line_end, looks_like_json, lossy_lines, split_records};
+use crate::common::json_opt::{check_json_version, json_long, json_short};
+use crate::common::lines::{line_end, looks_like_json, split_records};
 use crate::common::posixver::posix2_version;
 use crate::common::quote::{qa, quote_locale};
 
@@ -85,7 +86,7 @@ Options:
                                      (e.g., `--by size`)
   -w, --where <WHERE_EXPR>           Filter NDJSON objects before sorting (e.g., `--where
                                      \"size>10K\"`)
-  -J, --json                         Emit JSON / NDJSON output
+  -J, --json[=VERSION]               Write NDJSON records, even on a terminal
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -196,7 +197,8 @@ const SPECS: &[OptSpec<SortOpt>] = &[
     OptSpec::long("desc", HasArg::No, SortOpt::Ordering(b'r')).exact(),
     OptSpec::long("by", HasArg::Required, SortOpt::By).exact(),
     OptSpec::both(b'w', "where", HasArg::Required, SortOpt::Where).exact(),
-    OptSpec::both(b'J', "json", HasArg::No, SortOpt::Json).exact(),
+    json_short(SortOpt::Json),
+    json_long(SortOpt::Json),
     OptSpec::short(b'c', HasArg::No, SortOpt::Check),
     OptSpec::short(b'C', HasArg::No, SortOpt::CheckQuiet),
     OptSpec::short(b'y', HasArg::Required, SortOpt::Y),
@@ -636,7 +638,12 @@ fn parse_sort_args(args: Vec<OsString>) -> std::result::Result<SortArgs, i32> {
                 p.files.push(file);
                 continue;
             }
-            Arg::Opt(o, v) => (o, v.unwrap_or_default()),
+            Arg::Opt(o, v) => {
+                if matches!(o, Json) {
+                    check_json_version("sort", v.as_deref())?;
+                }
+                (o, v.unwrap_or_default())
+            }
         };
         match o {
             Ordering(c) => {
@@ -1240,27 +1247,29 @@ fn sort_in_memory(env: &mut Env, p: &SortArgs, ctx: &DogfishContext, ndjson: boo
             .find(|b| !b.is_empty())
             .is_some_and(|b| looks_like_json(b))
     {
-        let all_lines: Vec<String> = bufs.iter().flat_map(|b| lossy_lines(b)).collect();
-        if let Some(mut objs) = read_ndjson_stdin(&all_lines) {
+        let all: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+        if let Some(mut objs) = parse_ndjson(&all) {
             ctx.telemetry
                 .set_strategy("NDJSON field-aware parallel sort");
             if let Some(ref expr) = parsed.where_expr {
-                objs.retain(|o| eval_json_where(o, expr));
+                objs.retain(|o| eval_json_where(&o.value, expr));
             }
             let field = parsed
                 .by_field
                 .clone()
-                .unwrap_or_else(|| "name".to_string());
+                .unwrap_or_else(|| default_key(&objs).to_string());
             let reverse = parsed.gkey.reverse;
             objs.par_sort_by(|a, b| {
-                let ord = compare_json_field(a, b, &field);
+                let ord = compare_json_field(&a.value, &b.value, &field);
                 if reverse { ord.reverse() } else { ord }
             });
             if parsed.unique {
-                objs.dedup_by(|a, b| compare_json_field(a, b, &field) == Ordering::Equal);
+                objs.dedup_by(|a, b| {
+                    compare_json_field(&a.value, &b.value, &field) == Ordering::Equal
+                });
             }
             ctx.telemetry.add_items(objs.len() as u64);
-            if let Err(e) = emit_objects_or_table(&objs, ctx, parsed.json, !parsed.json) {
+            if let Err(e) = emit_records(&objs, ctx, parsed.json) {
                 return Err(die(e));
             }
             return Ok(());
