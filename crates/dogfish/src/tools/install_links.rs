@@ -9,9 +9,11 @@ use std::ffi::OsString;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, outln};
 
+use crate::common::actions;
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::quote_locale;
 
 const INSTALL_LINKS_HELP: &str = "\
@@ -25,6 +27,7 @@ Arguments:
 Options:
       --prefix <PREFIX>  Optional prefix for symlink names (e.g. `df-` creates `df-ls`, `df-cat`)
                          [default: \"\"]
+  -J, --json[=VERSION]   One NDJSON record per directory and symlink made
   -h, --help             Print help
 ";
 
@@ -36,6 +39,7 @@ struct InstallLinksArgs {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InstallLinksOpt {
     Prefix,
+    Json,
     Help,
     Version,
 }
@@ -44,6 +48,8 @@ const SPECS: &[OptSpec<InstallLinksOpt>] = &[
     OptSpec::long("prefix", HasArg::Required, InstallLinksOpt::Prefix),
     OptSpec::both(b'h', "help", HasArg::No, InstallLinksOpt::Help),
     OptSpec::long("version", HasArg::No, InstallLinksOpt::Version),
+    json_short(InstallLinksOpt::Json),
+    json_long(InstallLinksOpt::Json),
 ];
 
 /// Parses the command line; `Err` is the exit status after `--help`,
@@ -55,6 +61,10 @@ fn parse_install_links_args(args: Vec<OsString>) -> std::result::Result<InstallL
         let (o, v) = opt.map_err(|e| getopt_error("install-links", &e))?;
         match o {
             InstallLinksOpt::Prefix => prefix = v.as_deref().map(lossy).unwrap_or_default(),
+            InstallLinksOpt::Json => {
+                check_json_version("install-links", v.as_deref())?;
+                actions::start();
+            }
             InstallLinksOpt::Help => return Err(print_help(INSTALL_LINKS_HELP)),
             InstallLinksOpt::Version => return Err(print_version("install-links")),
         }
@@ -82,7 +92,20 @@ pub fn run_install_links(
         Err(code) => return Ok(code),
     };
     let target = Path::new(&parsed.target_dir);
+    // With -J, a `mkdir` record for each directory made, outermost first.
+    let mut missing: Vec<&Path> = target
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && p.symlink_metadata().is_err())
+        .collect();
     fs::create_dir_all(target)?;
+    if actions::on() {
+        missing.reverse();
+        for dir in missing {
+            actions::record("mkdir", |r| {
+                r.os_str("path", dir);
+            });
+        }
+    }
     let exe = std::env::current_exe()?;
     let st = ctx.style();
 
@@ -100,10 +123,18 @@ pub fn run_install_links(
             let _ = fs::remove_file(&link_path);
         }
         symlink(&exe, &link_path)?;
+        if actions::on() {
+            actions::record("symlink", |r| {
+                r.os_str("source", &exe).os_str("dest", &link_path);
+            });
+        }
         count += 1;
     }
 
     ctx.telemetry.add_items(count);
+    if actions::on() {
+        return Ok(0);
+    }
     outln!(
         "{} Installed {} utility symlinks in '{}' -> '{}'",
         st.bold_green("✔"),

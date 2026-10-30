@@ -125,42 +125,7 @@ pub fn run_history(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 fn history_record(r: &mut Record<'_>, e: &JournalEntry) {
     let secs = i64::try_from(e.timestamp_unix).unwrap_or(i64::MAX);
     r.u64("id", e.id).time("time", secs, 0).str("tool", &e.tool);
-    match &e.action {
-        JournalAction::TrashRemove {
-            original_path,
-            trash_path,
-        } => {
-            r.str("action", "trash")
-                .os_str("path", original_path)
-                .os_str("trash", trash_path);
-        }
-        JournalAction::Move {
-            src,
-            dst,
-            backup_path,
-            ..
-        } => {
-            r.str("action", "move")
-                .os_str("source", src)
-                .os_str("dest", dst);
-            if let Some(b) = backup_path {
-                r.os_str("backup", b);
-            }
-        }
-        JournalAction::CopyCreate {
-            src,
-            created_path,
-            backup_path,
-            ..
-        } => {
-            r.str("action", "copy")
-                .os_str("source", src)
-                .os_str("dest", created_path);
-            if let Some(b) = backup_path {
-                r.os_str("backup", b);
-            }
-        }
-    }
+    action_fields(r, "action", &e.action);
     if e.backup_bytes > 0 {
         r.u64("backup_size", e.backup_bytes);
     }
@@ -171,6 +136,47 @@ fn history_record(r: &mut Record<'_>, e: &JournalEntry) {
     ] {
         if on {
             r.bool(key, true);
+        }
+    }
+}
+
+/// What a journal entry did, as `key` (`trash`, `move` or `copy`), and its
+/// paths: of trash, `path` (the original) and `trash` (where it is kept);
+/// of move and copy, `source`, `dest` and `backup`. `undo -J` names the
+/// entry it reverses the same way, under `undone`.
+pub(crate) fn action_fields(r: &mut Record<'_>, key: &str, action: &JournalAction) {
+    match action {
+        JournalAction::TrashRemove {
+            original_path,
+            trash_path,
+        } => {
+            r.str(key, "trash")
+                .os_str("path", original_path)
+                .os_str("trash", trash_path);
+        }
+        JournalAction::Move {
+            src,
+            dst,
+            backup_path,
+            ..
+        } => {
+            r.str(key, "move").os_str("source", src).os_str("dest", dst);
+            if let Some(b) = backup_path {
+                r.os_str("backup", b);
+            }
+        }
+        JournalAction::CopyCreate {
+            src,
+            created_path,
+            backup_path,
+            ..
+        } => {
+            r.str(key, "copy")
+                .os_str("source", src)
+                .os_str("dest", created_path);
+            if let Some(b) = backup_path {
+                r.os_str("backup", b);
+            }
         }
     }
 }

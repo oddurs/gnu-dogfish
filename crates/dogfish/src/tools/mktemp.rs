@@ -8,11 +8,12 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, gnu_io_error, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::path::{concat_path, last_component};
 use crate::common::quote::quote_locale;
 
@@ -36,6 +37,8 @@ Files are created u+rw, and directories u+rwx, minus umask restrictions.
   -t                  interpret TEMPLATE as a single file name component,
                         relative to a directory: $TMPDIR, if set; else the
                         directory specified via -p; else /tmp [deprecated]
+  -J, --json[=VERSION]  write an NDJSON record of what was created, not
+                        its name (Dogfish)
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -48,12 +51,14 @@ enum MktempOpt {
     TmpDir,
     Deprecated,
     Suffix,
+    Json,
     Help,
     Version,
 }
 
 /// GNU's `longopts` and `"dp:qtuV"` (`-p` requires its argument, `--tmpdir`
-/// takes an optional one; `-V` is an undocumented `--version`).
+/// takes an optional one; `-V` is an undocumented `--version`), plus the
+/// Dogfish `-J, --json`.
 const SPECS: &[OptSpec<MktempOpt>] = &[
     OptSpec::both(b'd', "directory", HasArg::No, MktempOpt::Directory),
     OptSpec::both(b'q', "quiet", HasArg::No, MktempOpt::Quiet),
@@ -65,6 +70,8 @@ const SPECS: &[OptSpec<MktempOpt>] = &[
     OptSpec::short(b'p', HasArg::Required, MktempOpt::TmpDir),
     OptSpec::short(b't', HasArg::No, MktempOpt::Deprecated),
     OptSpec::short(b'V', HasArg::No, MktempOpt::Version),
+    json_short(MktempOpt::Json),
+    json_long(MktempOpt::Json),
 ];
 
 pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -73,7 +80,7 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     let mut opts = Getopt::new(args.into_iter().skip(1).collect(), SPECS);
     let (mut directory, mut dry_run, mut quiet, mut use_dest_dir, mut deprecated_t) =
         (false, false, false, false, false);
-    let (mut dest_dir_arg, mut suffix_opt) = (None, None);
+    let (mut dest_dir_arg, mut suffix_opt, mut json) = (None, None, false);
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -94,6 +101,12 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 deprecated_t = true;
             }
             Suffix => suffix_opt = v.map(OsString::into_vec),
+            Json => {
+                if let Err(code) = check_json_version("mktemp", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
         }
     }
     // -q hides only failures to create the file or directory; a bad
@@ -215,12 +228,17 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         match res {
             Ok(()) => {
                 ctx.telemetry.add_items(1);
-                let mut out = stdout::stdout();
-                let mut line = path.as_os_str().as_bytes().to_vec();
-                line.push(b'\n');
-                let written = out.write_all(&line).and_then(|()| out.flush());
-                // As in GNU: if the name cannot be written out, nobody will
-                // ever know of the file, so remove it again and fail.
+                let written = if json {
+                    write_record(&path, directory, dry_run)
+                } else {
+                    let mut out = stdout::stdout();
+                    let mut line = path.as_os_str().as_bytes().to_vec();
+                    line.push(b'\n');
+                    out.write_all(&line).and_then(|()| out.flush())
+                };
+                // As in GNU: if the name (or its record) cannot be written
+                // out, nobody will ever know of the file, so remove it again
+                // and fail.
                 if let Err(e) = written
                     && !dry_run
                 {
@@ -251,6 +269,23 @@ pub fn run_mktemp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         "failed to create {kind} via template {}: File exists",
         quote_locale(&full_template)
     ))
+}
+
+/// The `-J` record of what mktemp made: `{"action":"create"|"mkdir",
+/// "path":...}`, or with `-u`, which creates nothing, `{"path":...,
+/// "dry_run":true}`.
+fn write_record(path: &std::path::Path, directory: bool, dry_run: bool) -> io::Result<()> {
+    let mut w = RecordWriter::stdout();
+    w.record(|r| {
+        if !dry_run {
+            r.str("action", if directory { "mkdir" } else { "create" });
+        }
+        r.os_str("path", path);
+        if dry_run {
+            r.bool("dry_run", true);
+        }
+    })?;
+    w.flush()
 }
 
 /// mktemp's option table and help text, for its manual page and shell

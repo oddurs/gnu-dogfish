@@ -493,6 +493,35 @@ impl Record<'_> {
         }
     }
 
+    /// A list of texts from bytes (paths): an array of strings, each as
+    /// [`Record::bytes`] makes it, and when any of them is not UTF-8,
+    /// `<key>_bytes`, the array of every one's bytes in base64.
+    pub fn bytes_list(&mut self, key: &str, values: &[&[u8]]) -> &mut Self {
+        self.key(key);
+        self.buf.push(b'[');
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                self.buf.push(b',');
+            }
+            push_json_str(self.buf, &String::from_utf8_lossy(v));
+        }
+        self.buf.push(b']');
+        if values.iter().any(|v| std::str::from_utf8(v).is_err()) {
+            self.key_suffixed(key, "_bytes");
+            self.buf.push(b'[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    self.buf.push(b',');
+                }
+                self.buf.push(b'"');
+                push_base64(self.buf, v);
+                self.buf.push(b'"');
+            }
+            self.buf.push(b']');
+        }
+        self
+    }
+
     /// [`Record::bytes`] for a path or other `OsStr`.
     pub fn os_str(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         use std::os::unix::ffi::OsStrExt as _;
@@ -806,6 +835,28 @@ mod tests {
         assert_eq!(v["path"], "a\u{fffd}b");
         assert_eq!(
             STANDARD.decode(v["path_bytes"].as_str().unwrap()).unwrap(),
+            b"a\xffb"
+        );
+    }
+
+    #[test]
+    fn lists_of_names_get_a_base64_twin_when_one_is_not_utf8() {
+        assert_eq!(
+            one(|r| {
+                r.bytes_list("restored", &[b"a", b"b\"c"])
+                    .bytes_list("removed", &[]);
+            }),
+            "{\"restored\":[\"a\",\"b\\\"c\"],\"removed\":[]}\n"
+        );
+        let line = one(|r| {
+            r.bytes_list("restored", &[b"ok", b"a\xffb"]);
+        });
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["restored"], serde_json::json!(["ok", "a\u{fffd}b"]));
+        let twins = v["restored_bytes"].as_array().unwrap();
+        assert_eq!(STANDARD.decode(twins[0].as_str().unwrap()).unwrap(), b"ok");
+        assert_eq!(
+            STANDARD.decode(twins[1].as_str().unwrap()).unwrap(),
             b"a\xffb"
         );
     }

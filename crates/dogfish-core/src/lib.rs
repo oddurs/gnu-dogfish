@@ -28,7 +28,7 @@ pub use io::{
     CopyMethod, DEFAULT_BUF_SIZE, FastReader, InputSource, copy_file_fast, copy_tree, move_path,
     same_file,
 };
-pub use journal::{JournalAction, JournalEntry, Take, UndoJournal};
+pub use journal::{JournalAction, JournalEntry, Take, UndoJournal, Undone};
 pub use ndjson::{ErrorRecord, Record, RecordWriter};
 pub use table::{
     ColumnAlign, InputRecord, Table, default_key, emit_records, eval_json_where, parse_ndjson,

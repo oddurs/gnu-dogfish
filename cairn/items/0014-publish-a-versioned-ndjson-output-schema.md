@@ -3,12 +3,13 @@ id: 14
 uid: 26255f4d-3353-47ba-80d5-29011cffc507
 title: "One structured-output contract: NDJSON everywhere, versioned schemas"
 type: feature
-status: planned
+status: done
 milestone: "v0.3"
 depends_on:
 - 11
 created: 2026-10-29
 updated: 2026-10-30
+closed_at: 2026-10-30
 priority: p1
 effort: l
 area: direction
@@ -61,7 +62,7 @@ One contract, implemented once in dogfish-core and used by every tool:
 
 ## Acceptance criteria
 
-- [ ] Every tool that produces records supports `-J` with NDJSON framing, and every file-changing tool reports its actions with `-J`.
+- [x] Every tool that produces records supports `-J` with NDJSON framing, and every file-changing tool reports its actions with `-J`.
 - [x] Every `-J` producer has a published JSON Schema (version 1), and CI validates real output of every tool against it.
 - [x] `dogfish query`, `head`, `tail`, `sort`, `uniq` and `cut` consume any producer's output.
 - [x] `doc/ndjson.md` states the contract and compatibility policy, linked from the README.
@@ -70,3 +71,5 @@ One contract, implemented once in dogfish-core and used by every tool:
 
 - 2026-10-30: phase 2 (branch `ndjson-contract-2`). cp, mv, rm, mkdir, ln, chmod, chown and touch take `-J`: one action record per `-v` line, in `-v`'s order, instead of the text (`doc/ndjson.md`, "Action records"); with -J every diagnostic is also an error record on stdout, made once in `gnu_error!` (`ndjson::diagnostic`), stderr unchanged. Schemas for the eight tools and `error.v1.json`; every schema accepts the error record; tests/ndjson.rs validates real output of all of them and holds -J's records to -v's lines and -J's stderr to GNU's.
 - Criterion 1 is still open: tools that produce text GNU-style but no records yet (basename, dirname, mktemp, cat, tr, cut as a producer), and `mktemp`, `tee`, `dogfish undo` change files without action records.
+- 2026-10-30: phase 3 (branch `ndjson-contract-3`) closes criterion 1. New producers: basename (`path`, `name`), dirname (`path`, `dir`), hostname (`hostname`). New action records: mktemp (`create`/`mkdir`, or `dry_run` with -u, in place of the name), tee (`write` with `bytes` and `append`, one per FILE at the end of input; with -J the data goes to the FILEs only), `dogfish undo` (`undo` per entry: `undo_id`, `tool`, `undone`, the entry's paths, `restored`/`removed` arrays; `UndoJournal::undo_last` now returns them) and `dogfish install-links` (`mkdir`, `symlink`). Schemas, `producers()` entries and tests for each; GNU stderr parity checked for the new tools. No -v exists in any of them, so there is nothing to hold their records to. The audit's other tools need no -J: truncate, install, rmdir, link, unlink, pwd, tty, logname, groups and users are not Dogfish tools.
+- cat and tr, which the audit listed, have no -J by design: they are byte filters and their output is the data (so are tac, nl, paste, base64, basenc, and head/tail/cut/sort/uniq/shuf on text; echo, printf and yes print what they are given). Records would only wrap each line in a string, and their input need not be text or UTF-8. doc/ndjson.md states it ("Tools without records") and `dogfish schema cat` says so. cut is a record consumer, not a producer.

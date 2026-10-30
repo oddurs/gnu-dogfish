@@ -235,6 +235,38 @@ pub struct JournalEntry {
     pub cancelled: bool,
 }
 
+/// What [`UndoJournal::undo_last`] did to one entry: a sentence for people,
+/// and the paths it changed (empty when there was nothing left to undo).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Undone {
+    pub summary: String,
+    /// Paths given back what they held before the operation.
+    pub restored: Vec<PathBuf>,
+    /// Paths the operation had made, gone now (into the trash, or moved back).
+    pub removed: Vec<PathBuf>,
+}
+
+impl From<String> for Undone {
+    fn from(summary: String) -> Self {
+        Self {
+            summary,
+            ..Self::default()
+        }
+    }
+}
+
+impl Undone {
+    fn restored(mut self, p: &Path) -> Self {
+        self.restored.push(p.to_path_buf());
+        self
+    }
+
+    fn removed(mut self, p: &Path) -> Self {
+        self.removed.push(p.to_path_buf());
+        self
+    }
+}
+
 /// Manages `~/.dogfish/trash` and `~/.dogfish/journal.ndjson` for `dogfish undo` and
 /// `dogfish history`.
 ///
@@ -282,12 +314,12 @@ fn exists_no_follow(p: &Path) -> bool {
 }
 
 fn refuse_existing(p: &Path) -> io::Error {
+    let quoted = format!("'{}'", p.display());
+    // The error record of `undo -J` names the path.
+    crate::ndjson::note_quoted(p.as_os_str().as_encoded_bytes(), quoted.as_bytes());
     io::Error::new(
         io::ErrorKind::AlreadyExists,
-        format!(
-            "refusing to undo: '{}' already exists and would be overwritten",
-            p.display()
-        ),
+        format!("refusing to undo: {quoted} already exists and would be overwritten"),
     )
 }
 
@@ -990,7 +1022,7 @@ impl UndoJournal {
     /// Undo is idempotent: a pending entry (an operation that was interrupted) and an
     /// entry whose undo was itself interrupted are reversed from whatever state they
     /// left, so running `dogfish undo` again always makes progress.
-    pub fn undo_last(&self) -> io::Result<Option<(JournalEntry, String)>> {
+    pub fn undo_last(&self) -> io::Result<Option<(JournalEntry, Undone)>> {
         let _lock = self.lock()?;
         let mut entries = self.load_entries()?;
         let Some(entry) = entries.pop() else {
@@ -1048,17 +1080,17 @@ impl UndoJournal {
         Ok(Some((entry, summary)))
     }
 
-    fn undo_trash(&self, entry: &JournalEntry, orig: &Path, trash: &Path) -> io::Result<String> {
+    fn undo_trash(&self, entry: &JournalEntry, orig: &Path, trash: &Path) -> io::Result<Undone> {
         let shown = orig.display();
         match (exists_no_follow(orig), exists_no_follow(trash)) {
-            (true, false) if entry.pending => Ok(format!(
-                "Nothing to restore: '{shown}' was never removed (interrupted)"
-            )),
+            (true, false) if entry.pending => {
+                Ok(format!("Nothing to restore: '{shown}' was never removed (interrupted)").into())
+            }
             // An earlier undo restored it and was interrupted before saving the journal.
-            (true, false) => Ok(format!("'{shown}' is already restored")),
-            (false, false) => Ok(format!(
-                "Cannot restore '{shown}': its copy in the trash is gone"
-            )),
+            (true, false) => Ok(format!("'{shown}' is already restored").into()),
+            (false, false) => {
+                Ok(format!("Cannot restore '{shown}': its copy in the trash is gone").into())
+            }
             (exists, true) => {
                 if exists {
                     if entry.pending {
@@ -1068,7 +1100,7 @@ impl UndoJournal {
                     } else if on_other_fs(orig, trash) && same_tree(orig, trash) {
                         // An earlier undo copied it back across file systems and was
                         // interrupted before removing the trash copy.
-                        return Ok(format!("'{shown}' is already restored"));
+                        return Ok(format!("'{shown}' is already restored").into());
                     } else {
                         return Err(refuse_existing(orig));
                     }
@@ -1078,7 +1110,7 @@ impl UndoJournal {
                     fs::create_dir_all(parent)?;
                 }
                 move_path(trash, orig)?;
-                Ok(format!("Restored '{shown}' from trash"))
+                Ok(Undone::from(format!("Restored '{shown}' from trash")).restored(orig))
             }
         }
     }
@@ -1090,12 +1122,12 @@ impl UndoJournal {
         dst: &Path,
         backup: Option<&Path>,
         (copied, existed, src_inode, src_link): (bool, bool, Option<(u64, u64)>, Option<&Path>),
-    ) -> io::Result<String> {
+    ) -> io::Result<Undone> {
         let (s, t) = (exists_no_follow(src), exists_no_follow(dst));
         let b = backup.is_some_and(exists_no_follow);
         if src == dst {
             // Recorded by an older version for a move that left its source alone.
-            return Ok(format!("Nothing to move back to '{}'", src.display()));
+            return Ok(format!("Nothing to move back to '{}'", src.display()).into());
         }
         // Work out every step before taking any, so a refusal changes nothing.
         let (mut set_aside_src, mut move_back, mut set_aside_dst) = (false, false, false);
@@ -1126,7 +1158,7 @@ impl UndoJournal {
                 set_aside_dst = b || !existed;
             } else if backup.is_some() && !b {
                 // An earlier undo finished and was interrupted before saving.
-                return Ok(format!("'{}' is already moved back", src.display()));
+                return Ok(format!("'{}' is already moved back", src.display()).into());
             } else if on_other_fs(src, dst) && same_tree(src, dst) {
                 // An earlier undo copied `dst` back across file systems and was
                 // interrupted before removing it.
@@ -1163,8 +1195,19 @@ impl UndoJournal {
             }
             move_path(backup, dst)?;
         }
+        // What changed: `src` is back; `dst` holds its original again, or
+        // else what the move put there is gone.
+        let mut changed = Undone::default();
+        if move_back {
+            changed = changed.restored(src);
+        }
+        if b {
+            changed = changed.restored(dst);
+        } else if move_back || set_aside_dst {
+            changed = changed.removed(dst);
+        }
         let (src, dst) = (src.display(), dst.display());
-        Ok(if b {
+        changed.summary = if b {
             format!("Moved '{dst}' back to '{src}' and restored the original")
         } else if entry.backup_purged {
             format!(
@@ -1175,7 +1218,8 @@ impl UndoJournal {
             format!("Moved '{dst}' back to '{src}'")
         } else {
             format!("Nothing to move back to '{src}'")
-        })
+        };
+        Ok(changed)
     }
 
     /// Whether the hard link kept of a moved file (`link`) can stand in for
@@ -1194,14 +1238,15 @@ impl UndoJournal {
         backup: Option<&Path>,
         in_place: bool,
         existed: bool,
-    ) -> io::Result<String> {
+    ) -> io::Result<Undone> {
         let shown = created.display();
         if entry.backup_purged {
             // The copy is now the only version left; removing it would lose data.
             return Ok(format!(
                 "Left '{shown}' as is: the contents it replaced were discarded \
                  (backup limit) and cannot be restored"
-            ));
+            )
+            .into());
         }
         let exists = exists_no_follow(created);
         match backup {
@@ -1218,18 +1263,21 @@ impl UndoJournal {
                     }
                     move_path(b, created)?;
                 }
-                Ok(format!("Restored '{shown}' to its state before the copy"))
+                Ok(
+                    Undone::from(format!("Restored '{shown}' to its state before the copy"))
+                        .restored(created),
+                )
             }
             // Never saved (interrupted first), or restored by an interrupted undo.
-            Some(_) => Ok(format!("Nothing to restore: '{shown}' is as it was")),
-            None if entry.pending && existed => Ok(format!(
-                "Nothing to undo: '{shown}' was not changed (interrupted)"
-            )),
+            Some(_) => Ok(format!("Nothing to restore: '{shown}' is as it was").into()),
+            None if entry.pending && existed => {
+                Ok(format!("Nothing to undo: '{shown}' was not changed (interrupted)").into())
+            }
             None if exists => {
                 self.set_aside(created)?;
-                Ok(format!("Removed copied target '{shown}'"))
+                Ok(Undone::from(format!("Removed copied target '{shown}'")).removed(created))
             }
-            None => Ok(format!("Nothing to remove: '{shown}' is gone")),
+            None => Ok(format!("Nothing to remove: '{shown}' is gone").into()),
         }
     }
 

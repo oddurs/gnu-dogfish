@@ -5,11 +5,12 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::path::{base_len, last_component};
 use crate::common::quote::quote_locale;
 
@@ -22,6 +23,7 @@ If specified, also remove a trailing SUFFIX.
   -a, --multiple       support multiple arguments and treat each as a NAME
   -s, --suffix=SUFFIX  remove a trailing SUFFIX; implies -a
   -z, --zero           end each output line with NUL, not newline
+  -J, --json[=VERSION] one NDJSON record per NAME: path and name (Dogfish)
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -31,17 +33,21 @@ enum BasenameOpt {
     Multiple,
     Suffix,
     Zero,
+    Json,
     Help,
     Version,
 }
 
-/// GNU's `longopts` and `"+as:z"`: options end at the first NAME.
+/// GNU's `longopts` and `"+as:z"`: options end at the first NAME. Plus the
+/// Dogfish `-J, --json`.
 const SPECS: &[OptSpec<BasenameOpt>] = &[
     OptSpec::both(b'a', "multiple", HasArg::No, BasenameOpt::Multiple),
     OptSpec::both(b's', "suffix", HasArg::Required, BasenameOpt::Suffix),
     OptSpec::both(b'z', "zero", HasArg::No, BasenameOpt::Zero),
     OptSpec::long("help", HasArg::No, BasenameOpt::Help),
     OptSpec::long("version", HasArg::No, BasenameOpt::Version),
+    json_short(BasenameOpt::Json),
+    json_long(BasenameOpt::Json),
 ];
 
 pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -51,7 +57,7 @@ pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         SPECS,
         Order::StopAtOperand,
     );
-    let (mut multiple, mut suffix, mut zero) = (false, None, false);
+    let (mut multiple, mut suffix, mut zero, mut json) = (false, None, false, false);
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -64,6 +70,12 @@ pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 suffix = v;
             }
             Zero => zero = true,
+            Json => {
+                if let Err(code) = check_json_version("basename", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
             Help => return Ok(print_help(BASENAME_HELP)),
             Version => return Ok(print_version("basename")),
         }
@@ -83,12 +95,23 @@ pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
         (&names[..1], names.get(1).cloned())
     };
+    let suffix = suffix.as_deref().map(|s| s.as_bytes());
+    if json {
+        // One record per NAME: `-z` changes only the text's terminator.
+        let mut w = RecordWriter::stdout();
+        for name in names {
+            let base = compute_basename(name.as_bytes(), suffix);
+            w.record(|r| {
+                r.bytes("path", name.as_bytes()).bytes("name", &base);
+            })?;
+            ctx.telemetry.add_items(1);
+        }
+        w.flush()?;
+        return Ok(0);
+    }
     let mut out = io::BufWriter::new(stdout::stdout());
     for name in names {
-        out.write_all(&compute_basename(
-            name.as_bytes(),
-            suffix.as_deref().map(|s| s.as_bytes()),
-        ))?;
+        out.write_all(&compute_basename(name.as_bytes(), suffix))?;
         out.write_all(if zero { b"\0" } else { b"\n" })?;
         ctx.telemetry.add_items(1);
     }
