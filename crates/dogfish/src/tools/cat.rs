@@ -10,9 +10,7 @@ use anyhow::Result;
 use dogfish_core::{DogfishContext, InputSource, gnu_io_error, stdout};
 use memchr::memchr;
 
-use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version,
-};
+use crate::common::getopt::{Getopt, HasArg, OptSpec, getopt_error, print_help, print_version};
 use crate::common::input::{RawStdout, bytes_available, safe_read, stdin_file};
 use crate::common::quote::qf;
 
@@ -138,7 +136,7 @@ pub fn run_cat(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => return Ok(getopt_error("cat", &e)),
         }
     }
-    let files = lossy_all(getopt.operands());
+    let files = getopt.operands();
     // GNU checks standard output before reading anything; a closed one
     // fails with EBADF (here it is held by /dev/null).
     // SAFETY: fstat writes into the zeroed buffer it is given.

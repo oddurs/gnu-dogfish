@@ -12,8 +12,7 @@ use dogfish_core::{
 };
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, try_help,
-    xdectoimax,
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, try_help, xdectoimax,
 };
 use crate::common::gnu_regex::Regex;
 use crate::common::input::RawStdout;
@@ -164,7 +163,7 @@ fn build_style(arg: &[u8]) -> std::result::Result<Option<Style>, String> {
 /// Parses the command line in GNU's order: a bad style or format is
 /// reported and parsing goes on (then the usage hint and exit 1), a bad
 /// number or regex stops at once. Returns the configuration and the files.
-fn parse_nl_args(args: Vec<OsString>) -> std::result::Result<(NlConfig, Vec<String>), i32> {
+fn parse_nl_args(args: Vec<OsString>) -> std::result::Result<(NlConfig, Vec<OsString>), i32> {
     let fatal = |msg: String| {
         eprintln!("nl: {msg}");
         1
@@ -282,7 +281,7 @@ fn parse_nl_args(args: Vec<OsString>) -> std::result::Result<(NlConfig, Vec<Stri
     if !ok {
         return Err(try_help("nl"));
     }
-    Ok((cfg, lossy_all(opts.operands())))
+    Ok((cfg, opts.operands()))
 }
 
 /// Numbering state that carries across files.

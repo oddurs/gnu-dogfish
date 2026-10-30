@@ -227,7 +227,7 @@ struct SortArgs {
     nmerge: usize,
     sort_size: usize,
     nthreads: usize,
-    files0_from: Option<String>,
+    files0_from: Option<OsString>,
     files: Vec<OsString>,
     by_field: Option<String>,
     where_expr: Option<String>,
@@ -695,7 +695,7 @@ fn parse_sort_args(args: Vec<OsString>) -> std::result::Result<SortArgs, i32> {
                 p.compress = Some(v);
             }
             Debug => p.debug = true,
-            Files0From => p.files0_from = Some(lossy(&v)),
+            Files0From => p.files0_from = Some(v),
             Key => p.keys.push(parse_key(&v).map_err(fail)?),
             Merge => p.merge = true,
             BatchSize => p.nmerge = specify_nmerge(&v).map_err(fail)?,
@@ -833,9 +833,8 @@ fn sort_random_seed(source: Option<&OsStr>) -> Res<[u8; 16]> {
 
 /// The inputs named in `--files0-from=FROM` (GNU reads them all first and
 /// stops at the first bad name).
-fn files0_sources(from: &str) -> Res<Vec<OsString>> {
-    let mut list =
-        Files0From::open(from).map_err(|e| sort_die("open failed", OsStr::new(from), &e))?;
+fn files0_sources(from: &OsStr) -> Res<Vec<OsString>> {
+    let mut list = Files0From::open(from).map_err(|e| sort_die("open failed", from, &e))?;
     let names = list
         .read_all()
         .map_err(|_| die(format_args!("cannot read file names from {}", qa(from))))?;
@@ -847,7 +846,7 @@ fn files0_sources(from: &str) -> Res<Vec<OsString>> {
             return Err(die(msg));
         }
     }
-    Ok(names.into_iter().map(OsString::from).collect())
+    Ok(names)
 }
 
 /// GNU `check_inputs`: every input must be readable (`euidaccess`).
@@ -1303,7 +1302,7 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
 fn sort_main(mut p: SortArgs, ctx: &DogfishContext) -> Res<i32> {
     if let Some(from) = p.files0_from.as_deref() {
         if let Some(extra) = p.files.first() {
-            return Err(Die(extra_operand_error("sort", lossy(extra), 2)));
+            return Err(Die(extra_operand_error("sort", extra, 2)));
         }
         p.files = files0_sources(from)?;
     }

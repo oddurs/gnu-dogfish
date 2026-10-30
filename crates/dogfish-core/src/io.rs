@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -30,34 +31,37 @@ impl CopyMethod {
     }
 }
 
+/// An input operand: standard input (`-`, or no operands at all) or a file
+/// named by the operand's exact bytes, which need not be UTF-8.
 #[derive(Debug, Clone)]
 pub enum InputSource {
     Stdin,
-    File(String),
+    File(OsString),
 }
 
 impl InputSource {
-    pub fn from_args(files: &[String]) -> Vec<Self> {
+    pub fn from_args(files: &[OsString]) -> Vec<Self> {
         if files.is_empty() {
             vec![Self::Stdin]
         } else {
-            files
-                .iter()
-                .map(|f| {
-                    if f == "-" {
-                        Self::Stdin
-                    } else {
-                        Self::File(f.clone())
-                    }
-                })
-                .collect()
+            files.iter().map(|f| Self::from_arg(f)).collect()
         }
     }
 
-    pub fn display_name(&self) -> &str {
+    /// One operand: `-` is standard input.
+    pub fn from_arg(name: &OsStr) -> Self {
+        if name.as_encoded_bytes() == b"-" {
+            Self::Stdin
+        } else {
+            Self::File(name.to_os_string())
+        }
+    }
+
+    /// The operand as given (`-` for standard input).
+    pub fn display_name(&self) -> &OsStr {
         match self {
-            Self::Stdin => "-",
-            Self::File(p) => p.as_str(),
+            Self::Stdin => OsStr::new("-"),
+            Self::File(p) => p,
         }
     }
 }

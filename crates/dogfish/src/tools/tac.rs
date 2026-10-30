@@ -10,9 +10,7 @@ use anyhow::Result;
 use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error};
 use memchr::memrchr;
 
-use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version,
-};
+use crate::common::getopt::{Getopt, HasArg, OptSpec, getopt_error, print_help, print_version};
 use crate::common::gnu_regex::Regex;
 use crate::common::input::{RawStdout, close_stdin, stdin_file};
 use crate::common::quote::{qa, qf};
@@ -38,7 +36,7 @@ struct TacArgs {
     regex: bool,
     /// The separator as given (bytes: it need not be UTF-8).
     separator: Option<Vec<u8>>,
-    files: Vec<String>,
+    files: Vec<OsString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,7 +72,7 @@ fn parse_tac_args(args: Vec<OsString>) -> std::result::Result<TacArgs, i32> {
             TacOpt::Version => return Err(print_version("tac")),
         }
     }
-    parsed.files = lossy_all(opts.operands());
+    parsed.files = opts.operands();
     Ok(parsed)
 }
 

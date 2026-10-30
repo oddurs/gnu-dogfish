@@ -1,16 +1,17 @@
 //! base64 / basenc
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 
 use anyhow::{Result, anyhow};
 use data_encoding::{BASE32, BASE32HEX, HEXUPPER};
-use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, stdout};
+use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, stdout};
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::quote::{qf, quote_locale};
 
 /// The encodings `basenc` offers (`base64` always uses [`Encoding::Base64`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -545,7 +546,7 @@ struct CodecOptions<'a> {
     decode: bool,
     ignore_garbage: bool,
     wrap: &'a str,
-    file: Option<&'a str>,
+    file: Option<&'a OsStr>,
 }
 
 /// The shared body of `base64` and `basenc`.
@@ -561,9 +562,9 @@ fn run_codec(
     };
     let wrap = usize::try_from(wrap).unwrap_or(usize::MAX);
     let mut input: Box<dyn Read> = match opts.file {
-        Some(f) if f != "-" => Box::new(
-            File::open(f).map_err(|e| anyhow!("{}: {}", gnu_quote_file(f), gnu_io_error(&e)))?,
-        ),
+        Some(f) if f.as_encoded_bytes() != b"-" => {
+            Box::new(File::open(f).map_err(|e| anyhow!("{}: {}", qf(f), gnu_io_error(&e)))?)
+        }
         _ => Box::new(io::stdin().lock()),
     };
     // Each write is one of GNU's checked `fwrite` calls: the first that has
@@ -699,7 +700,7 @@ struct CodecArgs {
     wrap: String,
     /// The last encoding option (basenc), as in GNU.
     encoding: Option<Encoding>,
-    file: Option<String>,
+    file: Option<OsString>,
 }
 
 /// Parses `tool`'s command line; `Err` is the exit status after `--help`,
@@ -728,11 +729,11 @@ fn parse_codec_args(
             CodecOpt::Version => return Err(print_version(tool)),
         }
     }
-    let operands = lossy_all(opts.operands());
+    let operands = opts.operands();
     if let Some(extra) = operands.get(1) {
         return Err(usage_error(
             tool,
-            format!("extra operand {}", gnu_quote(extra)),
+            format!("extra operand {}", quote_locale(extra)),
         ));
     }
     p.file = operands.into_iter().next();

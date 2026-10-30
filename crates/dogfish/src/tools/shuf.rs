@@ -76,8 +76,8 @@ struct ShufConfig {
     /// `-i LO-HI`.
     range: Option<(u64, u64)>,
     head_lines: u64,
-    outfile: Option<String>,
-    random_source: Option<String>,
+    outfile: Option<OsString>,
+    random_source: Option<OsString>,
     repeat: bool,
     eol: u8,
     json: bool,
@@ -162,12 +162,14 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<ShufConfig, i32> {
                 }
             },
             ShufOpt::Output => {
+                let value = raw.unwrap_or_default();
                 if cfg.outfile.as_ref().is_some_and(|o| *o != value) {
                     return Err(die("multiple output files specified".to_string()));
                 }
                 cfg.outfile = Some(value);
             }
             ShufOpt::RandomSource => {
+                let value = raw.unwrap_or_default();
                 if cfg.random_source.as_ref().is_some_and(|r| *r != value) {
                     return Err(die("multiple random sources specified".to_string()));
                 }
@@ -205,18 +207,18 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<ShufConfig, i32> {
 enum Rng {
     File {
         file: io::BufReader<File>,
-        name: String,
+        name: OsString,
     },
     Fast(u64),
 }
 
 impl Rng {
-    fn new(source: Option<&str>) -> std::result::Result<Self, String> {
+    fn new(source: Option<&OsStr>) -> std::result::Result<Self, String> {
         match source {
             Some(name) => File::open(name)
                 .map(|f| Rng::File {
                     file: io::BufReader::new(f),
-                    name: name.to_string(),
+                    name: name.to_os_string(),
                 })
                 .map_err(|e| format!("{}: {}", qf(name), gnu_io_error(&e))),
             None => {
@@ -252,7 +254,7 @@ impl Rng {
                     } else {
                         gnu_io_error(&e)
                     };
-                    eprintln!("shuf: {}: {why}", qf(name.as_str()));
+                    eprintln!("shuf: {}: {why}", qf(name));
                     std::process::exit(1);
                 }
                 u64::from_le_bytes(b)
@@ -323,22 +325,28 @@ pub fn run_shuf(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // for -n 0).
     let mut data = Vec::new();
     if cfg.head_lines > 0 && !cfg.echo && cfg.range.is_none() {
-        let res = match cfg.operands.first().map(OsString::as_os_str) {
-            None => stdin_file().read_to_end(&mut data),
-            Some(p) if p == "-" => stdin_file().read_to_end(&mut data),
-            Some(path) => File::open(path).and_then(|mut f| f.read_to_end(&mut data)),
+        // GNU names the file when it cannot open it (`freopen`), not when
+        // reading fails.
+        let mut stdin;
+        let mut file;
+        let input: &mut File = match cfg.operands.first().map(OsString::as_os_str) {
+            Some(path) if path != "-" => match File::open(path) {
+                Ok(f) => {
+                    file = f;
+                    &mut file
+                }
+                Err(e) => {
+                    eprintln!("shuf: {}: {}", qf(path), gnu_io_error(&e));
+                    return Ok(1);
+                }
+            },
+            _ => {
+                stdin = stdin_file();
+                &mut stdin
+            }
         };
-        if let Err(e) = res {
-            let name = cfg
-                .operands
-                .first()
-                .map_or(OsStr::new("-"), OsString::as_os_str);
-            let what = if cfg.operands.is_empty() {
-                "read error".to_string()
-            } else {
-                qf(name)
-            };
-            eprintln!("shuf: {what}: {}", gnu_io_error(&e));
+        if let Err(e) = input.read_to_end(&mut data) {
+            eprintln!("shuf: read error: {}", gnu_io_error(&e));
             return Ok(1);
         }
     }

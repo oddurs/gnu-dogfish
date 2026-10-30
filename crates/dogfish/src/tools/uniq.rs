@@ -143,8 +143,8 @@ struct UniqConfig {
     delimit: Delimit,
     grouping: Grouping,
     delimiter: u8,
-    input: String,
-    output: String,
+    input: OsString,
+    output: OsString,
     by_field: Option<String>,
     json: bool,
 }
@@ -180,15 +180,15 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
         delimit: Delimit::None,
         grouping: Grouping::None,
         delimiter: b'\n',
-        input: "-".to_string(),
-        output: "-".to_string(),
+        input: OsString::from("-"),
+        output: OsString::from("-"),
         by_field: None,
         json: false,
     };
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<OsString> = Vec::new();
     let mut fields_from_digits = false;
     let mut output_option_used = false;
-    let add_file = |files: &mut Vec<String>, arg: String| {
+    let add_file = |files: &mut Vec<OsString>, arg: OsString| {
         if files.len() == 2 {
             eprintln!("uniq: extra operand {}", quote_locale(&arg));
             return Err(try_help("uniq"));
@@ -200,17 +200,17 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
     while let Some(item) = opts.next_in_order() {
         let (key, value) = match item.map_err(|e| getopt_error("uniq", &e))? {
             Arg::Operand(arg) => {
-                let arg = lossy(&arg);
                 // GNU's "-" optstring: an operand is seen in place, and `+N`
-                // means skip N characters.
-                match xstrtoumax(&arg, "") {
-                    (n, None) if arg.starts_with('+') && !strict_posix2 => cfg.skip_chars = n,
+                // means skip N characters. A file name keeps its bytes.
+                let text = lossy(&arg);
+                match xstrtoumax(&text, "") {
+                    (n, None) if text.starts_with('+') && !strict_posix2 => cfg.skip_chars = n,
                     _ => add_file(&mut files, arg)?,
                 }
                 // Under POSIXLY_CORRECT, options end with the first file.
                 if posixly_correct && !files.is_empty() {
                     while let Some(rest) = opts.take_next() {
-                        add_file(&mut files, lossy(&rest))?;
+                        add_file(&mut files, rest)?;
                     }
                     break;
                 }
@@ -301,7 +301,7 @@ fn parse_args(args: Vec<OsString>) -> std::result::Result<UniqConfig, i32> {
     }
     // What follows `--` is files, even `+N`.
     for rest in opts.operands() {
-        add_file(&mut files, lossy(&rest))?;
+        add_file(&mut files, rest)?;
     }
     if cfg.grouping != Grouping::None && output_option_used {
         eprintln!("uniq: --group is mutually exclusive with -c/-d/-D/-u");
