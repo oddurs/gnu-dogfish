@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/rm.v1.json",
+  "title": "rm -J record",
+  "description": "One file removed by `rm -J`, where `rm -v` would print a line. Error records are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "remove",
+          "description": "A file removed (`rm -v`: `removed 'PATH'`)."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file acted on, as named on the command line or below it."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "undo_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The `dogfish undo` id of the journal entry this action belongs to (`dogfish undo ID` reverses the whole operand)."
+        }
+      },
+      "required": [
+        "action",
+        "path"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "rmdir",
+          "description": "A directory removed (`rm -v`: `removed directory 'PATH'`)."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file acted on, as named on the command line or below it."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "undo_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The `dogfish undo` id of the journal entry this action belongs to (`dogfish undo ID` reverses the whole operand)."
+        }
+      },
+      "required": [
+        "action",
+        "path"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "trash",
+          "description": "With --safe: the operand moved to Dogfish's trash."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file acted on, as named on the command line or below it."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "undo_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The `dogfish undo` id of the journal entry this action belongs to (`dogfish undo ID` reverses the whole operand)."
+        }
+      },
+      "required": [
+        "action",
+        "path",
+        "undo_id"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

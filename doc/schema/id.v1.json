@@ -2,64 +2,105 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/id.v1.json",
   "title": "id -J record",
-  "description": "One user described by `id -J` (the current process, or each USER). One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
-  "type": "object",
-  "properties": {
-    "uid": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "The real user ID."
-    },
-    "user": {
-      "type": "string",
-      "description": "Its name; absent when it has none."
-    },
-    "gid": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "The real group ID."
-    },
-    "group": {
-      "type": "string",
-      "description": "Its name; absent when it has none."
-    },
-    "euid": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "The effective user ID."
-    },
-    "egid": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "The effective group ID."
-    },
-    "groups": {
-      "type": "array",
-      "description": "Every group, as `id -G` lists them.",
-      "items": {
-        "type": "object",
-        "properties": {
-          "gid": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "The group ID."
-          },
-          "name": {
-            "type": "string",
-            "description": "Its name; absent when it has none."
-          }
+  "description": "One user described by `id -J` (the current process, or each USER). Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The real user ID."
         },
-        "required": [
-          "gid"
+        "user": {
+          "type": "string",
+          "description": "Its name; absent when it has none."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The real group ID."
+        },
+        "group": {
+          "type": "string",
+          "description": "Its name; absent when it has none."
+        },
+        "euid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The effective user ID."
+        },
+        "egid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The effective group ID."
+        },
+        "groups": {
+          "type": "array",
+          "description": "Every group, as `id -G` lists them.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "gid": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The group ID."
+              },
+              "name": {
+                "type": "string",
+                "description": "Its name; absent when it has none."
+              }
+            },
+            "required": [
+              "gid"
+            ]
+          }
+        }
+      },
+      "required": [
+        "uid",
+        "gid",
+        "euid",
+        "egid",
+        "groups"
+      ]
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
         ]
       }
     }
-  },
-  "required": [
-    "uid",
-    "gid",
-    "euid",
-    "egid",
-    "groups"
-  ]
+  }
 }

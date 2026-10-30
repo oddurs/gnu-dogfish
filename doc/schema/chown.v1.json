@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/chown.v1.json",
+  "title": "chown -J record",
+  "description": "One file processed by `chown -J`, where `chown -v` (or with -c alone, `chown -c`) would print a line. Error records are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "chown",
+          "description": "One file processed by `chown`."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file acted on, as named on the command line or below it."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "changed",
+            "retained",
+            "failed",
+            "inaccessible",
+            "skipped"
+          ],
+          "description": "`changed` or `retained` (`-v`: 'changed ownership of', 'retained as'); `failed`: the change was refused; `inaccessible`: the file could not be reached."
+        },
+        "changed": {
+          "type": "boolean",
+          "description": "Whether the file was changed (`status` is `changed`)."
+        },
+        "uid_before": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The owner's user ID before."
+        },
+        "gid_before": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The group ID before."
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The owner's user ID after (or, when `failed` or `inaccessible`, the one asked for)."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The group ID after (or, when `failed` or `inaccessible`, the one asked for)."
+        }
+      },
+      "required": [
+        "action",
+        "path",
+        "status",
+        "changed"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
+}

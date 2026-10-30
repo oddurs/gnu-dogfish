@@ -2,50 +2,91 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/uname.v1.json",
   "title": "uname -J record",
-  "description": "The single record of `uname -J`: every field, whatever options select. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
-  "type": "object",
-  "properties": {
-    "sysname": {
-      "type": "string",
-      "description": "Kernel name (-s)."
+  "description": "The single record of `uname -J`: every field, whatever options select. Error records (`#/$defs/error`) are in the same stream. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "sysname": {
+          "type": "string",
+          "description": "Kernel name (-s)."
+        },
+        "nodename": {
+          "type": "string",
+          "description": "Network node host name (-n)."
+        },
+        "release": {
+          "type": "string",
+          "description": "Kernel release (-r)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Kernel version (-v)."
+        },
+        "machine": {
+          "type": "string",
+          "description": "Machine hardware name (-m)."
+        },
+        "processor": {
+          "type": "string",
+          "description": "Processor type (-p)."
+        },
+        "hardware_platform": {
+          "type": "string",
+          "description": "Hardware platform (-i)."
+        },
+        "operating_system": {
+          "type": "string",
+          "description": "Operating system (-o)."
+        }
+      },
+      "required": [
+        "sysname",
+        "nodename",
+        "release",
+        "version",
+        "machine",
+        "processor",
+        "hardware_platform",
+        "operating_system"
+      ]
     },
-    "nodename": {
-      "type": "string",
-      "description": "Network node host name (-n)."
-    },
-    "release": {
-      "type": "string",
-      "description": "Kernel release (-r)."
-    },
-    "version": {
-      "type": "string",
-      "description": "Kernel version (-v)."
-    },
-    "machine": {
-      "type": "string",
-      "description": "Machine hardware name (-m)."
-    },
-    "processor": {
-      "type": "string",
-      "description": "Processor type (-p)."
-    },
-    "hardware_platform": {
-      "type": "string",
-      "description": "Hardware platform (-i)."
-    },
-    "operating_system": {
-      "type": "string",
-      "description": "Operating system (-o)."
+    {
+      "$ref": "#/$defs/error"
     }
-  },
-  "required": [
-    "sysname",
-    "nodename",
-    "release",
-    "version",
-    "machine",
-    "processor",
-    "hardware_platform",
-    "operating_system"
-  ]
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "description": "An error record: the structured twin of a diagnostic the tool also printed on standard error, in order with the other records.",
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "The diagnostic as printed on standard error, without the `tool: ` prefix."
+        },
+        "path": {
+          "type": "string",
+          "description": "The file the diagnostic names first, as given."
+        },
+        "path_bytes": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+        },
+        "errno": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The system error number, when the diagnostic ends with its message (2 for `No such file or directory`)."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "dependentRequired": {
+        "path_bytes": [
+          "path"
+        ]
+      }
+    }
+  }
 }

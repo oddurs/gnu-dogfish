@@ -101,7 +101,13 @@ $ dogfish id -J
 {"uid":1000,"user":"ada","gid":1000,"group":"ada","euid":1000,"egid":1000,"groups":[{"gid":1000,"name":"ada"}]}
 $ dogfish du -a -J src | dogfish query -w "size>8K" -s size -d -n 1
 {"path":"src","size":1265664,"files":143}
+$ dogfish cp -rJ src missing backup | dogfish query -w 'action == copy' -n 2
+cp: cannot stat 'missing': No such file or directory
+{"action":"copy","source":"src","dest":"backup","type":"directory","undo_id":7}
+{"action":"copy","source":"src/main.rs","dest":"backup/main.rs","type":"file","bytes":14897,"undo_id":7}
 ```
+
+The tools that change files (`cp`, `mv`, `rm`, `mkdir`, `ln`, `chmod`, `chown`, `touch`) write one record per action with `-J`, the structured form of `-v`, and with `-J` every diagnostic is also an `{"error":...,"path":...,"errno":...}` record, in order with the others; standard error stays GNU's.
 
 ### 2. Global `--stats` Local Telemetry
 Append `--stats` to any Dogfish utility (or set `DOGFISH_STATS=1`; `echo`, `printf`, `true`, `false` and `yes` take their arguments as GNU does, so only the variable works there) to inspect wall-clock execution time, I/O throughput, item counts, and the active kernel/SIMD strategy:
