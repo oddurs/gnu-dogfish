@@ -388,6 +388,23 @@ gnu_cases! {
     printf_float_partial: "printf" ["%f\\n", "1.5x"];
     printf_dash_dash: "printf" ["--", "%s\\n", "a"];
     printf_dash_dash_only: "printf" ["--"];
+    // `long double`: the x86-64 80-bit format, glibc's printf_fp/printf_fphex.
+    printf_hex_float: "printf" ["%a|%A|%La|%a\n", "1", "-0.1", "0", "-0"];
+    printf_hex_float_precision: "printf" ["%.0a|%.1a|%#.0a|%.3A|%012.2a|%.0a\n", "1.5", "1.96875", "1", "1.999", "-1", "15.5"];
+    printf_hex_float_specials: "printf" ["%a %A %5a %-6A|\n", "inf", "-nan", "nan", "-inf"];
+    printf_hex_float_extremes: "printf" ["%a|%A|%a\n", "1e4932", "0x1p-16445", "0x1.fp-16385"];
+    printf_ld_max: "printf" ["%Lg|%e|%.0f\n", "1.18973149535723176502e+4932", "1e4932", "1e4932"];
+    printf_ld_overflow: "printf" ["%g|%f\n", "1e5000", "-1e4933x"];
+    printf_ld_underflow: "printf" ["%g|%e|%a\n", "1e-5000", "1e-4950", "0x1p-16446"];
+    printf_ld_smallest_subnormal: "printf" ["%e|%.30e|%g\n", "3.6451995318824746025e-4951", "0x1p-16445", "0x3p-16445"];
+    printf_ld_precision_digits: "printf" ["%.30f|%.25e|%.21g\n", "0.1", "1e-20", "1.0000000000000000001"];
+    printf_ld_rounding_ties: "printf" ["%.0f %.0f %.0f %.0f %.1f %.2e %.0e\n", "0.5", "1.5", "2.5", "-3.5", "0.25", "1.125", "0.95"];
+    printf_ld_big_integers: "printf" ["%.0f %g %.20g %f\n", "18446744073709551617", "1e20", "18446744073709551615", "0x1p70"];
+    printf_ld_g_edges: "printf" ["%g %g %#g %#g %#.0g %.0g %G\n", "0.0001", "0.0000999999999", "0.0000999999999", "999999.5", "1", "15", "1e-10"];
+    printf_ld_upper_specials: "printf" ["%F %F %E %G %010f|%-6e|\n", "inf", "-nan", "inf", "nan", "-inf", "nan"];
+    printf_ld_widths: "printf" ["%-20.5a|%+30.20Le|%040.30f|% .3g\n", "3", "-7", "2.5", "1"];
+    printf_ld_many_digits: "printf" ["%.4950e\n", "0x1p-16445"];
+    printf_empty_numeric_argument: "printf" ["%f|%d|%a|%u\n", "", "", "", ""];
 
     // -------------------------------------------------------------- env
     env_empty: "env" ["-i"];
@@ -626,6 +643,34 @@ gnu_cases! {
     seq_extra_operand: "seq" ["1", "2", "3", "4"];
     seq_missing_operand: "seq" [];
     seq_inf_last: "seq" ["-f", "%g", "inf", "1"];
+    // `long double` arithmetic, as GNU's on x86-64.
+    seq_ld_roadmap_case: "seq" ["-f", "%g", "1e20", "1e20"];
+    seq_ld_integer_spelling: "seq" ["1e30", "1e30"];
+    seq_ld_float_step_beyond_2_64: "seq" ["1", "1e19", "5e19"];
+    seq_ld_integers_beyond_2_64: "seq" ["-s", ",", "18446744073709551615", "18446744073709551620"];
+    seq_ld_integer_step_beyond_2_64: "seq" ["18446744073709551616", "18446744073709551616", "1e20"];
+    seq_ld_negative_beyond_2_64: "seq" ["-18446744073709551617", "-18446744073709551615"];
+    seq_ld_fraction_digits: "seq" ["-f", "%.25f", "0", "0.1", "0.5"];
+    seq_ld_fraction_steps_long: "seq" ["0.000000001", "0.000000001", "0.00000002"];
+    seq_ld_max: "seq" ["-f", "%Lg", "1e4932", "-1e4932", "-1e4932"];
+    seq_ld_max_fast: "seq" ["1e4932", "1e4932"];
+    seq_ld_overflow: "seq" ["1e4933"];
+    seq_ld_subnormals: "seq" ["-f", "%Le", "0x1p-16445", "0x1p-16445", "0x4p-16445"];
+    seq_ld_subnormal_inexact: "seq" ["1e-4950", "1"];
+    seq_ld_underflow_to_zero: "seq" ["1e-5000", "1"];
+    seq_ld_width_tiny: "seq" ["-w", "1e-30", "1e-30", "3e-30"];
+    seq_ld_width_mixed: "seq" ["-w", "-1.5", "0.25", "1e1"];
+    seq_ld_width_exponent_fraction: "seq" ["-w", "1.5e1", "2.25e1"];
+    seq_ld_hex_format: "seq" ["-f", "%a", "1", "0.1", "1.3"];
+    seq_ld_hex_format_upper: "seq" ["-f", "%012.3LA", "-2", "0.7", "2"];
+    seq_ld_hex_operands: "seq" ["0x1.8p1", "0x.4p1", "4"];
+    seq_ld_zero_increment_before_last: "seq" ["1", "0", "x"];
+    seq_ld_format_before_operands: "seq" ["-f", "%x", "a"];
+    seq_ld_endpoint_rounding: "seq" ["-f", "%.3f", "0", "0.1", "0.3"];
+    seq_ld_i64_bounds_down: "seq" ["-9223372036854775807", "-1", "-9223372036854775808"];
+    seq_ld_i64_bounds_wide: "seq" ["-w", "-9223372036854775808", "4611686018427387904", "9223372036854775807"];
+    seq_ld_user_format_integers: "seq" ["-f", "%+3.0f|%%", "-1", "2"];
+    seq_ld_default_format_wide_integers: "seq" ["-w", "-s", ", ", "-9", "4", "10"];
 
     // --------------------------------------------------------------- date
     date_epoch_utc: "date" ["-d", "@0"] env [("TZ", "UTC")];
@@ -1466,5 +1511,169 @@ fn commands_inherit_ignored_sigpipe() {
         let mask = shown.trim().rsplit('\t').next().unwrap_or("");
         let mask = u64::from_str_radix(mask, 16).unwrap_or(0);
         assert_ne!(mask & (1 << (libc::SIGPIPE - 1)), 0, "{tool}: {shown:?}");
+    }
+}
+
+/// A small deterministic generator for the randomized cases.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// A random `strtold` argument: decimal numbers over the whole 80-bit range
+/// (subnormals and overflow included), hexadecimal ones, integers around
+/// powers of two, halfway cases and specials.
+fn random_number(r: &mut Lcg, max_exp: i64) -> String {
+    let sign = ["", "", "-", "+"][r.below(4) as usize];
+    let digits = |r: &mut Lcg, n: u64| -> String {
+        (0..n)
+            .map(|_| char::from(b'0' + r.below(10) as u8))
+            .collect()
+    };
+    let body = match r.below(10) {
+        0..=3 => {
+            let n = 1 + r.below(25);
+            let d = digits(r, n);
+            let point = r.below(n + 1) as usize;
+            let e = r.below(2 * max_exp as u64 + 1) as i64 - max_exp;
+            format!("{}.{}e{e}", &d[..point], &d[point..])
+        }
+        4 => {
+            let (n, m) = (1 + r.below(8), r.below(8));
+            let int = digits(r, n);
+            format!("{int}.{}", digits(r, m))
+        }
+        5 => {
+            let hex: String = (0..1 + r.below(18))
+                .map(|_| char::from(b"0123456789abcdef"[r.below(16) as usize]))
+                .collect();
+            let e = r.below(2 * max_exp as u64 * 3 + 1) as i64 - max_exp * 3;
+            format!("0x{hex}p{e}")
+        }
+        6 => {
+            let k = r.below(70);
+            let delta = r.below(5) as i128 - 2;
+            ((1i128 << k) + delta).to_string()
+        }
+        7 => {
+            // Halfway between two decimal digits at some precision.
+            let (n, m) = (1 + r.below(3), r.below(6));
+            let int = digits(r, n);
+            format!("{int}.{}5", digits(r, m))
+        }
+        8 => [
+            "inf",
+            "nan",
+            "0",
+            "1",
+            "0.5",
+            "1e4932",
+            "0x1p-16445",
+            "1e-4950",
+        ][r.below(8) as usize]
+            .to_string(),
+        _ => format!(
+            "0x{:x}.{:x}p{}",
+            r.below(16),
+            r.next(),
+            r.below(200) as i64 - 100
+        ),
+    };
+    format!("{sign}{body}")
+}
+
+/// A random floating-point directive.
+fn random_directive(r: &mut Lcg) -> (String, u8) {
+    let conv = b"aAeEfFgG"[r.below(8) as usize];
+    let mut d = String::from("%");
+    for flag in ["-", "+", " ", "#", "0"] {
+        if r.below(5) == 0 {
+            d.push_str(flag);
+        }
+    }
+    if r.below(2) == 0 {
+        d.push_str(&r.below(30).to_string());
+    }
+    if r.below(3) != 0 {
+        d.push('.');
+        d.push_str(
+            &r.below(if conv | 0x20 == b'a' { 20 } else { 40 })
+                .to_string(),
+        );
+    }
+    if r.below(2) == 0 {
+        d.push('L');
+    }
+    d.push(char::from(conv));
+    (d, conv)
+}
+
+/// Thousands of random numbers through random `long double` directives, in
+/// printf and in seq, against GNU.
+#[test]
+fn printf_seq_long_double_randomized() {
+    let mut r = Lcg(0x5eed_1d0b);
+    for _ in 0..60 {
+        let (directive, conv) = random_directive(&mut r);
+        // %f of numbers near 1e4932 prints thousands of digits each.
+        let max_exp = if conv | 0x20 == b'f' { 40 } else { 4960 };
+        let numbers: Vec<String> = (0..100).map(|_| random_number(&mut r, max_exp)).collect();
+        let format = format!("{directive}|\n");
+        let mut args = vec![format.as_str()];
+        args.extend(numbers.iter().map(String::as_str));
+        common::check_lazy(
+            fixtures,
+            common::Case {
+                tool: "printf",
+                args: &args,
+                stdin: None,
+                compare_stderr: true,
+                locale: "C",
+                env: &[],
+            },
+        );
+        // seq: a few steps from one number by another of a similar size, so
+        // that every step moves (FIRST + i STEP never stalls).
+        for _ in 0..4 {
+            let first = random_number(&mut r, 6);
+            let Ok(f) = first.parse::<f64>() else {
+                continue;
+            };
+            if !f.is_finite() || f == 0.0 {
+                continue;
+            }
+            let step = random_number(&mut r, 6);
+            let Ok(st) = step.parse::<f64>() else {
+                continue;
+            };
+            if !st.is_finite() || st.abs() < f.abs() * 1e-9 || st.abs() < 1e-30 {
+                continue;
+            }
+            let last = format!("{:e}", f + st * r.below(20) as f64);
+            let fmt = format!("-f{directive}");
+            let fmt_arg = if r.below(3) == 0 { "-w" } else { fmt.as_str() };
+            common::check_lazy(
+                fixtures,
+                common::Case {
+                    tool: "seq",
+                    args: &[fmt_arg, "--", &first, &step, &last],
+                    stdin: None,
+                    compare_stderr: true,
+                    locale: "C",
+                    env: &[],
+                },
+            );
+        }
     }
 }

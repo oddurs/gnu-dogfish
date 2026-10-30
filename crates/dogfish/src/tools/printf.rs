@@ -9,9 +9,9 @@ use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, stdo
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::getopt::{HasArg, OptSpec, lossy_all, print_help, print_version};
+use crate::common::ldbl::{FloatSpec, LongDouble, Native, format_into, strtold};
 use crate::common::locale::utf8_locale;
-use crate::common::printf_format::{PrintfFlags, format_float, pad_field_into};
-use crate::common::strtod::strtod_prefix;
+use crate::common::printf_format::{PrintfFlags, pad_field_into};
 
 /// State shared while rendering: diagnostics flip the exit status to 1.
 struct PrintfRun<'a> {
@@ -41,6 +41,10 @@ impl<'a> PrintfRun<'a> {
         let Some(raw) = s else { return 0 };
         if let Some(code) = self.char_constant(raw) {
             return i128::from(code);
+        }
+        // Nothing to convert, and nothing left over: GNU says nothing.
+        if raw.is_empty() {
+            return 0;
         }
         let t = raw.trim_start();
         let b = t.as_bytes();
@@ -84,22 +88,26 @@ impl<'a> PrintfRun<'a> {
         value.clamp(min, max)
     }
 
-    fn float_arg(&mut self, s: Option<&str>) -> f64 {
-        let Some(raw) = s else { return 0.0 };
+    /// GNU's `vstrtold`: a `long double` argument, converted by `strtold`.
+    /// A range error is reported first; an empty argument is 0 silently.
+    fn float_arg(&mut self, s: Option<&str>) -> LongDouble {
+        let Some(raw) = s else {
+            return LongDouble::zero(false);
+        };
         if let Some(code) = self.char_constant(raw) {
-            return f64::from(code);
+            return LongDouble::from_u64(code.into());
         }
-        match strtod_prefix(raw) {
-            Some((v, used)) if used == raw.len() => v,
-            Some((v, _)) => {
-                self.complain(raw, "value not completely converted");
-                v
-            }
-            None => {
+        let r = strtold::<Native>(raw.as_bytes());
+        if r.erange {
+            self.complain(raw, "Numerical result out of range");
+        } else if r.len < raw.len() {
+            if r.len == 0 {
                 self.complain(raw, "expected a numeric value");
-                0.0
+            } else {
+                self.complain(raw, "value not completely converted");
             }
         }
+        r.value
     }
 
     /// GNU's character constants: `'c` or `"c` is the code of `c` (a whole
@@ -404,11 +412,18 @@ fn printf_once(
                     prec.is_none(),
                 )
             }
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+            b'a' | b'A' | b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                 let a = run.take();
                 let v = run.float_arg(a);
-                let (s, finite) = format_float(v, conv, prec, flags);
-                (s.into_bytes(), finite)
+                let spec = FloatSpec {
+                    conv,
+                    flags,
+                    width: 0,
+                    prec,
+                };
+                let mut body = Vec::new();
+                format_into(&mut body, v, &spec);
+                (body, v.is_finite())
             }
             b's' => {
                 let a = run.take().unwrap_or("").as_bytes();

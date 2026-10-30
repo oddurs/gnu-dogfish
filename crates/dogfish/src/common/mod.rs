@@ -27,6 +27,7 @@ pub(crate) mod human;
 pub(crate) mod input;
 pub(crate) mod interval;
 pub(crate) mod json_opt;
+pub(crate) mod ldbl;
 pub(crate) mod lines;
 pub(crate) mod locale;
 pub(crate) mod mode;

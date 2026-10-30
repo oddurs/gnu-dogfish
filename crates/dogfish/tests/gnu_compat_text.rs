@@ -505,6 +505,8 @@ shell_cases! {
     tail_follow_regular_stdin_polling: ["tail"] "seq 5 > f; timeout .5 tail ---dis -s.1 -f -n1 - f < f; echo $?";
     tail_follow_fifo: ["tail"] "mkfifo p; (echo 1; echo 2) > p & timeout 1 tail -s.1 -f p; echo $?";
     tail_follow_dev_null: ["tail"] "timeout .5 tail -s.1 -f /dev/null; echo $?";
+    seq_inf_counts_forever: ["seq"] "seq inf | head -n 3; seq 18446744073709551614 inf | head -n 4; seq 1e19 1 inf | head -n 2";
+    seq_nan_from_infinite_step: ["seq"] "seq -f %g inf -inf -inf | head -n 3; seq -inf 1 0 | head -n 2";
     tail_follow_reader_gone: ["tail"] "seq 5 > f; (trap '' PIPE; timeout 5 tail -s.1 -n2 -f f; echo $? >&2) | head -n1";
 
     // ----------------------------------------------------------------- wc
