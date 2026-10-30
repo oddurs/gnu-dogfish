@@ -16,8 +16,7 @@ use crate::common::getopt::{
 };
 use crate::common::interval::{duration_from_secs, parse_interval};
 use crate::common::quote::quote_locale;
-use crate::common::signals::parse_signal;
-use crate::common::signals::sig_name_into;
+use crate::common::signals::{keep_ignored_sigpipe, parse_signal, sig_name_into};
 
 const TIMEOUT_HELP: &str = "\
 Usage: timeout [OPTION] DURATION COMMAND [ARG]...
@@ -271,6 +270,7 @@ pub fn run_timeout(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Ok(())
         });
     }
+    keep_ignored_sigpipe(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::Result;
 use dogfish_core::{
     DEFAULT_BUF_SIZE, DogfishContext, InputSource, emit_objects_or_table, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin, stdout,
+    read_ndjson_stdin, stdout,
 };
 use memchr::{memchr_iter, memrchr};
 
@@ -246,7 +246,10 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("GNU head: BUFSIZ reads, seek back");
     let show_headers = parsed.verbose || (!parsed.quiet && sources.len() > 1);
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
+    // Each write is one of GNU's `fwrite` calls (`xwrite_stdout`): one that
+    // has to write and fails is `error writing 'standard output'`, while
+    // output still buffered fails at exit with `write error`.
+    let mut out = stdout::GnuFwrite::new(io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout));
     let mut first_header = true;
     let mut ok = true;
     let mut read_stdin = false;
@@ -262,6 +265,12 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
             InputSource::File(path) => match File::open(path) {
                 Ok(f) => {
+                    // With standard output closed, GNU opens it on
+                    // descriptor 1 (and closes it after).
+                    if stdout::was_closed() {
+                        let blksize = f.metadata().map_or(0, |m| m.blksize());
+                        stdout::gnu_input_on_fd1(blksize, false);
+                    }
                     file = f;
                     &mut file
                 }
@@ -280,7 +289,7 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         if show_headers {
             let sep = if first_header { "" } else { "\n" };
             first_header = false;
-            ignore_broken_pipe(writeln!(out, "{sep}==> {} <==", header_name(src)))?;
+            writeln!(out, "{sep}==> {} <==", header_name(src))?;
         }
         let mut head = Head {
             presume_input_pipe: parsed.presume_input_pipe,
@@ -290,7 +299,6 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         };
         match head.run(mode) {
             Ok(file_ok) => ok &= file_ok,
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(i32::from(!ok)),
             Err(e) if stdout::is_write_error(&e) => {
                 stdout::mark_reported();
                 eprintln!(
@@ -302,7 +310,7 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => return Err(e.into()),
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     if read_stdin && let Err(e) = close_stdin() {
         eprintln!("head: -: {}", gnu_io_error(&e));
         return Ok(1);
@@ -693,17 +701,17 @@ fn head_stdin_adaptive(count: u64, json: bool, ctx: &DogfishContext) -> Result<i
             emit_objects_or_table(slice, ctx, json, !json)?;
             return Ok(0);
         }
-        ignore_broken_pipe(copy_first_lines(&mut &all[..], count, &mut out).map(|_| ()))?;
-        ignore_broken_pipe(out.flush())?;
+        copy_first_lines(&mut &all[..], count, &mut out).map(|_| ())?;
+        out.flush()?;
         return Ok(0);
     }
 
     // Plain text streaming fast-path: stop immediately after `count` lines!
     if count > 0 {
-        ignore_broken_pipe(out.write_all(&first_line))?;
-        ignore_broken_pipe(copy_first_lines(&mut reader, count - 1, &mut out).map(|_| ()))?;
+        out.write_all(&first_line)?;
+        copy_first_lines(&mut reader, count - 1, &mut out).map(|_| ())?;
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(0)
 }
 

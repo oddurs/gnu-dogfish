@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version, usage_error,
@@ -92,7 +92,7 @@ pub fn run_basename(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         out.write_all(if zero { b"\0" } else { b"\n" })?;
         ctx.telemetry.add_items(1);
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     Ok(0)
 }
 

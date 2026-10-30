@@ -1,7 +1,7 @@
 //! yes — Page-aligned 64 KiB vector I/O
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
@@ -68,7 +68,6 @@ pub fn run_yes(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     loop {
         match out.write_all(&buf) {
             Ok(()) => ctx.telemetry.add_written(buf.len() as u64),
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
             Err(e) => {
                 stdout::mark_reported();
                 eprintln!("yes: standard output: {}", gnu_io_error(&e));

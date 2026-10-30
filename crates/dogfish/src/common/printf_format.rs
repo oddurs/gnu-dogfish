@@ -13,27 +13,37 @@ pub(crate) fn pad_field(body: Vec<u8>, width: usize, flags: PrintfFlags, zero_ok
     if body.len() >= width {
         return body;
     }
-    let pad = width - body.len();
-    if flags.left {
-        let mut v = body;
-        v.extend(std::iter::repeat_n(b' ', pad));
-        v
+    let mut v = Vec::with_capacity(width);
+    pad_field_into(&mut v, &body, width, flags, zero_ok);
+    v
+}
+
+/// Appends `body` to `out`, padded as [`pad_field`] pads it.
+pub(crate) fn pad_field_into(
+    out: &mut Vec<u8>,
+    body: &[u8],
+    width: usize,
+    flags: PrintfFlags,
+    zero_ok: bool,
+) {
+    let pad = width.saturating_sub(body.len());
+    if pad == 0 || flags.left {
+        out.extend_from_slice(body);
+        out.resize(out.len() + pad, b' ');
     } else if flags.zero && zero_ok {
         // Zeros go after any sign / 0x prefix.
-        let sign_len = match body.as_slice() {
+        let sign_len = match body {
             [b'-' | b'+' | b' ', b'0', b'x' | b'X', ..] => 3,
             [b'0', b'x' | b'X', ..] => 2,
             [b'-' | b'+' | b' ', ..] => 1,
             _ => 0,
         };
-        let mut v = body[..sign_len].to_vec();
-        v.extend(std::iter::repeat_n(b'0', pad));
-        v.extend_from_slice(&body[sign_len..]);
-        v
+        out.extend_from_slice(&body[..sign_len]);
+        out.resize(out.len() + pad, b'0');
+        out.extend_from_slice(&body[sign_len..]);
     } else {
-        let mut v = vec![b' '; pad];
-        v.extend(body);
-        v
+        out.resize(out.len() + pad, b' ');
+        out.extend_from_slice(body);
     }
 }
 
