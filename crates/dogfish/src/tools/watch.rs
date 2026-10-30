@@ -120,7 +120,7 @@ pub fn run_watch(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
         let now = Stamp::now();
         let clock = local_time(now.sec)
-            .map(|lt| format_time(b"%H:%M:%S", &lt, now.ns, now.sec, false))
+            .map(|lt| format_time(b"%H:%M:%S", &lt, now.ns, false))
             .unwrap_or_default();
         outln!(
             "{} {}   {}   {}",

@@ -88,7 +88,7 @@ const RFC_3339_FORMATS: [(&str, &str); 3] = [
 /// Formats one time with `fmt`, or reports it as out of range.
 fn render_date(stamp: Stamp, fmt: &[u8]) -> Option<Vec<u8>> {
     let lt = local_time(stamp.sec)?;
-    let mut line = format_time(fmt, &lt, stamp.ns, stamp.sec, false);
+    let mut line = format_time(fmt, &lt, stamp.ns, false);
     line.push(b'\n');
     Some(line)
 }
@@ -225,7 +225,7 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
                 "unix": stamp.sec,
                 "unix_ms": stamp.sec.saturating_mul(1000) + i64::from(stamp.ns / 1_000_000),
                 "utc": utc_time(stamp.sec).map(|lt| {
-                    let s = format_time(b"%Y-%m-%dT%H:%M:%S%:z", &lt, stamp.ns, stamp.sec, false);
+                    let s = format_time(b"%Y-%m-%dT%H:%M:%S%:z", &lt, stamp.ns, false);
                     String::from_utf8_lossy(&s).into_owned()
                 }),
                 "local": iso(stamp),

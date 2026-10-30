@@ -564,4 +564,19 @@ gnu_cases! {
     date_file_crlf: "date" ["-f", "-", "+%s"] env [("TZ", "UTC0")] stdin b"@1\r\n";
     date_long_tz_in_string: "date" ["-d", "TZ=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0\" 2017", "+%F"] env [("TZ", "UTC0")];
     date_tz_in_string_output_zone: "date" ["-d", "TZ=\"Asia/Tokyo\" 2000-01-01 09:00"] env [("TZ", "America/New_York")];
+    // Found by util/date-fuzz.py. nstrftime's year conversions for years
+    // before 0: %C and %y truncate toward zero, %C of -1..-99 is "-0".
+    date_negative_year_century: "date" ["-d", "@-12120000000000", "+%Y %C %y %g %G %+3C %+4y %_5C %-C"] env [("TZ", "UTC0")];
+    date_negative_year_small: "date" ["-f", "-", "+%Y %C %y %g %G|%+C|%+y"] env [("TZ", "UTC0")] stdin b"@-62198755200\n@-65000000000\n@-59000000000\n@-61000000000\n@-2208988800\n";
+    // %c and %x come from glibc's own strftime: an unpadded, int-wrapping
+    // %Y and a %y of (tm_year % 100 + 100) % 100.
+    date_c_x_odd_years: "date" ["-f", "-", "+%c|%x|%^c|%30c|%_12x|%Ec|%D"] env [("TZ", "UTC0")] stdin b"0005-01-01\n@67768036191676799\n@-12120000000000\n@-62198755200\n9999-12-31\n";
+    // %s is mktime of the broken-down time: in Moscow's repeated hour of
+    // 2014-10-26, whose offsets share tm_isdst, it names the other instant.
+    date_s_repeated_hour: "date" ["-f", "-", "+%s %T %z"] env [("TZ", "Europe/Moscow")] stdin b"@1414270800\n@1414272600\n@1414274400\n";
+    // ...and it moves glibc's mktime guess, which picks the side of the next
+    // line's ambiguous local time.
+    date_s_steers_next_line: "date" ["-f", "-", "+%s"] env [("TZ", "America/New_York")] stdin b"@0\n2020-11-01 01:31\n2020-11-01 01:31 +1 hour\n";
+    // A TZ="..." name that is not UTF-8 is echoed as bytes.
+    date_debug_tz_not_utf8: "date" ["--debug", "-f", "-", "-R"] env [("TZ", "Asia/Kolkata")] stdin b"TZ=\"\x80\" 2000-01-01\nTZ=\"E\x95ST5\" 00:00\n";
 }
