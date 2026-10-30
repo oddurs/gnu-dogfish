@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, RecordWriter, gnu_io_error, gnu_quote_file, stdout};
+use dogfish_core::{DogfishContext, RecordWriter, gnu_io_error, stdout};
 
 use crate::common::date_format::{Stamp, format_time, local_time};
 use crate::common::getopt::{
@@ -14,7 +14,7 @@ use crate::common::getopt::{
 };
 use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::parse_datetime::{TimeZone, parse_datetime2, tzset};
-use crate::common::quote::quote_locale;
+use crate::common::quote::{qf, quote_locale};
 
 const DATE_HELP: &str = "\
 Usage: date [OPTION]... [+FORMAT]
@@ -98,8 +98,8 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
     );
     // `-d` as given, for diagnostics, which echo its bytes.
     let mut date_raw: Option<OsString> = None;
-    let mut date_file: Option<String> = None;
-    let mut reference: Option<String> = None;
+    let mut date_file: Option<OsString> = None;
+    let mut reference: Option<OsString> = None;
     let mut set_str: Option<String> = None;
     // Formats are bytes: `date +$'\xb0'` prints that byte.
     let mut formats: Vec<Vec<u8>> = Vec::new();
@@ -118,8 +118,8 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
                 discarded_date |= date_raw.is_some();
                 date_raw = raw;
             }
-            "file" => date_file = value,
-            "reference" => reference = value,
+            "file" => date_file = raw,
+            "reference" => reference = raw,
             "set" => {
                 discarded_set |= set_str.is_some();
                 set_str = value;
@@ -153,8 +153,7 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         }
     }
     let operands = opts.operands();
-    let date_str = date_raw.as_deref().map(lossy);
-    let sources = [&date_str, &date_file, &reference]
+    let sources = [&date_raw, &date_file, &reference]
         .iter()
         .filter(|s| s.is_some())
         .count();
@@ -263,7 +262,7 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         let content = match content {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("date: {}: {}", gnu_quote_file(path), gnu_io_error(&e));
+                eprintln!("date: {}: {}", qf(path), gnu_io_error(&e));
                 return Ok(1);
             }
         };
@@ -295,7 +294,7 @@ pub fn run_date(args: Vec<OsString>, _ctx: &DogfishContext) -> Result<i32> {
         match std::fs::metadata(path).and_then(|m| m.modified()) {
             Ok(t) => Stamp::from_system_time(t),
             Err(e) => {
-                eprintln!("date: {}: {}", gnu_quote_file(path), gnu_io_error(&e));
+                eprintln!("date: {}: {}", qf(path), gnu_io_error(&e));
                 return Ok(1);
             }
         }

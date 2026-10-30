@@ -482,6 +482,7 @@ fn names_that_are_not_utf8_carry_their_bytes() {
     check(&[b"du", b"-aJ", b"d"], "path", path);
     check(&[b"realpath", b"-J", path], "path", path);
     check(&[b"md5sum", b"-J", path], "path", path);
+    check(&[b"wc", b"-J", path], "path", path);
 }
 
 #[test]

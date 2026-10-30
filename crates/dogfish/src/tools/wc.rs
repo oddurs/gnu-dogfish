@@ -1,7 +1,9 @@
 //! wc — SIMD `bytecount` + parallel UTF-8 aware scanner + `--json` + table mode
 
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::Result;
@@ -14,8 +16,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::common::files0::{Files0From, extra_operand_error};
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, lossy, lossy_all, print_help,
-    print_version, unsupported,
+    Getopt, HasArg, OptSpec, Order, argmatch, getopt_error, print_help, print_version, unsupported,
 };
 use crate::common::input::{close_stdin, safe_read, stdin_file, stdin_is_closed};
 use crate::common::json_opt::{check_json_version, json_long, json_short};
@@ -55,9 +56,9 @@ struct WcArgs {
     max_line_length: bool,
     json: bool,
     table: bool,
-    files0_from: Option<String>,
+    files0_from: Option<OsString>,
     total: TotalMode,
-    files: Vec<String>,
+    files: Vec<OsString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,7 +103,7 @@ const SPECS: &[OptSpec<WcArgsOpt>] = &[
 
 /// Parses the command line; `Err` is the exit status after `--help`,
 /// `--version` or a usage diagnostic.
-fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i32> {
+fn parse_wc_args(args: Vec<OsString>) -> std::result::Result<WcArgs, i32> {
     let mut parsed = WcArgs::default();
     let mut opts = Getopt::with_order(args.into_iter().skip(1).collect(), SPECS, Order::Permute);
     while let Some(opt) = opts.next() {
@@ -118,7 +119,7 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
                 parsed.json = true;
             }
             WcArgsOpt::Table => parsed.table = true,
-            WcArgsOpt::Files0From => parsed.files0_from = v.as_deref().map(lossy),
+            WcArgsOpt::Files0From => parsed.files0_from = v,
             WcArgsOpt::Total => {
                 parsed.total = argmatch(
                     "wc",
@@ -137,13 +138,13 @@ fn parse_wc_args(args: Vec<std::ffi::OsString>) -> std::result::Result<WcArgs, i
             WcArgsOpt::Version => return Err(print_version("wc")),
         }
     }
-    parsed.files = lossy_all(opts.operands());
+    parsed.files = opts.operands();
     Ok(parsed)
 }
 
 #[derive(Clone, Default)]
 struct WcRecord {
-    file: String,
+    file: OsString,
     lines: u64,
     words: u64,
     chars: u64,
@@ -408,7 +409,7 @@ fn count_bytes_only(file: &mut File) -> (u64, Option<io::Error>) {
 }
 
 /// Counts one opened input (GNU's `wc`).
-fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) -> Counted {
+fn count_input(input: WcInput, name: &OsStr, opts: &WcOpts, ctx: &DogfishContext) -> Counted {
     let mut stdin = stdin_file();
     let mut file = match input {
         WcInput::Stdin => None,
@@ -419,7 +420,7 @@ fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) 
         None => &mut stdin,
     };
     let record = |bytes: u64, s: WcScan| WcRecord {
-        file: name.to_string(),
+        file: name.to_os_string(),
         lines: s.lines,
         words: s.words,
         // GNU: where characters are bytes, -m reports the byte count.
@@ -499,8 +500,8 @@ fn count_input(input: WcInput, name: &str, opts: &WcOpts, ctx: &DogfishContext) 
 /// Counts `src` (GNU's `wc_file`); `Err` is the open error.
 fn count_source(src: &InputSource, opts: &WcOpts, ctx: &DogfishContext) -> io::Result<Counted> {
     let name = match src {
-        InputSource::Stdin => "standard input",
-        InputSource::File(p) => p.as_str(),
+        InputSource::Stdin => OsStr::new("standard input"),
+        InputSource::File(p) => p,
     };
     Ok(count_input(open_input(src)?, name, opts, ctx))
 }
@@ -546,9 +547,9 @@ fn write_counts(
     opts: &WcOpts,
     width: usize,
     r: &WcRecord,
-    name: Option<&str>,
+    name: Option<&OsStr>,
 ) -> io::Result<()> {
-    let mut row = String::new();
+    let mut row = Vec::new();
     let cols = [
         (opts.lines, r.lines),
         (opts.words, r.words),
@@ -559,21 +560,22 @@ fn write_counts(
     for (shown, val) in cols {
         if shown {
             if !row.is_empty() {
-                row.push(' ');
+                row.push(b' ');
             }
-            row.push_str(&format!("{val:>width$}"));
+            write!(row, "{val:>width$}")?;
         }
     }
     if let Some(n) = name {
-        row.push(' ');
-        if n.contains('\n') {
-            row.push_str(&qf(n));
+        // The name's bytes as given (GNU's `%s`).
+        row.push(b' ');
+        if n.as_bytes().contains(&b'\n') {
+            row.extend_from_slice(qf(n).as_bytes());
         } else {
-            row.push_str(n);
+            row.extend_from_slice(n.as_bytes());
         }
     }
-    row.push('\n');
-    out.write_all(row.as_bytes())
+    row.push(b'\n');
+    out.write_all(&row)
 }
 
 /// Running totals with GNU's overflow detection.
@@ -608,21 +610,17 @@ impl Totals {
 }
 
 /// A name from `--files0-from`: `-` is standard input, as an operand is.
-fn name_source(name: &str) -> InputSource {
-    if name == "-" {
-        InputSource::Stdin
-    } else {
-        InputSource::File(name.to_string())
-    }
+fn name_source(name: &OsStr) -> InputSource {
+    InputSource::from_arg(name)
 }
 
 /// The inputs: operands, or names read from `--files0-from`.
 enum Names {
     Args(Vec<InputSource>),
-    Files0(Files0From, Option<Vec<String>>),
+    Files0(Files0From, Option<Vec<OsString>>),
 }
 
-pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
+pub fn run_wc(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     // GNU line buffers standard output, before parsing options.
     stdout::gnu_flushes_early();
     let parsed = match parse_wc_args(args) {
@@ -776,7 +774,7 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                         Some(n) => n,
                         None => break,
                     },
-                    None => match list.next_name() {
+                    None => match list.next_os_name() {
                         Ok(Some(n)) => n,
                         Ok(None) => break,
                         Err(e) => {
@@ -816,7 +814,7 @@ pub fn run_wc(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
                 ok = false;
             }
         }
-        let name = (total_mode != TotalMode::Only).then_some("total");
+        let name = (total_mode != TotalMode::Only).then_some(OsStr::new("total"));
         let _ = write_counts(&mut out, &opts, width, &totals.rec, name);
     }
     let _ = out.flush();
@@ -849,10 +847,10 @@ fn wc_rich(
                     exit_code = 1;
                 }
                 let mut rec = c.rec;
-                rec.file = src.display_name().to_string();
+                rec.file = src.display_name().to_os_string();
                 match &mut w {
                     Some(w) => w.record(|r| {
-                        r.str("path", &rec.file)
+                        r.os_str("path", &rec.file)
                             .u64("lines", rec.lines)
                             .u64("words", rec.words)
                             .u64("chars", rec.chars)
@@ -888,7 +886,7 @@ fn wc_rich(
     for r in &records {
         let ratio = r.bytes as f64 / max_bytes as f64;
         tbl.add_row(vec![
-            st.bold(&r.file),
+            st.bold(&r.file.to_string_lossy()),
             r.lines.to_string(),
             r.words.to_string(),
             r.chars.to_string(),

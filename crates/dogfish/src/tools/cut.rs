@@ -13,7 +13,7 @@ use dogfish_core::{
 use memchr::memchr2;
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy_all, print_help, print_version, usage_error,
+    Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
 use crate::common::input::RawStdout;
 use crate::common::json_opt::{check_json_version, json_long, json_short};
@@ -70,7 +70,7 @@ struct CutArgs {
     zero_terminated: bool,
     where_expr: Option<String>,
     json: bool,
-    files: Vec<String>,
+    files: Vec<OsString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,7 +158,7 @@ fn parse_cut_args(args: Vec<OsString>) -> std::result::Result<CutArgs, i32> {
             CutOpt::Version => return Err(print_version("cut")),
         }
     }
-    p.files = lossy_all(opts.operands());
+    p.files = opts.operands();
     Ok(p)
 }
 
