@@ -793,8 +793,18 @@ fn action_records_are_the_lines_of_v_in_order() {
         // name, not position: the two runs use two trees, and siblings come
         // in inode order, which the file system need not repeat (ext4 puts a
         // new directory in another block group).
+        // A record whose names are not all UTF-8 is matched on the names that
+        // are, which may be none: it goes last, so it cannot take the line
+        // of a record that names its file in full.
         let mut unmatched: Vec<&String> = vlines.iter().collect();
-        for r in &actions {
+        let mut ordered = actions.clone();
+        ordered.sort_by_key(|r| {
+            names(r).iter().any(|n| n.contains('\u{fffd}'))
+                || ["path", "source", "dest", "backup"]
+                    .iter()
+                    .any(|k| r.get(format!("{k}_bytes")).is_some())
+        });
+        for r in &ordered {
             let wanted: Vec<String> = names(r)
                 .into_iter()
                 .filter(|n| !n.contains('\u{fffd}'))

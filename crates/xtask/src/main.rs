@@ -227,6 +227,9 @@ fn asan(root: &Path) -> Step {
         .arg(root.join("target/asan"))
         .env("RUSTFLAGS", "-Zsanitizer=address")
         .env("RUSTDOCFLAGS", "-Zsanitizer=address")
+        // Dogfish catches SIGBUS itself, to report a mapped input truncated
+        // under it; ASan's own handler would take the signal first.
+        .env("ASAN_OPTIONS", asan_options())
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .current_dir(root))
     .map_err(|e| {
@@ -234,6 +237,14 @@ fn asan(root: &Path) -> Step {
             "{e} (missing toolchain? `rustup toolchain install {ASAN_TOOLCHAIN} --component rust-src`)"
         )
     })
+}
+
+/// `ASAN_OPTIONS` from the environment, with `handle_sigbus=0` added.
+fn asan_options() -> String {
+    match std::env::var("ASAN_OPTIONS") {
+        Ok(o) if !o.is_empty() => format!("{o}:handle_sigbus=0"),
+        _ => "handle_sigbus=0".to_string(),
+    }
 }
 
 /// `cargo fuzz run` for each target in fuzz/ (or the one named), for the
