@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for `cargo xtask asan`. Only allocations a test
+# leaks on purpose (Box::leak for &'static arguments) belong here; a leak in
+# Dogfish's own code must be fixed, not listed.
+leak:ndjson::
