@@ -31,7 +31,7 @@ bench = false
 fuzzing = []
 
 [dependencies]
-dogfish-core = { path = "../dogfish-core", version = "0.1.0" }
+dogfish-core = { path = "../dogfish-core", version = "1.0.0" }
 serde.workspace = true
 serde_json.workspace = true
 memchr.workspace = true
