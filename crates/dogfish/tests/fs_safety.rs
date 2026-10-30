@@ -687,3 +687,73 @@ fn failed_cp_link_with_backup_puts_the_backup_back_and_records_nothing() {
     assert!(sb.history().is_empty(), "{:?}", sb.history());
     remove_other_fs_trash(&sb);
 }
+
+#[test]
+fn undo_of_mv_across_file_systems_keeps_hard_links() {
+    // The move copies `a` and unlinks it; its inode lives on as `b`. Undo
+    // used to copy the file back as a new inode, so `a` and `b` were no
+    // longer one file (and undoing an earlier in-place `cp` into it then
+    // reached `a` only).
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    let sb = Sandbox::new();
+    let (a, b) = (other.path().join("a"), other.path().join("b"));
+    fs::write(&a, "").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    sb.write("a", "\0");
+    fs::hard_link(sb.path("a"), sb.path("b")).unwrap();
+    let a_str = a.to_str().unwrap();
+    for args in [["cp", "a", a_str], ["mv", a_str, "a"]] {
+        let out = sb.run(&args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(fs::read_to_string(&b).unwrap(), "\0");
+    for _ in 0..2 {
+        let out = sb.run(&["undo"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    assert!(same_inode(&a, &b));
+    assert_eq!(fs::read_to_string(&a).unwrap(), "");
+    assert!(same_inode(&sb.path("a"), &sb.path("b")));
+    assert_eq!(sb.read("a"), "\0");
+    assert!(sb.history().is_empty());
+    remove_other_fs_trash(&sb);
+}
+
+#[test]
+fn undo_of_mv_across_file_systems_after_an_edit_keeps_both_versions() {
+    // Once the moved copy or the original (through another link) has
+    // changed, the kept inode can't stand in for the copy: undo copies the
+    // copy back as a new file, the other link keeps what it holds, and the
+    // kept inode stays in the trash.
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    for edit_copy in [true, false] {
+        let sb = Sandbox::new();
+        let (a, b) = (other.path().join("a"), other.path().join("b"));
+        fs::write(&a, "old").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        let out = sb.run(&["mv", a.to_str().unwrap(), "c"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let (moved, linked) = if edit_copy {
+            sb.write("c", "edited");
+            ("edited", "old")
+        } else {
+            fs::write(&b, "edited").unwrap();
+            ("old", "edited")
+        };
+        let out = sb.run(&["undo"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!sb.exists("c"));
+        assert_eq!(fs::read_to_string(&a).unwrap(), moved);
+        assert_eq!(fs::read_to_string(&b).unwrap(), linked);
+        assert!(!same_inode(&a, &b));
+        remove_other_fs_trash(&sb);
+        fs::remove_file(&a).unwrap();
+        fs::remove_file(&b).unwrap();
+    }
+}

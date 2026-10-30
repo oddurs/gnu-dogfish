@@ -208,6 +208,7 @@ pub(crate) fn make_backup(
                     copied: false,
                     existed: fs::symlink_metadata(&backup).is_ok(),
                     src_inode: inode(dst),
+                    src_link: None,
                 },
             )?),
             None => None,

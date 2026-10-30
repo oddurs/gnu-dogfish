@@ -204,6 +204,9 @@ struct UndoPlan {
     in_place: bool,
     /// mv across file systems: the source is completely copied.
     copied: bool,
+    /// mv across file systems: the hard link kept to the source's inode
+    /// (see [`UndoJournal::keep_link`]).
+    src_link: Option<PathBuf>,
     /// The pending journal entry (write-ahead), when it could be recorded.
     entry: Option<JournalEntry>,
 }
@@ -762,6 +765,7 @@ impl<'a> Copier<'a> {
                 copied: p.copied,
                 existed: p.existed,
                 src_inode: p.src_inode,
+                src_link: p.src_link.clone(),
             }
         } else {
             JournalAction::CopyCreate {
@@ -895,11 +899,18 @@ impl<'a> Copier<'a> {
 
     /// mv across file systems: `src` is completely copied, and about to be
     /// removed. From here on, undo moves the copy back even if part of `src`
-    /// is left.
+    /// is left. A non-directory with other hard links is first linked into
+    /// the trash, so undo can put its inode back.
     pub(crate) fn mark_copied(&mut self) {
-        if let Some(p) = &mut self.plan {
-            p.copied = true;
-            self.sync_entry();
+        let Some(p) = &mut self.plan else { return };
+        p.copied = true;
+        self.sync_entry();
+        if let Some(j) = &self.journal
+            && let Some(p) = &mut self.plan
+            && let Some(e) = &mut p.entry
+            && let Ok(Some(link)) = j.keep_link(e, &p.src)
+        {
+            p.src_link = Some(link);
         }
     }
 
@@ -909,6 +920,14 @@ impl<'a> Copier<'a> {
         let Some(plan) = self.plan.take() else { return };
         let Some(j) = &self.journal else { return };
         let exists = fs::symlink_metadata(&plan.created).is_ok();
+        if !(moved && exists)
+            && let Some(link) = &plan.src_link
+            && dogfish_core::journal::inode(link)
+                .is_some_and(|i| dogfish_core::journal::inode(&plan.src) == Some(i))
+        {
+            // `src` was not removed after all: the link kept to it is spare.
+            let _ = fs::remove_file(link);
+        }
         let action = match moved {
             // What is left at the source (a removal that failed part-way) is
             // a remnant of what is now at the destination.
@@ -919,6 +938,7 @@ impl<'a> Copier<'a> {
                 copied: fs::symlink_metadata(&plan.src).is_ok(),
                 existed: false,
                 src_inode: None,
+                src_link: plan.src_link,
             },
             _ if plan.backup.is_some() || (!plan.existed && exists) => JournalAction::CopyCreate {
                 src: absolute(&plan.src),
@@ -961,6 +981,7 @@ impl<'a> Copier<'a> {
             existed: fs::symlink_metadata(dst).is_ok(),
             in_place: false,
             copied: false,
+            src_link: None,
             entry: None,
         };
         if let Some(e) = self.adopted.take() {

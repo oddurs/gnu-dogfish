@@ -179,6 +179,7 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                     copied: false,
                     existed: fs::symlink_metadata(dst).is_ok(),
                     src_inode: inode(src),
+                    src_link: None,
                 },
             )
             .ok()
