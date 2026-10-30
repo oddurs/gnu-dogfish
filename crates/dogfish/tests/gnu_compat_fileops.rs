@@ -1128,6 +1128,19 @@ tree_cases! {
 
 // ------------------------------------- cp, mv and ln: GNU's copy.c and ln.c
 
+/// Eight directories of 30 files, some unreadable, with a read-only, a
+/// set-group-ID and a world-writable directory and a nested one: enough
+/// directories for cp's file workers to run at once.
+macro_rules! BIG_TREE {
+    () => {
+        "mkdir big && for d in 1 2 3 4 5 6 7 8; do mkdir big/s$d; \
+         for i in $(seq 1 30); do echo $d$i > big/s$d/f$i; done; done && \
+         mkdir big/s3/sub big/s7/w && echo z > big/s3/sub/z && \
+         chmod 000 big/s2/f3 big/s2/f17 big/s3/sub/z big/s5/f9 big/s8/f30 && \
+         chmod 555 big/s4 && chmod 2775 big/s6 && chmod 777 big/s7/w"
+    };
+}
+
 tree_cases! {
     // Same-file and backup rules.
     cp_backup_would_destroy_source: "cp" ["--backup=simple", "c.txt~", "c.txt"];
@@ -1233,6 +1246,15 @@ tree_cases! {
     cp_recursive_fifo_onto_file: "cp" ["-Rv", "fifo", "b"] setup("mkfifo fifo");
     cp_archive_fifo: "cp" ["-a", "fifo", "x"] setup("mkfifo -m 640 fifo");
     cp_recursive_tree_with_fifo: "cp" ["-R", "m", "x"] setup("mkdir m && mkfifo m/p && echo F > m/f");
+
+    // Files copied on worker threads (into directories the copy creates):
+    // the same tree, before a read-only directory's mode is restored. (Each
+    // run copies its own tree, whose inode order sets the order of the
+    // messages: `cp_recursive_parallel_messages_in_gnu_order` checks that.)
+    cp_recursive_parallel_tree: "cp" ["-r", "big", "x"] setup(BIG_TREE!()) => nostderr;
+    cp_recursive_parallel_merge: "cp" ["-r", "big/.", "x"]
+        setup(concat!("mkdir -p x/s1 && echo old > x/s1/f1 && ", BIG_TREE!())) => nostderr;
+    cp_recursive_parallel_two_operands: "cp" ["-r", "big/s2", "big/s3", "e"] setup(BIG_TREE!()) => nostderr;
 
     // --link, --preserve=links and dereferencing.
     cp_link_follow_command_line: "cp" ["--link", "-H", "la", "x"];
@@ -1679,6 +1701,121 @@ fn recursive_mode_and_owner_deeper_than_path_max() {
                 .arg(&gnu_dir)
                 .status();
         }
+    }
+    force_remove(&base);
+}
+
+/// `cp -r` copies the files of the directories it creates on worker threads.
+/// Copying one source tree with both programs, the messages (unreadable
+/// files, when not root, among an unreadable directory the walk reports
+/// itself) come in GNU's order, and the trees and exit statuses match. (The
+/// order follows inode numbers, so both must copy the same tree.)
+#[test]
+fn cp_recursive_parallel_messages_in_gnu_order() {
+    let Some(gnu) = gnu_tool("cp") else {
+        eprintln!("note: skipping — system cp missing or not GNU coreutils");
+        return;
+    };
+    let base = scratch_root().join("cp-parallel-order");
+    force_remove(&base);
+    fs::create_dir_all(&base).unwrap();
+    let build = "mkdir src && for d in $(seq 1 40); do mkdir src/s$d; \
+                 for i in $(seq 1 60); do echo $d.$i > src/s$d/f$i; done; \
+                 if [ $((d % 3)) = 0 ]; then chmod 000 src/s$d/f$((d % 7 + 1)) src/s$d/f$((d % 11 + 20)); fi; \
+                 if [ $((d % 5)) = 0 ]; then mkdir src/s$d/sub; echo z > src/s$d/sub/z; chmod 000 src/s$d/sub/z; fi; \
+                 if [ $((d % 4)) = 0 ]; then chmod 555 src/s$d; fi; done && \
+                 mkdir src/noread && echo q > src/noread/q && chmod 000 src/noread && \
+                 mkdir -p into/s2 && echo old > into/s2/f1";
+    let status = Command::new("sh")
+        .args(["-c", build])
+        .current_dir(&base)
+        .status()
+        .unwrap();
+    assert!(status.success(), "building the tree failed");
+    let cases: &[&[&str]] = &[
+        &["-r", "src", "@"],
+        &["-R", "--sparse=always", "src", "@"],
+        &["-r", "--no-preserve=mode", "src", "@"],
+        &["-rf", "src/s2", "src/s3", "src/noread", "src/s15", "@"],
+    ];
+    for (i, args) in cases.iter().enumerate() {
+        let (ours_dst, gnu_dst) = (format!("{i}-dogfish"), format!("{i}-gnu"));
+        let into = args.len() > 4;
+        for d in [&ours_dst, &gnu_dst] {
+            force_remove(&base.join(d));
+            if into {
+                // Into an existing directory, merging into one of its subdirectories.
+                fs::create_dir_all(base.join(d).join("s2")).unwrap();
+                fs::write(base.join(d).join("s2/f1"), "old\n").unwrap();
+            }
+        }
+        let with = |d: &str| {
+            args.iter()
+                .map(|a| {
+                    if *a == "@" {
+                        d.to_owned()
+                    } else {
+                        (*a).to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut ours = Command::new(dogfish_bin());
+        ours.arg("cp")
+            .args(with(&ours_dst))
+            .env("DOGFISH_HOME", base.join("dogfish-home"));
+        let mut theirs = Command::new(&gnu);
+        theirs.arg0("cp").args(with(&gnu_dst));
+        let a = exec(ours, &base, None, "C");
+        let b = exec(theirs, &base, None, "C");
+        let unname = |out: &[u8], d: &str| String::from_utf8_lossy(out).replace(d, "DEST");
+        assert_eq!(
+            unname(&a.stderr, &ours_dst),
+            unname(&b.stderr, &gnu_dst),
+            "stderr differs: cp {args:?}"
+        );
+        if fs::metadata(&base).unwrap().uid() != 0 {
+            let errors = a.stderr.iter().filter(|&&c| c == b'\n').count();
+            assert!(
+                errors >= 3,
+                "too few errors to show their order: cp {args:?}"
+            );
+        }
+        assert_eq!(a.stdout, b.stdout, "stdout differs: cp {args:?}");
+        assert_eq!(
+            a.status.code(),
+            b.status.code(),
+            "exit status differs: cp {args:?}"
+        );
+        // Modes first: the copy of `noread` is unreadable, as its source.
+        let modes = |d: &str| {
+            let mut find = Command::new("find");
+            find.args([d, "-printf", "%y %m %s %P\\n"]);
+            let mut l: Vec<String> = String::from_utf8_lossy(&exec(find, &base, None, "C").stdout)
+                .lines()
+                .map(String::from)
+                .collect();
+            l.sort();
+            l
+        };
+        assert_eq!(
+            modes(&ours_dst),
+            modes(&gnu_dst),
+            "modes differ: cp {args:?}"
+        );
+        for d in [&ours_dst, &gnu_dst] {
+            let status = Command::new("chmod")
+                .args(["-R", "u+rwx", d])
+                .current_dir(&base)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert_eq!(
+            snapshot(&base.join(&ours_dst), Compare::default()),
+            snapshot(&base.join(&gnu_dst), Compare::default()),
+            "trees differ: cp {args:?}"
+        );
     }
     force_remove(&base);
 }
