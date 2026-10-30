@@ -55,7 +55,12 @@ Thank you for your interest in contributing to **GNU/Dogfish**! Every improvemen
 3. **Run the Head-to-Head Benchmark Suite**:
    ```bash
    ./target/release/dogfish bench
+   util/bench.py -k sort        # against GNU coreutils, on the same inputs
    ```
+   The Benchmarks workflow runs `util/bench.py` on every merge to main. It keeps
+   each run in `history.ndjson` on the `bench-history` branch, and fails when
+   a GNU/Dogfish ratio falls more than 15% below its median over the last ten
+   runs on the same CPU model, confirmed by a second measurement.
 4. **Adding `unsafe`**: avoid it if `std` or an existing helper can do the job.
    Otherwise give the block a `// SAFETY:` comment (Clippy enforces it) and a
    row in [`doc/unsafe.md`](doc/unsafe.md) (`cargo xtask unsafe-audit` enforces
