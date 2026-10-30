@@ -251,7 +251,9 @@ pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     copy_tree_linked(src, dst, &mut HashMap::new())
 }
 
-fn copy_tree_linked(
+/// As [`copy_tree`], with `links` mapping the (device, inode) of each file of
+/// the source with more than one link to its first copy, carried across calls.
+pub fn copy_tree_linked(
     src: &Path,
     dst: &Path,
     links: &mut HashMap<(u64, u64), PathBuf>,
