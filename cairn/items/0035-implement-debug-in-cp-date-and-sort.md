@@ -3,14 +3,13 @@ id: 35
 uid: 33581729-a7b4-45aa-88fe-f2eb63d7d8ff
 title: "Implement --debug in cp, date and sort"
 type: bug
-status: doing
-assignee: claude
-claimed: 2026-10-29
+status: done
 milestone: "v1.0"
 depends_on:
 - 8
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
+closed_at: 2026-10-30
 priority: p3
 effort: m
 area: compat
@@ -41,9 +40,13 @@ date's part needs the full date grammar (0019).
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
 
 ## 2026-10-29
 
 `date --debug` is done (tests/date/date-debug.sh passes; traces match GNU's). cp and sort `--debug` remain.
+
+## 2026-10-30
+
+cp and sort `--debug` done: tests/cp/debug.sh, sort-debug-keys.sh and sort-debug-warn.sh pass. cp reports the method it actually used per file.

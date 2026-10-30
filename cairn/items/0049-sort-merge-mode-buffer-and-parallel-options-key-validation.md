@@ -3,12 +3,13 @@ id: 49
 uid: 88c8af2e-30a2-4c36-9b8a-35c7f4b5ceeb
 title: "sort: merge mode, buffer and parallel options, key validation"
 type: bug
-status: backlog
+status: done
 milestone: "v1.0"
 depends_on:
 - 8
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
+closed_at: 2026-10-30
 priority: p2
 effort: l
 area: compat
@@ -43,5 +44,9 @@ All listed tests pass; `sort -m` merges presorted inputs without loading them.
 
 ## Acceptance criteria
 
-- [ ] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
-- [ ] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+- [x] The listed GNU tests pass and are added to `util/gnu-baseline.json`.
+- [x] Each fixed behaviour has a differential case against GNU in `crates/dogfish/tests/gnu_compat*.rs`.
+
+## Notes
+
+- 2026-10-30: sort.rs became `tools/sort/` (merge, external sort, glibc-exact long double for `-g`, `--debug`). All listed tests pass except sort-continue, which skips under dash with `ulimit -n 7` before sort runs (it passes under bash), so it is not in the baseline.
