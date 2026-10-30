@@ -17,14 +17,12 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 
 use dogfish_core::ndjson::file_type_name;
-use dogfish_core::{Record, outln};
-
-use crate::common::actions;
 use dogfish_core::{
-    CopyMethod, DogfishContext, JournalAction, JournalEntry, Take, UndoJournal, crash_point,
-    gnu_io_error, move_path,
+    CopyMethod, DogfishContext, JournalAction, JournalEntry, Record, Take, UndoJournal,
+    crash_point, gnu_io_error, move_path, outln,
 };
 
+use crate::common::actions;
 use crate::common::backup::{Backup, BackupMode, make_backup};
 use crate::common::mode::{CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, strmode9};
 use crate::common::path::{
