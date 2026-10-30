@@ -384,7 +384,9 @@ gnu_cases! {
     wc_files0_from_non_utf8_stdin: "wc" ["-c", "--files0-from=-"] stdin b"odd\xffname.txt\0one\xff.txt";
     wc_files0_from_non_utf8_list: "wc" ["--files0-from=nope@xff@"];
     wc_files0_from_non_utf8_extra: "wc" ["--files0-from=-", "x@xff@"];
-    sort_files0_from_non_utf8_names: "sort" ["--files0-from=names0-odd.txt"];
+    sort_non_utf8: "sort" ["odd@xff@name.txt", "one@xff@.txt"];
+    sort_non_utf8_missing: "sort" ["odd@xff@name.txt", "nope@xff@"];
+    sort_files0_from_non_utf8_names:"sort" ["--files0-from=names0-odd.txt"];
     sort_files0_from_non_utf8_stdin: "sort" ["--files0-from=-"] stdin b"odd\xffname.txt\0one\xff.txt";
     sort_files0_from_non_utf8_list: "sort" ["--files0-from=nope@xff@"];
     sort_files0_from_non_utf8_extra: "sort" ["--files0-from=-", "x@xff@"];
