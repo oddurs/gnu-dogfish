@@ -109,6 +109,8 @@ pub(crate) struct CopyOptions {
     pub(crate) recursive: bool,
     pub(crate) update: bool,
     pub(crate) verbose: bool,
+    /// cp `--debug`: report how each file's data was copied.
+    pub(crate) debug: bool,
     pub(crate) stdin_tty: bool,
     pub(crate) open_dangling_dest_symlink: bool,
     /// `--keep-directory-symlink` (from coreutils 9.5): a directory is copied
@@ -149,6 +151,7 @@ impl CopyOptions {
             recursive: false,
             update: false,
             verbose: false,
+            debug: false,
             stdin_tty: false,
             open_dangling_dest_symlink: std::env::var_os("POSIXLY_CORRECT").is_some(),
             keep_directory_symlink: false,
@@ -173,6 +176,52 @@ impl CopyOptions {
             ..Self::for_cp()
         }
     }
+}
+
+/// GNU `enum copy_debug_val`: what `--debug` says about one way of copying.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebugVal {
+    Unknown,
+    No,
+    Yes,
+    /// Sparse detection by `SEEK_HOLE`.
+    External,
+    /// `SEEK_HOLE`, then zero runs within the data.
+    ExternalInternal,
+    Avoided,
+    Unsupported,
+}
+
+impl DebugVal {
+    /// GNU `copy_debug_string`.
+    fn as_str(self) -> &'static str {
+        match self {
+            DebugVal::No => "no",
+            DebugVal::Yes => "yes",
+            DebugVal::Avoided => "avoided",
+            DebugVal::Unsupported => "unsupported",
+            _ => "unknown",
+        }
+    }
+
+    /// GNU `copy_debug_sparse_string`.
+    fn sparse_str(self) -> &'static str {
+        match self {
+            DebugVal::No => "no",
+            DebugVal::Yes => "zeros",
+            DebugVal::External => "SEEK_HOLE",
+            DebugVal::ExternalInternal => "SEEK_HOLE + zeros",
+            _ => "unknown",
+        }
+    }
+}
+
+/// GNU `struct copy_debug`: how the last regular file's data was copied.
+#[derive(Clone, Copy)]
+struct CopyDebug {
+    offload: DebugVal,
+    reflink: DebugVal,
+    sparse_detection: DebugVal,
 }
 
 /// What [`Copier::copy`] reports besides success.
@@ -260,6 +309,8 @@ pub(crate) struct Copier<'a> {
     adopted: Option<JournalEntry>,
     /// How the data of the last regular file was copied (shown on a terminal).
     method: CopyMethod,
+    /// The same, as `--debug` reports it.
+    debug: CopyDebug,
 }
 
 /// Arguments of one `copy_internal` level that change while recursing.
@@ -706,6 +757,11 @@ impl<'a> Copier<'a> {
             renamed: false,
             adopted: None,
             method: CopyMethod::StandardCopy,
+            debug: CopyDebug {
+                offload: DebugVal::Unknown,
+                reflink: DebugVal::Unknown,
+                sparse_detection: DebugVal::Unknown,
+            },
         }
     }
 
@@ -1477,6 +1533,8 @@ impl<'a> Copier<'a> {
                 if skipped {
                     if self.x.interactive == Interactive::AlwaysNo {
                         self.diag(&format!("not replacing {}", qa(dst)));
+                    } else if self.x.debug {
+                        dogfish_core::outln!("skipped {}", qa(dst));
                     }
                     return_now = true;
                 }
@@ -2266,11 +2324,63 @@ impl<'a> Copier<'a> {
         src: &Path,
         dst: &Path,
         dst_mode: u32,
+        omitted: u32,
+        new_dst: &mut bool,
+        src_sb: &fs::Metadata,
+        dereference: Deref,
+        top: bool,
+    ) -> bool {
+        self.debug = CopyDebug {
+            offload: DebugVal::Unknown,
+            reflink: if self.x.reflink == Reflink::Never {
+                DebugVal::No
+            } else {
+                DebugVal::Unknown
+            },
+            sparse_detection: DebugVal::Unknown,
+        };
+        let mut source_opened = false;
+        let ok = self.copy_reg_data(
+            src,
+            dst,
+            dst_mode,
+            omitted,
+            new_dst,
+            src_sb,
+            dereference,
+            top,
+            &mut source_opened,
+        );
+        // GNU `emit_debug`, once the source was opened.
+        if self.x.debug
+            && source_opened
+            && !self.x.hard_link
+            && !self.x.symbolic_link
+            && self.x.data_copy_required
+        {
+            let d = self.debug;
+            dogfish_core::outln!(
+                "copy offload: {}, reflink: {}, sparse detection: {}",
+                d.offload.as_str(),
+                d.reflink.as_str(),
+                d.sparse_detection.sparse_str()
+            );
+        }
+        ok
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_reg_data(
+        &mut self,
+        src: &Path,
+        dst: &Path,
+        dst_mode: u32,
         mut omitted: u32,
         new_dst: &mut bool,
         src_sb: &fs::Metadata,
         dereference: Deref,
         top: bool,
+        source_opened: &mut bool,
     ) -> bool {
         let mut src_mode = src_sb.mode();
         let mut data_copy_required = self.x.data_copy_required;
@@ -2288,6 +2398,7 @@ impl<'a> Copier<'a> {
                 return false;
             }
         };
+        *source_opened = true;
         let src_open_sb = match source.metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -2423,6 +2534,7 @@ impl<'a> Copier<'a> {
                 Ok(()) => {
                     data_copy_required = false;
                     self.method = CopyMethod::FicloneCoW;
+                    self.debug.reflink = DebugVal::Yes;
                     let len = src_open_sb.len();
                     let t = &self.ctx.telemetry;
                     t.add_read(len);
@@ -2545,7 +2657,7 @@ impl<'a> Copier<'a> {
 
     /// GNU `handle_clone_fail`: false when the copy must fail.
     fn handle_clone_fail(
-        &self,
+        &mut self,
         src: &Path,
         dst: &Path,
         dest: &File,
@@ -2554,6 +2666,9 @@ impl<'a> Copier<'a> {
     ) -> bool {
         let report = is_terminal_error(errno(e));
         let always = self.x.reflink == Reflink::Always;
+        if !report {
+            self.debug.reflink = DebugVal::Unsupported;
+        }
         if always || report {
             self.diag_err(&format!("failed to clone {} from {}", qa(dst), qa(src)), e);
         }
@@ -2689,6 +2804,24 @@ impl<'a> Copier<'a> {
         st.last_write_made_hole = false;
         st.total_n_read = 0;
         let t = std::sync::Arc::clone(&self.ctx.telemetry);
+        let d = &mut self.debug;
+        if d.sparse_detection == DebugVal::Unknown {
+            d.sparse_detection = if hole_size != 0 {
+                DebugVal::Yes
+            } else {
+                DebugVal::No
+            };
+        } else if hole_size != 0 && d.sparse_detection == DebugVal::External {
+            d.sparse_detection = DebugVal::ExternalInternal;
+        }
+        // Without copy_file_range, gnulib's replacement fails with ENOSYS.
+        d.offload = if hole_size == 0 && allow_reflink && cfg!(target_os = "linux") {
+            d.offload
+        } else if hole_size == 0 && allow_reflink {
+            DebugVal::Unsupported
+        } else {
+            DebugVal::Avoided
+        };
 
         // Not looking for holes: let the kernel copy (copy_file_range).
         #[cfg(target_os = "linux")]
@@ -2712,10 +2845,12 @@ impl<'a> Copier<'a> {
                     if st.total_n_read == 0 {
                         break;
                     }
+                    self.debug.offload = DebugVal::Yes;
                     return true;
                 }
                 if n < 0 {
                     let e = io::Error::last_os_error();
+                    self.debug.offload = DebugVal::Unsupported;
                     let en = errno(&e);
                     if st.total_n_read == 0 && (is_clone_notsup(en) || en == libc::ENOENT) {
                         break;
@@ -2726,6 +2861,7 @@ impl<'a> Copier<'a> {
                     self.diag_err(&format!("error copying {} to {}", qa(src), qa(dst)), &e);
                     return false;
                 }
+                self.debug.offload = DebugVal::Yes;
                 let n = n as u64;
                 max_n_read -= n;
                 st.total_n_read += n;
@@ -2831,6 +2967,7 @@ impl<'a> Copier<'a> {
         src: &Path,
         dst: &Path,
     ) -> bool {
+        self.debug.sparse_detection = DebugVal::External;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut src_total_size = src_total_size as i64;
@@ -3012,6 +3149,7 @@ impl<'a> Copier<'a> {
             return None;
         }
         self.method = CopyMethod::ClonefileCoW;
+        self.debug.reflink = DebugVal::Yes;
         if !self.x.preserve_timestamps {
             let now = [timespec(0, libc::UTIME_NOW), timespec(0, libc::UTIME_NOW)];
             if let Err(e) = utimens_path(dst, &now, true) {

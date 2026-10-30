@@ -194,6 +194,7 @@ struct CpOpts {
     parents: bool,
     one_file_system: bool,
     verbose: bool,
+    debug: bool,
     attributes_only: bool,
     copy_contents: bool,
     sparse: Sparse,
@@ -249,6 +250,7 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         parents: false,
         one_file_system: false,
         verbose: false,
+        debug: false,
         attributes_only: false,
         copy_contents: false,
         sparse: crate::common::copy::Sparse::Auto,
@@ -279,7 +281,9 @@ pub fn run_cp(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 backup_arg = (!v.is_empty()).then_some(v);
             }
             CopyContents => o.copy_contents = true,
-            Debug | Context => {}
+            // --debug implies -v.
+            Debug => (o.debug, o.verbose) = (true, true),
+            Context => {}
             Reflink => {
                 const REFLINK: &[(&str, crate::common::copy::Reflink)] = &[
                     ("auto", crate::common::copy::Reflink::Auto),
@@ -484,6 +488,7 @@ fn copy_options(o: &CpOpts, backup: BackupMode, suffix: String) -> CopyOptions {
     x.recursive = o.recursive;
     x.update = o.update_older;
     x.verbose = o.verbose;
+    x.debug = o.debug;
     x
 }
 
