@@ -667,6 +667,8 @@ gnu_cases! {
     seq_ld_zero_increment_before_last: "seq" ["1", "0", "x"];
     seq_ld_format_before_operands: "seq" ["-f", "%x", "a"];
     seq_ld_endpoint_rounding: "seq" ["-f", "%.3f", "0", "0.1", "0.3"];
+    seq_ld_i64_bounds_down: "seq" ["-9223372036854775807", "-1", "-9223372036854775808"];
+    seq_ld_i64_bounds_wide: "seq" ["-w", "-9223372036854775808", "4611686018427387904", "9223372036854775807"];
     seq_ld_user_format_integers: "seq" ["-f", "%+3.0f|%%", "-1", "2"];
     seq_ld_default_format_wide_integers: "seq" ["-w", "-s", ", ", "-9", "4", "10"];
 

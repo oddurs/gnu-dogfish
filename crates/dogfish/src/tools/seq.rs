@@ -12,7 +12,7 @@ use crate::common::getopt::{
     usage_error,
 };
 use crate::common::json_opt::{check_json_version, json_long, json_short};
-use crate::common::ldbl::{FloatSpec, LongDouble, Native, format_into, strtold};
+use crate::common::ldbl::{Float, FloatSpec, Format, LongDouble, Native, format_into, strtold};
 use crate::common::printf_format::PrintfFlags;
 
 /// GNU's `xstrtold` with `cl_strtold`: the whole of `s` is a number, which
@@ -71,6 +71,24 @@ struct SeqOperand {
     width: usize,
     /// Fraction digits; `None` means "unknown" (hex or non-finite input).
     precision: Option<usize>,
+    /// The exact value when it is an integer that fits `i64` (see
+    /// [`operand_int`]).
+    int: Option<i64>,
+}
+
+/// The exact integer an operand names, if it fits `i64`: as written for
+/// plain decimal integers, so that it does not depend on how precise
+/// `long double` is, else the value when that is an integer exact in the
+/// format. `-0` is not one (it prints as "-0").
+///
+/// Where `long double` has 64 bits of significand every such integer is
+/// exact, so this is GNU's value; where it is `double` (Apple silicon),
+/// `-9223372036854775807` is still that number, not -2^63.
+fn operand_int<F: Format>(text: &str, value: Float<F>) -> Option<i64> {
+    if value.is_zero() && value.is_sign_negative() {
+        return None;
+    }
+    text.parse::<i64>().ok().or_else(|| value.exact_i64())
 }
 
 /// GNU's `scan_arg`.
@@ -143,6 +161,7 @@ fn scan_seq_operand(arg: &str) -> std::result::Result<SeqOperand, String> {
         value,
         width: width.max(0) as usize,
         precision,
+        int: operand_int(s, value),
     })
 }
 
@@ -520,6 +539,7 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         value: LongDouble::from_u64(1),
         width: 1,
         precision: Some(0),
+        int: Some(1),
     };
     let mut scanned = Vec::with_capacity(nums.len());
     for (i, n) in nums.iter().enumerate() {
@@ -596,13 +616,12 @@ pub fn run_seq(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         return Ok(0);
     }
 
-    // Integers in the default "%.0Lf" format are exact in `long double`
-    // (below 2^63, and 2^P), so they need no floating point at all.
-    let ints = (
-        first.value.exact_i64(),
-        step.value.exact_i64(),
-        last.value.exact_i64(),
-    );
+    // Integers in the default "%.0Lf" format are exact in an 80-bit `long
+    // double` (they fit i64), so they need no floating point at all; where
+    // `long double` is narrower they are counted exactly all the same,
+    // rather than as GNU's rounding would (`seq -9223372036854775807 -1
+    // -9223372036854775808` repeating -2^63 a thousand times).
+    let ints = (first.int, step.int, last.int);
     if let (true, b'f', Some(0), (Some(mut cur), Some(inc), Some(end))) =
         (default_format, fmt.spec.conv, fmt.spec.prec, ints)
     {
@@ -681,7 +700,7 @@ fn seq_json(
     last: SeqOperand,
     out_of_range: impl Fn(LongDouble) -> bool,
 ) -> Result<i32> {
-    let int = |o: SeqOperand| o.value.exact_i64().filter(|_| o.precision == Some(0));
+    let int = |o: SeqOperand| o.int.filter(|_| o.precision == Some(0));
     let mut w = RecordWriter::new(&mut *out);
     if let (Some(mut cur), Some(inc), Some(end)) = (int(first), int(step), int(last)) {
         while (inc > 0 && cur <= end) || (inc < 0 && cur >= end) {
@@ -726,9 +745,45 @@ pub mod fuzz {
     /// A `seq` operand.
     pub fn operand(arg: &str) {
         if let Ok(op) = scan_seq_operand(arg)
-            && let Some(i) = op.value.exact_i64()
+            && let Some(i) = op.int
         {
             assert_eq!(op.value.to_f64(), i as f64, "{arg:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ldbl::{Binary64, X87};
+
+    fn int<F: Format>(text: &str) -> Option<i64> {
+        operand_int(text, strtold::<F>(text.as_bytes()).value)
+    }
+
+    #[test]
+    fn integers_are_exact_whatever_long_double_is() {
+        for text in [
+            "-9223372036854775807",
+            "9223372036854775807",
+            "-9223372036854775808",
+        ] {
+            let n = text.parse::<i64>().ok();
+            assert_eq!(int::<X87>(text), n);
+            // A double rounds these to 2^63.
+            assert_eq!(int::<Binary64>(text), n);
+        }
+        assert_eq!(int::<Binary64>("9007199254740993"), Some(9007199254740993));
+        assert_eq!(int::<X87>("1e2"), Some(100));
+        assert_eq!(int::<X87>("0x10"), Some(16));
+        assert_eq!(int::<X87>("007"), Some(7));
+        assert_eq!(int::<X87>("-0"), None);
+        assert_eq!(int::<X87>("1.5"), None);
+        assert_eq!(int::<X87>("9223372036854775808"), None);
+        // Written as an exponent, the double's value is all there is.
+        assert_eq!(
+            int::<Binary64>("9.007199254740993e15"),
+            Some(9007199254740992)
+        );
     }
 }
