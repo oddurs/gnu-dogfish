@@ -121,6 +121,9 @@ pub(crate) struct CopyOptions {
     /// mv: `Some(0)` when the source was already renamed, `Some(errno)` when
     /// that failed, `None` when no rename was tried.
     pub(crate) rename_errno: Option<i32>,
+    /// mv: with `rename_errno == Some(0)`, where the destination was before the
+    /// rename resolved it away (`mv c c/c`, `c` a symlink to a directory).
+    pub(crate) renamed_dst: Option<PathBuf>,
 }
 
 impl CopyOptions {
@@ -157,6 +160,7 @@ impl CopyOptions {
             keep_directory_symlink: false,
             last_file: false,
             rename_errno: None,
+            renamed_dst: None,
         }
     }
 
@@ -1065,8 +1069,11 @@ impl<'a> Copier<'a> {
         };
         if let Some(e) = self.adopted.take() {
             // Begun by the caller before it renamed `src` to `dst`.
-            if let JournalAction::Move { src_inode, .. } = &e.action {
+            // Its `dst` was resolved before the rename, which can move what the
+            // path went through (`mv c c/c`, `c` a symlink to a directory).
+            if let JournalAction::Move { src_inode, dst, .. } = &e.action {
                 plan.src_inode = *src_inode;
+                plan.created = dst.clone();
             }
             plan.existed = false;
             plan.entry = Some(e);
@@ -1359,7 +1366,11 @@ impl<'a> Copier<'a> {
         // Where `dst` is once renamed: GNU reaches it through the target
         // directory's descriptor, which still works when the rename moved what
         // the path went through (`mv b a b`, with `b` a symlink to a directory).
-        let mut renamed_dst = dst.to_path_buf();
+        let mut renamed_dst = self
+            .x
+            .renamed_dst
+            .take()
+            .unwrap_or_else(|| dst.to_path_buf());
         if x_move {
             if rename_errno < 0 {
                 renamed_dst = stable_path(dst);
