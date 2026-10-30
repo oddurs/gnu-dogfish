@@ -10,9 +10,11 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::mode::{
     CHMOD_MODE_BITS, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, mode_adjust, mode_compile,
     process_umask, u32_to_mode_t,
@@ -29,6 +31,8 @@ Create the DIRECTORY(ies), if they do not already exist.
                     with their file modes unaffected by any -m option
   -v, --verbose     print a message for each created directory
   -Z, --context     accepted for compatibility (SELinux is not supported)
+  -J, --json[=VERSION]  Dogfish: one NDJSON record per created directory
+                    (what -v reports), instead of -v's text
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -39,6 +43,7 @@ enum MkdirOpt {
     Parents,
     Verbose,
     Context,
+    Json,
     Help,
     Version,
 }
@@ -53,6 +58,8 @@ const SPECS: &[OptSpec<MkdirOpt>] = &[
     OptSpec::long("help", HasArg::No, MkdirOpt::Help),
     OptSpec::long("version", HasArg::No, MkdirOpt::Version),
     OptSpec::short(b'Z', HasArg::No, MkdirOpt::Context),
+    json_short(MkdirOpt::Json),
+    json_long(MkdirOpt::Json),
 ];
 
 pub fn run_mkdir(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -69,6 +76,13 @@ pub fn run_mkdir(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Parents => parents = true,
             Verbose => verbose = true,
             Context => {}
+            Json => {
+                if let Err(code) = check_json_version("mkdir", v.as_deref()) {
+                    return Ok(code);
+                }
+                verbose = true;
+                actions::start();
+            }
             Help => return Ok(print_help(MKDIR_HELP)),
             Version => return Ok(print_version("mkdir")),
         }
@@ -140,7 +154,11 @@ fn mkdir_one(
     verbose: bool,
 ) -> std::result::Result<(), String> {
     let announce = |d: &OsStr| {
-        if verbose {
+        if actions::on() {
+            actions::record("mkdir", |r| {
+                r.os_str("path", d);
+            });
+        } else if verbose {
             outln!("mkdir: created directory {}", qa(d));
         }
     };

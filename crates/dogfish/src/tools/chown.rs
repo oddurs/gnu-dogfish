@@ -12,10 +12,12 @@ use std::path::Path;
 use anyhow::Result;
 use dogfish_core::{DogfishContext, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::dirfd::{EntryType, Lost, Names, Parent, WalkPath, fts_root_name};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::preserve_root::{DevIno, is_root_dev_ino, refuse_root, root_dev_ino};
 use crate::common::quote::{qa, quote_locale};
 use crate::common::users::{get_groupname_by_gid, get_username_by_uid};
@@ -40,6 +42,8 @@ With --reference, change the owner and group of each FILE to those of RFILE.
       --reference=RFILE  use RFILE's owner and group rather than specifying
                          OWNER:GROUP values
   -R, --recursive        operate on files and directories recursively
+  -J, --json[=VERSION]   Dogfish: one NDJSON record per file processed (what -v,
+                           or with -c what -c, reports), instead of the text
 
 The following options modify how a hierarchy is traversed when the -R
 option is also specified.  If more than one is specified, only the final
@@ -70,6 +74,7 @@ enum ChownOpt {
     TraverseCmdline,
     TraverseAll,
     TraverseNone,
+    Json,
     Help,
     Version,
 }
@@ -92,6 +97,8 @@ const SPECS: &[OptSpec<ChownOpt>] = &[
     OptSpec::short(b'H', HasArg::No, ChownOpt::TraverseCmdline),
     OptSpec::short(b'L', HasArg::No, ChownOpt::TraverseAll),
     OptSpec::short(b'P', HasArg::No, ChownOpt::TraverseNone),
+    json_short(ChownOpt::Json),
+    json_long(ChownOpt::Json),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +152,7 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         active_dirs: RefCell::default(),
     };
     let (mut deref, mut preserve_root, mut reference) = (None, false, None);
+    let mut json = false;
     while let Some(opt) = opts.next() {
         let (o, v) = match opt {
             Ok(o) => o,
@@ -176,7 +184,18 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             TraverseCmdline => run.traverse = Traverse::CommandLine,
             TraverseAll => run.traverse = Traverse::All,
             TraverseNone => run.traverse = Traverse::None,
+            Json => {
+                if let Err(code) = check_json_version("chown", v.as_deref()) {
+                    return Ok(code);
+                }
+                json = true;
+            }
         }
+    }
+    if json {
+        // A record wherever -v (or, with -c alone, -c) would print a line.
+        run.verbose |= !run.report_changes;
+        actions::start();
     }
     if run.recursive && run.traverse == Traverse::None {
         if deref == Some(true) {
@@ -365,9 +384,29 @@ fn user_group_str(user: Option<&str>, group: Option<&str>) -> Option<String> {
     }
 }
 
+/// The `uid` and `gid` fields of a `-J` record (`uid_before`, ... with a
+/// suffix), those that are known.
+fn ids(r: &mut dogfish_core::Record<'_>, suffix: &str, uid: Option<u32>, gid: Option<u32>) {
+    if let Some(u) = uid {
+        r.u64(&format!("uid{suffix}"), u64::from(u));
+    }
+    if let Some(g) = gid {
+        r.u64(&format!("gid{suffix}"), u64::from(g));
+    }
+}
+
 /// With `-v`, what GNU reports for a file it could not even stat.
 fn describe_failure_without_old(path: &Path, new_spec: Option<&str>, run: &ChownRun) {
-    if run.verbose {
+    if actions::on() {
+        if run.verbose {
+            actions::record("chown", |r| {
+                r.os_str("path", path)
+                    .str("status", "inaccessible")
+                    .bool("changed", false);
+                ids(r, "", run.spec.uid, run.spec.gid);
+            });
+        }
+    } else if run.verbose {
         let what = if run.spec.user.is_some() {
             "ownership"
         } else {
@@ -506,7 +545,37 @@ fn chown_path(
             }
         }
     }
-    if run.verbose || (run.report_changes && status_changed) {
+    if actions::on() {
+        if run.verbose || (run.report_changes && status_changed) {
+            let status = if failed {
+                "failed"
+            } else if status_changed {
+                "changed"
+            } else {
+                "retained"
+            };
+            actions::record("chown", |r| {
+                r.os_str("path", path.as_path())
+                    .str("status", status)
+                    .bool("changed", status_changed);
+                ids(r, "_before", Some(old_uid), Some(old_gid));
+                // What the file has now, or was to have.
+                let done = |want: Option<u32>, old: u32| {
+                    if failed || status_changed {
+                        want.unwrap_or(old)
+                    } else {
+                        old
+                    }
+                };
+                ids(
+                    r,
+                    "",
+                    Some(done(spec.uid, old_uid)),
+                    Some(done(spec.gid, old_gid)),
+                );
+            });
+        }
+    } else if run.verbose || (run.report_changes && status_changed) {
         let what = if spec.user.is_some() {
             "ownership"
         } else if spec.group.is_some() {

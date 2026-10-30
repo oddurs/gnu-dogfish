@@ -11,11 +11,13 @@ use anyhow::Result;
 use dogfish_core::journal::inode;
 use dogfish_core::{DogfishContext, JournalAction, UndoJournal, crash_point, gnu_io_error, outln};
 
+use crate::common::actions;
 use crate::common::backup::{backup_mode, backup_suffix};
 use crate::common::copy::{Copier, CopyOptions};
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, argmatch, getopt_error, lossy, print_help, print_version, usage_error,
 };
+use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::mode::process_umask;
 use crate::common::path::{
     base_len, dir_names, file_name_concat, last_component, rename_noreplace, stable_path,
@@ -46,6 +48,8 @@ If you specify more than one of -i, -f, -n, only the final one takes effect.
                                  UPDATE={all,none,older(default)}
   -u                           equivalent to --update[=older]
   -v, --verbose                explain what is being done
+  -J, --json[=VERSION]         Dogfish: one NDJSON record per action (what -v
+                                 reports), instead of -v's text
       --help        display this help and exit
       --version     output version information and exit
 ";
@@ -67,6 +71,7 @@ enum MvOpt {
     Verbose,
     Context,
     Debug,
+    Json,
     Help,
     Version,
 }
@@ -90,6 +95,8 @@ const SPECS: &[OptSpec<MvOpt>] = &[
     OptSpec::long("version", HasArg::No, MvOpt::Version),
     OptSpec::short(b'b', HasArg::No, MvOpt::Backup),
     OptSpec::short(b'u', HasArg::No, MvOpt::UpdateOlder),
+    json_short(MvOpt::Json),
+    json_long(MvOpt::Json),
 ];
 
 pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -155,6 +162,14 @@ pub fn run_mv(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
                 }
             }
             Verbose => x.verbose = true,
+            Json => {
+                if let Err(code) = check_json_version("mv", raw.as_deref()) {
+                    return Ok(code);
+                }
+                // A record wherever -v would print a line.
+                x.verbose = true;
+                actions::start();
+            }
         }
     }
 
@@ -273,7 +288,8 @@ fn do_move(copier: &mut Copier<'_>, src: &Path, dst: &Path, ctx: &DogfishContext
             // Copied: now remove the source, as `rm -r` would.
             copier.mark_copied();
             let mut removed = false;
-            ok = remove_tree(src, copier.x.verbose, &mut removed);
+            let id = copier.undo_id();
+            ok = remove_tree(src, copier.x.verbose, id, &mut removed);
             // A source nothing was removed from is intact: undo only has to
             // remove the copy.
             moved = ok || removed;
@@ -287,8 +303,9 @@ fn do_move(copier: &mut Copier<'_>, src: &Path, dst: &Path, ctx: &DogfishContext
 }
 
 /// Removes `p` and everything under it, with `rm -r`'s messages (what GNU mv
-/// runs after copying across file systems).
-fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
+/// runs after copying across file systems). `undo_id` is the journal entry
+/// the removals belong to, for their `-J` records.
+fn remove_tree(p: &Path, verbose: bool, undo_id: Option<u64>, removed: &mut bool) -> bool {
     let fail = |e: &io::Error| {
         eprintln!("mv: cannot remove {}: {}", qa(p), gnu_io_error(e));
         false
@@ -303,7 +320,14 @@ fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
             return fail(&e);
         }
         *removed = true;
-        if verbose {
+        if actions::on() {
+            actions::record("remove", |r| {
+                r.os_str("path", p);
+                if let Some(id) = undo_id {
+                    r.u64("undo_id", id);
+                }
+            });
+        } else if verbose {
             outln!("removed {}", qa(p));
         }
         return true;
@@ -315,7 +339,7 @@ fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
     let mut ok = true;
     for name in names {
         let (child, _) = file_name_concat(p.as_os_str().as_bytes(), name.as_bytes());
-        ok &= remove_tree(&child, verbose, removed);
+        ok &= remove_tree(&child, verbose, undo_id, removed);
     }
     if !ok {
         return false;
@@ -325,7 +349,14 @@ fn remove_tree(p: &Path, verbose: bool, removed: &mut bool) -> bool {
         return fail(&e);
     }
     *removed = true;
-    if verbose {
+    if actions::on() {
+        actions::record("rmdir", |r| {
+            r.os_str("path", p);
+            if let Some(id) = undo_id {
+                r.u64("undo_id", id);
+            }
+        });
+    } else if verbose {
         outln!("removed directory {}", qa(p));
     }
     true
