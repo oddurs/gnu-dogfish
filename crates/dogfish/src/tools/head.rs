@@ -3,7 +3,7 @@
 //! rendering on terminals.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -15,7 +15,7 @@ use dogfish_core::{
 use memchr::{memchr_iter, memrchr};
 
 use crate::common::getopt::{
-    Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, try_help,
+    Getopt, HasArg, OptSpec, getopt_error, lossy, print_help, print_version, try_help,
 };
 use crate::common::head_tail::{header_name, parse_count, to_usize};
 use crate::common::input::{RawStdout, close_stdin, full_read, safe_read, stdin_file};
@@ -97,7 +97,7 @@ struct HeadArgs {
     verbose: bool,
     zero_terminated: bool,
     json: bool,
-    files: Vec<String>,
+    files: Vec<OsString>,
 }
 
 /// Parses the command line like GNU's `main`; `Err` is the exit status
@@ -148,7 +148,7 @@ fn parse_head_args(args: Vec<OsString>) -> std::result::Result<HeadArgs, i32> {
             HeadOpt::Version => return Err(print_version("head")),
         }
     }
-    a.files = lossy_all(opts.operands());
+    a.files = opts.operands();
     Ok(a)
 }
 
@@ -293,7 +293,12 @@ pub fn run_head(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         if show_headers {
             let sep = if first_header { "" } else { "\n" };
             first_header = false;
-            writeln!(out, "{sep}==> {} <==", header_name(src))?;
+            // The name's bytes as given, unquoted (GNU's `%s`), in the
+            // pieces `writeln!` would write.
+            out.write_all(sep.as_bytes())?;
+            out.write_all(b"==> ")?;
+            out.write_all(header_name(src).as_encoded_bytes())?;
+            out.write_all(b" <==\n")?;
         }
         let mut head = Head {
             presume_input_pipe: parsed.presume_input_pipe,
@@ -329,7 +334,7 @@ struct Head<'a, W: Write> {
     presume_input_pipe: bool,
     input: &'a mut File,
     /// The input's name in messages (`standard input` for `-`).
-    name: &'a str,
+    name: &'a OsStr,
     out: &'a mut W,
 }
 

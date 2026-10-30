@@ -1,7 +1,7 @@
 //! `--files0-from=F`: file operands read as NUL-terminated names from F (or
 //! standard input for `-`), with GNU's diagnostics. Shared by du, wc and
-//! sort (gnulib `readtokens0` and `argv_iter`). Names are bytes underneath
-//! ([`Files0From::next_os_name`]), so du can use names that are not UTF-8.
+//! sort (gnulib `readtokens0` and `argv_iter`). Names are bytes, as read
+//! ([`Files0From::next_os_name`]): they need not be UTF-8.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -78,20 +78,12 @@ impl Files0From {
 
     /// Reads every remaining name (`readtokens0`); a final name without a
     /// NUL counts.
-    pub(crate) fn read_all(&mut self) -> io::Result<Vec<String>> {
+    pub(crate) fn read_all(&mut self) -> io::Result<Vec<OsString>> {
         let mut names = Vec::new();
-        while let Some(name) = self.next_name()? {
+        while let Some(name) = self.next_os_name()? {
             names.push(name);
         }
         Ok(names)
-    }
-
-    /// The next name as text (bytes that are not UTF-8 replaced), `None`
-    /// at the end of the list.
-    pub(crate) fn next_name(&mut self) -> io::Result<Option<String>> {
-        Ok(self
-            .next_os_name()?
-            .map(|n| n.to_string_lossy().into_owned()))
     }
 
     /// The next name, byte for byte, `None` at the end of the list.

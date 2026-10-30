@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
@@ -395,18 +395,11 @@ impl Source {
         }
     }
 
-    /// Opens the input: `mmap` through `FastReader` when the name is UTF-8 (all
-    /// `InputSource` can carry), a plain buffered read otherwise.
+    /// Opens the input through `FastReader` (`mmap` for a large regular file).
     fn open(&self) -> io::Result<FastReader> {
         match self {
             Self::Stdin => FastReader::open(&InputSource::Stdin),
-            Self::File(p) => match p.to_str() {
-                Some(s) => FastReader::open(&InputSource::File(s.to_owned())),
-                None => Ok(FastReader::Buffered(BufReader::with_capacity(
-                    DEFAULT_BUF_SIZE,
-                    Box::new(File::open(p)?),
-                ))),
-            },
+            Self::File(p) => FastReader::from_file(File::open(p)?),
         }
     }
 }

@@ -1349,6 +1349,9 @@ tree_cases! {
     id_non_utf8_user: "id" ["-u", "root", "u@xff@"];
     printenv_non_utf8: "printenv" ["nope@xff@"];
     env_non_utf8_verbose: "env" ["-v", "-i", "-u", "B@xff@", "A=x@xff@", "printenv", "A"];
+    tee_non_utf8: "tee" ["t@xff@", "nodir@xff@/x"] stdin b"hi\n";
+    tee_non_utf8_append: "tee" ["-a", "n@xff@"] setup("printf X > \"$(printf 'n\\377')\"") stdin b"hi\n";
+    sort_non_utf8_output: "sort" ["-o", "o@xff@", "n@xff@"] setup("printf 'b\\na\\n' > \"$(printf 'n\\377')\"");
     env_non_utf8_bad_unset: "env" ["-u", "B@xff@=", "true"];
 }
 
