@@ -1,12 +1,14 @@
 //! SHA-256 for `sha256sum`.
 //!
-//! On x86-64 CPUs with AVX2 and BMI2 but no SHA extensions, this computes the
-//! message schedule of two blocks at once in AVX2 registers, interleaved with
-//! the scalar rounds of the first block, which use BMI2's `rorx`/`andn`; the
-//! second block's rounds then read their schedule from memory (the method of
-//! OpenSSL's `sha256_block_data_order_avx2`, which GNU `sha256sum` reaches
-//! through libcrypto). `ring` covers everything else: SHA-NI, AVX, SSSE3 and
-//! the other architectures.
+//! On x86-64 CPUs with AVX2 and BMI2 but no SHA extensions, this runs an
+//! assembly loop that computes the message schedule of two blocks at once in
+//! AVX2 registers, interleaved with the scalar rounds of the first block,
+//! which use BMI2's `rorx`/`andn`; the second block's rounds then read their
+//! schedule from memory. That is the method of OpenSSL's
+//! `sha256_block_data_order_avx2`, which GNU `sha256sum` reaches through
+//! libcrypto. With AVX-512VL the schedule uses its lane rotation and
+//! three-way XOR, on the same 256-bit registers. `ring` covers everything
+//! else: SHA-NI, AVX, SSSE3 and the other architectures.
 
 /// A SHA-256 computation.
 pub(crate) enum Sha256 {
@@ -48,8 +50,6 @@ impl Sha256 {
 /// The AVX2 implementation.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use std::arch::x86_64::*;
-
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -76,8 +76,16 @@ mod avx2 {
             && !is_x86_feature_detected!("sha")
     }
 
+    /// AVX-512F and VL, for the shorter message schedule (still on 256-bit
+    /// registers, which do not lower the clock).
+    fn has_avx512vl() -> bool {
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl")
+    }
+
     /// The streaming state; only built once [`is_fastest`] said yes.
     pub(crate) struct Avx2Sha256 {
+        /// [`has_avx512vl`], asked once.
+        vl: bool,
         state: [u32; 8],
         buf: [u8; 64],
         buf_len: usize,
@@ -86,7 +94,13 @@ mod avx2 {
 
     impl Avx2Sha256 {
         pub(super) fn new() -> Self {
+            Self::with_vl(true)
+        }
+
+        /// With `vl` false, the AVX2 schedule even where AVX-512VL is there.
+        pub(super) fn with_vl(vl: bool) -> Self {
             Self {
+                vl: vl && has_avx512vl(),
                 state: H0,
                 buf: [0; 64],
                 buf_len: 0,
@@ -95,9 +109,22 @@ mod avx2 {
         }
 
         fn blocks(&mut self, blocks: &[[u8; 64]]) {
+            if blocks.is_empty() {
+                return;
+            }
+            let (state, data, n) = (&mut self.state, blocks.as_ptr().cast(), blocks.len());
             // SAFETY: an `Avx2Sha256` is only made once `is_fastest` found
-            // AVX2, BMI1 and BMI2, all that `compress` enables.
-            unsafe { compress(&mut self.state, blocks) }
+            // AVX2, BMI1 and BMI2, all that `compress_avx2` uses, and `vl` is
+            // only set once `has_avx512vl` found AVX-512F and VL as well.
+            // `data` points to `n` (at least one) whole blocks, which the
+            // code only reads; `state` is the 8 words it updates.
+            unsafe {
+                if self.vl {
+                    compress_avx512vl(state, data, n)
+                } else {
+                    compress_avx2(state, data, n)
+                }
+            }
         }
 
         pub(super) fn update(&mut self, mut data: &[u8]) {
@@ -137,277 +164,415 @@ mod avx2 {
         }
     }
 
-    /// One round; the caller rotates the roles of the eight working variables.
-    /// `$bc` holds `b ^ c`: this round's `a ^ b` is the next round's `b ^ c`,
-    /// which saves an operation in `Maj`.
+    /// The constants the assembly reads, at fixed byte offsets.
+    #[repr(C, align(64))]
+    struct Consts {
+        /// Offset 0: the round constants of each group of four words, twice
+        /// (once for each block), as the schedule adds them.
+        kk: [[u32; 8]; 16],
+        /// Offset 512: a `vpshufb` mask that makes big-endian words.
+        bswap: [u32; 8],
+        /// Offset 544: a `vpshufb` mask that moves words 0 and 2 of each
+        /// 128-bit lane to 0 and 1 and clears 2 and 3...
+        low: [u32; 8],
+        /// Offset 576: ...and one that moves them to 2 and 3 and clears 0
+        /// and 1.
+        high: [u32; 8],
+    }
+
+    // Read only by the assembly, which Rust cannot see.
+    #[allow(dead_code)]
+    static CONSTS: Consts = Consts {
+        kk: {
+            let mut kk = [[0; 8]; 16];
+            let mut i = 0;
+            while i < 64 {
+                kk[i / 4][i % 4] = K[i];
+                kk[i / 4][i % 4 + 4] = K[i];
+                i += 1;
+            }
+            kk
+        },
+        bswap: [
+            0x0001_0203,
+            0x0405_0607,
+            0x0809_0a0b,
+            0x0c0d_0e0f,
+            0x0001_0203,
+            0x0405_0607,
+            0x0809_0a0b,
+            0x0c0d_0e0f,
+        ],
+        low: [
+            0x0302_0100,
+            0x0b0a_0908,
+            u32::MAX,
+            u32::MAX,
+            0x0302_0100,
+            0x0b0a_0908,
+            u32::MAX,
+            u32::MAX,
+        ],
+        high: [
+            u32::MAX,
+            u32::MAX,
+            0x0302_0100,
+            0x0b0a_0908,
+            u32::MAX,
+            u32::MAX,
+            0x0302_0100,
+            0x0b0a_0908,
+        ],
+    };
+
+    // The assembly below, in Intel syntax, keeps the working variables `a`
+    // to `h` in eax, ebx, ecx, edx, r8d, r9d, r10d and r11d, renaming them
+    // from round to round instead of moving them, and uses five temporaries:
+    //
+    //   r12d, r13d  Sigma0/Sigma1 parts; r13d carries Sigma0(a) of a round
+    //               into the next, which adds it to its `a` (OpenSSL's
+    //               deferral, which shortens the round's critical path)
+    //   r14d        `f` at the start of a round (`e` copied at the end of
+    //               the one before), then Ch's parts
+    //   r15d, esi   `b ^ c` coming in and `a ^ b` going out, swapping roles
+    //               each round (this round's `a ^ b` is the next's `b ^ c`)
+    //
+    // rdi is the byte offset of the current rounds in the `W + K` area on the
+    // stack (and of their group of constants in `CONSTS.kk`), rbp points to
+    // `CONSTS`, and ymm0-ymm3 hold the last 16 schedule words of both blocks
+    // (the first block in the low 128-bit lane), ymm4-ymm7 are temporaries
+    // and ymm8 is the byte-swap mask.
+    //
+    // The `W + K` area is 8 chunks of 64 bytes, one for each 8 rounds:
+    // words 8c..8c+3 of the first block, the same of the second, then
+    // words 8c+4..8c+7 of each. So group j (words 4j..4j+3 of both blocks,
+    // one ymm register) is at byte 32j, and the second block's words are 16
+    // bytes after the first's.
+
+    /// One instruction of assembly text, from its tokens.
+    macro_rules! ins {
+        ($($t:tt)*) => {
+            concat!(stringify!($($t)*), "\n")
+        };
+    }
+
+    /// One round. The registers are `[32-bit 64-bit]` pairs in the roles
+    /// `a` to `h`, then the temporaries that hold `a ^ b` (going out) and
+    /// `b ^ c` (coming in); `$off` is the offset of this round's `W + K`
+    /// from rsp + rdi.
     macro_rules! round {
-        ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $bc:ident, $wk:expr) => {
-            let s1 = $e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25);
-            let ch = ($e & $f) ^ (!$e & $g);
-            let t1 = $h.wrapping_add(s1).wrapping_add(ch).wrapping_add($wk);
-            let s0 = $a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22);
-            let ab = $a ^ $b;
-            let maj = (ab & $bc) ^ $b;
-            $bc = ab;
-            $d = $d.wrapping_add(t1);
-            $h = t1.wrapping_add(s0).wrapping_add(maj);
-        };
-    }
-
-    /// Where word `t` of the first block sits in the interleaved `W + K` array
-    /// (the second block's is 4 further on).
-    const fn wk_index(t: usize) -> usize {
-        8 * (t / 4) + t % 4
-    }
-
-    /// Eight rounds from word `$base`, reading `W + K` from `$wk` at offset `$lane`;
-    /// `$bc` carries `b ^ c` from one round to the next.
-    macro_rules! rounds8 {
-        ($v:ident, $bc:ident, $wk:ident, $lane:expr, $base:expr) => {
-            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = $v;
-            round!(a, b, c, d, e, f, g, h, $bc, $wk[wk_index($base) + $lane]);
-            round!(
-                h,
-                a,
-                b,
-                c,
-                d,
-                e,
-                f,
-                g,
-                $bc,
-                $wk[wk_index($base + 1) + $lane]
-            );
-            round!(
-                g,
-                h,
-                a,
-                b,
-                c,
-                d,
-                e,
-                f,
-                $bc,
-                $wk[wk_index($base + 2) + $lane]
-            );
-            round!(
-                f,
-                g,
-                h,
-                a,
-                b,
-                c,
-                d,
-                e,
-                $bc,
-                $wk[wk_index($base + 3) + $lane]
-            );
-            round!(
-                e,
-                f,
-                g,
-                h,
-                a,
-                b,
-                c,
-                d,
-                $bc,
-                $wk[wk_index($base + 4) + $lane]
-            );
-            round!(
-                d,
-                e,
-                f,
-                g,
-                h,
-                a,
-                b,
-                c,
-                $bc,
-                $wk[wk_index($base + 5) + $lane]
-            );
-            round!(
-                c,
-                d,
-                e,
-                f,
-                g,
-                h,
-                a,
-                b,
-                $bc,
-                $wk[wk_index($base + 6) + $lane]
-            );
-            round!(
-                b,
-                c,
-                d,
-                e,
-                f,
-                g,
-                h,
-                a,
-                $bc,
-                $wk[wk_index($base + 7) + $lane]
-            );
-            $v = [a, b, c, d, e, f, g, h];
-        };
-    }
-
-    /// Rotates each 32-bit lane right by `N` (`M` = 32 - `N`).
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn ror<const N: i32, const M: i32>(x: __m256i) -> __m256i {
-        _mm256_or_si256(_mm256_srli_epi32::<N>(x), _mm256_slli_epi32::<M>(x))
-    }
-
-    /// The next four schedule words of both blocks from the previous sixteen
-    /// (`x0` oldest), as in Intel's SSE/AVX SHA-256 code.
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn schedule(x0: __m256i, x1: __m256i, x2: __m256i, x3: __m256i) -> __m256i {
-        // W[t-15..t-12] and W[t-7..t-4].
-        let w15 = _mm256_alignr_epi8::<4>(x1, x0);
-        let w7 = _mm256_alignr_epi8::<4>(x3, x2);
-        let s0 = _mm256_xor_si256(
-            _mm256_xor_si256(ror::<7, 25>(w15), ror::<18, 14>(w15)),
-            _mm256_srli_epi32::<3>(w15),
-        );
-        let mut t = _mm256_add_epi32(_mm256_add_epi32(x0, s0), w7);
-        let sigma1 = |v: __m256i| {
-            _mm256_xor_si256(
-                _mm256_xor_si256(ror::<17, 15>(v), ror::<19, 13>(v)),
-                _mm256_srli_epi32::<10>(v),
+        ([$a:ident $aq:ident] [$b:ident $bq:ident] [$c:ident $cq:ident] [$d:ident $dq:ident]
+         [$e:ident $eq:ident] [$f:ident $fq:ident] [$g:ident $gq:ident] [$h:ident $hq:ident],
+         [$ab:ident $abq:ident] [$bc:ident $bcq:ident], $off:literal) => {
+            concat!(
+                // h += W + K; r14d = f & e.
+                ins!(add $h, dword ptr [rsp + rdi + $off]),
+                ins!(and r14d, $e),
+                ins!(rorx r12d, $e, 25),
+                ins!(rorx $ab, $e, 11),
+                // The previous round's Sigma0.
+                ins!(lea $a, [$aq + r13]),
+                ins!(lea $h, [$hq + r14]),
+                ins!(andn r14d, $e, $g),
+                ins!(xor r12d, $ab),
+                ins!(rorx r13d, $e, 6),
+                // h += Ch(e, f, g) = (e & f) + (!e & g).
+                ins!(lea $h, [$hq + r14]),
+                // h += Sigma1(e).
+                ins!(xor r12d, r13d),
+                ins!(mov $ab, $a),
+                ins!(rorx r14d, $a, 22),
+                ins!(lea $h, [$hq + r12]),
+                ins!(xor $ab, $b),
+                ins!(rorx r13d, $a, 13),
+                ins!(rorx r12d, $a, 2),
+                // d += T1.
+                ins!(lea $d, [$dq + $hq]),
+                // Maj(a, b, c) = ((a ^ b) & (b ^ c)) ^ b.
+                ins!(and $bc, $ab),
+                ins!(xor r13d, r14d),
+                ins!(xor $bc, $b),
+                // r13d = Sigma0(a), for the next round.
+                ins!(xor r13d, r12d),
+                // h = T1 + Maj(a, b, c).
+                ins!(lea $h, [$hq + $bcq]),
+                ins!(mov r14d, $e),
             )
         };
-        // W[t], W[t+1] need sigma1 of W[t-2], W[t-1] (lanes 2, 3 of x3)...
-        let lo = sigma1(_mm256_shuffle_epi32::<0b11_10_11_10>(x3));
-        t = _mm256_add_epi32(
-            t,
-            _mm256_blend_epi32::<0b1100_1100>(lo, _mm256_setzero_si256()),
-        );
-        // ...and W[t+2], W[t+3] need sigma1 of the W[t], W[t+1] just made.
-        let hi = sigma1(_mm256_shuffle_epi32::<0b01_00_01_00>(t));
-        _mm256_add_epi32(
-            t,
-            _mm256_blend_epi32::<0b1100_1100>(_mm256_setzero_si256(), hi),
-        )
     }
 
-    /// Words `4j..4j+3` of blocks `a` (lanes 0-3) and `b` (lanes 4-7).
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn load(a: &[u8; 64], b: &[u8; 64], j: usize) -> __m256i {
-        let w = |block: &[u8; 64], k: usize| {
-            let at = 16 * j + 4 * k;
-            i32::from_be_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]])
+    /// Four rounds from the roles `$a`..`$h`, reading `W + K` at the four
+    /// offsets.
+    macro_rules! rounds4 {
+        ($a:tt $b:tt $c:tt $d:tt $e:tt $f:tt $g:tt $h:tt,
+         $o0:literal, $o1:literal, $o2:literal, $o3:literal) => {
+            concat!(
+                round!($a $b $c $d $e $f $g $h, [r15d r15] [esi rsi], $o0),
+                round!($h $a $b $c $d $e $f $g, [esi rsi] [r15d r15], $o1),
+                round!($g $h $a $b $c $d $e $f, [r15d r15] [esi rsi], $o2),
+                round!($f $g $h $a $b $c $d $e, [esi rsi] [r15d r15], $o3),
+            )
         };
-        _mm256_setr_epi32(
-            w(a, 0),
-            w(a, 1),
-            w(a, 2),
-            w(a, 3),
-            w(b, 0),
-            w(b, 1),
-            w(b, 2),
-            w(b, 3),
-        )
     }
 
-    /// Stores `x` plus the round constants of word group `j` (both blocks) as
-    /// `wk[8j..8j+8]`.
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn store(wk: &mut [u32; 128], j: usize, x: __m256i) {
-        let k = |i: usize| K[4 * j + i] as i32;
-        let kk = _mm256_setr_epi32(k(0), k(1), k(2), k(3), k(0), k(1), k(2), k(3));
-        let dst = &mut wk[8 * j..8 * j + 8];
-        // SAFETY: `dst` is 8 writable `u32`s (32 bytes); the store is unaligned.
-        unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast(), _mm256_add_epi32(x, kk)) }
+    /// Four rounds with `a` in eax (rounds 8k to 8k + 3)...
+    macro_rules! rounds4_a {
+        ($o0:literal, $o1:literal, $o2:literal, $o3:literal) => {
+            rounds4!(
+                [eax rax] [ebx rbx] [ecx rcx] [edx rdx] [r8d r8] [r9d r9] [r10d r10] [r11d r11],
+                $o0, $o1, $o2, $o3
+            )
+        };
     }
 
-    /// Compresses `blocks` into `state`, two at a time. Callers must have
-    /// checked [`is_fastest`] (AVX2, BMI1 and BMI2).
-    #[target_feature(enable = "avx2,bmi1,bmi2")]
-    // The last round of a block leaves `b ^ c` for a next round there is not.
-    #[allow(unused_assignments)]
-    fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-        let mut i = 0;
-        while i < blocks.len() {
-            let a = &blocks[i];
-            // A lone last block is paired with itself; its copy is ignored.
-            let b = blocks.get(i + 1).unwrap_or(a);
-            // W + K of words 4j..4j+3: block a at 8j..8j+3, block b at 8j+4..8j+7.
-            let mut wk = [0u32; 128];
-            let (mut x0, mut x1, mut x2, mut x3) =
-                (load(a, b, 0), load(a, b, 1), load(a, b, 2), load(a, b, 3));
-            store(&mut wk, 0, x0);
-            store(&mut wk, 1, x1);
-            store(&mut wk, 2, x2);
-            store(&mut wk, 3, x3);
-            let mut v = *state;
-            let mut bc = v[1] ^ v[2];
-            // Block a's rounds, with the schedule of both blocks computed
-            // alongside, a group of eight rounds ahead of where it is needed.
-            macro_rules! step {
-                ($x0:ident, $x1:ident, $x2:ident, $x3:ident, $j:expr) => {
-                    $x0 = schedule($x0, $x1, $x2, $x3);
-                    store(&mut wk, $j, $x0);
-                };
-            }
-            // The rounds read `W + K` back through an opaque reference: the
-            // compiler would otherwise extract each word from the vector
-            // register that computed it (two ALU micro-ops a round) instead
-            // of loading it (a load port).
-            macro_rules! group {
-                ($base:expr) => {
-                    let view: &[u32; 128] = std::hint::black_box(&wk);
-                    rounds8!(v, bc, view, 0, $base);
-                };
-            }
-            group!(0);
-            step!(x0, x1, x2, x3, 4);
-            step!(x1, x2, x3, x0, 5);
-            group!(8);
-            step!(x2, x3, x0, x1, 6);
-            step!(x3, x0, x1, x2, 7);
-            group!(16);
-            step!(x0, x1, x2, x3, 8);
-            step!(x1, x2, x3, x0, 9);
-            group!(24);
-            step!(x2, x3, x0, x1, 10);
-            step!(x3, x0, x1, x2, 11);
-            group!(32);
-            step!(x0, x1, x2, x3, 12);
-            step!(x1, x2, x3, x0, 13);
-            group!(40);
-            step!(x2, x3, x0, x1, 14);
-            step!(x3, x0, x1, x2, 15);
-            group!(48);
-            group!(56);
-            for (s, w) in state.iter_mut().zip(v) {
-                *s = s.wrapping_add(w);
-            }
-            if i + 1 < blocks.len() {
-                // Block b: its schedule is all in `wk` already.
-                let mut v = *state;
-                let mut bc = v[1] ^ v[2];
-                let view: &[u32; 128] = std::hint::black_box(&wk);
-                rounds8!(v, bc, view, 4, 0);
-                rounds8!(v, bc, view, 4, 8);
-                rounds8!(v, bc, view, 4, 16);
-                rounds8!(v, bc, view, 4, 24);
-                rounds8!(v, bc, view, 4, 32);
-                rounds8!(v, bc, view, 4, 40);
-                rounds8!(v, bc, view, 4, 48);
-                rounds8!(v, bc, view, 4, 56);
-                for (s, w) in state.iter_mut().zip(v) {
-                    *s = s.wrapping_add(w);
-                }
-            }
-            i += 2;
-        }
+    /// ...and with `a` in r8d (rounds 8k + 4 to 8k + 7).
+    macro_rules! rounds4_e {
+        ($o0:literal, $o1:literal, $o2:literal, $o3:literal) => {
+            rounds4!(
+                [r8d r8] [r9d r9] [r10d r10] [r11d r11] [eax rax] [ebx rbx] [ecx rcx] [edx rdx],
+                $o0, $o1, $o2, $o3
+            )
+        };
     }
+
+    /// The next group of schedule words of both blocks with AVX2, from the
+    /// previous four (`$x0` oldest, which it replaces), as in Intel's and
+    /// OpenSSL's AVX code; then the group plus its round constants is stored
+    /// at `$off` from rsp + rdi.
+    macro_rules! schedule_avx2 {
+        ($x0:ident, $x1:ident, $x2:ident, $x3:ident, $off:literal) => {
+            concat!(
+                // W[t-15..t-12] and W[t-7..t-4].
+                ins!(vpalignr ymm4, $x1, $x0, 4),
+                ins!(vpalignr ymm5, $x3, $x2, 4),
+                ins!(vpaddd $x0, $x0, ymm5),
+                // sigma0(W[t-15..t-12]).
+                ins!(vpsrld ymm5, ymm4, 7),
+                ins!(vpsrld ymm6, ymm4, 3),
+                ins!(vpslld ymm7, ymm4, 14),
+                ins!(vpxor ymm6, ymm6, ymm5),
+                ins!(vpsrld ymm5, ymm5, 11),
+                ins!(vpxor ymm6, ymm6, ymm7),
+                ins!(vpslld ymm7, ymm7, 11),
+                ins!(vpxor ymm6, ymm6, ymm5),
+                ins!(vpxor ymm6, ymm6, ymm7),
+                ins!(vpaddd $x0, $x0, ymm6),
+                // sigma1(W[t-2], W[t-1]) into words 0 and 1: each word
+                // doubled into a quadword, whose right shifts are rotations.
+                ins!(vpshufd ymm4, $x3, 0xfa),
+                ins!(vpsrld ymm5, ymm4, 10),
+                ins!(vpsrlq ymm4, ymm4, 17),
+                ins!(vpxor ymm5, ymm5, ymm4),
+                ins!(vpsrlq ymm4, ymm4, 2),
+                ins!(vpxor ymm5, ymm5, ymm4),
+                ins!(vpshufb ymm5, ymm5, ymmword ptr [rbp + 544]),
+                ins!(vpaddd $x0, $x0, ymm5),
+                // sigma1(W[t], W[t+1]), just made, into words 2 and 3.
+                ins!(vpshufd ymm4, $x0, 0x50),
+                ins!(vpsrld ymm5, ymm4, 10),
+                ins!(vpsrlq ymm4, ymm4, 17),
+                ins!(vpxor ymm5, ymm5, ymm4),
+                ins!(vpsrlq ymm4, ymm4, 2),
+                ins!(vpxor ymm5, ymm5, ymm4),
+                ins!(vpshufb ymm5, ymm5, ymmword ptr [rbp + 576]),
+                ins!(vpaddd $x0, $x0, ymm5),
+                ins!(vpaddd ymm4, $x0, ymmword ptr [rbp + rdi + $off]),
+                ins!(vmovdqa ymmword ptr [rsp + rdi + $off], ymm4),
+            )
+        };
+    }
+
+    /// [`schedule_avx2`] with AVX-512VL's `vprord` (rotate) and `vpternlogd`
+    /// (here a three-way XOR): 22 instructions instead of 31.
+    macro_rules! schedule_avx512vl {
+        ($x0:ident, $x1:ident, $x2:ident, $x3:ident, $off:literal) => {
+            concat!(
+                ins!(vpalignr ymm4, $x1, $x0, 4),
+                ins!(vpalignr ymm5, $x3, $x2, 4),
+                ins!(vpaddd $x0, $x0, ymm5),
+                ins!(vprord ymm5, ymm4, 7),
+                ins!(vprord ymm6, ymm4, 18),
+                ins!(vpsrld ymm4, ymm4, 3),
+                ins!(vpternlogd ymm4, ymm5, ymm6, 0x96),
+                ins!(vpaddd $x0, $x0, ymm4),
+                // sigma1 of words 2 and 3 of x3, shifted down to 0 and 1...
+                ins!(vprord ymm4, $x3, 17),
+                ins!(vprord ymm5, $x3, 19),
+                ins!(vpsrld ymm6, $x3, 10),
+                ins!(vpternlogd ymm6, ymm4, ymm5, 0x96),
+                ins!(vpsrldq ymm6, ymm6, 8),
+                ins!(vpaddd $x0, $x0, ymm6),
+                // ...and of the new words 0 and 1, shifted up to 2 and 3.
+                ins!(vprord ymm4, $x0, 17),
+                ins!(vprord ymm5, $x0, 19),
+                ins!(vpsrld ymm6, $x0, 10),
+                ins!(vpternlogd ymm6, ymm4, ymm5, 0x96),
+                ins!(vpslldq ymm6, ymm6, 8),
+                ins!(vpaddd $x0, $x0, ymm6),
+                ins!(vpaddd ymm4, $x0, ymmword ptr [rbp + rdi + $off]),
+                ins!(vmovdqa ymmword ptr [rsp + rdi + $off], ymm4),
+            )
+        };
+    }
+
+    /// Defines `$name(state, data, n)`, which compresses the `n` (at least
+    /// one) 64-byte blocks at `data` into `state`, two at a time, with
+    /// `$schedule` for the message schedule.
+    ///
+    /// Frame (rsp aligned to 64): the `W + K` area at 0..512, then the
+    /// caller's rsp at 512, `state` at 520, the next block pair at 528, the
+    /// number of blocks left at 536, and where the current loop of rounds
+    /// without schedule ends at 544.
+    ///
+    /// The rounds are loops of 16 and 8, as in OpenSSL, which keeps the code
+    /// small enough for the decoded micro-op cache. (The Rust version this
+    /// replaced unrolled all 128 rounds into some 3,500 instructions, and
+    /// lost to OpenSSL by 7%; the compiler's own loops of the same rounds
+    /// spilled and shuffled registers.)
+    macro_rules! compress {
+        ($name:ident, $schedule:ident) => {
+            #[unsafe(naked)]
+            unsafe extern "sysv64" fn $name(state: *mut [u32; 8], data: *const u8, n: usize) {
+                core::arch::naked_asm!(
+                    "push rbx",
+                    "push rbp",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "push r15",
+                    "mov rax, rsp",
+                    "sub rsp, 576",
+                    "and rsp, -64",
+                    "mov qword ptr [rsp + 512], rax",
+                    "mov qword ptr [rsp + 520], rdi",
+                    "mov qword ptr [rsp + 528], rsi",
+                    "mov qword ptr [rsp + 536], rdx",
+                    "lea rbp, [rip + {consts}]",
+                    "vmovdqa ymm8, ymmword ptr [rbp + 512]",
+                    // Each pair of blocks (a lone last block is paired with
+                    // itself, and the copy's rounds skipped).
+                    "7:",
+                    "mov rsi, qword ptr [rsp + 528]",
+                    "lea r12, [rsi + 64]",
+                    "cmp qword ptr [rsp + 536], 1",
+                    "cmove r12, rsi",
+                    "vmovdqu xmm0, xmmword ptr [rsi]",
+                    "vinserti128 ymm0, ymm0, xmmword ptr [r12], 1",
+                    "vpshufb ymm0, ymm0, ymm8",
+                    "vmovdqu xmm1, xmmword ptr [rsi + 16]",
+                    "vinserti128 ymm1, ymm1, xmmword ptr [r12 + 16], 1",
+                    "vpshufb ymm1, ymm1, ymm8",
+                    "vmovdqu xmm2, xmmword ptr [rsi + 32]",
+                    "vinserti128 ymm2, ymm2, xmmword ptr [r12 + 32], 1",
+                    "vpshufb ymm2, ymm2, ymm8",
+                    "vmovdqu xmm3, xmmword ptr [rsi + 48]",
+                    "vinserti128 ymm3, ymm3, xmmword ptr [r12 + 48], 1",
+                    "vpshufb ymm3, ymm3, ymm8",
+                    "vpaddd ymm4, ymm0, ymmword ptr [rbp]",
+                    "vmovdqa ymmword ptr [rsp], ymm4",
+                    "vpaddd ymm4, ymm1, ymmword ptr [rbp + 32]",
+                    "vmovdqa ymmword ptr [rsp + 32], ymm4",
+                    "vpaddd ymm4, ymm2, ymmword ptr [rbp + 64]",
+                    "vmovdqa ymmword ptr [rsp + 64], ymm4",
+                    "vpaddd ymm4, ymm3, ymmword ptr [rbp + 96]",
+                    "vmovdqa ymmword ptr [rsp + 96], ymm4",
+                    "mov r12, qword ptr [rsp + 520]",
+                    "mov eax, dword ptr [r12]",
+                    "mov ebx, dword ptr [r12 + 4]",
+                    "mov ecx, dword ptr [r12 + 8]",
+                    "mov edx, dword ptr [r12 + 12]",
+                    "mov r8d, dword ptr [r12 + 16]",
+                    "mov r9d, dword ptr [r12 + 20]",
+                    "mov r10d, dword ptr [r12 + 24]",
+                    "mov r11d, dword ptr [r12 + 28]",
+                    "mov esi, ebx",
+                    "xor esi, ecx",
+                    "xor r13d, r13d",
+                    "mov r14d, r9d",
+                    "xor edi, edi",
+                    // Rounds 0-47 of the first block, 16 at a time, with the
+                    // schedule of both blocks for 16 rounds later.
+                    ".p2align 6",
+                    "3:",
+                    rounds4_a!(0, 4, 8, 12),
+                    $schedule!(ymm0, ymm1, ymm2, ymm3, 128),
+                    rounds4_e!(32, 36, 40, 44),
+                    $schedule!(ymm1, ymm2, ymm3, ymm0, 160),
+                    rounds4_a!(64, 68, 72, 76),
+                    $schedule!(ymm2, ymm3, ymm0, ymm1, 192),
+                    rounds4_e!(96, 100, 104, 108),
+                    $schedule!(ymm3, ymm0, ymm1, ymm2, 224),
+                    "add rdi, 128",
+                    "cmp rdi, 384",
+                    "jb 3b",
+                    "mov qword ptr [rsp + 544], 512",
+                    // Rounds without schedule, 8 at a time: 48-63 of the
+                    // first block (rdi 384 to 512), all of the second's (rdi
+                    // 16 to 528, its words being 16 bytes on).
+                    ".p2align 6",
+                    "4:",
+                    rounds4_a!(0, 4, 8, 12),
+                    rounds4_e!(32, 36, 40, 44),
+                    "add rdi, 64",
+                    "cmp rdi, qword ptr [rsp + 544]",
+                    "jb 4b",
+                    // The last round's Sigma0, then state += the variables.
+                    "add eax, r13d",
+                    "mov r12, qword ptr [rsp + 520]",
+                    "add eax, dword ptr [r12]",
+                    "mov dword ptr [r12], eax",
+                    "add ebx, dword ptr [r12 + 4]",
+                    "mov dword ptr [r12 + 4], ebx",
+                    "add ecx, dword ptr [r12 + 8]",
+                    "mov dword ptr [r12 + 8], ecx",
+                    "add edx, dword ptr [r12 + 12]",
+                    "mov dword ptr [r12 + 12], edx",
+                    "add r8d, dword ptr [r12 + 16]",
+                    "mov dword ptr [r12 + 16], r8d",
+                    "add r9d, dword ptr [r12 + 20]",
+                    "mov dword ptr [r12 + 20], r9d",
+                    "add r10d, dword ptr [r12 + 24]",
+                    "mov dword ptr [r12 + 24], r10d",
+                    "add r11d, dword ptr [r12 + 28]",
+                    "mov dword ptr [r12 + 28], r11d",
+                    // After the first block, the second, unless it was alone.
+                    "cmp edi, 512",
+                    "jne 5f",
+                    "cmp qword ptr [rsp + 536], 2",
+                    "jb 5f",
+                    "mov esi, ebx",
+                    "xor esi, ecx",
+                    "xor r13d, r13d",
+                    "mov r14d, r9d",
+                    "mov edi, 16",
+                    "mov qword ptr [rsp + 544], 528",
+                    "jmp 4b",
+                    // The next pair, if any.
+                    "5:",
+                    "mov rdx, qword ptr [rsp + 536]",
+                    "sub rdx, 2",
+                    "jbe 6f",
+                    "mov qword ptr [rsp + 536], rdx",
+                    "add qword ptr [rsp + 528], 128",
+                    "jmp 7b",
+                    "6:",
+                    "vzeroupper",
+                    "mov rsp, qword ptr [rsp + 512]",
+                    "pop r15",
+                    "pop r14",
+                    "pop r13",
+                    "pop r12",
+                    "pop rbp",
+                    "pop rbx",
+                    "ret",
+                    consts = sym CONSTS,
+                )
+            }
+        };
+    }
+
+    compress!(compress_avx2, schedule_avx2);
+    compress!(compress_avx512vl, schedule_avx512vl);
 }
 
 #[cfg(test)]
@@ -420,6 +585,59 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(c.finish().as_ref());
         out
+    }
+
+    fn hex(d: [u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Bytes from a fixed xorshift generator.
+    #[cfg(target_arch = "x86_64")]
+    fn noise(n: usize, mut seed: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 32) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reference_vectors() {
+        // FIPS 180-2 appendix B and the NIST examples.
+        let cases: [(&[u8], &str); 4] = [
+            (
+                b"",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+            (
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+                "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+            ),
+        ];
+        for (input, want) in cases {
+            let mut h = Sha256::new();
+            h.update(input);
+            assert_eq!(hex(h.finish()), want);
+        }
+        let mut h = Sha256::new();
+        for _ in 0..1000 {
+            h.update(&[b'a'; 1000]);
+        }
+        assert_eq!(
+            hex(h.finish()),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     #[test]
@@ -442,20 +660,40 @@ mod tests {
         }
     }
 
+    /// Both schedules (where the CPU has them), on every length up to three
+    /// blocks past the two-block step, then random lengths and splits.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_path_matches_ring() {
+    fn avx2_paths_match_ring() {
         if !(is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("bmi1")
             && is_x86_feature_detected!("bmi2"))
         {
             return;
         }
-        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 + i / 3) as u8).collect();
-        for len in (0..260).chain([4095, 4096, 4097, 5000]) {
-            let mut h = avx2::Avx2Sha256::new();
-            h.update(&data[..len]);
-            assert_eq!(h.finish(), ring_digest(&data[..len]), "len {len}");
+        let data = noise(70_000, 0x9e37_79b9_7f4a_7c15);
+        for vl in [false, true] {
+            for len in (0..=320).chain([4095, 4096, 4097, 65_536, 70_000]) {
+                let mut h = avx2::Avx2Sha256::with_vl(vl);
+                h.update(&data[..len]);
+                assert_eq!(h.finish(), ring_digest(&data[..len]), "vl {vl} len {len}");
+            }
+            let mut seed = 12345u64;
+            let mut next = |m: u64| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (seed >> 33) % m
+            };
+            for _ in 0..200 {
+                let len = next(20_000) as usize;
+                let mut h = avx2::Avx2Sha256::with_vl(vl);
+                let mut at = 0;
+                while at < len {
+                    let n = (next(700) as usize).min(len - at);
+                    h.update(&data[at..at + n]);
+                    at += n;
+                }
+                assert_eq!(h.finish(), ring_digest(&data[..len]), "vl {vl} len {len}");
+            }
         }
     }
 }
