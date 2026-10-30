@@ -673,7 +673,7 @@ fn action_records_are_the_lines_of_v_in_order() {
             .lines()
             .map(str::to_string)
             .collect();
-        // One record per -v line, in order, naming what the line names; a
+        // One record per -v line, naming what the line names; a
         // --backup has a record of its own, before the action's, whose line
         // names it. Diagnostics are error records.
         let actions: Vec<&Value> = recs
@@ -686,12 +686,23 @@ fn action_records_are_the_lines_of_v_in_order() {
             "{args:?}:\n{vlines:#?}\n{:#?}",
             briefs(&recs)
         );
-        for (line, r) in vlines.iter().zip(&actions) {
-            for name in names(r) {
-                if !name.contains('\u{fffd}') {
-                    assert!(line.contains(&name), "{args:?}: {line} vs {r}");
-                }
-            }
+        // Each record names what one of the lines names. They are matched by
+        // name, not position: the two runs use two trees, and siblings come
+        // in inode order, which the file system need not repeat (ext4 puts a
+        // new directory in another block group).
+        let mut unmatched: Vec<&String> = vlines.iter().collect();
+        for r in &actions {
+            let wanted: Vec<String> = names(r)
+                .into_iter()
+                .filter(|n| !n.contains('\u{fffd}'))
+                .collect();
+            let hit = unmatched
+                .iter()
+                .position(|line| wanted.iter().all(|n| line.contains(n.as_str())));
+            let Some(i) = hit else {
+                panic!("{args:?}: no line for {r} in {unmatched:#?}");
+            };
+            unmatched.remove(i);
         }
         for (i, r) in recs.iter().enumerate() {
             if r["action"] == "backup" {
