@@ -106,7 +106,9 @@ def gen_inputs(work):
 
 
 def benchmarks(p, scratch):
-    """(name, tool, argv-after-tool, stdin path or None, setup per run or None, invocations)."""
+    """(name, tool, argv-after-tool, stdin path or None, setup per run or None, invocations).
+
+    argv may be {"gnu": [...], "dogfish": [...]} when the two sides differ."""
     L, N, C, D, B = p["log.txt"], p["nums.txt"], p["data.csv"], p["dups.txt"], p["blob.bin"]
     T = p["tree"]
     out = os.path.join(scratch, "out")
@@ -165,6 +167,9 @@ def benchmarks(p, scratch):
         ("ls -1 300 dirs", "ls", ["-1", T + "/d000/s000"], None, None, 50),
         ("du -s 30k files", "du", ["-s", T], None, None, 1),
         ("du -ah 30k files", "du", ["-ah", T], None, None, 1),
+        # Dogfish's -J records, against GNU's text for the same listing.
+        ("ls -lR -J 30k files", "ls", {"gnu": ["-lR", T], "dogfish": ["-lR", "-J", T]}, None, None, 1),
+        ("du -a -J 30k files", "du", {"gnu": ["-a", T], "dogfish": ["-a", "-J", T]}, None, None, 1),
         ("chmod -R 30k files", "chmod", ["-R", "u+w", T], None, None, 1),
         ("stat 100 files", "stat", [os.path.join(T, "d000/s000/f%03d.txt" % i) for i in range(100)], None, None, 1),
     ]
@@ -225,7 +230,10 @@ def main():
             if os.path.lexists(link):
                 os.remove(link)
             os.symlink(dogfish, link)
-        sides = {"gnu": [os.path.join(gnu_dir, tool)] + argv, "dogfish": [link] + argv}
+        # A dict gives each side its own arguments (for Dogfish-only options).
+        per_side = argv if isinstance(argv, dict) else {"gnu": argv, "dogfish": argv}
+        sides = {"gnu": [os.path.join(gnu_dir, tool)] + per_side["gnu"],
+                 "dogfish": [link] + per_side["dogfish"]}
         samples = {"gnu": [], "dogfish": []}
         for i in range(repeat + 1):
             for side in (("gnu", "dogfish") if i % 2 else ("dogfish", "gnu")):
