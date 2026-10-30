@@ -641,7 +641,9 @@ mod odd_years {
     fn fixtures() -> &'static Path {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
-            let dir = super::common::fresh_fixture_dir().join("odd-years");
+            // Inside the binary's fixture directory, not a fresh one: making
+            // it fresh again would delete it under the tests running in it.
+            let dir = super::fixtures().join("odd-years");
             std::fs::create_dir_all(&dir).unwrap();
             if make_files(&dir) {
                 return dir;
