@@ -1,6 +1,6 @@
 //! `ls` options and their parsing.
 
-use dogfish_core::ColorMode;
+use dogfish_core::{ColorMode, Switches};
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -288,10 +288,9 @@ pub(crate) struct LsOpts {
     pub(crate) line_length: usize,
     pub(crate) tab_size: usize,
     pub(crate) eol: u8,
-    /// GNU `print_with_color`, as `--color`, `-f` and `--zero` leave it.
+    /// GNU `print_with_color`, as `--color`, `-f` and `--zero` leave it,
+    /// and off when the Dogfish `--no-color` came after the last `--color`.
     pub(crate) color: bool,
-    /// The last `--color=WHEN`, which also governs the rich terminal output.
-    pub(crate) color_mode: Option<ColorMode>,
     /// The colour table in effect for GNU-style output (`None`: no colour).
     pub(crate) colors: Option<LsColors>,
     /// GNU `check_symlink_mode`: follow symlinks to colour or group them.
@@ -358,6 +357,7 @@ fn ls_time_formats(style: &str) -> std::result::Result<[String; 2], i32> {
 pub(crate) fn parse_ls_args(
     args: &[OsString],
     stdout_is_tty: bool,
+    switches: &Switches,
 ) -> std::result::Result<(LsOpts, Vec<OsString>), i32> {
     let specs = ls_option_table(args);
     let mut parsed = Getopt::new(args.to_vec(), &specs);
@@ -400,7 +400,6 @@ pub(crate) fn parse_ls_args(
         tab_size: 8,
         eol: b'\n',
         color: false,
-        color_mode: None,
         colors: None,
         check_symlink_mode: false,
         dired: false,
@@ -480,7 +479,12 @@ pub(crate) fn parse_ls_args(
                 let on = when == "always" || (when == "auto" && stdout_is_tty);
                 if key == "color" {
                     o.color = on;
-                    o.color_mode = ColorMode::from_when(when);
+                    // Also the rich output's colours. The getopt loop records
+                    // the Dogfish `--no-color` in `switches` as it meets it
+                    // too, so whichever of the two comes last wins.
+                    if let Some(mode) = ColorMode::from_when(when) {
+                        switches.set_color(mode);
+                    }
                 } else {
                     o.hyperlink = on;
                 }
@@ -704,6 +708,9 @@ pub(crate) fn parse_ls_args(
             "version" => return Err(print_version("ls")),
             _ => unreachable!("unhandled ls option"),
         }
+    }
+    if switches.color() == ColorMode::Never {
+        o.color = false;
     }
     // GNU consults COLUMNS only when the format or colouring needs a width.
     o.line_length = match width_opt {

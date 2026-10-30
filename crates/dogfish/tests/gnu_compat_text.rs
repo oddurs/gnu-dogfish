@@ -518,6 +518,11 @@ shell_cases! {
     // ---------------------------------------------------------------- tac
     tac_closed_stdin: ["tac"] "tac - - <&-; echo $?";
     tac_pipe_twice: ["tac"] "printf 'x\\ny\\n' | tac - -";
+    // A directory fails where tac_seekable reads (EINVAL or EISDIR, as the
+    // file system has it), and the diagnostic comes before the output still
+    // in tac's 8 KiB buffer, after what stdio already had.
+    tac_directory: ["tac"] "mkdir d; tac d; echo $?";
+    tac_directory_order: ["tac"] "mkdir d; printf 'a\\nb\\n' > f; seq 1500 > m; seq 3000 > b; tac f d f 2>&1 | cat; tac m d m 2>&1 | md5sum; tac b d f 2>&1 | md5sum; tac f nonexist f 2>&1 | cat; tac - d < f 2>&1 | cat";
 
     // ---------------------------------------------- echo / mktemp, POSIX
     echo_posixly_correct: ["echo"] "export POSIXLY_CORRECT=1; env echo -n -E 'foo\\n'; env echo -nE foo; env echo -E -n foo; env echo --version";
@@ -549,6 +554,12 @@ shell_cases! {
     sort_key_errors: ["sort"] "for k in 0 1.0 1,0 1x 1,2x 1. , 1.1,-k0 2.,3 2,; do sort -k$k /dev/null; done 2>&1; echo $?";
     sort_incompatible_options: ["sort"] "sort -dfgiMnR /dev/null; sort -in /dev/null; sort -k1,1nR /dev/null; sort --sort=random -n /dev/null; echo $?";
     sort_obsolete_keys: ["sort"] "printf 'a 2\\nb 1\\n' > f; sort +1 -2 f; sort +1x f; _POSIX2_VERSION=200112 sort +1 f; echo $?";
+    // sort.pl's obsolete keys: +A.x -B.y is -k A+1.x+1,B.y (y = 0) or B+1.y.
+    // POSIX 1003.1-2001 (200112) takes `+POS` for a file unless a `-POS` follows.
+    sort_obsolete_keys_sort_pl: ["sort"] "export _POSIX2_VERSION=199209; printf 'y k b\\nz k a\\n' | sort +1 -3; for e in 1 1.0 1.1 1.2 1.1b; do printf 'a c\\na b\\n' | sort -s +0 -$e; done; printf ':ba\\n:ab\\n' | sort -t : +1.1 -1.2; printf 'a:1\\nb:-\\n' | sort -n -t: +1; printf 'axx\\nb-1\\n' | sort +0.1n; printf 'b 2\\nb 1\\nb 3\\n' | sort +0 +1nr; sort +1x </dev/null; echo $?";
+    sort_obsolete_keys_default_posix: ["sort"] "printf 'y k b\\nz k a\\n' > f; sort +1 -3 f; sort -r +0 -1 f; sort +1.1 -1.2 f; sort +0 +1nr f; sort +1 -2 -o out f; cat out; sort +2 f; sort -- +1 f; sort +1 -- -2 f; echo $?";
+    sort_obsolete_keys_posix2001: ["sort"] "export _POSIX2_VERSION=200112; printf 'b 1\\na 2\\n' > f; sort +1 f; echo $?; sort +1 -2 f; echo $?; POSIXLY_CORRECT=1 sort +1 -2 f; echo $?; _POSIX2_VERSION=200809 sort +1 f; echo $?";
+    sort_obsolete_keys_invalid: ["sort"] "printf 'b\\na\\n' > f; for k in '+1 -x' '+1 -1x' '+1 -1.x' '+1.' '+' '+a' '+-1' '+1 -.2' '+99999999999999999999 -99999999999999999999' '+1.1 f -2'; do sort $k f; echo $?; done 2>&1";
     sort_general_long_double: ["sort"] "printf '1.189731495357231765e+4932\\n-3.3621031431120935063e-4932\\n0\\n3.3621031431120935063e-4932\\n2.2250738585072014e-308\\n1.0000000000000000001\\n1\\n-nan\\nnan\\nx\\n1e5000\\n' | sort -gs";
     sort_general_nan_merge: ["sort"] "echo nan > F; sort -g -m F F";
     sort_output_dash_is_a_file: ["sort"] "printf 'b\\na\\n' > f; sort -o - f; echo; cat ./-";

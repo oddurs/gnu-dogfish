@@ -161,6 +161,77 @@ impl std::ops::Deref for TacInput {
     }
 }
 
+/// The error GNU's `tac_seekable` meets on a file Dogfish could not read
+/// (`e`): it reads from the last [`WRITESIZE`]-byte block before the
+/// offset SEEK_END gives, so a directory fails with EINVAL where ext4 puts
+/// that past the largest file offset, and with EISDIR elsewhere.
+fn seekable_read_error(file: &mut File, e: io::Error) -> io::Error {
+    let Ok(end) = file.seek(SeekFrom::End(0)) else {
+        return e;
+    };
+    let block = WRITESIZE as u64;
+    if file.seek(SeekFrom::Start(end - end % block)).is_err() {
+        return e;
+    }
+    let mut buf = [0u8; WRITESIZE];
+    file.read(&mut buf).err().unwrap_or(e)
+}
+
+/// GNU tac's `output` buffer size, and its read size for seekable files.
+const WRITESIZE: usize = 8192;
+
+/// Standard output as GNU tac writes it: records collect in an
+/// [`WRITESIZE`]-byte buffer that goes to stdio only when full, so a
+/// diagnostic (whose `error()` flushes stdio, not that buffer) comes before
+/// the last partial block of output.
+struct TacOut {
+    pending: Vec<u8>,
+    stdio: io::BufWriter<RawStdout>,
+}
+
+impl TacOut {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(WRITESIZE),
+            stdio: io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout),
+        }
+    }
+
+    /// What `error()` does to standard output before it prints.
+    fn flush_stdio(&mut self) {
+        let _ = self.stdio.flush();
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.stdio.write_all(&self.pending)?;
+        self.pending.clear();
+        self.stdio.flush()
+    }
+}
+
+impl Write for TacOut {
+    fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
+        let len = data.len();
+        let room = WRITESIZE - self.pending.len();
+        if data.len() < room {
+            self.pending.extend_from_slice(data);
+            return Ok(len);
+        }
+        self.pending.extend_from_slice(&data[..room]);
+        self.stdio.write_all(&self.pending)?;
+        self.pending.clear();
+        data = &data[room..];
+        let whole = data.len() - data.len() % WRITESIZE;
+        self.stdio.write_all(&data[..whole])?;
+        self.pending.extend_from_slice(&data[whole..]);
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn read_input(src: &InputSource) -> std::result::Result<TacInput, (bool, io::Error)> {
     match src {
         InputSource::Stdin => {
@@ -174,12 +245,16 @@ fn read_input(src: &InputSource) -> std::result::Result<TacInput, (bool, io::Err
         }
         InputSource::File(path) => {
             let file = File::open(path).map_err(|e| (true, e))?;
+            let probe = file.try_clone();
             FastReader::from_file(file)
                 .and_then(|r| match r {
                     FastReader::Mapped(m) => Ok(TacInput::Mapped(m)),
                     r => r.into_bytes().map(TacInput::Owned),
                 })
-                .map_err(|e| (false, e))
+                .map_err(|e| match probe {
+                    Ok(mut f) => (false, seekable_read_error(&mut f, e)),
+                    Err(_) => (false, e),
+                })
         }
     }
 }
@@ -217,7 +292,7 @@ pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     ctx.telemetry
         .set_strategy("mmap + memrchr reverse SIMD line scan");
 
-    let mut out = io::BufWriter::with_capacity(DEFAULT_BUF_SIZE, RawStdout);
+    let mut out = TacOut::new();
     let mut ok = true;
     let mut read_stdin = false;
 
@@ -226,7 +301,7 @@ pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         let data = match read_input(src) {
             Ok(data) => data,
             Err((opening, e)) => {
-                let _ = out.flush();
+                out.flush_stdio();
                 match src {
                     InputSource::File(path) if opening => eprintln!(
                         "tac: failed to open {} for reading: {}",
@@ -252,7 +327,7 @@ pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             Err(e) => return Err(e.into()),
         }
     }
-    out.flush()?;
+    out.finish()?;
     if read_stdin && let Err(e) = close_stdin() {
         eprintln!("tac: -: {}", gnu_io_error(&e));
         ok = false;

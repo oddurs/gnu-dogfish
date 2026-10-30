@@ -1,4 +1,6 @@
-//! Local time and GNU `strftime`-style formatting shared by date and watch.
+//! Local time and GNU `nstrftime`: the one formatter behind `date`, `watch`,
+//! `date --debug` and (through [`crate::common::strftime`]) `ls --time-style`,
+//! `du --time` and `stat`.
 
 use std::ffi::CStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,6 +103,20 @@ fn iso_week_days(yday: i64, wday: i64) -> i64 {
 /// widths and the `E`/`O` modifiers. `lt` is in the current `TZ`, which `%s`
 /// converts it back from.
 pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> Vec<u8> {
+    format_time_within(fmt, lt, ns, upcase, i64::from(i32::MAX))
+}
+
+/// [`format_time`] with field widths cut to `max_width`, for a caller that
+/// rejects any text longer than `max_width - 1` bytes (GNU's fixed-size
+/// `nstrftime` buffers): a wider field could only be longer, so the result
+/// is the same whenever it is short enough, without padding a huge width.
+pub(crate) fn format_time_within(
+    fmt: &[u8],
+    lt: &LocalTime,
+    ns: u32,
+    upcase: bool,
+    max_width: i64,
+) -> Vec<u8> {
     let tm = &lt.tm;
     let year = i64::from(tm.tm_year) + 1900;
     let mut out = Vec::new();
@@ -129,7 +145,7 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
         if fmt.get(i).is_some_and(u8::is_ascii_digit) {
             width = 0;
             while let Some(d @ b'0'..=b'9') = fmt.get(i).copied() {
-                width = (width * 10 + i64::from(d - b'0')).min(i32::MAX as i64);
+                width = (width * 10 + i64::from(d - b'0')).min(max_width);
                 i += 1;
             }
         }
@@ -145,32 +161,36 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
             colons += 1;
         }
         let conv = fmt.get(i + colons).copied();
-        // A conversion GNU does not know is copied through literally.
+        // nstrftime's bad_format: what GNU does not know is copied through
+        // literally, from the '%' to `end`, padded and case-converted like
+        // any other text.
         let bad = |out: &mut Vec<u8>, end: usize| {
-            // GNU pads the copied spec as if its leading '%' took no room.
             let spec = &fmt[start..end.min(fmt.len())];
-            let width = if width < 0 { width } else { width + 1 };
-            push_padded(out, spec, width, pad, false, false);
+            push_padded(out, spec, width, pad, to_upper, false);
         };
-        if colons > 0 && (conv != Some(b'z') || colons > 3) {
-            i += colons;
+        if colons > 0 && conv != Some(b'z') {
+            // Colons are valid only before 'z': the spec ends at the first
+            // one, and the rest of the format goes on after it.
             bad(&mut out, i + 1);
             i += 1;
             continue;
         }
         i += colons;
         let Some(conv) = conv else {
-            // A trailing '%' spec (GNU extension) is copied, padded normally.
-            push_padded(&mut out, &fmt[start..], width, pad, false, false);
+            // A trailing '%' spec (GNU extension) is copied.
+            bad(&mut out, fmt.len());
             break;
         };
+        let conv_at = i;
         i += 1;
         let e_bad = b"aAbhBdDeFgGHIjklmMNSUVwW";
-        let o_bad = b"aAcDFqxXY";
+        let o_bad = b"aAcDFxXY";
         if (modifier == b'E' && e_bad.contains(&conv))
             || (modifier == b'O' && o_bad.contains(&conv))
         {
-            bad(&mut out, i);
+            // `#` upcases %b before nstrftime looks at the modifier.
+            let upper = to_upper || (change_case && matches!(conv, b'b' | b'h'));
+            push_padded(&mut out, &fmt[start..i], width, pad, upper, false);
             continue;
         }
         let hour12 = if tm.tm_hour % 12 == 0 {
@@ -178,13 +198,24 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
         } else {
             tm.tm_hour % 12
         };
+        // What gnulib leaves to the C library's strftime: `%O` with a number
+        // that is not negative, and `%EC`, `%Ey`, `%EY`.
+        let underlying = |out: &mut Vec<u8>| {
+            push_underlying(out, modifier, conv, tm, width, pad, to_upper);
+        };
         let num = |out: &mut Vec<u8>, digits: i64, value: i64, space_pad: bool| {
+            if modifier == b'O' && value >= 0 {
+                return underlying(out);
+            }
             let pad = if space_pad && pad == 0 { b'_' } else { pad };
             push_number(out, digits, value, pad, width, false, 0);
         };
         // nstrftime's DO_YEARISH: a magnitude and a sign, so that the
         // century of years -99..-1 can be "-0".
         let year_signed = |out: &mut Vec<u8>, digits: i64, magnitude: u64, negative: bool| {
+            if modifier == b'O' && !negative {
+                return underlying(out);
+            }
             let limit = if digits == 2 { 99 } else { 9999 };
             let sign = pad == b'+' && (magnitude > limit || digits < width);
             push_signed(out, digits, magnitude, negative, pad, width, sign, 0);
@@ -201,8 +232,11 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
         };
         match conv {
             b'%' => {
-                if pad != 0 || width >= 0 || modifier != 0 || to_upper || change_case {
-                    bad(&mut out, i);
+                if conv_at - 1 != start {
+                    // "%5%": the spec ends before the second '%', which
+                    // starts the next one.
+                    bad(&mut out, conv_at);
+                    i = conv_at;
                 } else {
                     out.push(b'%');
                 }
@@ -231,6 +265,7 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
                 s.extend_from_slice(format!("{yy:02}").as_bytes());
                 push_padded(&mut out, &s, width, pad, false, false);
             }
+            b'C' | b'y' | b'Y' if modifier == b'E' => underlying(&mut out),
             b'C' => {
                 // nstrftime truncates toward zero, so the century of a
                 // negative year has the year's sign: -382247 is -3822.
@@ -241,17 +276,30 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
                 year_signed(&mut out, 2, century.unsigned_abs(), negative);
             }
             b'd' => num(&mut out, 2, tm.tm_mday.into(), false),
+            // nstrftime hands the flag to the subformat's years only
+            // (`yr_spec`): "%_D" is "%m/%d/%_y".
+            b'D' if pad != 0 => {
+                let subfmt = format!("%m/%d/%{}y", pad as char);
+                sub(&mut out, &subfmt, to_upper);
+            }
             b'D' => sub(&mut out, "%m/%d/%y", to_upper),
             b'e' => num(&mut out, 2, tm.tm_mday.into(), true),
             b'F' => {
+                // nstrftime's "%Y-%m-%d" with the year's width (which can
+                // be 0, unlike any width a format can spell) and flag.
                 let (year_pad, year_width) = if pad == 0 && width < 0 {
-                    ('+', 4)
+                    (b'+', 4)
                 } else {
-                    (if pad == 0 { '0' } else { pad as char }, (width - 6).max(0))
+                    (pad, (width - 6).max(0))
                 };
-                let subfmt = format!("%{year_pad}{year_width}Y-%m-%d");
-                let rendered = format_time(subfmt.as_bytes(), lt, ns, to_upper);
-                out.extend_from_slice(&rendered);
+                let (magnitude, negative) = (year.unsigned_abs(), year < 0);
+                let sign = year_pad == b'+' && (magnitude > 9999 || 4 < year_width);
+                let mut s = Vec::new();
+                push_signed(
+                    &mut s, 4, magnitude, negative, year_pad, year_width, sign, 0,
+                );
+                s.extend_from_slice(&format_time(b"-%m-%d", lt, ns, to_upper));
+                push_padded(&mut out, &s, width, pad, false, false);
             }
             b'g' | b'G' | b'V' => {
                 let yday = i64::from(tm.tm_yday);
@@ -362,6 +410,7 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
             b'Y' => year_sign(&mut out, 4, year),
             // Without a known DST state there is no known offset.
             b'z' if tm.tm_isdst < 0 => {}
+            b'z' if colons > 3 => bad(&mut out, i),
             b'z' => {
                 // `c_long` is narrower than i64 on 32-bit targets.
                 #[allow(clippy::useless_conversion)]
@@ -370,6 +419,10 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
                 let negative = off < 0 || (off == 0 && lt.zone.first() == Some(&b'-'));
                 let a = off.unsigned_abs() as i64;
                 let (h, m, s) = (a / 3600, a / 60 % 60, a % 60);
+                if modifier == b'O' && !negative {
+                    underlying(&mut out);
+                    continue;
+                }
                 let colons = match colons {
                     3 if s != 0 => 2,
                     3 if m != 0 => 1,
@@ -400,6 +453,30 @@ pub(crate) fn format_time(fmt: &[u8], lt: &LocalTime, ns: u32, upcase: bool) -> 
         }
     }
     out
+}
+
+/// nstrftime's `underlying_strftime`: `%` `modifier` `conv` through the C
+/// library's own strftime, then padded to `width` like any other text.
+fn push_underlying(
+    out: &mut Vec<u8>,
+    modifier: u8,
+    conv: u8,
+    tm: &libc::tm,
+    width: i64,
+    pad: u8,
+    upper: bool,
+) {
+    // The space tells an empty result from a failure, as in gnulib.
+    let ufmt = [b' ', b'%', modifier, conv, 0];
+    let mut buf = [0u8; 1024];
+    // SAFETY: `ufmt` is NUL-terminated, `buf` is writable for its whole
+    // length, and `tm` is a valid struct tm (its tm_zone, if read at all,
+    // comes from localtime_r).
+    let len =
+        unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), ufmt.as_ptr().cast(), tm) };
+    if len != 0 {
+        push_padded(out, &buf[1..len], width, pad, upper, false);
+    }
 }
 
 /// Appends `s` padded on the left to `width` (zeros for the `0`/`+` flags,
