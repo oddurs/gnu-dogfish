@@ -605,6 +605,9 @@ pub(crate) fn error_bytes(tool: &str, msg: &[u8]) {
     line.extend_from_slice(msg);
     line.push(b'\n');
     let _ = std::io::stderr().write_all(&line);
+    if dogfish_core::ndjson::capturing() {
+        dogfish_core::ndjson::diagnostic(&String::from_utf8_lossy(&line[..line.len() - 1]));
+    }
 }
 
 /// Prints GNU's "Try 'TOOL --help'" hint and returns the tool's usage status.

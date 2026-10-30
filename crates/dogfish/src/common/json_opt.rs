@@ -24,9 +24,15 @@ pub(crate) const fn json_long<K: Copy>(key: K) -> OptSpec<K> {
 
 /// Checks the argument of `--json=VERSION` (`None` for `-J` or a bare
 /// `--json`). `Err` is the exit status after a usage diagnostic.
+///
+/// From here on, every diagnostic the tool prints also writes an error
+/// record to standard output (`dogfish_core::ndjson::capture_errors`).
 pub(crate) fn check_json_version(tool: &str, value: Option<&OsStr>) -> Result<(), i32> {
     match dogfish_core::ndjson::parse_version(value.map(OsStr::as_bytes)) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            dogfish_core::ndjson::capture_errors(tool);
+            Ok(())
+        }
         Err(e) => Err(usage_error(tool, e)),
     }
 }
@@ -41,5 +47,6 @@ mod tests {
         assert_eq!(check_json_version("ls", Some(OsStr::new("1"))), Ok(()));
         assert_eq!(check_json_version("ls", Some(OsStr::new("2"))), Err(2));
         assert_eq!(check_json_version("cut", Some(OsStr::new(""))), Err(1));
+        dogfish_core::ndjson::stop_capture();
     }
 }

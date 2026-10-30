@@ -137,8 +137,18 @@ pub(crate) fn quote_bytes(arg: &[u8], style: Quoting) -> String {
     String::from_utf8_lossy(&quote_bytes_raw(arg, style, b"")).into_owned()
 }
 
-/// `quotearg_buffer_restyled`; `extra` are additional bytes to backslash-escape.
+/// `quotearg_buffer`: `arg` quoted in `style`; `extra` are additional bytes
+/// to backslash-escape. With `-J`, the name is remembered, so that the
+/// error record of a diagnostic quoting it can give its bytes as `path`
+/// (`dogfish_core::ndjson::note_quoted`).
 pub(crate) fn quote_bytes_raw(arg: &[u8], style: Quoting, extra: &[u8]) -> Vec<u8> {
+    let out = quote_bytes_restyled(arg, style, extra);
+    dogfish_core::ndjson::note_quoted(arg, &out);
+    out
+}
+
+/// `quotearg_buffer_restyled`.
+fn quote_bytes_restyled(arg: &[u8], style: Quoting, extra: &[u8]) -> Vec<u8> {
     let utf8 = locale_is_utf8();
     let (open, close): (&[u8], &[u8]) = match style {
         Quoting::C | Quoting::CMaybe => (b"\"", b"\""),
@@ -344,7 +354,7 @@ pub(crate) fn quote_bytes_raw(arg: &[u8], style: Quoting, extra: &[u8]) -> Vec<u
         return force();
     }
     if shell && !elide && encountered_single_quote && all_compat {
-        return quote_bytes_raw(arg, Quoting::C, extra);
+        return quote_bytes_restyled(arg, Quoting::C, extra);
     }
     if !elide {
         out.extend_from_slice(close);
