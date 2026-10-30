@@ -948,7 +948,11 @@ fn test_ls_color_and_no_color_last_wins() {
             .arg("ls")
             .args(args)
             .arg(dir)
+            // Without LS_COLORS, GNU ls colours only for a TERM its database
+            // knows (CI runners have none), even with --color=always.
             .env_remove("LS_COLORS")
+            .env_remove("COLORTERM")
+            .env("TERM", "xterm")
             .output()
             .expect("failed to execute dogfish")
     };
