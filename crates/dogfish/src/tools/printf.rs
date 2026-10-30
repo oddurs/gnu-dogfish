@@ -5,12 +5,12 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout};
+use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, stdout};
 
 use crate::common::escapes::unescape_echo_bytes;
 use crate::common::getopt::{HasArg, OptSpec, lossy_all, print_help, print_version};
 use crate::common::locale::utf8_locale;
-use crate::common::printf_format::{PrintfFlags, format_float, pad_field};
+use crate::common::printf_format::{PrintfFlags, format_float, pad_field_into};
 use crate::common::strtod::strtod_prefix;
 
 /// State shared while rendering: diagnostics flip the exit status to 1.
@@ -173,6 +173,9 @@ fn format_int(v: i128, conv: u8, prec: Option<usize>, flags: PrintfFlags) -> Str
 }
 
 /// Renders the format once. Returns `false` if `\c` stopped all output.
+/// Each piece of output is also recorded as the stdio call GNU makes for it
+/// (`putchar` for text and escapes, one `printf` per conversion), for the
+/// diagnostic of a write error.
 fn printf_once(
     fmt: &[u8],
     run: &mut PrintfRun<'_>,
@@ -182,9 +185,11 @@ fn printf_once(
     while i < fmt.len() {
         let ch = fmt[i];
         if ch == b'\\' {
+            let mark = out.len();
             i += 1;
             let Some(&e) = fmt.get(i) else {
                 out.push(b'\\');
+                stdout::gnu_putchars(1);
                 break;
             };
             i += 1;
@@ -250,10 +255,12 @@ fn printf_once(
                     out.push(other);
                 }
             }
+            stdout::gnu_putchars(out.len() - mark);
             continue;
         }
         if ch != b'%' {
             out.push(ch);
+            stdout::gnu_putchars(1);
             i += 1;
             continue;
         }
@@ -261,6 +268,7 @@ fn printf_once(
         i += 1;
         if fmt.get(i) == Some(&b'%') {
             out.push(b'%');
+            stdout::gnu_putchars(1);
             i += 1;
             continue;
         }
@@ -269,9 +277,12 @@ fn printf_once(
             i += 1;
             if let Some(a) = run.take() {
                 if c == b'q' {
-                    out.extend_from_slice(gnu_quote_file(a).as_bytes());
+                    let quoted = gnu_quote_file(a);
+                    stdout::gnu_fwrite(quoted.len());
+                    out.extend_from_slice(quoted.as_bytes());
                 } else {
                     let (bytes, stop) = unescape_echo_bytes(a.as_bytes(), true);
+                    stdout::gnu_putchars(bytes.len());
                     out.extend(bytes);
                     if stop {
                         return Ok(false);
@@ -376,22 +387,28 @@ fn printf_once(
         }
         if overflow {
             // Found by fuzzing: this was allocated (a 2^41-byte width aborted).
+            // GNU's printf(3) fails with EOVERFLOW, printing nothing and
+            // setting the stream's error flag.
             run.take();
             run.overflow = true;
+            stdout::gnu_ferror();
             continue;
         }
-        let field: Vec<u8> = match conv {
+        // The field's text, and whether zero padding applies to it.
+        let (body, zero_ok): (Vec<u8>, bool) = match conv {
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
                 let a = run.take();
                 let v = run.int_arg(a, matches!(conv, b'd' | b'i'));
-                let s = format_int(v, conv, prec, flags);
-                pad_field(s.into_bytes(), width, flags, prec.is_none())
+                (
+                    format_int(v, conv, prec, flags).into_bytes(),
+                    prec.is_none(),
+                )
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                 let a = run.take();
                 let v = run.float_arg(a);
                 let (s, finite) = format_float(v, conv, prec, flags);
-                pad_field(s.into_bytes(), width, flags, finite)
+                (s.into_bytes(), finite)
             }
             b's' => {
                 let a = run.take().unwrap_or("").as_bytes();
@@ -399,12 +416,11 @@ fn printf_once(
                     Some(p) => &a[..p.min(a.len())],
                     None => a,
                 };
-                pad_field(a.to_vec(), width, flags, false)
+                (a.to_vec(), false)
             }
             b'c' => {
                 let a = run.take().unwrap_or("");
-                let c = a.as_bytes().first().copied().unwrap_or(0);
-                pad_field(vec![c], width, flags, false)
+                (vec![a.as_bytes().first().copied().unwrap_or(0)], false)
             }
             _ => {
                 eprintln!(
@@ -414,7 +430,17 @@ fn printf_once(
                 return Err(());
             }
         };
-        out.extend(field);
+        // A field too wide for memory fails as GNU's printf(3) does.
+        let mark = out.len();
+        if out.try_reserve(width.max(body.len())).is_err() {
+            eprintln!(
+                "printf: cannot perform formatted output: {}",
+                gnu_io_error(&io::Error::from_raw_os_error(libc::ENOMEM))
+            );
+            return Err(());
+        }
+        pad_field_into(out, &body, width, flags, zero_ok);
+        stdout::gnu_fwrite(out.len() - mark);
     }
     Ok(true)
 }
@@ -504,12 +530,22 @@ pub fn run_printf(raw: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         }
     }
 
+    // Unlike GNU, nothing was written yet: a write error is reported at
+    // exit, as GNU's `close_stdout` would after the calls recorded above.
     let mut out = stdout::stdout();
-    ignore_broken_pipe(out.write_all(&output))?;
+    out.write_all(&output)?;
     ctx.telemetry.add_written(output.len() as u64);
     if run.overflow {
-        ignore_broken_pipe(out.flush())?;
-        eprintln!("printf: write error");
+        // GNU's `close_stdout` sees the error flag: a bare `write error`,
+        // or one with the reason when the final flush fails too, as does
+        // closing a closed descriptor.
+        out.flush()?;
+        if stdout::was_closed() {
+            let e = io::Error::from_raw_os_error(libc::EBADF);
+            eprintln!("printf: write error: {}", gnu_io_error(&e));
+        } else {
+            eprintln!("printf: write error");
+        }
         return Ok(1);
     }
     Ok(if ok && !run.failed { 0 } else { 1 })

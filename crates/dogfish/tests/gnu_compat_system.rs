@@ -1290,3 +1290,175 @@ fn write_error_like_gnu() {
         assert_eq!(ours, theirs, "{tool} {args:?} >/dev/full");
     }
 }
+
+/// How standard output fails in `write_errors_match_gnu`.
+#[derive(Clone, Copy, Debug)]
+enum WriteFailure {
+    /// `>/dev/full`: ENOSPC.
+    Full,
+    /// A pipe whose reader is gone, with SIGPIPE ignored (`trap '' PIPE`):
+    /// EPIPE.
+    BrokenPipe,
+    /// `>&-`: EBADF.
+    Closed,
+}
+
+/// Runs `tool args` through both implementations with standard output
+/// failing as `how` says; returns `(dogfish, GNU)`, or `None` without GNU.
+fn run_failing(tool: &str, args: &[&str], how: WriteFailure) -> Option<(Outcome, Outcome)> {
+    let gnu = gnu_tool(tool)?;
+    let run = |mut cmd: Command| {
+        let stdout = match how {
+            WriteFailure::Full => Stdio::from(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .expect("open /dev/full"),
+            ),
+            WriteFailure::BrokenPipe => {
+                let (read_end, write_end) = std::io::pipe().expect("pipe");
+                drop(read_end);
+                Stdio::from(write_end)
+            }
+            WriteFailure::Closed => Stdio::null(),
+        };
+        // SAFETY: the closure runs in the forked child and only calls
+        // signal(2) and close(2), which are async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                match how {
+                    WriteFailure::Full => {}
+                    WriteFailure::BrokenPipe => {
+                        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                    }
+                    WriteFailure::Closed => {
+                        libc::close(libc::STDOUT_FILENO);
+                    }
+                }
+                Ok(())
+            });
+        }
+        let out = cmd
+            .args(args)
+            .current_dir(fixtures())
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .env_remove("POSIXLY_CORRECT")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut ours = Command::new(dogfish_bin());
+    ours.arg(tool);
+    let mut theirs = Command::new(gnu);
+    theirs.arg0(tool);
+    Some((run(ours), run(theirs)))
+}
+
+/// Every way a write to standard output can fail gets GNU's diagnostic (or
+/// none), at GNU's point, with GNU's exit status: `close_stdout`'s `write
+/// error` with or without the reason, the tools' own messages (`yes:
+/// standard output`, `head: error writing`, `sort: write failed`), tools
+/// that stop at the first failed write and tools that go on.
+#[test]
+fn write_errors_match_gnu() {
+    if !Path::new("/dev/full").exists() {
+        eprintln!("note: skipping — no /dev/full");
+        return;
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("yes", &[]),
+        ("yes", &["abc"]),
+        ("head", &["-c", "1000000", "/dev/zero"]),
+        ("head", &["-c", "4096", "/dev/zero"]),
+        ("head", &["-c", "4095", "/dev/zero"]),
+        ("head", &["-n", "-3", "big.dat"]),
+        ("head", &["a.txt", "nonexist"]),
+        ("tail", &["-c", "5000", "big.dat"]),
+        ("tail", &["-c", "100", "big.dat"]),
+        ("tail", &["a.txt", "nonexist"]),
+        ("printf", &["%01000000d", "0"]),
+        ("printf", &["%04096d", "0"]),
+        ("printf", &["%04095d", "0"]),
+        ("printf", &["a%04096d", "0"]),
+        ("printf", &["%05000d\\n", "0"]),
+        ("printf", &["%d\\n", "x"]),
+        ("printf", &["abc%z"]),
+        ("printf", &["%s", "hello"]),
+        ("printf", &["%2147483647d", "0"]),
+        ("printf", &["a%2147483647db\\n", "0"]),
+        ("echo", &["hi"]),
+        ("seq", &["100000"]),
+        ("cat", &["a.txt"]),
+        ("cat", &["big.dat"]),
+        ("wc", &["a.txt", "nonexist"]),
+        ("wc", &["--help"]),
+        ("md5sum", &["a.txt", "nonexist"]),
+        ("md5sum", &["--version"]),
+        ("stat", &["-c", "%s", "a.txt", "nonexist"]),
+        ("base64", &["big.dat"]),
+        ("base64", &["-d", "bigbad.b64"]),
+        ("sort", &["big.dat"]),
+        ("sort", &["lines.txt"]),
+        ("sort", &["--help"]),
+        ("du", &["a.txt"]),
+        ("du", &["--version"]),
+        ("ls", &["--color=always", "d"]),
+        ("ls", &["nonexist", "d"]),
+        ("cut", &["-c1", "a.txt", "nonexist"]),
+        ("nl", &["a.txt", "nonexist"]),
+        ("date", &["-f", "dates.txt"]),
+        ("env", &["yes"]),
+        ("timeout", &["10", "yes"]),
+    ];
+    for how in [
+        WriteFailure::Full,
+        WriteFailure::BrokenPipe,
+        WriteFailure::Closed,
+    ] {
+        for (tool, args) in cases {
+            let Some((ours, theirs)) = run_failing(tool, args, how) else {
+                continue;
+            };
+            assert_eq!(ours, theirs, "{tool} {args:?} with {how:?}");
+        }
+    }
+}
+
+/// `env` and `timeout` run their command with SIGPIPE ignored when it was
+/// ignored for them, as GNU's do.
+#[test]
+fn commands_inherit_ignored_sigpipe() {
+    for (tool, args) in [
+        ("env", &["grep", "^SigIgn", "/proc/self/status"][..]),
+        ("timeout", &["10", "grep", "^SigIgn", "/proc/self/status"]),
+    ] {
+        if !Path::new("/proc/self/status").exists() {
+            return;
+        }
+        let run = |mut cmd: Command| {
+            // SAFETY: the closure runs in the forked child and only calls
+            // signal(2), which is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+            let out = cmd.args(args).output().expect("spawn");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let mut ours = Command::new(dogfish_bin());
+        ours.arg(tool);
+        let shown = run(ours);
+        let mask = shown.trim().rsplit('\t').next().unwrap_or("");
+        let mask = u64::from_str_radix(mask, 16).unwrap_or(0);
+        assert_ne!(mask & (1 << (libc::SIGPIPE - 1)), 0, "{tool}: {shown:?}");
+    }
+}

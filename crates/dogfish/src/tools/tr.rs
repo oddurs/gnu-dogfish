@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use anyhow::Result;
-use dogfish_core::{DogfishContext, gnu_io_error, io::ignore_broken_pipe};
+use dogfish_core::{DogfishContext, gnu_io_error};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, Order, getopt_error, print_help, print_version,
@@ -857,7 +857,7 @@ pub fn run_tr(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
             k
         };
-        ignore_broken_pipe(out.write_all(&data[..kept]))?;
+        out.write_all(&data[..kept])?;
         ctx.telemetry.add_written(kept as u64);
     }
     Ok(0)

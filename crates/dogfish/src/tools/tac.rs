@@ -7,10 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 
 use anyhow::Result;
-use dogfish_core::{
-    DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error,
-    io::ignore_broken_pipe, stdout,
-};
+use dogfish_core::{DEFAULT_BUF_SIZE, DogfishContext, FastReader, InputSource, gnu_io_error};
 use memchr::memrchr;
 
 use crate::common::getopt::{
@@ -254,12 +251,10 @@ pub fn run_tac(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         ctx.telemetry.add_read(data.len() as u64);
         match tac_buffer(&data, &sep, parsed.before, &mut out) {
             Ok(()) => ctx.telemetry.add_written(data.len() as u64),
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(i32::from(!ok)),
-            Err(e) if stdout::is_write_error(&e) => return Err(e.into()),
             Err(e) => return Err(e.into()),
         }
     }
-    ignore_broken_pipe(out.flush())?;
+    out.flush()?;
     if read_stdin && let Err(e) = close_stdin() {
         eprintln!("tac: -: {}", gnu_io_error(&e));
         ok = false;

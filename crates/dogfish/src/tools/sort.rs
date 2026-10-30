@@ -12,7 +12,7 @@ use anyhow::Result;
 use digest::Digest;
 use dogfish_core::{
     DogfishContext, FastReader, InputSource, emit_objects_or_table, eval_json_where, gnu_io_error,
-    io::ignore_broken_pipe, read_ndjson_stdin, stdout, table::compare_json_field,
+    read_ndjson_stdin, stdout, table::compare_json_field,
 };
 use md5::Md5;
 use rayon::prelude::*;
@@ -1204,6 +1204,9 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+    // GNU sort exits at its first failed write (below), leaving nothing
+    // for `close_stdout` to flush.
+    stdout::gnu_flushes_early();
 
     let mut global = SortOpts {
         skip_sblanks: parsed.ignore_blanks,
@@ -1304,6 +1307,16 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
             }
         }
     };
+    // GNU, run with standard output closed, opens the first named input on
+    // descriptor 1 and keeps it open.
+    if stdout::was_closed()
+        && let Some(InputSource::File(path)) =
+            sources.iter().find(|s| matches!(s, InputSource::File(_)))
+    {
+        let blksize =
+            std::fs::metadata(path).map_or(0, |m| std::os::unix::fs::MetadataExt::blksize(&m));
+        stdout::gnu_input_on_fd1(blksize, true);
+    }
     // Inputs stay mapped, except with -o, which may truncate one of them.
     let keep_mapped = parsed.output.is_none();
     let mut bufs: Vec<SortInput> = Vec::with_capacity(sources.len());
@@ -1432,43 +1445,67 @@ pub fn run_sort(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
     }
 
     let to_stdout = parsed.output.as_deref().is_none_or(|o| o == "-");
-    let sink: Box<dyn Write> = match parsed.output.as_deref() {
+    // GNU moves an output file onto descriptor 1 and writes it as stdout.
+    let (sink, mut gnu, out_name): (Box<dyn Write>, _, _) = match parsed.output.as_deref() {
         Some(path) if path != "-" => match std::fs::File::create(path) {
-            Ok(f) => Box::new(f),
+            Ok(f) => {
+                let blksize = std::os::unix::fs::MetadataExt::blksize(&f.metadata()?);
+                (
+                    Box::new(f),
+                    stdout::StdioModel::for_blksize(blksize),
+                    qf(path),
+                )
+            }
             Err(e) => {
                 eprintln!("sort: open failed: {}: {}", path, gnu_io_error(&e));
                 return Ok(2);
             }
         },
-        _ => Box::new(RawStdout),
+        _ => (
+            Box::new(RawStdout),
+            stdout::StdioModel::new(),
+            "'standard output'".to_string(),
+        ),
     };
     let mut out = io::BufWriter::with_capacity(256 * 1024, sink);
     let mut written = 0u64;
-    // GNU names a failed write to standard output, then exits with its
-    // `close_stdout` diagnostic (`sort: write error`).
-    let stdout_failed = |what: &str, e: &io::Error| {
-        let failed = to_stdout && stdout::is_write_error(e);
+    // GNU writes each line with one `fwrite`: when one of them has to call
+    // write(2), it fails with `write failed`; output still buffered fails
+    // in the final `fflush`. Either way GNU exits at once, and its
+    // `close_stdout` adds `sort: write error` (here, for an output file).
+    let mut gnu_wrote = false;
+    let output_failed = |gnu_wrote: bool, e: &io::Error| {
+        let failed = !to_stdout || stdout::is_write_error(e);
         if failed {
-            eprintln!("sort: {what}: 'standard output': {}", gnu_io_error(e));
+            let what = if gnu_wrote {
+                "write failed"
+            } else {
+                "fflush failed"
+            };
+            eprintln!("sort: {what}: {out_name}: {}", gnu_io_error(e));
+            if !to_stdout {
+                eprintln!("sort: write error");
+            }
         }
         failed
     };
     for s in &lines {
+        gnu_wrote |= gnu.fwrite(s.len() + 1);
         if let Err(e) = out.write_all(s).and_then(|()| out.write_all(&[eol])) {
-            if stdout_failed("write failed", &e) {
+            if output_failed(gnu_wrote, &e) {
                 return Ok(2);
             }
-            ignore_broken_pipe(Err(e))?;
+            return Err(e.into());
         }
         written += s.len() as u64 + 1;
     }
     ctx.telemetry.add_items(lines.len() as u64);
     ctx.telemetry.add_written(written);
     if let Err(e) = out.flush() {
-        if stdout_failed("fflush failed", &e) {
+        if output_failed(gnu_wrote, &e) {
             return Ok(2);
         }
-        ignore_broken_pipe(Err(e))?;
+        return Err(e.into());
     }
     Ok(0)
 }

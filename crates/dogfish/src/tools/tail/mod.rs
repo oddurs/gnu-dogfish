@@ -17,8 +17,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use anyhow::Result;
 use dogfish_core::{
-    DogfishContext, emit_objects_or_table, gnu_io_error, io::ignore_broken_pipe, read_ndjson_stdin,
-    stdout,
+    DogfishContext, emit_objects_or_table, gnu_io_error, read_ndjson_stdin, stdout,
 };
 use memchr::{memchr_iter, memrchr};
 
@@ -486,6 +485,8 @@ fn st_blksize(st: &Metadata) -> u64 {
 pub(super) struct Out {
     buf: Vec<u8>,
     written: u64,
+    /// glibc's buffer, which decides when GNU's `fwrite` writes.
+    gnu: stdout::StdioModel,
 }
 
 impl Out {
@@ -493,18 +494,19 @@ impl Out {
         Out {
             buf: Vec::with_capacity(BUFSIZ),
             written: 0,
+            gnu: stdout::StdioModel::new(),
         }
     }
 
     /// `xwrite_stdout`: a failure is fatal, `error writing 'standard output'`.
+    /// The data goes out when GNU's `fwrite` would write it.
     pub(super) fn write(&mut self, data: &[u8]) -> R<()> {
         self.written += data.len() as u64;
-        if self.buf.len() + data.len() <= BUFSIZ {
-            self.buf.extend_from_slice(data);
+        self.buf.extend_from_slice(data);
+        if !self.gnu.fwrite(data.len()) {
             return Ok(());
         }
-        let res = self.drain().and_then(|()| stdout::write_whole(data));
-        res.map_err(|e| {
+        self.drain().map_err(|e| {
             stdout::mark_reported();
             eprintln!(
                 "tail: error writing 'standard output': {}",
@@ -515,6 +517,7 @@ impl Out {
     }
 
     fn drain(&mut self) -> io::Result<()> {
+        self.gnu.fflush();
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -1100,7 +1103,7 @@ fn tail_ndjson(a: &TailArgs, ctx: &DogfishContext) -> Result<i32> {
     }
     let start = last_lines_start(&all, count, a.line_end);
     let mut out = RawStdout;
-    ignore_broken_pipe(io::Write::write_all(&mut out, &all[start..]))?;
+    io::Write::write_all(&mut out, &all[start..])?;
     Ok(0)
 }
 
