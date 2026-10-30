@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/nproc.v1.json",
+  "title": "nproc -J record",
+  "description": "The single record of `nproc -J`. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "type": "object",
+  "properties": {
+    "processors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "What nproc prints: the processing units available, after --all, --ignore and OMP_NUM_THREADS / OMP_THREAD_LIMIT."
+    },
+    "installed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Processing units installed."
+    }
+  },
+  "required": [
+    "processors",
+    "installed"
+  ]
+}

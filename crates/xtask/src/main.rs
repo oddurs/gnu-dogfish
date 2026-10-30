@@ -24,6 +24,7 @@ const CI: &[&str] = &[
     "fmt",
     "clippy",
     "unsafe-audit",
+    "schemas",
     "msrv",
     "macos",
     "test",
@@ -39,6 +40,10 @@ const STEPS: &[(&str, &str)] = &[
     ("fmt", "cargo fmt --check"),
     ("clippy", "Clippy on every target, warnings denied"),
     ("unsafe-audit", "every `unsafe` is listed in doc/unsafe.md"),
+    (
+        "schemas",
+        "every doc/schema/*.json is a valid JSON Schema, built into the binary as is",
+    ),
     (
         "msrv",
         "type-check with the rust-version toolchain (rustup)",
@@ -159,6 +164,20 @@ fn run_step(root: &Path, step: &str, args: &[String]) -> Step {
         "package" => package(root),
         "gnu" => run(Command::new(root.join("util/gnu-tests.sh")).current_dir(root)),
         "unsafe-audit" => unsafe_audit::audit(root).map(|summary| eprintln!("xtask: {summary}")),
+        // The checker lives with the record tests (crates/dogfish/tests/ndjson/).
+        "schemas" => cargo(
+            root,
+            &[
+                "test",
+                "-p",
+                "dogfish",
+                "--locked",
+                "--test",
+                "ndjson",
+                "--",
+                "schema_files_are_valid_schemas",
+            ],
+        ),
         "deny" => deny(root),
         "asan" => asan(root),
         "dist" => dist::target_arg(args).and_then(|t| {

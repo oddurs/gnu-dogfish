@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddurs/gnu-dogfish/blob/main/doc/schema/realpath.v1.json",
+  "title": "realpath -J record",
+  "description": "One name resolved by `realpath -J`. One record per line (NDJSON); version 1 of the Dogfish record format (doc/ndjson.md). Fields may be added in later releases.",
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "The operand, as given."
+    },
+    "path_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `path`, base64, present only when they are not UTF-8 (`path` then holds the lossy form)."
+    },
+    "resolved": {
+      "type": "string",
+      "description": "The canonical name realpath prints for it (relative with --relative-to)."
+    },
+    "resolved_bytes": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "The bytes of `resolved`, base64, present only when they are not UTF-8 (`resolved` then holds the lossy form)."
+    }
+  },
+  "required": [
+    "path",
+    "resolved"
+  ],
+  "dependentRequired": {
+    "path_bytes": [
+      "path"
+    ],
+    "resolved_bytes": [
+      "resolved"
+    ]
+  }
+}
