@@ -6,9 +6,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Result, anyhow};
 use data_encoding::{BASE32, BASE32HEX, HEXUPPER};
-use dogfish_core::{
-    DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, io::ignore_broken_pipe, stdout,
-};
+use dogfish_core::{DogfishContext, gnu_io_error, gnu_quote, gnu_quote_file, stdout};
 
 use crate::common::getopt::{
     Getopt, HasArg, OptSpec, getopt_error, lossy, lossy_all, print_help, print_version, usage_error,
@@ -450,7 +448,7 @@ fn encode_stream(
                 Err(e) => error = Some(e),
             }
         }
-        ignore_broken_pipe(out.write_all(&outbuf)).map_err(StreamError::Write)?;
+        out.write_all(&outbuf).map_err(StreamError::Write)?;
         ctx.telemetry.add_written(outbuf.len() as u64);
         if error.is_some() {
             return Ok(error);
@@ -461,7 +459,7 @@ fn encode_stream(
     }
     // When wrapping, terminate the last line.
     if wrap != 0 && column > 0 {
-        ignore_broken_pipe(out.write_all(b"\n")).map_err(StreamError::Write)?;
+        out.write_all(b"\n").map_err(StreamError::Write)?;
     }
     Ok(None)
 }
@@ -530,7 +528,7 @@ fn decode_stream(
         };
         outbuf.clear();
         let ok = encoding.decode_groups(&clean[..ready], &table, &mut outbuf);
-        ignore_broken_pipe(out.write_all(&outbuf)).map_err(StreamError::Write)?;
+        out.write_all(&outbuf).map_err(StreamError::Write)?;
         ctx.telemetry.add_written(outbuf.len() as u64);
         if !ok {
             return Ok(Some(CodecError::Invalid));
@@ -568,7 +566,9 @@ fn run_codec(
         ),
         _ => Box::new(io::stdin().lock()),
     };
-    let mut out = stdout::stdout();
+    // Each write is one of GNU's checked `fwrite` calls: the first that has
+    // to write and fails ends the run with `write error`.
+    let mut out = stdout::GnuFwrite::new(stdout::stdout());
     let result = if opts.decode {
         decode_stream(encoding, &mut *input, &mut out, opts.ignore_garbage, ctx)
     } else {
@@ -586,6 +586,12 @@ fn run_codec(
         }
         Err(StreamError::Read(e)) => {
             eprintln!("{tool}: read error: {}", gnu_io_error(&e));
+            Ok(1)
+        }
+        // GNU's `write_error`, which still knows why.
+        Err(StreamError::Write(e)) if stdout::is_write_error(&e) => {
+            stdout::mark_reported();
+            eprintln!("{tool}: write error: {}", gnu_io_error(&e));
             Ok(1)
         }
         Err(StreamError::Write(e)) => Err(e.into()),

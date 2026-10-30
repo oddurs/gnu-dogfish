@@ -7,6 +7,13 @@
 // The tools' entry points are not called from here.
 #![allow(dead_code, unused_imports)]
 
+/// As in `main.rs`: diagnostics print as glibc's `error` does.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        dogfish_core::gnu_error!($($arg)*)
+    };
+}
+
 mod common;
 mod manual;
 mod tool_list;
