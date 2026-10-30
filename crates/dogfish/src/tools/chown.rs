@@ -1,5 +1,7 @@
 //! chown — `USER[:GROUP]`, `:GROUP`, `USER:`, numeric ids, -R/-h/-H/-L/-P, --from
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
@@ -120,6 +122,10 @@ struct ChownRun {
     quiet: bool,
     /// `/`'s identity under `-R --preserve-root` (GNU `chopt.root_dev_ino`).
     root_dev_ino: Option<DevIno>,
+    /// Under `-L`, the directories being walked (entered, not yet left), as
+    /// fts keeps them in logical mode (`enter_dir`/`leave_dir` in gnulib's
+    /// `fts-cycle.c`) to find a directory that is its own ancestor.
+    active_dirs: RefCell<HashSet<DevIno>>,
 }
 
 pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -136,6 +142,7 @@ pub fn run_chown(args: Vec<OsString>, ctx: &DogfishContext) -> Result<i32> {
         verbose: false,
         quiet: false,
         root_dev_ino: None,
+        active_dirs: RefCell::default(),
     };
     let (mut deref, mut preserve_root, mut reference) = (None, false, None);
     while let Some(opt) = opts.next() {
@@ -415,10 +422,21 @@ fn chown_path(
         }
     };
     let walked_type = EntryType::of(&walked);
-    let traverse_dir = run.recursive && walked_type == EntryType::Dir;
+    let mut traverse_dir = run.recursive && walked_type == EntryType::Dir;
+    // fts `enter_dir` in logical mode: a directory already being walked is
+    // `FTS_DC`. chown changes it like a file and does not enter it again;
+    // GNU's `cycle_warning_required` is false under `FTS_LOGICAL`, so there
+    // is no warning and the exit status is unaffected.
+    let dir_id = DevIno::of_stat(&walked);
+    if traverse_dir && run.traverse == Traverse::All && !run.active_dirs.borrow_mut().insert(dir_id)
+    {
+        traverse_dir = false;
+    }
+    let entered = traverse_dir && run.traverse == Traverse::All;
     // GNU `change_file_owner`, FTS_D: every directory the walk would enter is
     // checked, the command-line operands and those reached through `-L` alike.
-    if traverse_dir && is_root_dev_ino(run.root_dev_ino, DevIno::of_stat(&walked)) {
+    if traverse_dir && is_root_dev_ino(run.root_dev_ino, dir_id) {
+        leave_dir(run, entered, dir_id);
         refuse_root("chown", path.as_path());
         return Ok(false);
     }
@@ -445,7 +463,9 @@ fn chown_path(
     let mut ok = true;
     // Like GNU (fts post-order), a directory's contents are changed before it.
     if traverse_dir {
-        ok &= chown_dir(parent, name, path, depth, walk_follows, run, ctx)?;
+        let status = chown_dir(parent, name, path, depth, walk_follows, run, ctx);
+        leave_dir(run, entered, dir_id);
+        ok &= status?;
     }
 
     let (old_uid, old_gid) = (st.st_uid, st.st_gid);
@@ -513,6 +533,13 @@ fn chown_path(
     Ok(ok)
 }
 
+/// fts `leave_dir`: `dir`, which the walk `entered`, is no longer being walked.
+fn leave_dir(run: &ChownRun, entered: bool, dir: DevIno) {
+    if entered {
+        run.active_dirs.borrow_mut().remove(&dir);
+    }
+}
+
 /// With `-R`, changes the owners of the entries of directory `name` in
 /// `parent` (printed as `path`), `depth` levels below an operand; `follow`:
 /// the walk followed `name` if it is a symlink. A directory deep enough lets
@@ -522,7 +549,8 @@ fn chown_path(
 /// `-L` is GNU's `FTS_LOGICAL`, which walks by full path (`FTS_NOCHDIR`): a
 /// directory may be reached through a symlink, whose `..` is not where the
 /// walk came from. So does this, failing where GNU's does (`PATH_MAX`, a
-/// symlink loop).
+/// symlink chain too long to resolve); a directory that is its own
+/// ancestor is found by `chown_path` before it gets here.
 fn chown_dir(
     parent: &mut Parent,
     name: &CStr,
@@ -625,6 +653,7 @@ mod tests {
             verbose: false,
             quiet: true,
             root_dev_ino: root,
+            active_dirs: RefCell::default(),
         }
     }
 
