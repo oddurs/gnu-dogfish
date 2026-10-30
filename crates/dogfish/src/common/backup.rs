@@ -10,7 +10,7 @@ use dogfish_core::journal::inode;
 use dogfish_core::{JournalAction, JournalEntry, Take, UndoJournal, crash_point, move_path};
 
 use crate::common::getopt::argmatch;
-use crate::common::path::{absolute, base_len, c_path, last_component, rename_noreplace};
+use crate::common::path::{base_len, c_path, last_component, rename_noreplace, stable_path};
 
 /// `--backup` version control, as in GNU `backupfile`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,49 +184,80 @@ fn check_extension(s: &mut Vec<u8>, filelen: usize, dir: &Path) -> bool {
     false
 }
 
+/// A rename made by [`make_backup`].
+pub(crate) struct Backup {
+    /// The backup's name, spelled after the destination operand (for messages).
+    pub(crate) name: PathBuf,
+    /// The names by which the backup and the destination are reached
+    /// afterwards (to put the backup back, or to replace the destination),
+    /// as GNU reaches them: through the target directory's descriptor, so
+    /// they keep naming the renamed entries when the rename moved a symlink
+    /// the operand goes through (`cp -r l/l l/l`, `l` a symlink to `.`, backs
+    /// up `l/l/l`, which is `l`), else by the destination's name as spelled.
+    pub(crate) real: PathBuf,
+    pub(crate) real_dst: PathBuf,
+    /// The rename's journal entry.
+    pub(crate) entry: Option<JournalEntry>,
+}
+
 /// gnulib `backup_file_rename`: renames `dst` to its backup name (never over an
 /// existing numbered backup) and returns that name, with its journal entry.
 /// With a journal, the rename is recorded (before it happens, see
 /// [`UndoJournal::begin`]) and a backup file that is about to be replaced is
 /// saved first, so `dogfish undo` can bring everything back.
+///
+/// `real_dst` is how `dst` is reached (see [`Backup::real`]). The journal
+/// records both names with their directory resolved ([`stable_path`]), as
+/// they are when renamed, so undo puts back what was renamed.
 pub(crate) fn make_backup(
     dst: &Path,
+    real_dst: &Path,
     mode: BackupMode,
     suffix: &str,
     journal: Option<&UndoJournal>,
     tool: &str,
-) -> io::Result<(PathBuf, Option<JournalEntry>)> {
+) -> io::Result<Backup> {
+    let in_dir = |dir: &Path, name: &Path| match (dir.parent(), name.file_name()) {
+        (Some(d), Some(base)) => d.join(base),
+        _ => name.to_path_buf(),
+    };
+    let stable_dst = stable_path(real_dst);
     loop {
-        let (backup, mode, fits) = backup_candidate(dst, mode, suffix);
+        let (name, mode, fits) = backup_candidate(dst, mode, suffix);
+        let backup = in_dir(real_dst, &name);
+        let stable_backup = in_dir(&stable_dst, &name);
         let mut entry = match journal {
             Some(j) => Some(j.begin(
                 tool,
                 JournalAction::Move {
-                    src: absolute(dst),
-                    dst: absolute(&backup),
+                    src: stable_dst.clone(),
+                    dst: stable_backup.clone(),
                     backup_path: None,
                     copied: false,
-                    existed: fs::symlink_metadata(&backup).is_ok(),
-                    src_inode: inode(dst),
+                    existed: fs::symlink_metadata(&stable_backup).is_ok(),
+                    src_inode: inode(&stable_dst),
+                    src_link: None,
                 },
             )?),
             None => None,
         };
         let saved = match (journal, &mut entry) {
-            (Some(j), Some(e)) if mode == BackupMode::Simple => j.take(e, &backup, Take::Move)?,
+            (Some(j), Some(e)) if mode == BackupMode::Simple => {
+                j.take(e, &stable_backup, Take::Move)?
+            }
             _ => None,
         };
         crash_point();
         let res = if mode == BackupMode::Simple {
-            fs::rename(dst, &backup)
+            fs::rename(&stable_dst, &stable_backup)
         } else {
-            rename_noreplace(dst, &backup)
+            rename_noreplace(&stable_dst, &stable_backup)
         };
         if let Err(e) = res {
             if let (Some(j), Some(mut entry)) = (journal, entry) {
                 let back = saved
                     .as_ref()
-                    .is_none_or(|s| move_path(Path::new(s), &backup).is_ok());
+                    .is_none_or(|s| move_path(Path::new(s), &stable_backup).is_ok());
                 if back {
                     let _ = j.cancel(&mut entry);
                 }
@@ -240,6 +271,11 @@ pub(crate) fn make_backup(
         if let (Some(j), Some(e)) = (journal, &mut entry) {
             let _ = j.commit(e);
         }
-        return Ok((backup, entry));
+        return Ok(Backup {
+            name,
+            real: backup,
+            real_dst: real_dst.to_path_buf(),
+            entry,
+        });
     }
 }

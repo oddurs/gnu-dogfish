@@ -525,6 +525,7 @@ fn copy_into(
     parents: bool,
     strip_slashes: bool,
 ) -> bool {
+    copier.set_target_dir(Path::new(dir));
     if sources.len() >= 2 {
         copier.track_destinations();
         copier.track_sources();

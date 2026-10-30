@@ -1146,6 +1146,17 @@ tree_cases! {
     cp_hard_link_symlink_onto_symlink: "cp" ["-dl", "la", "lla"];
     cp_force_symbolic_onto_hard_link: "cp" ["-sf", "h1", "h2"];
     cp_no_dereference_hard_linked_symlinks: "cp" ["-d", "ll1", "lh1"] setup("ln lh1 ll1");
+    // Through a symlink to the directory itself: `s/s/s` is the entry `s/s`
+    // (the same file, checked before any backup), and a backup renames the
+    // symlink, after which the operand's path no longer leads anywhere.
+    cp_backup_onto_itself_through_dir_symlink: "cp" ["--backup=simple", "-r", "s/s", "s/s"]
+        setup("mkdir s && : > s/c && ln -s ../s s/s");
+    mv_backup_through_dir_symlink: "mv" ["--backup=numbered", "s", "s/s"]
+        setup("mkdir s && : > s/c && ln -s ../s s/s");
+    mv_simple_backup_through_dir_symlink: "mv" ["-bv", "s", "s/s"]
+        setup("mkdir s && : > s/c && ln -s ../s s/s");
+    cp_backup_through_dot_symlink_cannot_unbackup: "cp" ["-Pbv", "-T", "la", "l/l"]
+        setup("ln -s . l");
 
     // Option parsing (glibc getopt_long and the order GNU checks things in).
     cp_keep_directory_symlink_is_9_5: "cp" ["--keep-directory-symlink", "a", "n"];

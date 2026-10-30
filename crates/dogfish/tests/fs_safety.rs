@@ -686,3 +686,127 @@ fn failed_cp_link_with_backup_puts_the_backup_back_and_records_nothing() {
     assert!(sb.history().is_empty(), "{:?}", sb.history());
     remove_other_fs_trash(&sb);
 }
+
+/// `a/` holding `c` and `a/a`, a symlink to `../a` (so `a/a/a` is `a/a`).
+fn dir_with_symlink_to_itself(sb: &Sandbox) {
+    sb.write("a/c", "");
+    symlink("../a", sb.path("a/a")).unwrap();
+}
+
+#[test]
+fn cp_backup_onto_itself_through_a_directory_symlink_changes_nothing() {
+    // `a/a/a` is the entry `a/a`. The same-file check compared the parent
+    // directories without following `a/a`, so cp renamed `a/a` to `a/a~`
+    // and then failed, leaving it renamed.
+    let sb = Sandbox::new();
+    dir_with_symlink_to_itself(&sb);
+    let out = sb.run(&["cp", "--backup=simple", "-r", "a/a", "a/a"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), "cp: 'a/a' and 'a/a/a' are the same file\n");
+    assert_eq!(fs::read_link(sb.path("a/a")).unwrap(), Path::new("../a"));
+    assert!(!sb.exists("a/a~"));
+    assert!(sb.history().is_empty(), "{:?}", sb.history());
+}
+
+#[test]
+fn undo_puts_back_a_backup_made_through_a_symlink_it_renamed() {
+    // The backup renames the symlink the destination's path goes through;
+    // the journal recorded the path as spelled (`a/a/a`), which then named
+    // nothing, so undo left the symlink renamed.
+    let sb = Sandbox::new();
+    dir_with_symlink_to_itself(&sb);
+    let out = sb.run(&["mv", "--backup=numbered", "a", "a/a"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "mv: cannot move 'a' to a subdirectory of itself, 'a/a/a'\n"
+    );
+    assert!(sb.exists("a/a.~1~"));
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(fs::read_link(sb.path("a/a")).unwrap(), Path::new("../a"));
+    assert!(!sb.exists("a/a.~1~"));
+
+    // As GNU, cp can't put the backup back by the path as spelled; undo can.
+    symlink(".", sb.path("l")).unwrap();
+    let out = sb.run(&["cp", "-Pb", "-T", "a/a", "l/l"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("cannot un-backup 'l/l'"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(sb.run(&["undo"]).status.success());
+    assert_eq!(fs::read_link(sb.path("l")).unwrap(), Path::new("."));
+    assert!(!sb.exists("l~"));
+    assert!(sb.history().is_empty(), "{:?}", sb.history());
+}
+
+#[test]
+fn undo_of_mv_across_file_systems_keeps_hard_links() {
+    // The move copies `a` and unlinks it; its inode lives on as `b`. Undo
+    // used to copy the file back as a new inode, so `a` and `b` were no
+    // longer one file (and undoing an earlier in-place `cp` into it then
+    // reached `a` only).
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    let sb = Sandbox::new();
+    let (a, b) = (other.path().join("a"), other.path().join("b"));
+    fs::write(&a, "").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    sb.write("a", "\0");
+    fs::hard_link(sb.path("a"), sb.path("b")).unwrap();
+    let a_str = a.to_str().unwrap();
+    for args in [["cp", "a", a_str], ["mv", a_str, "a"]] {
+        let out = sb.run(&args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(fs::read_to_string(&b).unwrap(), "\0");
+    for _ in 0..2 {
+        let out = sb.run(&["undo"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    assert!(same_inode(&a, &b));
+    assert_eq!(fs::read_to_string(&a).unwrap(), "");
+    assert!(same_inode(&sb.path("a"), &sb.path("b")));
+    assert_eq!(sb.read("a"), "\0");
+    assert!(sb.history().is_empty());
+    remove_other_fs_trash(&sb);
+}
+
+#[test]
+fn undo_of_mv_across_file_systems_after_an_edit_keeps_both_versions() {
+    // Once the moved copy or the original (through another link) has
+    // changed, the kept inode can't stand in for the copy: undo copies the
+    // copy back as a new file, the other link keeps what it holds, and the
+    // kept inode stays in the trash.
+    let Some(other) = other_fs_dir() else {
+        eprintln!("note: no second file system at /dev/shm");
+        return;
+    };
+    for edit_copy in [true, false] {
+        let sb = Sandbox::new();
+        let (a, b) = (other.path().join("a"), other.path().join("b"));
+        fs::write(&a, "old").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        let out = sb.run(&["mv", a.to_str().unwrap(), "c"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let (moved, linked) = if edit_copy {
+            sb.write("c", "edited");
+            ("edited", "old")
+        } else {
+            fs::write(&b, "edited").unwrap();
+            ("old", "edited")
+        };
+        let out = sb.run(&["undo"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!sb.exists("c"));
+        assert_eq!(fs::read_to_string(&a).unwrap(), moved);
+        assert_eq!(fs::read_to_string(&b).unwrap(), linked);
+        assert!(!same_inode(&a, &b));
+        remove_other_fs_trash(&sb);
+        fs::remove_file(&a).unwrap();
+        fs::remove_file(&b).unwrap();
+    }
+}

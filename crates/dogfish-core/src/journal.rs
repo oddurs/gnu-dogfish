@@ -124,6 +124,17 @@ pub enum JournalAction {
         /// the evidence that a file at `dst` is `src` renamed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         src_inode: Option<(u64, u64)>,
+        /// A move across file systems of a non-directory with other hard
+        /// links: a hard link to `src`'s inode, kept in the trash on `src`'s
+        /// file system (named here before it is made, and before `src` is
+        /// unlinked). Undo renames it back to `src`, so the other links share
+        /// the file again, instead of copying `dst` back as a new inode.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "json_path::option"
+        )]
+        src_link: Option<PathBuf>,
     },
     /// File or directory created via `cp` (`created_path`). `backup_path` holds the prior
     /// contents of `created_path` if the copy overwrote or merged into something.
@@ -161,11 +172,13 @@ impl JournalAction {
     }
 
     /// Everything this entry keeps in the trash, deleted once the entry is dropped.
-    fn payload_path(&self) -> Option<&Path> {
-        match self {
-            Self::TrashRemove { trash_path, .. } => Some(trash_path),
-            _ => self.backup_path(),
-        }
+    fn payload_paths(&self) -> impl Iterator<Item = &Path> {
+        let (main, link) = match self {
+            Self::TrashRemove { trash_path, .. } => (Some(trash_path.as_path()), None),
+            Self::Move { src_link, .. } => (self.backup_path(), src_link.as_deref()),
+            Self::CopyCreate { .. } => (self.backup_path(), None),
+        };
+        main.into_iter().chain(link)
     }
 
     fn drop_backup(&mut self) -> Option<PathBuf> {
@@ -801,7 +814,7 @@ impl UndoJournal {
         for old in all {
             if excess > 0 && !old.pending {
                 excess -= 1;
-                if let Some(p) = old.action.payload_path() {
+                for p in old.action.payload_paths() {
                     crash_point();
                     remove_any(p)?;
                 }
@@ -848,7 +861,7 @@ impl UndoJournal {
 
         let referenced: HashSet<PathBuf> = entries
             .iter()
-            .filter_map(|e| e.action.payload_path().map(Path::to_path_buf))
+            .flat_map(|e| e.action.payload_paths().map(Path::to_path_buf))
             .collect();
         for (i, dir) in self.trash_dirs().iter().enumerate() {
             let items = match fs::read_dir(dir) {
@@ -907,6 +920,40 @@ impl UndoJournal {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// mv across file systems, about to unlink `src` (a copy of it is complete
+    /// at the destination): when `src` is a non-directory with other hard
+    /// links, keeps a hard link to it in the trash on its file system, as the
+    /// `src_link` of the pending `entry` (a `Move`). The slot is recorded in
+    /// the journal before it is made. Returns it, or `None` when there is
+    /// nothing to keep or it can't be linked there (undo then copies the
+    /// destination back, as for a file with no other links).
+    pub fn keep_link(&self, entry: &mut JournalEntry, src: &Path) -> io::Result<Option<PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        let JournalAction::Move { src_link, .. } = &mut entry.action else {
+            return Ok(None);
+        };
+        let Ok(m) = fs::symlink_metadata(src) else {
+            return Ok(None);
+        };
+        if m.is_dir() || m.nlink() < 2 {
+            return Ok(None);
+        }
+        let slot = self.trash_slot(src);
+        *src_link = Some(slot.clone());
+        self.update(entry)?;
+        crash_point();
+        if fs::hard_link(src, &slot).is_ok() {
+            return Ok(Some(slot));
+        }
+        // Recorded but not made: undo finds no slot and copies back, so
+        // failing to say so is harmless.
+        if let JournalAction::Move { src_link, .. } = &mut entry.action {
+            *src_link = None;
+        }
+        let _ = self.update(entry);
+        Ok(None)
     }
 
     /// Stages a file or directory into `~/.dogfish/trash` and records a `TrashRemove` entry.
@@ -974,12 +1021,13 @@ impl UndoJournal {
                 copied,
                 existed,
                 src_inode,
+                src_link,
             } => self.undo_move(
                 &entry,
                 src,
                 dst,
                 backup_path.as_deref(),
-                (*copied, *existed, *src_inode),
+                (*copied, *existed, *src_inode, src_link.as_deref()),
             )?,
             JournalAction::CopyCreate {
                 created_path,
@@ -1041,7 +1089,7 @@ impl UndoJournal {
         src: &Path,
         dst: &Path,
         backup: Option<&Path>,
-        (copied, existed, src_inode): (bool, bool, Option<(u64, u64)>),
+        (copied, existed, src_inode, src_link): (bool, bool, Option<(u64, u64)>, Option<&Path>),
     ) -> io::Result<String> {
         let (s, t) = (exists_no_follow(src), exists_no_follow(dst));
         let b = backup.is_some_and(exists_no_follow);
@@ -1057,7 +1105,18 @@ impl UndoJournal {
             move_back =
                 !entry.pending || copied || src_inode.is_some_and(|i| inode(dst) == Some(i));
         } else if s && t {
-            if copied {
+            if copied && fs::symlink_metadata(src).is_ok_and(|m| !m.is_dir()) {
+                // Interrupted before unlinking `src` (one step for a
+                // non-directory): it is intact, so keep it (its inode and
+                // hard links) and drop the copy.
+                set_aside_dst = true;
+                if let Some(link) = src_link
+                    && inode(link).is_some_and(|i| inode(src) == Some(i))
+                {
+                    crash_point();
+                    fs::remove_file(link)?;
+                }
+            } else if copied {
                 set_aside_src = true;
                 move_back = true;
             } else if entry.pending {
@@ -1084,7 +1143,16 @@ impl UndoJournal {
                 crash_point();
                 fs::create_dir_all(parent)?;
             }
-            move_path(dst, src)?;
+            match src_link.filter(|l| Self::same_file_kept(l, dst)) {
+                // The inode `src` was, with its other hard links: put it back
+                // and set the copy aside.
+                Some(link) => {
+                    crash_point();
+                    fs::rename(link, src)?;
+                    set_aside_dst = true;
+                }
+                None => move_path(dst, src)?,
+            }
         }
         if set_aside_dst {
             self.set_aside(dst)?;
@@ -1108,6 +1176,15 @@ impl UndoJournal {
         } else {
             format!("Nothing to move back to '{src}'")
         })
+    }
+
+    /// Whether the hard link kept of a moved file (`link`) can stand in for
+    /// the copy at `dst`: both are non-directories, with the same contents
+    /// and permission bits. If either was changed since the move, undo copies
+    /// `dst` back instead, as a new file: the other links keep what they hold
+    /// and `link` stays in the trash, so neither version is lost.
+    fn same_file_kept(link: &Path, dst: &Path) -> bool {
+        fs::symlink_metadata(link).is_ok_and(|m| !m.is_dir()) && same_tree(link, dst)
     }
 
     fn undo_copy(
@@ -1268,6 +1345,7 @@ mod tests {
             copied: false,
             existed: false,
             src_inode: None,
+            src_link: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // UTF-8 paths stay plain strings; others are base64 bytes.

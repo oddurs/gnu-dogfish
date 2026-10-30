@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
-use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use proptest::test_runner::{Config, FileFailurePersistence, TestCaseError, TestRunner};
 
 // ------------------------------------------------------------------ trees
 
@@ -481,15 +481,43 @@ impl Sandbox {
         args
     }
 
-    /// Whether `op` is a `mv` between the two file systems.
-    fn moves_across(&self, op: &Op) -> bool {
+    /// Whether `op` is a `mv` between the two file systems of a directory
+    /// holding a file with hard links outside it. The move copies the tree,
+    /// so, as with GNU, those links are not kept, and undo can't restore
+    /// them; nor can it undo, for the outside links, an earlier change made
+    /// in place through a name inside the tree (it reaches only the copy).
+    /// (A non-directory keeps its links: undo puts its inode back.)
+    fn splits_links(&self, op: &Op) -> bool {
         let Some(other) = &self.other else {
             return false;
         };
         let on_other = |p: &P| self.render(p).starts_with(&*other.to_string_lossy());
+        let linked_outside = |p: &P| {
+            let path = self.work.join(self.render(p));
+            let mut dirs = vec![path.clone()];
+            dirs.extend(fs::canonicalize(&path).ok());
+            dirs.into_iter().any(|dir| {
+                if !fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+                    return false;
+                }
+                let mut inner = Vec::new();
+                walk(&dir, Path::new(""), &mut inner);
+                let mut names: HashMap<(u64, u64), u64> = HashMap::new();
+                for (_, m) in &inner {
+                    if !m.is_dir() {
+                        *names.entry((m.dev(), m.ino())).or_default() += 1;
+                    }
+                }
+                inner
+                    .iter()
+                    .any(|(_, m)| !m.is_dir() && m.nlink() > names[&(m.dev(), m.ino())])
+            })
+        };
+        let srcs = &op.paths[..op.paths.len().saturating_sub(1)];
         matches!(op.tool, Tool::Mv)
             && op.paths.iter().any(on_other)
             && !op.paths.iter().all(on_other)
+            && srcs.iter().any(linked_outside)
     }
 
     /// Whether `op` could open a FIFO for reading or writing and block (as
@@ -654,12 +682,12 @@ fn check_sequence(
     setup(&sb, work, other);
     let before = snapshot(&sb.roots());
     let mut log = String::new();
-    let mut moved_across = false;
+    let mut split_links = false;
     for op in ops {
         if sb.may_block(op) {
             continue;
         }
-        moved_across |= sb.moves_across(op);
+        split_links |= sb.splits_links(op);
         let pre = snapshot(&sb.roots());
         let args = sb.op_args(op);
         let out = sb.run(&args, &[])?;
@@ -690,11 +718,21 @@ fn check_sequence(
     }
     STATS[2].fetch_add(sb.journal_len()? as u64, Ordering::Relaxed);
     sb.undo_all(&log)?;
-    let mut after = snapshot(&sb.roots());
-    if moved_across {
-        // A move across file systems copies: like GNU's, it cannot keep hard
-        // links to files outside what it moves, and neither can moving back.
-        after.links = before.links.clone();
+    let after = snapshot(&sb.roots());
+    if split_links {
+        // See `Sandbox::splits_links`: the tree can't be restored exactly,
+        // but every content must still be in it or in the trash.
+        let mut have = file_contents(&after);
+        have.extend(sb.trash_contents());
+        for data in file_contents(&before) {
+            prop_assert!(
+                have.contains(&data),
+                "content {:?} lost by undo\n{}",
+                String::from_utf8_lossy(&data),
+                log
+            );
+        }
+        return Ok(());
     }
     prop_assert!(
         before == after,
@@ -708,10 +746,18 @@ fn check_sequence(
 /// Operations that failed, that succeeded, and journal entries undone.
 static STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// A runner that replays the seeds saved in `undo_model.proptest-regressions`
+/// (next to this file) before new cases, and saves the seed of a new failure
+/// there. On failure proptest prints that seed (a `cc ...` line) and the
+/// shrunk input, so a failure in CI can be replayed by adding the line to the
+/// file. `PROPTEST_RNG_SEED` fixes the seed of the random cases.
 fn runner(default_cases: u32) -> TestRunner {
     TestRunner::new(Config {
         cases: cases(default_cases),
-        failure_persistence: None,
+        source_file: Some(file!()),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
         max_shrink_iters: 2048,
         ..Config::default()
     })
@@ -753,10 +799,10 @@ fn check_crash(
     setup(&sb, work, other);
     let before = snapshot(&sb.roots());
     let mut log = String::new();
-    let mut moved_across = false;
+    let mut split_links = false;
     for p in prefix {
         if !sb.may_block(p) {
-            moved_across |= sb.moves_across(p);
+            split_links |= sb.splits_links(p);
             let args = sb.op_args(p);
             sb.run(&args, &[])?;
             log += &format!("$ dogfish {}\n", args.join(" "));
@@ -765,7 +811,7 @@ fn check_crash(
     if sb.may_block(op) {
         return Ok(false);
     }
-    moved_across |= sb.moves_across(op);
+    split_links |= sb.splits_links(op);
     let args = sb.op_args(op);
     let out = sb.run(&args, &[("DOGFISH_CRASH_AT", n.to_string())])?;
     use std::os::unix::process::ExitStatusExt;
@@ -793,12 +839,9 @@ fn check_crash(
             log
         );
     }
-    if !crashed {
+    if !crashed && !split_links {
         // Ran to completion: the ordinary contract holds.
-        let mut after = snapshot(&sb.roots());
-        if moved_across {
-            after.links = before.links.clone();
-        }
+        let after = snapshot(&sb.roots());
         prop_assert!(
             before == after,
             "undo did not restore the tree:\n{}{}",
@@ -853,6 +896,73 @@ fn crash_hook_is_inert_in_release_builds() {
     }
 }
 
+// ------------------------------------------------------------ fixed cases
+
+fn file(data: &[u8]) -> Node {
+    Node::File {
+        data: data.to_vec(),
+        mode: 0o644,
+    }
+}
+
+fn dir(children: Vec<(usize, Node)>) -> Node {
+    Node::Dir {
+        mode: 0o755,
+        children,
+    }
+}
+
+/// `NAMES[first]` in the work tree, or on the other file system.
+fn at(first: usize, other_fs: bool) -> P {
+    P {
+        pick: None,
+        first,
+        second: None,
+        other_fs,
+        slash: false,
+    }
+}
+
+fn fixed_op(tool: Tool, flags: &[&'static str], paths: Vec<P>) -> Op {
+    Op {
+        tool,
+        flags: flags.to_vec(),
+        paths,
+    }
+}
+
+/// A work tree, the tree on the other file system, and the operations.
+type Case = (Vec<(usize, Node)>, Vec<(usize, Node)>, Vec<Op>);
+
+/// Counterexamples the random sequences found, kept as fixed cases.
+#[test]
+fn undo_restores_known_counterexamples() {
+    // cairn 0063: `cp` writes into the existing `a` on one file system, so
+    // the `b` hard-linked to it changes too; `mv` then copies that `a` to
+    // the other file system and unlinks it. Undoing the move copied it back
+    // as a new inode, and undoing the `cp` then restored only that one,
+    // leaving `b` changed. Both directions, with either content copied.
+    let mut cases: Vec<Case> = Vec::new();
+    for (theirs, ours) in [(&b"\0"[..], &b""[..]), (b"", b"\0")] {
+        let linked = |data: &[u8]| vec![(0, file(data)), (1, Node::HardLink(0))];
+        for to_other in [true, false] {
+            cases.push((
+                linked(if to_other { theirs } else { ours }),
+                linked(if to_other { ours } else { theirs }),
+                vec![
+                    fixed_op(Tool::Cp, &[], vec![at(0, !to_other), at(0, to_other)]),
+                    fixed_op(Tool::Mv, &[], vec![at(0, to_other), at(0, !to_other)]),
+                ],
+            ));
+        }
+    }
+    for (work, other, ops) in &cases {
+        if let Err(e) = check_sequence(work, other, ops) {
+            panic!("{ops:?}: {e}");
+        }
+    }
+}
+
 /// Operations whose every step is in the journal before it happens: killed at
 /// any step, undoing what the journal holds brings back the exact tree.
 #[test]
@@ -860,26 +970,6 @@ fn crash_then_undo_restores_exactly() {
     if !cfg!(debug_assertions) {
         return;
     }
-    let file = |data: &[u8]| Node::File {
-        data: data.to_vec(),
-        mode: 0o644,
-    };
-    let dir = |children: Vec<(usize, Node)>| Node::Dir {
-        mode: 0o755,
-        children,
-    };
-    let at = |first: usize, other_fs: bool| P {
-        pick: None,
-        first,
-        second: None,
-        other_fs,
-        slash: false,
-    };
-    let op = |tool: Tool, flags: &[&'static str], paths: Vec<P>| Op {
-        tool,
-        flags: flags.to_vec(),
-        paths,
-    };
     // a: a file hard-linked as c; b: a directory; d: a file.
     let work = vec![
         (0, file(b"a")),
@@ -892,20 +982,24 @@ fn crash_then_undo_restores_exactly() {
     ];
     let other = vec![(0, file(b"other a")), (1, Node::HardLink(0))];
     let cases = [
-        op(Tool::Rm, &["-r"], vec![at(1, false)]),
-        op(Tool::Rm, &[], vec![at(0, true)]),
-        op(Tool::Mv, &[], vec![at(3, false), at(0, false)]),
-        op(Tool::Mv, &["-b"], vec![at(3, false), at(0, false)]),
-        op(Tool::Mv, &[], vec![at(1, false), at(2, true)]),
-        op(Tool::Mv, &[], vec![at(3, false), at(0, true)]),
-        op(Tool::Cp, &[], vec![at(3, false), at(0, false)]),
-        op(
+        fixed_op(Tool::Rm, &["-r"], vec![at(1, false)]),
+        fixed_op(Tool::Rm, &[], vec![at(0, true)]),
+        fixed_op(Tool::Mv, &[], vec![at(3, false), at(0, false)]),
+        fixed_op(Tool::Mv, &["-b"], vec![at(3, false), at(0, false)]),
+        fixed_op(Tool::Mv, &[], vec![at(1, false), at(2, true)]),
+        fixed_op(Tool::Mv, &[], vec![at(3, false), at(0, true)]),
+        fixed_op(Tool::Cp, &[], vec![at(3, false), at(0, false)]),
+        fixed_op(
             Tool::Cp,
             &["--remove-destination"],
             vec![at(3, false), at(0, false)],
         ),
-        op(Tool::Cp, &["-b"], vec![at(3, false), at(0, false)]),
-        op(Tool::Cp, &[], vec![at(3, false), at(0, true)]),
+        fixed_op(Tool::Cp, &["-b"], vec![at(3, false), at(0, false)]),
+        fixed_op(Tool::Cp, &[], vec![at(3, false), at(0, true)]),
+        // Hard-linked files moved across file systems, both ways.
+        fixed_op(Tool::Mv, &[], vec![at(0, false), at(2, true)]),
+        fixed_op(Tool::Mv, &[], vec![at(0, true), at(2, false)]),
+        fixed_op(Tool::Mv, &["-b"], vec![at(0, true), at(3, false)]),
     ];
     for op in &cases {
         for n in 1..200 {
@@ -920,10 +1014,7 @@ fn crash_then_undo_restores_exactly() {
             let crashed = out.status.signal() == Some(libc::SIGKILL);
             let log = format!("$ DOGFISH_CRASH_AT={n} dogfish {}", args.join(" "));
             sb.undo_all(&log).unwrap();
-            let mut after = snapshot(&sb.roots());
-            if sb.moves_across(op) {
-                after.links = before.links.clone();
-            }
+            let after = snapshot(&sb.roots());
             assert!(
                 before == after,
                 "{log}: undo did not restore the tree:\n{}",
