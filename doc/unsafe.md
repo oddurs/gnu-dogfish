@@ -171,7 +171,8 @@ with `read(2)` instead.
 | Item | Operation | Why it is sound |
 | --- | --- | --- |
 | `local_time` | `localtime_r` and `tm_zone` | Out-pointer; a non-null `tm_zone` points at libc's zone-name storage and is copied before any other time call. |
-| `format_time` | `mktime` for `%s` | In/out pointer to a local, initialized `struct tm` copy. |
+| `format_time_within` | `mktime` for `%s` | In/out pointer to a local, initialized `struct tm` copy. |
+| `push_underlying` | `strftime` for what gnulib leaves to the C library (`%EC`, `%Oy`, ...) | NUL-terminated format in a local array; the output buffer is a local array of the length passed; `tm` comes from `localtime_r`. |
 
 ### `crates/dogfish/src/common/dirfd.rs`
 
@@ -253,13 +254,6 @@ with `read(2)` instead.
 | --- | --- | --- |
 | `keep_ignored_sigpipe` | `sigaction` to read SIGPIPE's disposition | A null new action; the old one is written to a zeroed local `sigaction`. |
 | `keep_ignored_sigpipe` | `CommandExt::pre_exec` | The closure runs in the forked child and only calls `signal`, which is async-signal-safe. |
-
-### `crates/dogfish/src/common/strftime.rs`
-
-| Item | Operation | Why it is sound |
-| --- | --- | --- |
-| `local_tm` | `localtime_r` | Out-pointer. |
-| `tm_zone_name` | `CStr::from_ptr(tm_zone)` | Checked non-null first; `localtime_r` sets it to a static C string. |
 
 ### `crates/dogfish/src/common/uname_info.rs`
 

@@ -37,7 +37,7 @@ GNU/Dogfish aims to be byte-for-byte compatible with GNU coreutils 9.4 for every
 - **`env -v`**: not every debug line is reproduced.
 - **`id ''`**: the error message lacks GNU's errno suffix.
 - **`printf '\u...'`**: always emits UTF-8, even in the C locale.
-- **`date`**: setting the clock is refused; `--resolution` is not implemented.
+- **`date`**: setting the clock is refused; `--resolution` is not implemented, and neither is the clock-resolution width GNU gives a `%-N` in a date format (Dogfish prints `%-N` as `ls` and `du` do, without trailing zeros; GNU `date` prints `%9N` on Linux).
 
 ## Deliberate extensions (not bugs)
 

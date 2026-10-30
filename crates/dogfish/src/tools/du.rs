@@ -23,7 +23,7 @@ use crate::common::human::{
 };
 use crate::common::json_opt::{check_json_version, json_long, json_short};
 use crate::common::quote::{Quoting, qa, qf, quote_bytes, quote_locale};
-use crate::common::strftime::{Timespec, format_local_time};
+use crate::common::strftime::{Timespec, print_local_time};
 
 const DU_OPTIONS: &[OptSpec<&str>] = &[
     OptSpec::both(b'a', "all", HasArg::No, "all"),
@@ -868,13 +868,21 @@ fn du_time_format(style: Option<OsString>) -> std::result::Result<String, i32> {
     argmatch("du", "time style", &style, &styles).map(str::to_string)
 }
 
-/// A `--time` timestamp as GNU's `show_date` prints it.
-fn du_show_time(format: &str, t: Timespec) -> String {
-    format_local_time(format, t).unwrap_or_else(|| {
-        let secs = t.sec.to_string();
-        eprintln!("du: time {} is out of range", quote_locale(&secs));
-        secs
-    })
+/// A `--time` timestamp as GNU's `show_date` prints it: the seconds, after
+/// a diagnostic, when the time has no broken-down form. `flush` runs first
+/// then, as GNU's error() flushes what was printed before.
+fn du_show_time(
+    format: &str,
+    t: Timespec,
+    flush: impl FnOnce() -> io::Result<()>,
+) -> io::Result<String> {
+    if let Some(text) = print_local_time(format, t) {
+        return Ok(text);
+    }
+    flush()?;
+    let secs = t.sec.to_string();
+    eprintln!("du: time {} is out of range", quote_locale(&secs));
+    Ok(secs)
 }
 
 pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32> {
@@ -1121,11 +1129,8 @@ pub fn run_du(args: Vec<std::ffi::OsString>, ctx: &DogfishContext) -> Result<i32
         out.write_all(format_size_gnu(line.size).as_bytes())?;
         out.write_all(b"\t")?;
         if let Some(format) = &time_format {
-            if format_local_time(format, line.time).is_none() {
-                // GNU's error() flushes what was printed first.
-                out.flush()?;
-            }
-            out.write_all(du_show_time(format, line.time).as_bytes())?;
+            let text = du_show_time(format, line.time, || out.flush())?;
+            out.write_all(text.as_bytes())?;
             out.write_all(b"\t")?;
         }
         out.write_all(&line.path)?;

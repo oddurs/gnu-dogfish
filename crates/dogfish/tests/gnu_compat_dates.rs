@@ -580,3 +580,98 @@ gnu_cases! {
     // A TZ="..." name that is not UTF-8 is echoed as bytes.
     date_debug_tz_not_utf8: "date" ["--debug", "-f", "-", "-R"] env [("TZ", "Asia/Kolkata")] stdin b"TZ=\"\x80\" 2000-01-01\nTZ=\"E\x95ST5\" 00:00\n";
 }
+
+// nstrftime as ls, du and stat use it too: the E and O modifiers (what
+// gnulib leaves to glibc's strftime), unknown conversions, and the flags a
+// subformat passes on.
+gnu_cases! {
+    date_modifiers_odd_years: "date" ["-f", "-", "+%EC|%Ey|%EY|%Oy|%OC|%Og|%OG|%_5Od|%-Od|%_Oe|%5EY|%^Ox|%#Eb|%Oq|%_6Oz"] env [("TZ", "UTC0")] stdin b"@-62200000000\n@-100000000000\n@-62162035200\n@0\n@67767976233316800\n";
+    date_modifiers_offset: "date" ["-d", "@0", "+%Oz|%_9Oz|%-Oz|%5Oz"] env [("TZ", "Asia/Kolkata")];
+    date_modifiers_negative_offset: "date" ["-d", "@0", "+%Oz|%_9Oz|%-Oz|%5Oz"] env [("TZ", "America/St_Johns")];
+    date_unknown_conversions: "date" ["-d", "@0", "+[%5J][%_5J][%5OX][%5:J][%5::J][%5%d][%^5%d][%5E][%5::::z][%::%d][%:][%5]"] env [("TZ", "UTC0")];
+    date_flagged_subformats: "date" ["-f", "-", "+%_D|%-D|%+D|%_F|%-F|%3F|%12F|%+12F|%_15F|%010F"] env [("TZ", "UTC0")] stdin b"@-62200000000\n@-62162035200\n@0\n";
+}
+
+/// ls, du and stat format file times with the formatter `date` uses
+/// (`common/date_format.rs`): files dated in odd years, from before year 0
+/// to the largest `int` year.
+mod odd_years {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// The fixture files, `y<seconds since the epoch>`.
+    const FILES: [&str; 9] = [
+        "y-67768040609740800", // the first second of year -2147481748
+        "y-12219292800000",
+        "y-100000000000", // year -1199
+        "y-62200000000",  // year -2
+        "y-62167219200",  // year 0
+        "y-62135596800",  // year 1
+        "y-59000000000",
+        "y67767976233316800",
+        "y67768036191676799", // the last second of year 2147485547
+    ];
+
+    fn stamp(name: &str) -> SystemTime {
+        let secs: i64 = name[1..].parse().unwrap();
+        let d = Duration::from_secs(secs.unsigned_abs());
+        if secs < 0 {
+            UNIX_EPOCH - d
+        } else {
+            UNIX_EPOCH + d
+        }
+    }
+
+    /// Creates the files in `dir`; false if its file system cannot hold
+    /// their times (ext4 with 128-byte inodes keeps 1901 to 2446 only).
+    fn make_files(dir: &Path) -> bool {
+        FILES.iter().all(|name| {
+            let path = dir.join(name);
+            let t = stamp(name);
+            let times = std::fs::FileTimes::new().set_accessed(t).set_modified(t);
+            std::fs::File::create(&path).is_ok_and(|f| f.set_times(times).is_ok())
+                && std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|m| m == t)
+        })
+    }
+
+    fn fixtures() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = super::common::fresh_fixture_dir().join("odd-years");
+            std::fs::create_dir_all(&dir).unwrap();
+            if make_files(&dir) {
+                return dir;
+            }
+            // tmpfs keeps 64-bit times. One directory per test binary and
+            // user (the owner of `dir`), replaced on every run.
+            let uid = std::fs::metadata(&dir).map_or(0, |m| m.uid());
+            let shm =
+                Path::new("/dev/shm").join(format!("{}-odd-years-{uid}", env!("CARGO_CRATE_NAME")));
+            let _ = std::fs::remove_dir_all(&shm);
+            if std::fs::create_dir_all(&shm).is_ok() && make_files(&shm) {
+                return shm;
+            }
+            eprintln!("note: no file system here keeps times before 1901");
+            dir
+        })
+    }
+
+    const STYLE: &str =
+        "--time-style=+%C.%y.%g.%G.%Y|%c|%x|%F|%D|%EC|%Ey|%EY|%Oy|%OC|%+6Y|%_3C|%-y|%s";
+
+    crate::gnu_cases! {
+        ls_odd_years_format: "ls" ["-l", STYLE, FILES[0], FILES[1], FILES[2], FILES[3], FILES[4], FILES[5], FILES[6], FILES[7], FILES[8]] env [("TZ", "UTC0")];
+        ls_odd_years_default: "ls" ["-l", "."] env [("TZ", "UTC0")];
+        ls_odd_years_full_iso: "ls" ["-lU", "--full-time", "."] env [("TZ", "America/New_York")];
+        ls_odd_years_long_iso: "ls" ["-l", "--time-style=long-iso", "."] env [("TZ", "UTC0")];
+        du_odd_years_format: "du" ["--time", STYLE, "-a", "."] env [("TZ", "UTC0")];
+        du_odd_years_default: "du" ["--time", "-a", "."] env [("TZ", "UTC0")];
+        du_odd_years_full_iso: "du" ["--time", "--time-style=full-iso", "-a", "."] env [("TZ", "America/New_York")];
+        stat_odd_years: "stat" ["-c", "%n %y|%x|%Y|%X", FILES[0], FILES[1], FILES[2], FILES[3], FILES[4], FILES[5], FILES[6], FILES[7], FILES[8]] env [("TZ", "UTC0")];
+        stat_odd_years_default: "stat" [FILES[3], FILES[8]] env [("TZ", "Asia/Kolkata")];
+    }
+}

@@ -565,10 +565,11 @@ fn render_epoch(out: &mut Vec<u8>, d: &StatDirective, t: Timespec) {
     out.resize(out.len() + pad, b' ');
 }
 
-/// GNU `stat`'s `human_time`: `2024-01-31 12:34:56.123456789 +0100`.
+/// GNU `stat`'s `human_time`: `2024-01-31 12:34:56.123456789 +0100`, or
+/// `SECONDS.NNNNNNNNN` for a time with no broken-down form.
 fn stat_human_time(t: Timespec) -> Vec<u8> {
     format_local_time("%Y-%m-%d %H:%M:%S.%N %z", t)
-        .unwrap_or_else(|| t.sec.to_string())
+        .unwrap_or_else(|| format!("{}.{:09}", t.sec, t.nsec))
         .into_bytes()
 }
 
